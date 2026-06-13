@@ -31,6 +31,15 @@ from clbfield.official.mrixfields2026 import (
     requires_segmentation,
     spec_as_dict,
 )
+from clbfield.official.submissions import (
+    ExpectedSubmissionEntry,
+    SubmissionValidationReport,
+    audit_prediction_manifest_rows,
+    build_submission_zip,
+    expected_submission_entries,
+    validate_submission_dir,
+    validate_submission_zip,
+)
 
 __all__ = [
     "FIELDS",
@@ -39,6 +48,8 @@ __all__ = [
     "INTENSITY_RANGE",
     "MRIxFieldsFilename",
     "OFFICIAL_MODALITIES",
+    "ExpectedSubmissionEntry",
+    "SubmissionValidationReport",
     "SUBMISSION_SHAPE",
     "SUBMISSION_Z_CLIP",
     "TASK1_PAIRS",
@@ -47,10 +58,13 @@ __all__ = [
     "TRAIN_SLICE_RANGE",
     "VALIDATION_RELEASED_IDS",
     "build_prediction_filename",
+    "audit_prediction_manifest_rows",
+    "build_submission_zip",
     "expected_modalities",
     "expected_prediction_file_count",
     "expected_segmentation_file_count",
     "expected_subject_ids_for_pair",
+    "expected_submission_entries",
     "expected_subtask_count",
     "get_task_pairs",
     "internal_modality_from_official",
@@ -62,4 +76,6 @@ __all__ = [
     "parse_pair_name",
     "requires_segmentation",
     "spec_as_dict",
+    "validate_submission_dir",
+    "validate_submission_zip",
 ]

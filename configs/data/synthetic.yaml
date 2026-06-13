@@ -1,0 +1,10 @@
+name: synthetic
+num_samples: 4
+volume_shape: [1, 8, 8, 8]
+source_domains:
+  - field_strength_t: 3.0
+    contrast: T1w
+target_domains:
+  - field_strength_t: 1.5
+    contrast: T2w
+

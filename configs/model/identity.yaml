@@ -1,0 +1,7 @@
+name: identity
+encoder: identity
+decoder: identity
+translator: identity
+learnable_scale: true
+initial_scale: 0.95
+

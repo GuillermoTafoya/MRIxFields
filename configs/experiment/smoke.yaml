@@ -1,0 +1,13 @@
+seed: 13
+data:
+  name: synthetic
+  num_samples: 4
+  volume_shape: [1, 8, 8, 8]
+model:
+  name: identity
+  initial_scale: 0.95
+training:
+  steps: 2
+  batch_size: 2
+  lr: 0.01
+

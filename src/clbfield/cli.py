@@ -9,6 +9,7 @@ from typing import Any
 
 from clbfield.config import dump_yaml_config, load_yaml_config
 from clbfield.data.manifests import audit_manifest, load_manifest
+from clbfield.official.mrixfields2026 import spec_as_dict
 from clbfield.training.smoke_train import SmokeTrainConfig, run_smoke_train
 
 
@@ -29,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit-manifest", help="Validate manifest structure and paths.")
     audit.add_argument("manifest", type=Path)
     audit.add_argument("--strict-paths", action="store_true")
+
+    subparsers.add_parser(
+        "mrixfields2026-print-spec",
+        help="Print official MRIxFields2026 constants, task specs, and validation IDs.",
+    )
 
     return parser
 
@@ -58,6 +64,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ok"] else 1
 
+    if args.command == "mrixfields2026-print-spec":
+        print(json.dumps(spec_as_dict(), indent=2))
+        return 0
+
     raise ValueError(f"Unknown command: {args.command}")
 
 
@@ -78,4 +88,3 @@ def _override(config: dict[str, Any], section: str, key: str, value: Any | None)
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

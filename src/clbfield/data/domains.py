@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 
+from clbfield.official.mrixfields2026 import internal_modality_from_official, normalize_modality
+
 FIELD_STRENGTHS_T: tuple[float, ...] = (0.1, 1.5, 3.0, 5.0, 7.0)
 FIELD_MIN_T = min(FIELD_STRENGTHS_T)
 FIELD_MAX_T = max(FIELD_STRENGTHS_T)
@@ -27,6 +29,13 @@ class Contrast(str, Enum):
             return value
         for contrast in cls:
             if value == contrast.value or value == contrast.name:
+                return contrast
+        try:
+            internal_label = internal_modality_from_official(normalize_modality(str(value)))
+        except ValueError:
+            internal_label = ""
+        for contrast in cls:
+            if internal_label == contrast.value:
                 return contrast
         raise ValueError(f"Unsupported contrast {value!r}. Expected one of {contrast_values()}.")
 
@@ -124,4 +133,3 @@ def domain_from_any(value: Domain | dict[str, Any]) -> Domain:
     if isinstance(value, dict):
         return Domain.from_dict(value)
     raise TypeError(f"Cannot parse Domain from {type(value).__name__}.")
-

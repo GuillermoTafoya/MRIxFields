@@ -1,26 +1,28 @@
 # AGENTS.md
 
-Repository guidance for Codex and other coding agents working on CLB-Field.
+Repository guidance for Codex and other coding agents working on FieldBridge.
 
 ## Project Purpose
 
-CLB-Field is a research scaffold for polymorphic MRI field and contrast translation.
+FieldBridge is a research scaffold for polymorphic MRI field and contrast translation.
 The current codebase is intentionally synthetic-data-only and CPU-friendly. It defines
 contracts, interfaces, stubs, configs, tests, and a smoke training path, but it must
 not include real MRI data or generated research artifacts.
 
 ## Repo Layout
 
-- `src/clbfield/`: installable Python package.
-- `src/clbfield/data/`: domain objects, records, manifests, data sources, datasets,
+- `src/fieldbridge/`: installable Python package.
+- `src/fieldbridge/data/`: domain objects, records, manifests, data sources, datasets,
   and transforms.
-- `src/clbfield/models/`: encoder, decoder, translator, and conditioning contracts,
+- `src/fieldbridge/models/`: encoder, decoder, translator, and conditioning contracts,
   identity implementations, and research stubs.
-- `src/clbfield/training/`: batch helpers, losses, synthetic smoke training, and
+- `src/fieldbridge/training/`: batch helpers, losses, synthetic smoke training, and
   checkpoint helpers.
-- `src/clbfield/evaluation/`: lightweight tensor metrics.
-- `src/clbfield/config/`: YAML config loading helpers.
+- `src/fieldbridge/evaluation/`: lightweight tensor metrics.
+- `src/fieldbridge/config/`: YAML config loading helpers.
 - `configs/`: checked-in synthetic/model/experiment YAML examples.
+- `docs/`: architecture reference (`ARCHITECTURE.md`) and per-phase implementation
+  plans (`docs/plans/`).
 - `notebooks/`: lightweight bootstrap scripts only. Do not add executed notebooks
   or outputs.
 - `tests/`: pytest coverage for domains, datasets, model interfaces, and smoke
@@ -34,8 +36,8 @@ Use PowerShell on Windows unless another shell is explicitly requested.
 ```powershell
 python -m pip install -e ".[dev]"
 pytest
-clbfield smoke-train
-clbfield print-config --config configs/experiment/smoke.yaml
+fieldbridge smoke-train
+fieldbridge print-config --config configs/experiment/smoke.yaml
 ```
 
 The package is designed so the default smoke path runs on CPU and uses synthetic
@@ -48,7 +50,7 @@ before handing work back.
 
 ```powershell
 pytest
-clbfield smoke-train
+fieldbridge smoke-train
 ```
 
 Optional quality extras are declared separately:
@@ -103,7 +105,7 @@ Work is ready to hand back when:
 
 - The requested files or behavior are implemented.
 - `pytest` passes, or any inability to run it is clearly reported.
-- `clbfield smoke-train` still runs for changes touching package, CLI, data, model,
+- `fieldbridge smoke-train` still runs for changes touching package, CLI, data, model,
   or training code.
 - No forbidden data, secrets, checkpoints, archives, or generated artifacts were added.
 - The worktree status is understood and reported.

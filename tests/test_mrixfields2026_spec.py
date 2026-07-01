@@ -1,7 +1,7 @@
 import pytest
 
-from clbfield.data.domains import Contrast, Domain
-from clbfield.official.mrixfields2026 import (
+from fieldbridge.data.domains import Contrast, Domain
+from fieldbridge.official.mrixfields2026 import (
     FIELDS,
     FIELD_VALUES,
     FULL_SHAPE,

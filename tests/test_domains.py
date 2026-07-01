@@ -1,7 +1,9 @@
+import math
+
 import pytest
 import torch
 
-from clbfield.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
+from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 
 
 def test_domain_encodings_are_continuous_and_categorical() -> None:
@@ -11,11 +13,13 @@ def test_domain_encodings_are_continuous_and_categorical() -> None:
     contrast = domain.contrast_encoding()
     conditioning = domain.conditioning_vector()
 
-    assert field.shape == (1,)
-    assert 0.0 <= float(field.item()) <= 1.0
+    assert field.shape == (2,)
+    assert torch.isfinite(field).all()
+    assert math.isclose(float(field[0].item()), math.log(3.0), rel_tol=1e-6)
+    assert math.isclose(float(field[1].item()), 3.0 / 7.0, rel_tol=1e-6)
     assert contrast.shape == (len(CONTRASTS),)
     assert torch.sum(contrast).item() == 1.0
-    assert conditioning.shape == (1 + len(CONTRASTS),)
+    assert conditioning.shape == (2 + len(CONTRASTS),)
     assert domain.to_dict() == {"field_strength_t": 3.0, "contrast": "T2-FLAIR"}
 
 

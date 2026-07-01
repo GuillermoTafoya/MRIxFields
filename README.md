@@ -1,6 +1,6 @@
-# CLB-Field
+# FieldBridge
 
-Initial research scaffold for CLB-Field, a polymorphic PyTorch/MONAI-compatible
+Initial research scaffold for FieldBridge, a polymorphic PyTorch/MONAI-compatible
 framework for MRI field and contrast translation.
 
 This repository intentionally contains no real MRI data, credentials, model
@@ -12,14 +12,14 @@ path uses synthetic tensors only.
 ```powershell
 pip install -e ".[dev]"
 pytest
-clbfield smoke-train
+fieldbridge smoke-train
 ```
 
 ## CLI
 
 ```powershell
-clbfield smoke-train
-clbfield print-config --config configs/experiment/smoke.yaml
-clbfield audit-manifest path/to/manifest.yaml
+fieldbridge smoke-train
+fieldbridge print-config --config configs/experiment/smoke.yaml
+fieldbridge audit-manifest path/to/manifest.yaml
 ```
 

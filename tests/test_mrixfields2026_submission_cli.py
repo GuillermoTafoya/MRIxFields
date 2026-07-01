@@ -1,7 +1,7 @@
 import json
 
-from clbfield.cli import main
-from clbfield.official.submissions import (
+from fieldbridge.cli import main
+from fieldbridge.official.submissions import (
     expected_submission_entries,
     validate_submission_zip,
 )

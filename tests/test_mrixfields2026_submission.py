@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from zipfile import ZipFile
 
-from clbfield.official.submissions import (
+from fieldbridge.official.submissions import (
     build_submission_zip,
     expected_submission_entries,
     validate_submission_dir,

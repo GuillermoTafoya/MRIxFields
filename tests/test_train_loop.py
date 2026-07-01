@@ -103,3 +103,25 @@ def test_run_train_loop_autoencoder_checkpoint_contains_model_weights(tmp_path) 
     assert state["decoder"]
     assert "translator" in state
     assert "optimizer" in state
+
+
+def test_run_train_loop_autoencoder_updates_encoder_and_decoder_params() -> None:
+    encoder = CNNEncoder(hidden_channels=(2,), latent_channels=3, spatial_dims=3)
+    decoder = CNNDecoder(hidden_channels=(2,), latent_channels=3, spatial_dims=3)
+    translator = IdentityTranslator()
+    encoder_before = [param.detach().clone() for param in encoder.parameters()]
+    decoder_before = [param.detach().clone() for param in decoder.parameters()]
+    config = TrainLoopConfig(
+        steps=1,
+        batch_size=1,
+        num_samples=2,
+        volume_shape=(1, 8, 8, 8),
+        seed=13,
+        lr=0.01,
+        stage="autoencoder",
+    )
+
+    run_train_loop(config, encoder=encoder, decoder=decoder, translator=translator)
+
+    assert any(not torch.equal(before, after) for before, after in zip(encoder_before, encoder.parameters()))
+    assert any(not torch.equal(before, after) for before, after in zip(decoder_before, decoder.parameters()))

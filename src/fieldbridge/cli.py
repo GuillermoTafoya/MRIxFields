@@ -16,6 +16,12 @@ from fieldbridge.data.datasets import ManifestVolumeDataset, collate_raw_batches
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
+from fieldbridge.official.data_manifest import (
+    audit_mrixfields_manifest,
+    read_manifest_jsonl,
+    scan_mrixfields_data_root,
+    write_manifest_jsonl,
+)
 from fieldbridge.official.mrixfields2026 import spec_as_dict
 from fieldbridge.official.submissions import (
     build_submission_zip,
@@ -101,6 +107,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
     )
 
+    build_manifest = subparsers.add_parser(
+        "mrixfields2026-build-manifest",
+        help="Scan an extracted MRIxFields2026 data root and write a JSONL audit manifest.",
+    )
+    build_manifest.add_argument("--data-root", type=Path, required=True)
+    build_manifest.add_argument("--out", type=Path, required=True)
+    build_manifest.add_argument("--split", action="append", default=None)
+    build_manifest.add_argument("--inspect-payload", action="store_true")
+    build_manifest.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    audit_data = subparsers.add_parser(
+        "mrixfields2026-audit-data",
+        help="Audit an MRIxFields2026 JSONL manifest or extracted data root.",
+    )
+    audit_source = audit_data.add_mutually_exclusive_group(required=True)
+    audit_source.add_argument("--manifest", type=Path)
+    audit_source.add_argument("--data-root", type=Path)
+    audit_data.add_argument("--inspect-payload", action="store_true")
+    audit_data.add_argument("--json", action="store_true", help="Emit JSON output.")
+
     return parser
 
 
@@ -185,6 +211,30 @@ def main(argv: list[str] | None = None) -> int:
             payload = {"out": str(args.out), "validation": validation.to_dict()}
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if validation.ok else 1
+
+    if args.command == "mrixfields2026-build-manifest":
+        records = scan_mrixfields_data_root(
+            args.data_root,
+            splits=args.split,
+            include_payload_metadata=args.inspect_payload,
+        )
+        write_manifest_jsonl(records, args.out)
+        report = audit_mrixfields_manifest(records)
+        payload = {"out": str(args.out), "audit": report.to_dict()}
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if report.ok else 1
+
+    if args.command == "mrixfields2026-audit-data":
+        if args.manifest is not None:
+            records = read_manifest_jsonl(args.manifest)
+        else:
+            records = scan_mrixfields_data_root(
+                args.data_root,
+                include_payload_metadata=args.inspect_payload,
+            )
+        report = audit_mrixfields_manifest(records)
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0 if report.ok else 1
 
     raise ValueError(f"Unknown command: {args.command}")
 

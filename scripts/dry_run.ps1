@@ -13,10 +13,10 @@ python -m pip install -q -e ".[dev]"
 Write-Host "== [2/4] pytest =="
 python -m pytest -q
 
-Write-Host "== [3/4] clbfield smoke-train =="
-python -m clbfield.cli smoke-train --steps $Steps --batch-size $BatchSize --json
+Write-Host "== [3/4] fieldbridge smoke-train =="
+python -m fieldbridge.cli smoke-train --steps $Steps --batch-size $BatchSize --json
 
-Write-Host "== [4/4] clbfield train (translator stage, identity variant) =="
-python -m clbfield.cli train --config configs/experiment/smoke.yaml --steps $Steps --batch-size $BatchSize --json
+Write-Host "== [4/4] fieldbridge train (translator stage, identity variant) =="
+python -m fieldbridge.cli train --config configs/experiment/smoke.yaml --steps $Steps --batch-size $BatchSize --json
 
 Write-Host "== dry run OK =="

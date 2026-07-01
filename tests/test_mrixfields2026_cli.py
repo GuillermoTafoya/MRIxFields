@@ -1,6 +1,6 @@
 import json
 
-from clbfield.cli import main
+from fieldbridge.cli import main
 
 
 def test_mrixfields2026_print_spec_cli_outputs_json(capsys) -> None:

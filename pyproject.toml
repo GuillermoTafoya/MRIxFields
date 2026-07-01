@@ -1,16 +1,16 @@
 [build-system]
 requires = []
-build-backend = "clbfield_build_backend"
+build-backend = "fieldbridge_build_backend"
 backend-path = ["build_backend"]
 
 [project]
-name = "clb-field"
+name = "field-bridge"
 version = "0.1.0"
 description = "Polymorphic PyTorch/MONAI-compatible framework for MRI field and contrast translation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "CLB-Field contributors" }]
+authors = [{ name = "FieldBridge contributors" }]
 dependencies = [
   "torch>=2.0",
   "PyYAML>=6.0",
@@ -35,7 +35,7 @@ nifti = [
 ]
 
 [project.scripts]
-clbfield = "clbfield.cli:main"
+fieldbridge = "fieldbridge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -54,7 +54,7 @@ select = ["B", "E", "F", "I", "UP"]
 
 [tool.mypy]
 python_version = "3.10"
-packages = ["clbfield"]
+packages = ["fieldbridge"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

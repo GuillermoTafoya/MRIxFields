@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from clbfield.training.checkpoints import (
+from fieldbridge.training.checkpoints import (
     checkpoint_filename,
     load_checkpoint,
     resolve_git_commit,

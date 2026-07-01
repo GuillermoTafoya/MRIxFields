@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from clbfield.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
+from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 
 
 def test_domain_encodings_are_continuous_and_categorical() -> None:

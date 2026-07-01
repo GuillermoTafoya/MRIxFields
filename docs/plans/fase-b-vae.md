@@ -51,7 +51,7 @@ decided elsewhere (e.g. in preprocessing scripts outside this repo).
 
 ## 4. Model
 
-New file `src/clbfield/models/autoencoders/kl_vae_gan.py`:
+New file `src/fieldbridge/models/autoencoders/kl_vae_gan.py`:
 
 ```python
 class KLVAEEncoder(BaseEncoder):
@@ -74,7 +74,7 @@ class KLVAEDecoder(BaseDecoder):
 - `encode()` reparameterizes (`mean + eps * std`) for training; expose `encode_dist()`
   separately since `kl_divergence(mean, logvar)` needs both, not just the sample.
 
-New file `src/clbfield/models/discriminators/patch_discriminator.py`:
+New file `src/fieldbridge/models/discriminators/patch_discriminator.py`:
 
 ```python
 class PatchDiscriminator(nn.Module):
@@ -95,7 +95,7 @@ Register in `models/factory.py`: `_ENCODERS["kl_vae_gan"] = KLVAEEncoder`,
 Etapa 1 has no translator and a different loss set (KL + adversarial + perceptual, no
 transport-cost/cycle/identity). Reusing it would force awkward no-op translator plumbing.
 
-New file `src/clbfield/training/stage1_vae.py`:
+New file `src/fieldbridge/training/stage1_vae.py`:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -137,7 +137,7 @@ path).
   keys were skipped rather than failing silently.
 - Oversampling: real training draws from `ManifestVolumeDataset` with a
   `torch.utils.data.WeightedRandomSampler`. Add a small helper (new file
-  `src/clbfield/data/sampling.py` or a function in `datasets.py` — decide based on size
+  `src/fieldbridge/data/sampling.py` or a function in `datasets.py` — decide based on size
   once written) `domain_oversampling_weights(records, *, boost_by_field: dict[float, float])`
   that returns per-record weights (e.g. `{0.1: 3.0}` to sample 0.1T three times as often).
 - **Both of these run outside the repo** (GPU rental, real data) — the checked-in code

@@ -1,7 +1,7 @@
 import pytest
 
-from clbfield.official.mrixfields2026 import FULL_SHAPE, SUBMISSION_SHAPE
-from clbfield.official.validation import (
+from fieldbridge.official.mrixfields2026 import FULL_SHAPE, SUBMISSION_SHAPE
+from fieldbridge.official.validation import (
     submission_shape_from_full_shape,
     validate_dtype,
     validate_intensity_range,

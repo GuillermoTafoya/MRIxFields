@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from clbfield.training.losses import (
+from fieldbridge.training.losses import (
     adversarial_hinge_loss_discriminator,
     adversarial_hinge_loss_generator,
     cycle_consistency_loss,

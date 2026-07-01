@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from clbfield.evaluation.metrics import lpips_metric, nrmse, ssim
+from fieldbridge.evaluation.metrics import lpips_metric, nrmse, ssim
 
 
 def test_nrmse_zero_for_identical_tensors() -> None:

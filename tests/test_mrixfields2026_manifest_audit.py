@@ -1,4 +1,4 @@
-from clbfield.official.submissions import (
+from fieldbridge.official.submissions import (
     audit_prediction_manifest_rows,
     expected_submission_entries,
 )

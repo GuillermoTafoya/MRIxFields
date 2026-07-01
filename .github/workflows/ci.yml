@@ -19,5 +19,5 @@ jobs:
       - name: Run tests
         run: pytest
       - name: Run smoke CLI
-        run: clbfield smoke-train --steps 1
+        run: fieldbridge smoke-train --steps 1
 

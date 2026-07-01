@@ -1,6 +1,6 @@
 import math
 
-from clbfield.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
 
 
 def test_smoke_train_runs_on_cpu() -> None:

@@ -1,12 +1,12 @@
 from torch.utils.data import DataLoader
 
-from clbfield.data.contracts import VolumeRecord
-from clbfield.data.datasets import (
+from fieldbridge.data.contracts import VolumeRecord
+from fieldbridge.data.datasets import (
     SyntheticVolumeDataset,
     collate_raw_batches,
     random_any_to_any_selector,
 )
-from clbfield.data.domains import Domain
+from fieldbridge.data.domains import Domain
 
 
 def test_synthetic_dataset_batch_shape() -> None:

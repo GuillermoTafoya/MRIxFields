@@ -15,8 +15,8 @@ import argparse
 import json
 from pathlib import Path
 
-from clbfield.data.manifests import Manifest
-from clbfield.data.sources import records_from_directory
+from fieldbridge.data.manifests import Manifest
+from fieldbridge.data.sources import records_from_directory
 
 
 def main() -> int:

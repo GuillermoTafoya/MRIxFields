@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from clbfield.data.domains import Contrast
-from clbfield.data.sources import nifti_image_loader, records_from_directory
+from fieldbridge.data.domains import Contrast
+from fieldbridge.data.sources import nifti_image_loader, records_from_directory
 
 
 def _touch(path: Path) -> None:

@@ -1,12 +1,12 @@
 import pytest
 import torch
 
-from clbfield.data.domains import Domain
-from clbfield.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
-from clbfield.models.conditioning import DomainConditioner
-from clbfield.models.factory import build_decoder, build_encoder, build_translator
-from clbfield.models.film import FiLMLayer
-from clbfield.models.translators.identity import IdentityTranslator
+from fieldbridge.data.domains import Domain
+from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
+from fieldbridge.models.conditioning import DomainConditioner
+from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
+from fieldbridge.models.film import FiLMLayer
+from fieldbridge.models.translators.identity import IdentityTranslator
 
 
 def test_identity_model_interfaces_preserve_shape() -> None:

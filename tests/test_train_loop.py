@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from clbfield.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
-from clbfield.models.translators.identity import IdentityTranslator
-from clbfield.training.train_loop import TrainLoopConfig, assert_frozen, run_train_loop
+from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
+from fieldbridge.models.translators.identity import IdentityTranslator
+from fieldbridge.training.train_loop import TrainLoopConfig, assert_frozen, run_train_loop
 
 
 def _models(*, learnable_scale: bool = True) -> tuple[IdentityEncoder, IdentityDecoder, IdentityTranslator]:

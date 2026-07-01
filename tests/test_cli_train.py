@@ -1,6 +1,6 @@
 import json
 
-from clbfield.cli import main
+from fieldbridge.cli import main
 
 
 def test_train_cli_runs_with_default_smoke_config(capsys) -> None:

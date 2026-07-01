@@ -1,13 +1,13 @@
-# CLB-Field — Architecture & Current State
+# FieldBridge — Architecture & Current State
 
-Technical reference for the `clbfield` package as it exists after **Fase A** (cross-cutting
+Technical reference for the `fieldbridge` package as it exists after **Fase A** (cross-cutting
 infra). For the full research roadmap (ablation ladder, losses, compute budget) see the
 project's Claude Code skill `mrixfields-project`; this document covers what is actually
 implemented and how the pieces fit together.
 
 ## 1. Purpose
 
-`clbfield` is the implementation scaffold for MRIxFields Task 3: a single conditional
+`fieldbridge` is the implementation scaffold for MRIxFields Task 3: a single conditional
 model that translates MRI volumes between 5 field strengths (0.1/1.5/3/5/7T) and 3
 contrasts (T1w/T2w/T2-FLAIR), any combination to any combination, with shared parameters
 (no per-field or per-pair subnetworks — a hard challenge requirement).
@@ -19,17 +19,17 @@ OT-CFM → entropic-OT Schrödinger bridge → optional adversarial refinement).
 ## 2. Package layout
 
 ```
-src/clbfield/
+src/fieldbridge/
 ├── data/            # domain objects, records, manifests, sources, datasets, transforms
 ├── models/          # encoder/decoder/translator contracts, conditioning, factory
 ├── training/         # batch helpers, losses, checkpoints, smoke + real train loops
 ├── evaluation/       # tensor metrics, including the 3 official Task 3 metrics
 ├── official/         # MRIxFields2026 challenge spec, submission build/validate
 ├── config/           # YAML load/merge helpers
-└── cli.py            # `clbfield` entry point
+└── cli.py            # `fieldbridge` entry point
 ```
 
-Everything under `src/clbfield/` must keep running on CPU with synthetic data — no real
+Everything under `src/fieldbridge/` must keep running on CPU with synthetic data — no real
 MRI data, checkpoints, or NIfTI files are committed to this repo (see `AGENTS.md`). Real
 training happens outside the repo (rented GPU), driven by the same code.
 
@@ -132,13 +132,13 @@ zip; do not reimplement naming or validation logic elsewhere.
 ## 9. CLI (`cli.py`)
 
 ```powershell
-clbfield smoke-train [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
-clbfield train        [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
-clbfield print-config --config PATH
-clbfield audit-manifest MANIFEST [--strict-paths]
-clbfield mrixfields2026-print-spec
-clbfield mrixfields2026-audit-submission --root PATH --task {task1,task2,task3} [--allow-missing-seg] [--allow-extra-files] [--json]
-clbfield mrixfields2026-zip-submission --submission-root PATH --task {task1,task2,task3} --out PATH.zip [--allow-missing-seg]
+fieldbridge smoke-train [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
+fieldbridge train        [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
+fieldbridge print-config --config PATH
+fieldbridge audit-manifest MANIFEST [--strict-paths]
+fieldbridge mrixfields2026-print-spec
+fieldbridge mrixfields2026-audit-submission --root PATH --task {task1,task2,task3} [--allow-missing-seg] [--allow-extra-files] [--json]
+fieldbridge mrixfields2026-zip-submission --submission-root PATH --task {task1,task2,task3} --out PATH.zip [--allow-missing-seg]
 ```
 
 `train` reads `config["model"]["name"]` (default `"identity"`) and builds
@@ -177,7 +177,7 @@ long GPU run. Key files:
 - `test_mrixfields2026_*.py` — the official challenge layer (spec, submission,
   validation, CLI) — untouched, already exhaustive.
 
-Run `pytest` (fast, CPU) and `clbfield smoke-train` before handing back any change that
+Run `pytest` (fast, CPU) and `fieldbridge smoke-train` before handing back any change that
 touches package, CLI, data, model, or training code.
 
 ## 12. Status vs. the ablation ladder

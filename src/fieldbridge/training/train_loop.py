@@ -166,8 +166,10 @@ def run_train_loop(
         assert_frozen(encoder)
         assert_frozen(decoder)
         trainable_params = list(translator.parameters())
+    elif cfg.stage == "autoencoder":
+        trainable_params = list(encoder.parameters()) + list(decoder.parameters())
     else:
-        trainable_params = list(encoder.parameters()) + list(decoder.parameters()) + list(translator.parameters())
+        raise ValueError(f"Unsupported training stage {cfg.stage!r}.")
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.lr)
 
     start_step = 0

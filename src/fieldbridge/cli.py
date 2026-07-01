@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -125,11 +126,14 @@ def main(argv: list[str] | None = None) -> int:
         _override(config, "training", "batch_size", args.batch_size)
         if args.seed is not None:
             config["seed"] = args.seed
-        model_config = dict(config.get("model", {}))
-        model_name = model_config.pop("name", "identity")
-        encoder = build_encoder(model_name)
-        decoder = build_decoder(model_name)
-        translator = build_translator(model_name, **model_config)
+        model_config = _model_config(config)
+        model_name = str(model_config.get("name", "identity"))
+        encoder_name, encoder_kwargs = _component_config(model_config, "encoder", model_name)
+        decoder_name, decoder_kwargs = _component_config(model_config, "decoder", model_name)
+        translator_name, translator_kwargs = _component_config(model_config, "translator", model_name)
+        encoder = build_encoder(encoder_name, **encoder_kwargs)
+        decoder = build_decoder(decoder_name, **decoder_kwargs)
+        translator = build_translator(translator_name, **translator_kwargs)
         loop_config = TrainLoopConfig.from_mapping(config)
         loader = _build_manifest_loader(args.manifest, batch_size=loop_config.batch_size) if args.manifest else None
         result = run_train_loop(loop_config, encoder=encoder, decoder=decoder, translator=translator, loader=loader)
@@ -195,6 +199,55 @@ def _load_optional_config(path: Path) -> dict[str, Any]:
     if path.exists():
         return load_yaml_config(path)
     return {}
+
+
+def _model_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    value = config.get("model", {})
+    if not isinstance(value, Mapping):
+        raise ValueError("Config section 'model' must be a mapping.")
+    return dict(value)
+
+
+def _component_config(
+    model_config: Mapping[str, Any],
+    component: str,
+    default_name: str,
+) -> tuple[str, dict[str, Any]]:
+    nested = model_config.get(component, {})
+    if nested is None:
+        nested_config: dict[str, Any] = {}
+    elif isinstance(nested, Mapping):
+        nested_config = dict(nested)
+    else:
+        raise ValueError(f"model.{component} must be a mapping when provided.")
+
+    name = str(nested_config.pop("name", default_name))
+    top_level_kwargs = _top_level_component_kwargs(model_config, component, default_name)
+
+    if component in {"encoder", "decoder"} and default_name != "identity":
+        return name, {**top_level_kwargs, **nested_config}
+    if component == "translator" and default_name == "identity":
+        return name, {**top_level_kwargs, **nested_config}
+    return name, nested_config
+
+
+def _top_level_component_kwargs(
+    model_config: Mapping[str, Any],
+    component: str,
+    default_name: str,
+) -> dict[str, Any]:
+    top_level = {
+        key: value
+        for key, value in model_config.items()
+        if key not in {"name", "variant", "encoder", "decoder", "translator"}
+    }
+    if default_name == "cnn_autoencoder" and component in {"encoder", "decoder"}:
+        shared_keys = {"spatial_dims", "hidden_channels", "latent_channels", "activation", "use_norm"}
+        encoder_keys = shared_keys | {"in_channels"}
+        decoder_keys = shared_keys | {"out_channels", "final_activation"}
+        allowed = encoder_keys if component == "encoder" else decoder_keys
+        return {key: value for key, value in top_level.items() if key in allowed}
+    return top_level
 
 
 def _override(config: dict[str, Any], section: str, key: str, value: Any | None) -> None:

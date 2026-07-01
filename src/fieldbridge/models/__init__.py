@@ -1,5 +1,6 @@
 """Model contracts and baseline implementations."""
 
+from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncoder
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
 from fieldbridge.models.conditioning import DomainConditioner
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
@@ -9,6 +10,8 @@ from fieldbridge.models.translators.identity import IdentityTranslator
 __all__ = [
     "DomainConditioner",
     "FiLMLayer",
+    "CNNDecoder",
+    "CNNEncoder",
     "IdentityDecoder",
     "IdentityEncoder",
     "IdentityTranslator",

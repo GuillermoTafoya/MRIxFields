@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from fieldbridge.data.domains import Domain
+from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncoder
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
 from fieldbridge.models.conditioning import DomainConditioner
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
@@ -62,6 +63,37 @@ def test_factory_builds_identity_models_by_name() -> None:
     assert isinstance(build_encoder("identity"), IdentityEncoder)
     assert isinstance(build_decoder("identity"), IdentityDecoder)
     assert isinstance(build_translator("identity", learnable_scale=True), IdentityTranslator)
+
+
+def test_cnn_autoencoder_preserves_3d_volume_shape() -> None:
+    source = Domain(3.0, "T1w")
+    x = torch.randn(2, 1, 8, 8, 8)
+    encoder = CNNEncoder(hidden_channels=(4, 8), latent_channels=6, spatial_dims=3)
+    decoder = CNNDecoder(hidden_channels=(4, 8), latent_channels=6, spatial_dims=3)
+
+    z = encoder.encode(x, [source, source])
+    y = decoder.decode(z, [source, source])
+
+    assert z.shape == (2, 6, 2, 2, 2)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+def test_cnn_autoencoder_supports_2d_slice_tensors() -> None:
+    source = Domain(3.0, "T1w")
+    x = torch.randn(2, 1, 16, 16)
+    encoder = CNNEncoder(hidden_channels=(4,), latent_channels=5, spatial_dims=2)
+    decoder = CNNDecoder(hidden_channels=(4,), latent_channels=5, spatial_dims=2)
+
+    y = decoder.decode(encoder.encode(x, [source, source]), [source, source])
+
+    assert y.shape == x.shape
+
+
+def test_factory_builds_cnn_autoencoder_by_name() -> None:
+    assert isinstance(build_encoder("cnn_autoencoder"), CNNEncoder)
+    assert isinstance(build_decoder("cnn_autoencoder"), CNNDecoder)
+    assert isinstance(build_translator("cnn_autoencoder"), IdentityTranslator)
 
 
 def test_factory_rejects_unknown_name() -> None:

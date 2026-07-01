@@ -11,15 +11,25 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from fieldbridge.models.autoencoders.base import BaseDecoder, BaseEncoder
+from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncoder
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.models.translators.identity import IdentityTranslator
 
 T = TypeVar("T")
 
-_ENCODERS: dict[str, Callable[..., BaseEncoder]] = {"identity": IdentityEncoder}
-_DECODERS: dict[str, Callable[..., BaseDecoder]] = {"identity": IdentityDecoder}
-_TRANSLATORS: dict[str, Callable[..., BaseTranslator]] = {"identity": IdentityTranslator}
+_ENCODERS: dict[str, Callable[..., BaseEncoder]] = {
+    "identity": IdentityEncoder,
+    "cnn_autoencoder": CNNEncoder,
+}
+_DECODERS: dict[str, Callable[..., BaseDecoder]] = {
+    "identity": IdentityDecoder,
+    "cnn_autoencoder": CNNDecoder,
+}
+_TRANSLATORS: dict[str, Callable[..., BaseTranslator]] = {
+    "identity": IdentityTranslator,
+    "cnn_autoencoder": IdentityTranslator,
+}
 
 
 def build_encoder(name: str, **kwargs: Any) -> BaseEncoder:

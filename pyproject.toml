@@ -27,6 +27,12 @@ quality = [
 monai = [
   "monai>=1.3",
 ]
+perceptual = [
+  "lpips>=0.1.4",
+]
+nifti = [
+  "nibabel>=5.0",
+]
 
 [project.scripts]
 clbfield = "clbfield.cli:main"

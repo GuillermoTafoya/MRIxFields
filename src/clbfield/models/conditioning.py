@@ -23,7 +23,12 @@ def normalize_domain_batch(domains: DomainBatch, *, batch_size: int | None = Non
 
 
 class DomainConditioner(nn.Module):
-    """Convert field and contrast metadata into conditioning vectors."""
+    """Convert a (source, target) domain pair into a single conditioning vector.
+
+    The `log(f_target / f_source)` term only makes sense for a pair, not a lone
+    `Domain`, so this conditioner takes source and target domains together rather
+    than encoding either side in isolation.
+    """
 
     def __init__(
         self,
@@ -36,32 +41,49 @@ class DomainConditioner(nn.Module):
         self.conditioning_dim = int(conditioning_dim)
         self.contrast_embedding = nn.Embedding(len(CONTRASTS), contrast_embedding_dim)
         self.field_projection = nn.Sequential(
-            nn.Linear(1, field_embedding_dim),
+            nn.Linear(2, field_embedding_dim),
             nn.SiLU(),
         )
+        combined_dim = 2 * field_embedding_dim + 1 + 2 * contrast_embedding_dim
         self.output_projection = nn.Sequential(
-            nn.Linear(contrast_embedding_dim + field_embedding_dim, conditioning_dim),
+            nn.Linear(combined_dim, conditioning_dim),
             nn.SiLU(),
             nn.Linear(conditioning_dim, conditioning_dim),
         )
 
     def forward(
         self,
-        domains: DomainBatch,
+        source_domains: DomainBatch,
+        target_domains: DomainBatch,
         *,
         batch_size: int | None = None,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        domain_list = normalize_domain_batch(domains, batch_size=batch_size)
+        source_list = normalize_domain_batch(source_domains, batch_size=batch_size)
+        target_list = normalize_domain_batch(target_domains, batch_size=len(source_list))
         if device is None:
             device = next(self.parameters()).device
-        fields = torch.stack([domain.field_encoding(device=device) for domain in domain_list], dim=0)
-        contrast_ids = torch.tensor(
-            [domain.contrast_index for domain in domain_list],
-            dtype=torch.long,
-            device=device,
+
+        source_fields = torch.stack([domain.field_encoding(device=device) for domain in source_list], dim=0)
+        target_fields = torch.stack([domain.field_encoding(device=device) for domain in target_list], dim=0)
+        log_field_ratio = (target_fields[:, 0] - source_fields[:, 0]).unsqueeze(-1)
+
+        source_contrast_ids = torch.tensor(
+            [domain.contrast_index for domain in source_list], dtype=torch.long, device=device
         )
-        contrast_features = self.contrast_embedding(contrast_ids)
-        field_features = self.field_projection(fields)
-        return self.output_projection(torch.cat([field_features, contrast_features], dim=-1))
+        target_contrast_ids = torch.tensor(
+            [domain.contrast_index for domain in target_list], dtype=torch.long, device=device
+        )
+
+        combined = torch.cat(
+            [
+                self.field_projection(source_fields),
+                self.field_projection(target_fields),
+                log_field_ratio,
+                self.contrast_embedding(source_contrast_ids),
+                self.contrast_embedding(target_contrast_ids),
+            ],
+            dim=-1,
+        )
+        return self.output_projection(combined)
 

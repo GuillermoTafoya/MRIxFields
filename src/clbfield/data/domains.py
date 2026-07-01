@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from math import isclose
@@ -12,7 +13,6 @@ import torch
 from clbfield.official.mrixfields2026 import internal_modality_from_official, normalize_modality
 
 FIELD_STRENGTHS_T: tuple[float, ...] = (0.1, 1.5, 3.0, 5.0, 7.0)
-FIELD_MIN_T = min(FIELD_STRENGTHS_T)
 FIELD_MAX_T = max(FIELD_STRENGTHS_T)
 
 
@@ -76,16 +76,13 @@ class Domain:
     def field_encoding(
         self,
         *,
-        normalize: bool = True,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        """Return a continuous scalar encoding for field strength."""
+        """Return [log(field_strength_t), field_strength_t / FIELD_MAX_T]."""
 
         value = self.field_strength_t
-        if normalize:
-            value = (value - FIELD_MIN_T) / (FIELD_MAX_T - FIELD_MIN_T)
-        return torch.tensor([value], dtype=dtype, device=device)
+        return torch.tensor([math.log(value), value / FIELD_MAX_T], dtype=dtype, device=device)
 
     def contrast_encoding(
         self,
@@ -102,7 +99,6 @@ class Domain:
     def conditioning_vector(
         self,
         *,
-        normalize_field: bool = True,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
@@ -110,7 +106,7 @@ class Domain:
 
         return torch.cat(
             [
-                self.field_encoding(normalize=normalize_field, dtype=dtype, device=device),
+                self.field_encoding(dtype=dtype, device=device),
                 self.contrast_encoding(dtype=dtype, device=device),
             ],
             dim=0,

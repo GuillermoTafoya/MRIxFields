@@ -7,14 +7,21 @@ import json
 from pathlib import Path
 from typing import Any
 
+from torch.utils.data import DataLoader
+
 from clbfield.config import dump_yaml_config, load_yaml_config
+from clbfield.data.contracts import RawBatch
+from clbfield.data.datasets import ManifestVolumeDataset, collate_raw_batches
 from clbfield.data.manifests import audit_manifest, load_manifest
+from clbfield.data.sources import nifti_image_loader
+from clbfield.models.factory import build_decoder, build_encoder, build_translator
 from clbfield.official.mrixfields2026 import spec_as_dict
 from clbfield.official.submissions import (
     build_submission_zip,
     validate_submission_dir,
 )
 from clbfield.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from clbfield.training.train_loop import TrainLoopConfig, run_train_loop
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +34,20 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--batch-size", type=int, default=None)
     smoke.add_argument("--seed", type=int, default=None)
     smoke.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train = subparsers.add_parser("train", help="Run the configurable Etapa 2 translator training loop.")
+    train.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
+    train.add_argument("--steps", type=int, default=None)
+    train.add_argument("--batch-size", type=int, default=None)
+    train.add_argument("--seed", type=int, default=None)
+    train.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional manifest of real NIfTI volumes (requires the 'nifti' extra) to use "
+        "instead of the synthetic loader. Never commit a real manifest to the repo.",
+    )
+    train.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     print_config = subparsers.add_parser("print-config", help="Print a YAML config.")
     print_config.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
@@ -98,6 +119,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"smoke-train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
         return 0
 
+    if args.command == "train":
+        config = _load_optional_config(args.config)
+        _override(config, "training", "steps", args.steps)
+        _override(config, "training", "batch_size", args.batch_size)
+        if args.seed is not None:
+            config["seed"] = args.seed
+        model_config = dict(config.get("model", {}))
+        model_name = model_config.pop("name", "identity")
+        encoder = build_encoder(model_name)
+        decoder = build_decoder(model_name)
+        translator = build_translator(model_name, **model_config)
+        loop_config = TrainLoopConfig.from_mapping(config)
+        loader = _build_manifest_loader(args.manifest, batch_size=loop_config.batch_size) if args.manifest else None
+        result = run_train_loop(loop_config, encoder=encoder, decoder=decoder, translator=translator, loader=loader)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
     if args.command == "print-config":
         print(dump_yaml_config(load_yaml_config(args.config)))
         return 0
@@ -142,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if validation.ok else 1
 
     raise ValueError(f"Unknown command: {args.command}")
+
+
+def _build_manifest_loader(manifest_path: Path, *, batch_size: int) -> "DataLoader[RawBatch]":
+    manifest = load_manifest(manifest_path)
+    dataset = ManifestVolumeDataset(manifest.records, image_loader=nifti_image_loader)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
 
 
 def _load_optional_config(path: Path) -> dict[str, Any]:

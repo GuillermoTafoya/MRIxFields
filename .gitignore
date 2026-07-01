@@ -2,7 +2,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
-.mypy_cache/
+.mypy_ca11che/
 .ruff_cache/
 .coverage
 htmlcov/
@@ -12,6 +12,9 @@ venv/
 env/
 .env
 .env.*
+
+.claude/
+CLAUDE.md
 
 build/
 dist/

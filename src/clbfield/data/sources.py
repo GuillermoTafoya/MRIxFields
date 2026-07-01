@@ -7,8 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import torch
+
 from clbfield.data.contracts import VolumeRecord
 from clbfield.data.manifests import Manifest, load_manifest
+from clbfield.official.mrixfields2026 import parse_mrixfields_filename
 
 
 class DataSource(Protocol):
@@ -94,4 +97,77 @@ def _resolve_relative_paths(manifest: Manifest, root: Path) -> Manifest:
             )
         )
     return Manifest.from_records(records, name=manifest.name, metadata=manifest.metadata)
+
+
+def nifti_image_loader(path: Path, record: VolumeRecord) -> torch.Tensor:
+    """Load an official MRIxFields NIfTI volume as a `(1, D, H, W)` float32 tensor.
+
+    Requires the optional `nibabel` dependency (`pip install -e ".[nifti]"`); it is not
+    part of the core install so CPU/synthetic-only workflows never need it.
+    """
+
+    del record
+    try:
+        import nibabel as nib
+    except ImportError as exc:  # pragma: no cover - exercised only without the optional dep
+        raise ImportError("nifti_image_loader requires nibabel: pip install -e \".[nifti]\".") from exc
+
+    volume = torch.from_numpy(nib.load(str(path)).get_fdata(dtype="float32"))
+    if not torch.isfinite(volume).all():
+        raise ValueError(f"Non-finite values in NIfTI volume: {path}")
+    return volume.unsqueeze(0)
+
+
+_DEFAULT_PRIORITY_DIRS: tuple[str, ...] = (
+    "Validating_prospective",
+    "Training_prospective",
+    "Training_retrospective",
+)
+
+
+def records_from_directory(
+    root: Path | str,
+    *,
+    max_records: int | None = 8,
+    priority_dirs: Sequence[str] = _DEFAULT_PRIORITY_DIRS,
+) -> list[VolumeRecord]:
+    """Build `VolumeRecord`s from a directory of official-format NIfTI files.
+
+    Meant for ad-hoc dry runs against a small slice of real data (e.g. a Drive-mounted
+    Colab runtime), not for checked-in manifests — per `AGENTS.md`, real data/paths never
+    land in this repo. Files under `priority_dirs` (matched by any path component) are
+    preferred over the rest, mirroring how validation/paired data is prioritized for
+    quick sanity checks; ties break by sorted path for determinism.
+    """
+
+    root = Path(root)
+    all_paths = sorted(p for p in root.rglob("*.nii.gz") if not p.name.endswith("_seg.nii.gz"))
+
+    def _priority(path: Path) -> int:
+        parts = set(path.relative_to(root).parts)
+        for rank, keyword in enumerate(priority_dirs):
+            if keyword in parts:
+                return rank
+        return len(priority_dirs)
+
+    ordered = sorted(all_paths, key=lambda p: (_priority(p), str(p)))
+    if max_records is not None:
+        ordered = ordered[:max_records]
+
+    records = []
+    for path in ordered:
+        parsed = parse_mrixfields_filename(path.name)
+        case_id = path.stem.removesuffix(".nii")
+        split = next((part for part in path.relative_to(root).parts if part in priority_dirs), None)
+        records.append(
+            VolumeRecord(
+                case_id=case_id,
+                image_path=path,
+                domain={"field_strength_t": float(parsed.field[:-1]), "contrast": parsed.modality},
+                subject_id=parsed.subject_id,
+                split=split,
+                metadata={"prefix": parsed.prefix},
+            )
+        )
+    return records
 

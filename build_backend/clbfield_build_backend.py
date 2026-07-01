@@ -113,6 +113,10 @@ def _metadata() -> str:
         'Requires-Dist: ruff>=0.6; extra == "quality"',
         "Provides-Extra: monai",
         'Requires-Dist: monai>=1.3; extra == "monai"',
+        "Provides-Extra: perceptual",
+        'Requires-Dist: lpips>=0.1.4; extra == "perceptual"',
+        "Provides-Extra: nifti",
+        'Requires-Dist: nibabel>=5.0; extra == "nifti"',
         "",
     ]
     return "\n".join(lines)

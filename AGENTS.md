@@ -21,6 +21,8 @@ not include real MRI data or generated research artifacts.
 - `src/clbfield/evaluation/`: lightweight tensor metrics.
 - `src/clbfield/config/`: YAML config loading helpers.
 - `configs/`: checked-in synthetic/model/experiment YAML examples.
+- `docs/`: architecture reference (`ARCHITECTURE.md`) and per-phase implementation
+  plans (`docs/plans/`).
 - `notebooks/`: lightweight bootstrap scripts only. Do not add executed notebooks
   or outputs.
 - `tests/`: pytest coverage for domains, datasets, model interfaces, and smoke

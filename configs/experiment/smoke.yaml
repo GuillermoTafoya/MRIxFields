@@ -5,6 +5,7 @@ data:
   volume_shape: [1, 8, 8, 8]
 model:
   name: identity
+  learnable_scale: true
   initial_scale: 0.95
 training:
   steps: 2

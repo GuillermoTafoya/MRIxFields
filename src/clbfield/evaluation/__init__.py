@@ -1,6 +1,6 @@
 """Evaluation metrics."""
 
-from clbfield.evaluation.metrics import mae, mse, psnr
+from clbfield.evaluation.metrics import lpips_metric, mae, mse, nrmse, psnr, ssim
 
-__all__ = ["mae", "mse", "psnr"]
+__all__ = ["lpips_metric", "mae", "mse", "nrmse", "psnr", "ssim"]
 

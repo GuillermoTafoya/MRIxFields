@@ -36,6 +36,7 @@ from fieldbridge.utils.seeding import seed_everything
 
 Precision = Literal["fp32", "bf16"]
 Stage = Literal["autoencoder", "translator"]
+Device = Literal["auto", "cpu", "cuda"]
 
 DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "reconstruction": 1.0,
@@ -56,10 +57,12 @@ class TrainLoopConfig:
     stage: Stage = "translator"
     variant: str = "identity"
     precision: Precision = "fp32"
+    device: Device = "auto"
     gradient_checkpointing: bool = False
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LOSS_WEIGHTS))
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
+    checkpoint_at_end: bool = False
     resume_from: Path | None = None
 
     @classmethod
@@ -85,6 +88,7 @@ class TrainLoopConfig:
             stage=training.get("stage", data.get("stage", defaults.stage)),
             variant=model.get("variant", data.get("variant", defaults.variant)),
             precision=training.get("precision", data.get("precision", defaults.precision)),
+            device=training.get("device", data.get("device", defaults.device)),
             gradient_checkpointing=bool(
                 training.get(
                     "gradient_checkpointing", data.get("gradient_checkpointing", defaults.gradient_checkpointing)
@@ -96,6 +100,9 @@ class TrainLoopConfig:
                 training.get(
                     "checkpoint_every_steps", data.get("checkpoint_every_steps", defaults.checkpoint_every_steps)
                 )
+            ),
+            checkpoint_at_end=bool(
+                training.get("checkpoint_at_end", data.get("checkpoint_at_end", defaults.checkpoint_at_end))
             ),
             resume_from=Path(resume_from) if resume_from else None,
         )
@@ -111,8 +118,10 @@ class TrainLoopConfig:
             "stage": self.stage,
             "variant": self.variant,
             "precision": self.precision,
+            "device": self.device,
             "gradient_checkpointing": self.gradient_checkpointing,
             "loss_weights": dict(self.loss_weights),
+            "checkpoint_at_end": self.checkpoint_at_end,
         }
 
 
@@ -147,7 +156,7 @@ def run_train_loop(
 ) -> TrainLoopResult:
     cfg = _coerce_config(config)
     seed_everything(cfg.seed)
-    device = torch.device("cpu")
+    device = _resolve_device(cfg.device)
 
     encoder = encoder.to(device)
     decoder = decoder.to(device)
@@ -164,6 +173,10 @@ def run_train_loop(
     start_step = 0
     if cfg.resume_from is not None:
         state = load_checkpoint(cfg.resume_from, map_location=device)
+        if "encoder" in state:
+            encoder.load_state_dict(state["encoder"])
+        if "decoder" in state:
+            decoder.load_state_dict(state["decoder"])
         translator.load_state_dict(state["translator"])
         optimizer.load_state_dict(state["optimizer"])
         start_step = int(state.get("step", 0))
@@ -178,11 +191,10 @@ def run_train_loop(
         pair_sampling="random_any_to_any",
     )
     iterator = iter(data_loader)
-    autocast_ctx = (
-        torch.autocast(device_type="cpu", dtype=torch.bfloat16) if cfg.precision == "bf16" else nullcontext()
-    )
+    autocast_ctx = _autocast_context(device, cfg.precision)
 
     losses: list[float] = []
+    last_checkpoint_step: int | None = None
     for step in range(start_step, start_step + cfg.steps):
         try:
             batch = next(iterator)
@@ -198,8 +210,22 @@ def run_train_loop(
         optimizer.step()
         losses.append(float(total_loss.detach().cpu()))
 
-        if cfg.checkpoint_dir is not None and cfg.checkpoint_every_steps and (step + 1) % cfg.checkpoint_every_steps == 0:
-            _save_step_checkpoint(cfg, translator, optimizer, step + 1)
+        if (
+            cfg.checkpoint_dir is not None
+            and cfg.checkpoint_every_steps
+            and (step + 1) % cfg.checkpoint_every_steps == 0
+        ):
+            _save_step_checkpoint(cfg, encoder, decoder, translator, optimizer, step + 1)
+            last_checkpoint_step = step + 1
+
+    final_step = start_step + len(losses)
+    if (
+        cfg.checkpoint_dir is not None
+        and cfg.checkpoint_at_end
+        and losses
+        and last_checkpoint_step != final_step
+    ):
+        _save_step_checkpoint(cfg, encoder, decoder, translator, optimizer, final_step)
 
     return TrainLoopResult(steps=len(losses), losses=losses)
 
@@ -245,13 +271,24 @@ def _translate(
 
 
 def _save_step_checkpoint(
-    cfg: TrainLoopConfig, translator: BaseTranslator, optimizer: torch.optim.Optimizer, step: int
+    cfg: TrainLoopConfig,
+    encoder: BaseEncoder,
+    decoder: BaseDecoder,
+    translator: BaseTranslator,
+    optimizer: torch.optim.Optimizer,
+    step: int,
 ) -> None:
     assert cfg.checkpoint_dir is not None
     filename = checkpoint_filename(cfg.stage, cfg.variant, step)
     save_checkpoint(
         cfg.checkpoint_dir / filename,
-        {"translator": translator.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
+        {
+            "encoder": encoder.state_dict(),
+            "decoder": decoder.state_dict(),
+            "translator": translator.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        },
         seed=cfg.seed,
         config=cfg.to_dict(),
     )
@@ -263,3 +300,21 @@ def _coerce_config(config: TrainLoopConfig | Mapping[str, Any] | None) -> TrainL
     if isinstance(config, TrainLoopConfig):
         return config
     return TrainLoopConfig.from_mapping(config)
+
+
+def _resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("training.device is 'cuda', but CUDA is not available.")
+    if device != "cpu" and device != "cuda":
+        raise ValueError("training.device must be 'auto', 'cpu', or 'cuda'.")
+    return torch.device(device)
+
+
+def _autocast_context(device: torch.device, precision: Precision):
+    if precision == "fp32":
+        return nullcontext()
+    if precision == "bf16":
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    raise ValueError("training.precision must be 'fp32' or 'bf16'.")

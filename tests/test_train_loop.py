@@ -125,3 +125,21 @@ def test_run_train_loop_autoencoder_updates_encoder_and_decoder_params() -> None
 
     assert any(not torch.equal(before, after) for before, after in zip(encoder_before, encoder.parameters()))
     assert any(not torch.equal(before, after) for before, after in zip(decoder_before, decoder.parameters()))
+
+
+def test_run_train_loop_logs_progress_to_stderr(capsys) -> None:
+    encoder, decoder, translator = _models()
+    config = TrainLoopConfig(
+        steps=1,
+        batch_size=1,
+        num_samples=2,
+        seed=13,
+        log_every_steps=1,
+    )
+
+    run_train_loop(config, encoder=encoder, decoder=decoder, translator=translator)
+    captured = capsys.readouterr()
+
+    assert "train start:" in captured.err
+    assert "train step=1/1" in captured.err
+    assert "loss=" in captured.err

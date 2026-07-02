@@ -33,4 +33,5 @@ training:
   checkpoint_dir: outputs/autoencoder/checkpoints
   checkpoint_every_steps: 100
   checkpoint_at_end: true
+  log_every_steps: 1
   resume_from: null

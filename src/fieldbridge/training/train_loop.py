@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
+import time
 from typing import Any, Literal
 
 import torch
@@ -63,6 +65,7 @@ class TrainLoopConfig:
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
     checkpoint_at_end: bool = False
+    log_every_steps: int = 0
     resume_from: Path | None = None
 
     @classmethod
@@ -104,6 +107,7 @@ class TrainLoopConfig:
             checkpoint_at_end=bool(
                 training.get("checkpoint_at_end", data.get("checkpoint_at_end", defaults.checkpoint_at_end))
             ),
+            log_every_steps=int(training.get("log_every_steps", data.get("log_every_steps", defaults.log_every_steps))),
             resume_from=Path(resume_from) if resume_from else None,
         )
 
@@ -122,6 +126,7 @@ class TrainLoopConfig:
             "gradient_checkpointing": self.gradient_checkpointing,
             "loss_weights": dict(self.loss_weights),
             "checkpoint_at_end": self.checkpoint_at_end,
+            "log_every_steps": self.log_every_steps,
         }
 
 
@@ -129,13 +134,24 @@ class TrainLoopConfig:
 class TrainLoopResult:
     steps: int
     losses: list[float] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
     @property
     def final_loss(self) -> float:
         return self.losses[-1] if self.losses else float("nan")
 
+    @property
+    def seconds_per_step(self) -> float:
+        return self.elapsed_seconds / self.steps if self.steps else float("nan")
+
     def to_dict(self) -> dict[str, Any]:
-        return {"steps": self.steps, "losses": self.losses, "final_loss": self.final_loss}
+        return {
+            "steps": self.steps,
+            "losses": self.losses,
+            "final_loss": self.final_loss,
+            "elapsed_seconds": self.elapsed_seconds,
+            "seconds_per_step": self.seconds_per_step,
+        }
 
 
 def assert_frozen(module: nn.Module) -> None:
@@ -194,10 +210,18 @@ def run_train_loop(
     )
     iterator = iter(data_loader)
     autocast_ctx = _autocast_context(device, cfg.precision)
+    batches_per_epoch = _loader_length(data_loader)
+    if cfg.log_every_steps > 0:
+        _log_training_progress(
+            f"train start: stage={cfg.stage} steps={cfg.steps} batch_size={cfg.batch_size} "
+            f"device={device.type} batches_per_epoch={batches_per_epoch or 'unknown'}"
+        )
 
     losses: list[float] = []
     last_checkpoint_step: int | None = None
+    train_start = time.perf_counter()
     for step in range(start_step, start_step + cfg.steps):
+        step_start = time.perf_counter()
         try:
             batch = next(iterator)
         except StopIteration:
@@ -210,7 +234,9 @@ def run_train_loop(
             total_loss = _compute_total_loss(encoder, decoder, translator, batch, cfg)
         total_loss.backward()
         optimizer.step()
-        losses.append(float(total_loss.detach().cpu()))
+        _sync_if_cuda(device)
+        loss_value = float(total_loss.detach().cpu())
+        losses.append(loss_value)
 
         if (
             cfg.checkpoint_dir is not None
@@ -219,6 +245,23 @@ def run_train_loop(
         ):
             _save_step_checkpoint(cfg, encoder, decoder, translator, optimizer, step + 1)
             last_checkpoint_step = step + 1
+
+        current_step = step + 1
+        if cfg.log_every_steps > 0 and (
+            len(losses) == 1 or current_step % cfg.log_every_steps == 0 or len(losses) == cfg.steps
+        ):
+            elapsed = time.perf_counter() - train_start
+            step_elapsed = time.perf_counter() - step_start
+            _log_training_progress(
+                _format_step_log(
+                    current_step=current_step,
+                    total_steps=start_step + cfg.steps,
+                    batches_per_epoch=batches_per_epoch,
+                    loss=loss_value,
+                    step_seconds=step_elapsed,
+                    avg_seconds=elapsed / len(losses),
+                )
+            )
 
     final_step = start_step + len(losses)
     if (
@@ -229,7 +272,8 @@ def run_train_loop(
     ):
         _save_step_checkpoint(cfg, encoder, decoder, translator, optimizer, final_step)
 
-    return TrainLoopResult(steps=len(losses), losses=losses)
+    elapsed_seconds = time.perf_counter() - train_start
+    return TrainLoopResult(steps=len(losses), losses=losses, elapsed_seconds=elapsed_seconds)
 
 
 def _compute_total_loss(
@@ -302,6 +346,42 @@ def _coerce_config(config: TrainLoopConfig | Mapping[str, Any] | None) -> TrainL
     if isinstance(config, TrainLoopConfig):
         return config
     return TrainLoopConfig.from_mapping(config)
+
+
+def _loader_length(loader: DataLoader[RawBatch]) -> int | None:
+    try:
+        return len(loader)
+    except TypeError:
+        return None
+
+
+def _format_step_log(
+    *,
+    current_step: int,
+    total_steps: int,
+    batches_per_epoch: int | None,
+    loss: float,
+    step_seconds: float,
+    avg_seconds: float,
+) -> str:
+    epoch_text = ""
+    if batches_per_epoch:
+        epoch = ((current_step - 1) // batches_per_epoch) + 1
+        batch = ((current_step - 1) % batches_per_epoch) + 1
+        epoch_text = f" epoch={epoch} batch={batch}/{batches_per_epoch}"
+    return (
+        f"train step={current_step}/{total_steps}{epoch_text} loss={loss:.6f} "
+        f"step_sec={step_seconds:.3f} avg_sec_per_step={avg_seconds:.3f}"
+    )
+
+
+def _log_training_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _resolve_device(device: str) -> torch.device:

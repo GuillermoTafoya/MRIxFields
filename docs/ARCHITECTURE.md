@@ -74,6 +74,7 @@ field/contrast-specific subnetworks (disqualifying under the challenge rules).
 | `translators/base.py` | `BaseTranslator.forward(z, source_domain, target_domain, t=None)` — the contract every ladder translator implements. |
 | `translators/identity.py` | Pass-through with an optional learnable scale (smoke tests). |
 | `translators/conditional_cnn.py` | CPU-friendly conditional CNN baseline for `x_hat = G(x, source_domain, target_domain)` on 2D slices or 3D volumes. |
+| `translators/conditional_unet.py` | Sharper deterministic U-Net baseline with conditioned decoder blocks and optional gated skips. |
 | `translators/ot_cfm_stub.py`, `translators/sb_stub.py` | Intentional stubs — `raise NotImplementedError`. Real implementations replace these files in place (Fases D and E). |
 | `models/factory.py` | Name-based registry: `build_encoder/decoder/translator("identity", **kwargs)`. Extended with `"stargan_v2_latent"`, `"ot_cfm"`, `"schrodinger_bridge"` as those stages land. |
 
@@ -91,6 +92,22 @@ cross-domain interface tests, but it makes no scientific translation claim yet.
 This model is intentionally not a diffusion model, not a Schrodinger bridge, and not a
 VAE. It exists to prove the shared-parameter contract and training interface before the
 later ablation-ladder methods are implemented.
+
+### Conditional U-Net field translator baseline
+
+`ConditionalUNetFieldTranslator` keeps the same image-to-image call shape:
+`model(x, source_domain, target_domain)`. It uses `DomainEmbedding` to build a
+source-target conditioning vector and injects that vector into decoder blocks through
+FiLM GroupNorm. Same-domain calls (`source_domain == target_domain`) are the initial
+reconstruction path; cross-domain calls use the same shared parameters with different
+conditioning.
+
+The U-Net skips are configurable. The default `skip_mode="gated"` applies a channel-wise
+sigmoid gate from the conditioning vector before concatenating skip features, preserving
+high-resolution anatomy without making the skip path an unconditional source-domain copy.
+`skip_mode="concat"` provides ordinary U-Net concatenation, and `skip_mode="none"` falls
+back toward a bottleneck translator. This is still a deterministic baseline, not
+diffusion, a Schrodinger bridge, adversarial training, or a VAE.
 
 ## 6. Training (`training/`)
 

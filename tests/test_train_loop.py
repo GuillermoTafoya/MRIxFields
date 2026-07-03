@@ -3,6 +3,7 @@ import torch
 
 from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncoder
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
+from fieldbridge.models.translators.conditional_cnn import ConditionalCNNFieldTranslator
 from fieldbridge.models.translators.identity import IdentityTranslator
 from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.train_loop import TrainLoopConfig, assert_frozen, run_train_loop
@@ -36,6 +37,32 @@ def test_run_train_loop_with_cycle_and_identity_terms() -> None:
     result = run_train_loop(config, encoder=encoder, decoder=decoder, translator=translator)
 
     assert all(torch.isfinite(torch.tensor(value)) for value in result.losses)
+
+
+def test_run_train_loop_with_conditional_cnn_translator() -> None:
+    translator = ConditionalCNNFieldTranslator(
+        hidden_channels=(2,),
+        latent_channels=2,
+        cond_dim=8,
+        spatial_dims=3,
+    )
+    config = TrainLoopConfig(
+        steps=1,
+        batch_size=1,
+        num_samples=2,
+        volume_shape=(1, 4, 8, 8),
+        seed=13,
+    )
+
+    result = run_train_loop(
+        config,
+        encoder=IdentityEncoder(),
+        decoder=IdentityDecoder(),
+        translator=translator,
+    )
+
+    assert result.steps == 1
+    assert torch.isfinite(torch.tensor(result.final_loss))
 
 
 def test_assert_frozen_rejects_trainable_params() -> None:

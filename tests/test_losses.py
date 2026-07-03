@@ -4,10 +4,14 @@ import torch
 from fieldbridge.training.losses import (
     adversarial_hinge_loss_discriminator,
     adversarial_hinge_loss_generator,
+    background_penalty,
+    combined_reconstruction_loss,
     cycle_consistency_loss,
+    gradient_loss,
     identity_loss,
     kl_divergence,
     lpips_loss,
+    masked_l1_loss,
     synthseg_inloss_stub,
     transport_cost_loss,
 )
@@ -57,6 +61,48 @@ def test_identity_loss() -> None:
     loss = identity_loss(x, x_identity_output)
 
     _assert_finite_and_backprop(loss, x, x_identity_output)
+
+
+def test_masked_l1_loss_ignores_outside_mask_voxels() -> None:
+    prediction = torch.tensor([[[[1.0, 100.0], [3.0, 100.0]]]], requires_grad=True)
+    target = torch.tensor([[[[0.0, 0.0], [1.0, 0.0]]]])
+    mask = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
+
+    loss = masked_l1_loss(prediction, target, mask)
+
+    assert torch.isclose(loss, torch.tensor(1.5))
+    _assert_finite_and_backprop(loss, prediction)
+
+
+def test_background_penalty_penalizes_outside_mask_prediction() -> None:
+    prediction = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], requires_grad=True)
+    mask = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
+
+    loss = background_penalty(prediction, mask)
+
+    assert torch.isclose(loss, torch.tensor(3.0))
+    _assert_finite_and_backprop(loss, prediction)
+
+
+def test_gradient_loss_returns_nonnegative_scalar() -> None:
+    prediction = torch.randn(1, 1, 4, 4, requires_grad=True)
+    target = torch.randn(1, 1, 4, 4)
+
+    loss = gradient_loss(prediction, target)
+
+    assert loss.ndim == 0
+    assert loss.item() >= 0.0
+    _assert_finite_and_backprop(loss, prediction)
+
+
+def test_combined_reconstruction_loss_backpropagates() -> None:
+    prediction = torch.randn(1, 1, 4, 4, requires_grad=True)
+    target = torch.randn(1, 1, 4, 4)
+    mask = torch.ones(1, 1, 4, 4)
+
+    loss = combined_reconstruction_loss(prediction, target, mask)
+
+    _assert_finite_and_backprop(loss, prediction)
 
 
 def test_adversarial_hinge_losses() -> None:

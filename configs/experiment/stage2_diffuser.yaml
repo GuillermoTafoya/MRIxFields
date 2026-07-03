@@ -12,6 +12,14 @@ model:
   timestep_embedding_dim: 64
   field_conditioning_dim: 32
   activation: silu
+# Must match the encoder architecture of the checkpoint referenced by
+# training.vae_checkpoint below (see configs/model/kl_vae.yaml) — used to construct a
+# KLVAEEncoder before loading its trained state dict.
+vae_model:
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 128
+  activation: silu
 training:
   steps: 1000
   batch_size: 8

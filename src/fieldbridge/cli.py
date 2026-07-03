@@ -16,6 +16,7 @@ from fieldbridge.data.datasets import ImageTransform, ManifestVolumeDataset, col
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
 from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+from fieldbridge.models.diffusion.denoising_unet import DenoisingUNet
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.official.data_manifest import (
     audit_mrixfields_manifest,
@@ -29,6 +30,8 @@ from fieldbridge.official.submissions import (
     validate_submission_dir,
 )
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
+from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
 
 
@@ -56,6 +59,39 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of the synthetic loader. Never commit a real manifest to the repo.",
     )
     train.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train_stage1_vae = subparsers.add_parser(
+        "train-stage1-vae", help="Run Etapa 1 VAE-only training (KLVAEEncoder/Decoder, SSIM+nRMSE+LPIPS+KL)."
+    )
+    train_stage1_vae.add_argument("--config", type=Path, default=Path("configs/experiment/stage1_vae.yaml"))
+    train_stage1_vae.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Manifest of real NIfTI volumes (requires the 'nifti' extra). No synthetic "
+        "fallback for this stage — never commit a real manifest to the repo.",
+    )
+    train_stage1_vae.add_argument("--steps", type=int, default=None)
+    train_stage1_vae.add_argument("--batch-size", type=int, default=None)
+    train_stage1_vae.add_argument("--seed", type=int, default=None)
+    train_stage1_vae.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train_stage2_diffuser = subparsers.add_parser(
+        "train-stage2-diffuser",
+        help="Run Etapa 1's conditional latent diffuser training (VAE frozen by default).",
+    )
+    train_stage2_diffuser.add_argument("--config", type=Path, default=Path("configs/experiment/stage2_diffuser.yaml"))
+    train_stage2_diffuser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Manifest of real NIfTI volumes (requires the 'nifti' extra). No synthetic "
+        "fallback for this stage — never commit a real manifest to the repo.",
+    )
+    train_stage2_diffuser.add_argument("--steps", type=int, default=None)
+    train_stage2_diffuser.add_argument("--batch-size", type=int, default=None)
+    train_stage2_diffuser.add_argument("--seed", type=int, default=None)
+    train_stage2_diffuser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     print_config = subparsers.add_parser("print-config", help="Print a YAML config.")
     print_config.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
@@ -168,6 +204,45 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "train-stage1-vae":
+        config = _load_optional_config(args.config)
+        _override(config, "training", "steps", args.steps)
+        _override(config, "training", "batch_size", args.batch_size)
+        if args.seed is not None:
+            config["seed"] = args.seed
+        model_config = _model_config(config)
+        encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+        decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+        stage_config = Stage1VAEConfig.from_mapping(config)
+        loader = _build_manifest_loader(args.manifest, batch_size=stage_config.batch_size)
+        result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"train-stage1-vae completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "train-stage2-diffuser":
+        config = _load_optional_config(args.config)
+        _override(config, "training", "steps", args.steps)
+        _override(config, "training", "batch_size", args.batch_size)
+        if args.seed is not None:
+            config["seed"] = args.seed
+        model_config = _model_config(config)
+        unet = DenoisingUNet(**{key: value for key, value in model_config.items() if key != "name"})
+        vae_model_config = config.get("vae_model", {})
+        if not isinstance(vae_model_config, Mapping):
+            raise ValueError("Config section 'vae_model' must be a mapping.")
+        encoder = build_encoder("kl_vae", **dict(vae_model_config))
+        stage_config = Stage2DiffuserConfig.from_mapping(config)
+        loader = _build_manifest_loader(args.manifest, batch_size=stage_config.batch_size)
+        result = run_stage2_diffuser_train(stage_config, unet=unet, encoder=encoder, loader=loader)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"train-stage2-diffuser completed: steps={result.steps} final_loss={result.final_loss:.6f}")
         return 0
 
     if args.command == "print-config":
@@ -304,6 +379,18 @@ def _top_level_component_kwargs(
         allowed = encoder_keys if component == "encoder" else decoder_keys
         return {key: value for key, value in top_level.items() if key in allowed}
     return top_level
+
+
+_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "activation", "use_norm"}
+
+
+def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str, Any]:
+    kwargs = {key: value for key, value in model_config.items() if key in _KL_VAE_SHARED_KEYS}
+    if component == "encoder" and "in_channels" in model_config:
+        kwargs["in_channels"] = model_config["in_channels"]
+    if component == "decoder" and "out_channels" in model_config:
+        kwargs["out_channels"] = model_config["out_channels"]
+    return kwargs
 
 
 def _override(config: dict[str, Any], section: str, key: str, value: Any | None) -> None:

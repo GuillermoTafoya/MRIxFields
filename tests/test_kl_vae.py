@@ -197,7 +197,8 @@ def test_run_stage1_vae_train_smoke_3d_volume() -> None:
 def test_run_stage1_vae_train_3d_volume_raises_if_ssim_weight_nonzero() -> None:
     # evaluation.metrics.ssim is 2D-only by design (avg_pool2d-based) — confirms the
     # guard in _compute_vae_loss is load-bearing, not just an optimization, and that
-    # spatial_dims=3 configs MUST keep ssim weight at 0 (nrmse+lpips+kl instead).
+    # spatial_dims=3 configs MUST keep ssim weight at 0 (nrmse+kl only, see the lpips
+    # test below — lpips has the same 2D-only limitation, so it's nrmse+kl, not +lpips).
     encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
     loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
@@ -206,6 +207,23 @@ def test_run_stage1_vae_train_3d_volume_raises_if_ssim_weight_nonzero() -> None:
     )
 
     with pytest.raises(ValueError):
+        run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+
+def test_run_stage1_vae_train_3d_volume_raises_if_lpips_weight_nonzero() -> None:
+    # lpips_loss wraps a 2D VGG16 net — _to_three_channel's `.repeat(1, 3, 1, 1)`
+    # assumes a 4D (B,C,H,W) tensor and raises on 5D (B,C,D,H,W) volumes. Same
+    # "guard, don't just weight" requirement as ssim above; spatial_dims=3 configs
+    # MUST keep lpips weight at 0 too.
+    pytest.importorskip("lpips")
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
+    config = Stage1VAEConfig(
+        steps=1, batch_size=2, loss_weights={"ssim": 0.0, "nrmse": 0.0, "lpips": 1.0, "kl": 0.0}
+    )
+
+    with pytest.raises(RuntimeError):
         run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
 
 

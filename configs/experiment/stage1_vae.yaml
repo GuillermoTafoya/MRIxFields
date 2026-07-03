@@ -31,7 +31,14 @@ training:
     # non-4D tensors — MUST stay 0 with spatial_dims=3 above, or every step crashes.
     ssim: 0.0
     nrmse: 1.0
-    lpips: 1.0
+    # lpips wraps a 2D VGG16 net (via the `lpips` package) — same 2D-only limitation as
+    # ssim, just a different crash site (_to_three_channel's .repeat assumes 4D). MUST
+    # also stay 0 with spatial_dims=3. Net effect: with full 3D volumes, only nrmse+kl
+    # of the requested SSIM+nRMSE+LPIPS+KL recipe are usable as currently implemented —
+    # a real degradation, not just a config tweak. A 3D-adapted SSIM (avg_pool3d) and a
+    # slice-based LPIPS (average over sampled 2D slices) are the follow-up if this
+    # matters for the actual results, not implemented here.
+    lpips: 0.0
     kl: 0.0001
   ssim_window_size: 7
   warm_start_checkpoint: null

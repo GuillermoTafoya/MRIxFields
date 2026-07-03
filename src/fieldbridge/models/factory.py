@@ -15,6 +15,7 @@ from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncod
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.models.translators.conditional_cnn import ConditionalCNNFieldTranslator
+from fieldbridge.models.translators.conditional_unet import ConditionalUNetFieldTranslator
 from fieldbridge.models.translators.identity import IdentityTranslator
 
 T = TypeVar("T")
@@ -32,6 +33,8 @@ _TRANSLATORS: dict[str, Callable[..., BaseTranslator]] = {
     "cnn_autoencoder": IdentityTranslator,
     "conditional_cnn": ConditionalCNNFieldTranslator,
     "conditional_cnn_field_translator": ConditionalCNNFieldTranslator,
+    "conditional_unet": ConditionalUNetFieldTranslator,
+    "conditional_unet_field_translator": ConditionalUNetFieldTranslator,
 }
 
 

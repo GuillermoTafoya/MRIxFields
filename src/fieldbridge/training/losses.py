@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 from torch.nn import functional as F
 
@@ -12,6 +14,101 @@ def reconstruction_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.
 
 def latent_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(prediction, target)
+
+
+def masked_l1_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean absolute error over the selected mask region."""
+
+    _validate_same_shape(prediction, target)
+    if mask is None:
+        return F.l1_loss(prediction, target)
+    prepared_mask = _prepare_mask(mask, prediction)
+    denominator = _positive_mask_sum(prepared_mask, "masked_l1_loss")
+    return (torch.abs(prediction - target) * prepared_mask).sum() / denominator
+
+
+def masked_mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean squared error over the selected mask region."""
+
+    _validate_same_shape(prediction, target)
+    if mask is None:
+        return F.mse_loss(prediction, target)
+    prepared_mask = _prepare_mask(mask, prediction)
+    denominator = _positive_mask_sum(prepared_mask, "masked_mse_loss")
+    return ((prediction - target).pow(2) * prepared_mask).sum() / denominator
+
+
+def gradient_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L1 loss between finite spatial gradients of prediction and target."""
+
+    _validate_same_shape(prediction, target)
+    if prediction.ndim < 3:
+        raise ValueError(
+            "gradient_loss expects tensors with batch, channel, and at least one spatial dimension."
+        )
+    prepared_mask = _prepare_mask(mask, prediction) if mask is not None else None
+    losses: list[torch.Tensor] = []
+    for dim in range(2, prediction.ndim):
+        if int(prediction.shape[dim]) < 2:
+            continue
+        pred_diff = prediction.diff(dim=dim)
+        target_diff = target.diff(dim=dim)
+        diff_mask = _gradient_mask(prepared_mask, dim) if prepared_mask is not None else None
+        losses.append(masked_l1_loss(pred_diff, target_diff, diff_mask))
+    if not losses:
+        return prediction.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def background_penalty(prediction: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Penalize nonzero prediction values outside the foreground mask."""
+
+    if mask is None:
+        return torch.abs(prediction).mean()
+    prepared_mask = _prepare_mask(mask, prediction)
+    outside_mask = (1.0 - prepared_mask).clamp_min(0.0)
+    denominator = outside_mask.sum()
+    if not bool(torch.any(outside_mask > 0).detach().cpu().item()):
+        return prediction.sum() * 0.0
+    return (torch.abs(prediction) * outside_mask).sum() / denominator
+
+
+def combined_reconstruction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    weights: Mapping[str, float] | None = None,
+) -> torch.Tensor:
+    """Weighted reconstruction loss for synthetic translator interface tests.
+
+    SSIM is intentionally omitted here; it can be added later if a lightweight,
+    dependency-free implementation is needed for training.
+    """
+
+    _validate_same_shape(prediction, target)
+    active_weights = {"masked_l1": 1.0, "gradient": 0.1, "background": 0.05}
+    if weights is not None:
+        active_weights.update(dict(weights))
+    total = prediction.sum() * 0.0
+    if active_weights.get("masked_l1", 0.0):
+        total = total + active_weights["masked_l1"] * masked_l1_loss(prediction, target, mask)
+    if active_weights.get("gradient", 0.0):
+        total = total + active_weights["gradient"] * gradient_loss(prediction, target, mask)
+    if active_weights.get("background", 0.0):
+        total = total + active_weights["background"] * background_penalty(prediction, mask)
+    return total
 
 
 def kl_divergence(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -117,3 +214,39 @@ def synthseg_inloss_stub(*args: object, **kwargs: object) -> torch.Tensor:
 
     del args, kwargs
     raise NotImplementedError("SynthSeg in-loss depends on official preproc labels not yet available.")
+
+
+def _validate_same_shape(prediction: torch.Tensor, target: torch.Tensor) -> None:
+    if prediction.shape != target.shape:
+        raise ValueError(
+            "prediction and target must have the same shape; "
+            f"got {tuple(prediction.shape)} and {tuple(target.shape)}."
+        )
+
+
+def _prepare_mask(mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    prepared = mask.to(device=reference.device, dtype=reference.dtype)
+    if prepared.ndim == reference.ndim - 1 and int(prepared.shape[0]) == int(reference.shape[0]):
+        prepared = prepared.unsqueeze(1)
+    try:
+        prepared = torch.broadcast_to(prepared, reference.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"mask with shape {tuple(mask.shape)} cannot broadcast to {tuple(reference.shape)}."
+        ) from exc
+    if not torch.isfinite(prepared).all():
+        raise ValueError("mask must contain only finite values.")
+    return prepared
+
+
+def _positive_mask_sum(mask: torch.Tensor, loss_name: str) -> torch.Tensor:
+    denominator = mask.sum()
+    if not bool((denominator > 0).detach().cpu().item()):
+        raise ValueError(f"{loss_name} mask must select at least one element.")
+    return denominator
+
+
+def _gradient_mask(mask: torch.Tensor, dim: int) -> torch.Tensor:
+    before = mask.narrow(dim, 0, int(mask.shape[dim]) - 1)
+    after = mask.narrow(dim, 1, int(mask.shape[dim]) - 1)
+    return before * after

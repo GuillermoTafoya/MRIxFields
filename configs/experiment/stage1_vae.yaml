@@ -3,11 +3,22 @@ data:
   name: nifti_manifest
   root: ${MRIXFIELDS_DATA_ROOT}
   manifest: ${MRIXFIELDS_MANIFEST}
+  # Real volumes are full 3D (e.g. 364x436x364) — decoding back toward full resolution
+  # with latent_channels=128 allocates tens of GB per intermediate activation otherwise
+  # (confirmed: a single up-sampling conv tried to allocate ~14.7GB at full res). Random
+  # patch cropping (see data/transforms.py:random_crop) is required, not optional, at
+  # this scale. Must match stage2_diffuser.yaml's patch_size (same encoder is reused).
+  patch_size: [64, 64, 64]
 model:
   name: kl_vae
   in_channels: 1
   base_channels: 32
   latent_channels: 128
+  # Full 3D volumes (matching the real manifest's NIfTI files and the CNN autoencoder's
+  # already-proven 3D path) — no slice-extraction step exists in this pipeline, and
+  # compute cost was explicitly waved off. Reverses fase-b-vae.md's original "2D
+  # estricto" rule for this component; confirmed with Simón 2026-07-03.
+  spatial_dims: 3
   activation: silu
 training:
   steps: 1000
@@ -16,7 +27,9 @@ training:
   device: auto
   precision: bf16
   loss_weights:
-    ssim: 1.0
+    # evaluation.metrics.ssim is 2D-only by design (avg_pool2d-based) and raises on
+    # non-4D tensors — MUST stay 0 with spatial_dims=3 above, or every step crashes.
+    ssim: 0.0
     nrmse: 1.0
     lpips: 1.0
     kl: 0.0001

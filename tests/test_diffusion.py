@@ -37,6 +37,30 @@ def _make_synthetic_2d_loader(*, num_samples: int = 4, batch_size: int = 2) -> D
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
 
 
+class _Synthetic3DDataset(Dataset[RawBatch]):
+    """Small 3D (C, D, H, W) dummy dataset — matches the real manifest path (full
+    volumes, no slice-extraction step)."""
+
+    def __init__(self, *, num_samples: int = 4, volume_shape: tuple[int, int, int, int] = (1, 8, 8, 8), seed: int = 13) -> None:
+        self.num_samples = num_samples
+        self.volume_shape = volume_shape
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, index: int) -> RawBatch:
+        generator = torch.Generator().manual_seed(self.seed + index)
+        image = torch.randn(self.volume_shape, generator=generator)
+        domain = Domain(3.0, "T1w")
+        return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"s{index}"})
+
+
+def _make_synthetic_3d_loader(*, num_samples: int = 4, batch_size: int = 2) -> DataLoader[RawBatch]:
+    dataset = _Synthetic3DDataset(num_samples=num_samples)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
+
+
 def test_timestep_embedding_shape_and_finite() -> None:
     embedding = sinusoidal_timestep_embedding(torch.arange(5), embedding_dim=16)
 
@@ -171,6 +195,18 @@ def test_denoising_unet_gradients_reach_conditioner_and_blocks() -> None:
     assert torch.isfinite(unet.blocks_level0[0].film.projection.weight.grad).all()
 
 
+def test_denoising_unet_forward_shape_and_finite_3d() -> None:
+    unet = DenoisingUNet(latent_channels=3, base_channels=6, spatial_dims=3, num_levels=1)
+    z_t = torch.randn(2, 3, 4, 4, 4)
+    t = torch.randint(0, 100, (2,))
+    domains = [Domain(0.1, "T2-FLAIR"), Domain(3.0, "T1w")]
+
+    eps_hat = unet(z_t, t, domains)
+
+    assert eps_hat.shape == z_t.shape
+    assert torch.isfinite(eps_hat).all()
+
+
 def test_denoising_unet_rejects_wrong_latent_channels() -> None:
     unet = DenoisingUNet(latent_channels=4, base_channels=8, num_levels=1)
     z_t = torch.randn(2, 6, 8, 8)
@@ -203,6 +239,18 @@ def test_run_stage2_diffuser_train_smoke_joint_vae_reaches_encoder_gradients() -
 
     assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
     assert any(p.grad is not None for p in encoder.parameters())
+
+
+def test_run_stage2_diffuser_train_smoke_3d_volume() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    unet = DenoisingUNet(latent_channels=3, base_channels=6, spatial_dims=3, num_levels=1)
+    loader = _make_synthetic_3d_loader()
+    config = Stage2DiffuserConfig(steps=2, batch_size=2, num_timesteps=10, train_vae_jointly=False)
+
+    result = run_stage2_diffuser_train(config, unet=unet, encoder=encoder, loader=loader)
+
+    assert result.steps == 2
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
 def test_run_stage2_diffuser_train_checkpoint_and_resume(tmp_path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import ImageTransform, ManifestVolumeDataset, collate_raw_batches
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
-from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+from fieldbridge.data.transforms import compose, normalize_percentile_clip_to_unit_range, random_crop
 from fieldbridge.models.diffusion.denoising_unet import DenoisingUNet
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.official.data_manifest import (
@@ -216,7 +217,9 @@ def main(argv: list[str] | None = None) -> int:
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
         stage_config = Stage1VAEConfig.from_mapping(config)
-        loader = _build_manifest_loader(args.manifest, batch_size=stage_config.batch_size)
+        loader = _build_manifest_loader(
+            args.manifest, batch_size=stage_config.batch_size, transform=_manifest_transform(config)
+        )
         result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -237,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Config section 'vae_model' must be a mapping.")
         encoder = build_encoder("kl_vae", **dict(vae_model_config))
         stage_config = Stage2DiffuserConfig.from_mapping(config)
-        loader = _build_manifest_loader(args.manifest, batch_size=stage_config.batch_size)
+        loader = _build_manifest_loader(
+            args.manifest, batch_size=stage_config.batch_size, transform=_manifest_transform(config)
+        )
         result = run_stage2_diffuser_train(stage_config, unet=unet, encoder=encoder, loader=loader)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -381,7 +386,22 @@ def _top_level_component_kwargs(
     return top_level
 
 
-_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "activation", "use_norm"}
+def _manifest_transform(config: Mapping[str, Any]) -> ImageTransform:
+    """Percentile-clip normalization, plus a random spatial patch crop if
+    data.patch_size is set in the config — required for full 3D volumes at typical
+    resolutions (e.g. 364x436x364), where decoding back toward full resolution with
+    enough latent channels for the diffuser OOMs on essentially any GPU otherwise. See
+    random_crop's docstring.
+    """
+
+    data_config = config.get("data", {})
+    patch_size = data_config.get("patch_size") if isinstance(data_config, Mapping) else None
+    if patch_size is None:
+        return normalize_percentile_clip_to_unit_range
+    return compose([normalize_percentile_clip_to_unit_range, partial(random_crop, patch_size=patch_size)])
+
+
+_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "spatial_dims", "activation", "use_norm"}
 
 
 def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str, Any]:

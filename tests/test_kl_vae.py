@@ -15,6 +15,30 @@ def _domain_pair(batch_size: int) -> list[Domain]:
     return [Domain(3.0, "T1w") for _ in range(batch_size)]
 
 
+class _Synthetic3DDataset(Dataset[RawBatch]):
+    """Small 3D (C, D, H, W) dummy dataset — matches the real manifest path, whose
+    NIfTI volumes are full 3D volumes with no slice-extraction step."""
+
+    def __init__(self, *, num_samples: int = 4, volume_shape: tuple[int, int, int, int] = (1, 8, 8, 8), seed: int = 13) -> None:
+        self.num_samples = num_samples
+        self.volume_shape = volume_shape
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, index: int) -> RawBatch:
+        generator = torch.Generator().manual_seed(self.seed + index)
+        image = torch.randn(self.volume_shape, generator=generator)
+        domain = Domain(3.0, "T1w")
+        return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"s{index}"})
+
+
+def _make_synthetic_3d_loader(*, num_samples: int = 4, batch_size: int = 2) -> DataLoader[RawBatch]:
+    dataset = _Synthetic3DDataset(num_samples=num_samples)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
+
+
 class _Synthetic2DDataset(Dataset[RawBatch]):
     """Small 2D (C, H, W) dummy dataset for stage1_vae smoke tests.
 
@@ -108,6 +132,30 @@ def test_kl_divergence_on_encoder_output_is_finite_and_nonnegative() -> None:
     assert loss >= -1e-5
 
 
+def test_encode_decode_roundtrip_3d_volume() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    x = torch.randn(1, 1, 8, 8, 8)
+    domain = _domain_pair(1)
+
+    z = encoder.encode(x, domain)
+    y = decoder.decode(z, domain)
+
+    assert z.shape == (1, 3, 2, 2, 2)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    assert y.min() >= -1.0
+    assert y.max() <= 1.0
+
+
+def test_encoder_3d_rejects_4d_input() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    x = torch.randn(1, 1, 8, 8)
+
+    with pytest.raises(ValueError):
+        encoder.encode_dist(x)
+
+
 def test_factory_builds_kl_vae_by_name() -> None:
     assert isinstance(build_encoder("kl_vae", base_channels=8, latent_channels=6), KLVAEEncoder)
     assert isinstance(build_decoder("kl_vae", base_channels=8, latent_channels=6), KLVAEDecoder)
@@ -128,6 +176,37 @@ def test_run_stage1_vae_train_smoke() -> None:
     assert result.steps == 3
     assert len(result.losses) == 3
     assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
+
+
+def test_run_stage1_vae_train_smoke_3d_volume() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    loader = _make_synthetic_3d_loader(num_samples=4, batch_size=2)
+    config = Stage1VAEConfig(
+        steps=2,
+        batch_size=2,
+        loss_weights={"ssim": 0.0, "nrmse": 1.0, "lpips": 0.0, "kl": 1e-4},
+    )
+
+    result = run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+    assert result.steps == 2
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
+
+
+def test_run_stage1_vae_train_3d_volume_raises_if_ssim_weight_nonzero() -> None:
+    # evaluation.metrics.ssim is 2D-only by design (avg_pool2d-based) — confirms the
+    # guard in _compute_vae_loss is load-bearing, not just an optimization, and that
+    # spatial_dims=3 configs MUST keep ssim weight at 0 (nrmse+lpips+kl instead).
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
+    config = Stage1VAEConfig(
+        steps=1, batch_size=2, loss_weights={"ssim": 1.0, "nrmse": 0.0, "lpips": 0.0, "kl": 0.0}
+    )
+
+    with pytest.raises(ValueError):
+        run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
 
 
 def test_run_stage1_vae_train_smoke_with_lpips() -> None:

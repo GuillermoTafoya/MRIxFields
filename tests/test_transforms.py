@@ -6,6 +6,7 @@ from fieldbridge.data.transforms import (
     identity_transform,
     normalize_percentile_clip_to_unit_range,
     normalize_zero_mean_unit_variance,
+    random_crop,
 )
 
 
@@ -45,6 +46,38 @@ def test_percentile_clip_composes_with_identity_transform() -> None:
     direct = normalize_percentile_clip_to_unit_range(image)
 
     assert torch.equal(composed, direct)
+
+
+def test_random_crop_3d_produces_requested_patch_shape() -> None:
+    image = torch.randn(1, 20, 24, 20)
+
+    cropped = random_crop(image, patch_size=(8, 8, 8))
+
+    assert cropped.shape == (1, 8, 8, 8)
+
+
+def test_random_crop_stays_within_bounds_of_source_image() -> None:
+    image = torch.arange(20 * 24 * 20, dtype=torch.float32).reshape(1, 20, 24, 20)
+
+    cropped = random_crop(image, patch_size=(8, 8, 8))
+
+    # Every value in the crop must actually come from somewhere in the source tensor.
+    assert set(cropped.flatten().tolist()) <= set(image.flatten().tolist())
+
+
+def test_random_crop_rejects_patch_larger_than_image() -> None:
+    image = torch.randn(1, 4, 4, 4)
+
+    with pytest.raises(ValueError):
+        random_crop(image, patch_size=(8, 8, 8))
+
+
+def test_random_crop_2d_case() -> None:
+    image = torch.randn(1, 16, 16)
+
+    cropped = random_crop(image, patch_size=(8, 8))
+
+    assert cropped.shape == (1, 8, 8)
 
 
 def test_normalize_zero_mean_unit_variance_matches_manual_computation() -> None:

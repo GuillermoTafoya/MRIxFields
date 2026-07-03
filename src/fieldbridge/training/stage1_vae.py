@@ -260,8 +260,12 @@ def _compute_vae_loss(
     z = mean + eps * torch.exp(0.5 * logvar)
     reconstructed = decoder.decode(z, batch.source_domain)
 
-    total = weights.get("ssim", 0.0) * ssim_loss(reconstructed, batch.image, window_size=cfg.ssim_window_size)
-    total = total + weights.get("nrmse", 0.0) * nrmse_loss(reconstructed, batch.image)
+    total = weights.get("nrmse", 0.0) * nrmse_loss(reconstructed, batch.image)
+    if weights.get("ssim", 0.0) > 0:
+        # evaluation.metrics.ssim hard-rejects non-4D tensors ("this project is
+        # 2D-only") — guarded, not just weighted, so spatial_dims=3 volumes (5D
+        # tensors) don't crash even when this weight is 0 in the config.
+        total = total + weights["ssim"] * ssim_loss(reconstructed, batch.image, window_size=cfg.ssim_window_size)
     if weights.get("lpips", 0.0) > 0:
         total = total + weights["lpips"] * lpips_loss(reconstructed, batch.image, net=lpips_net)
     total = total + weights.get("kl", 0.0) * kl_divergence(mean, logvar)

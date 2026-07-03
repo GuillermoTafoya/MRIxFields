@@ -53,6 +53,28 @@ def normalize_percentile_clip_to_unit_range(
     return 2.0 * (clamped - lo) / (hi - lo) - 1.0
 
 
+def random_crop(image: torch.Tensor, *, patch_size: Iterable[int]) -> torch.Tensor:
+    """Random crop of `patch_size` over the trailing spatial dims.
+
+    Needed for full-resolution 3D volumes (e.g. 364x436x364): decoding back toward full
+    resolution with enough latent channels for the diffuser allocates tens of GB per
+    intermediate activation, OOMing on essentially any GPU. Patch-based training (random
+    crops, not the full volume) is the standard fix for 3D medical imaging at this
+    scale — this is not optional once spatial_dims=3 is combined with a real volume's
+    resolution, regardless of how much compute budget is available.
+    """
+
+    patch = tuple(int(p) for p in patch_size)
+    spatial_shape = tuple(image.shape[-len(patch) :])
+    starts = []
+    for size, size_patch in zip(spatial_shape, patch):
+        if size_patch > size:
+            raise ValueError(f"patch_size {patch} exceeds image spatial shape {spatial_shape}.")
+        starts.append(0 if size_patch == size else int(torch.randint(0, size - size_patch + 1, (1,)).item()))
+    slices = tuple(slice(start, start + size_patch) for start, size_patch in zip(starts, patch))
+    return image[(..., *slices)]
+
+
 def compose(transforms: Iterable[TensorTransform]) -> TensorTransform:
     ordered = tuple(transforms)
 

@@ -134,6 +134,21 @@ losses) — Fase B introduces a dedicated module for that (see
   deterministic cycling behavior used by `smoke_train.py`.
 - `ALL_DOMAINS` — the 15 domains (5 fields × 3 contrasts) used as the sampling pool.
 
+### Pseudo-pair degradation pretraining
+
+`data/degradation.py` provides pure-PyTorch synthetic low-field degradation utilities for
+pretraining loops shaped as `x_high -> x_low_synthetic -> pred -> x_high`. The strength
+helper uses log field ratios, so `7T -> 0.1T` degrades more strongly than `3T -> 1.5T`.
+The composed transform includes resolution loss, blur, FFT low-pass filtering, smooth
+bias, noise, and intensity compression. This is a synthetic scaffold, not a physically
+accurate MRI simulator.
+
+`training/pseudo_pairs.py` builds `(x_low_synthetic, x_high)` pairs from a high-field
+tensor and high/low `Domain` values. `data/masks.py` contains lightweight mask cleanup
+for synthetic tests and notebook sanity checks. `data/prospective.py` groups prospective
+paired filenames by `(case_id, sequence)` and provides leave-one-subject-out folds; real
+prospective paired evaluation should keep subject/case IDs split at the fold boundary.
+
 ## 7. Evaluation (`evaluation/metrics.py`)
 
 The three official MRIxFields Task 3 metrics are implemented:

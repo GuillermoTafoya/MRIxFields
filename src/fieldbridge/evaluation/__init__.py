@@ -1,6 +1,32 @@
 """Evaluation metrics."""
 
-from fieldbridge.evaluation.metrics import lpips_metric, mae, mse, nrmse, psnr, ssim
+from fieldbridge.evaluation.metrics import (
+    gradient_mae,
+    lpips_metric,
+    mae,
+    masked_mae,
+    masked_mse,
+    masked_psnr,
+    mse,
+    normalized_cross_correlation,
+    nrmse,
+    outside_mask_mean_abs,
+    psnr,
+    ssim,
+)
 
-__all__ = ["lpips_metric", "mae", "mse", "nrmse", "psnr", "ssim"]
+__all__ = [
+    "gradient_mae",
+    "lpips_metric",
+    "mae",
+    "masked_mae",
+    "masked_mse",
+    "masked_psnr",
+    "mse",
+    "normalized_cross_correlation",
+    "nrmse",
+    "outside_mask_mean_abs",
+    "psnr",
+    "ssim",
+]
 

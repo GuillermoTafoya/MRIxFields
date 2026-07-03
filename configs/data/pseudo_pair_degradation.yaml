@@ -1,0 +1,17 @@
+name: pseudo_pair_degradation
+description: synthetic pretraining scaffold, not a physical MRI simulator
+degradation:
+  strength_from_field_ratio: true
+  operations:
+    downsample_then_upsample: true
+    gaussian_blur: true
+    low_pass_filter: true
+    smooth_bias_field: true
+    additive_gaussian_noise: true
+    intensity_compression: true
+loss_weights:
+  masked_l1: 1.0
+  gradient: 0.2
+  background: 0.5
+evaluation:
+  prospective_split: leave_one_subject_out

@@ -1,0 +1,5 @@
+name: kl_vae
+in_channels: 1
+base_channels: 32
+latent_channels: 128
+activation: silu

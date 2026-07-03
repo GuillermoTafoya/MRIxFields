@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from fieldbridge.evaluation.metrics import nrmse
 from fieldbridge.training.losses import (
     adversarial_hinge_loss_discriminator,
     adversarial_hinge_loss_generator,
@@ -8,6 +9,8 @@ from fieldbridge.training.losses import (
     identity_loss,
     kl_divergence,
     lpips_loss,
+    nrmse_loss,
+    ssim_loss,
     synthseg_inloss_stub,
     transport_cost_loss,
 )
@@ -81,3 +84,33 @@ def test_lpips_loss_requires_optional_dependency() -> None:
 def test_synthseg_inloss_stub_fails_explicitly() -> None:
     with pytest.raises(NotImplementedError):
         synthseg_inloss_stub()
+
+
+def test_ssim_loss_zero_for_identical_tensors() -> None:
+    x = torch.rand(2, 1, 16, 16, requires_grad=True)
+
+    loss = ssim_loss(x, x.detach())
+
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-4)
+    _assert_finite_and_backprop(loss, x)
+
+
+def test_ssim_loss_positive_for_different_tensors() -> None:
+    prediction = torch.rand(2, 1, 16, 16, requires_grad=True)
+    target = torch.rand(2, 1, 16, 16)
+
+    loss = ssim_loss(prediction, target)
+
+    assert loss > 0.0
+    _assert_finite_and_backprop(loss, prediction)
+
+
+def test_nrmse_loss_matches_evaluation_metric() -> None:
+    prediction = torch.rand(2, 1, 8, 8, requires_grad=True)
+    target = torch.rand(2, 1, 8, 8)
+
+    loss = nrmse_loss(prediction, target)
+    expected = nrmse(prediction.detach(), target)
+
+    assert torch.isclose(loss, expected)
+    _assert_finite_and_backprop(loss, prediction)

@@ -12,9 +12,10 @@ from torch.utils.data import DataLoader
 
 from fieldbridge.config import dump_yaml_config, load_yaml_config
 from fieldbridge.data.contracts import RawBatch
-from fieldbridge.data.datasets import ManifestVolumeDataset, collate_raw_batches
+from fieldbridge.data.datasets import ImageTransform, ManifestVolumeDataset, collate_raw_batches
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
+from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.official.data_manifest import (
     audit_mrixfields_manifest,
@@ -239,9 +240,14 @@ def main(argv: list[str] | None = None) -> int:
     raise ValueError(f"Unknown command: {args.command}")
 
 
-def _build_manifest_loader(manifest_path: Path, *, batch_size: int) -> "DataLoader[RawBatch]":
+def _build_manifest_loader(
+    manifest_path: Path,
+    *,
+    batch_size: int,
+    transform: ImageTransform | None = normalize_percentile_clip_to_unit_range,
+) -> "DataLoader[RawBatch]":
     manifest = load_manifest(manifest_path)
-    dataset = ManifestVolumeDataset(manifest.records, image_loader=nifti_image_loader)
+    dataset = ManifestVolumeDataset(manifest.records, image_loader=nifti_image_loader, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
 
 

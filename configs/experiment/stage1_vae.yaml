@@ -1,0 +1,33 @@
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 128
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: auto
+  precision: bf16
+  loss_weights:
+    ssim: 1.0
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+  ssim_window_size: 7
+  warm_start_checkpoint: null
+  checkpoint_dir: outputs/stage1_vae/checkpoints
+  checkpoint_every_steps: 100
+  checkpoint_at_end: true
+  # 128 latent channels can exceed save_checkpoint's 10MB default guardrail once
+  # base_channels is sized for real use — raised explicitly here rather than letting a
+  # real run die on a checkpoint-size ValueError after GPU time.
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 1
+  resume_from: null

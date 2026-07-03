@@ -1,0 +1,8 @@
+name: field_conditioned_unet
+latent_channels: 128
+base_channels: 128
+num_levels: 1
+num_blocks_per_level: 2
+timestep_embedding_dim: 64
+field_conditioning_dim: 32
+activation: silu

@@ -21,6 +21,34 @@ def kl_divergence(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return per_sample.mean()
 
 
+def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
+    """1 - ssim(...) — ssim is "higher is better", losses in this module are "minimize".
+
+    Deferred import: evaluation/metrics.py imports training.losses.lpips_loss (also
+    deferred, inside lpips_metric) — importing evaluation.metrics at module level here
+    would work today (no actual cycle, since that import is function-local on the other
+    side too) but keeping both sides deferred avoids ever depending on which one loads
+    first.
+    """
+
+    from fieldbridge.evaluation.metrics import ssim
+
+    return 1.0 - ssim(prediction, target, **kwargs)
+
+
+def nrmse_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
+    """Alias for evaluation.metrics.nrmse — already "lower is better", no sign flip needed.
+
+    Kept here (rather than importing evaluation.metrics.nrmse directly at call sites) so
+    every term in a loss composition comes from training.losses, not half from here and
+    half reached into evaluation.metrics directly.
+    """
+
+    from fieldbridge.evaluation.metrics import nrmse
+
+    return nrmse(prediction, target, **kwargs)
+
+
 def transport_cost_loss(z_source: torch.Tensor, z_translated: torch.Tensor) -> torch.Tensor:
     """Penalize latent displacement between source and translated latents."""
 

@@ -1,6 +1,14 @@
+import inspect
 import json
 
-from fieldbridge.cli import main
+from fieldbridge.cli import _build_manifest_loader, main
+from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+
+
+def test_build_manifest_loader_defaults_to_percentile_clip_transform() -> None:
+    default_transform = inspect.signature(_build_manifest_loader).parameters["transform"].default
+
+    assert default_transform is normalize_percentile_clip_to_unit_range
 
 
 def test_train_cli_runs_with_default_smoke_config(capsys) -> None:

@@ -1,0 +1,31 @@
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+model:
+  name: field_conditioned_unet
+  latent_channels: 128
+  base_channels: 128
+  num_levels: 1
+  num_blocks_per_level: 2
+  timestep_embedding_dim: 64
+  field_conditioning_dim: 32
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: auto
+  precision: bf16
+  num_timesteps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  train_vae_jointly: false
+  vae_checkpoint: null
+  checkpoint_dir: outputs/stage2_diffuser/checkpoints
+  checkpoint_every_steps: 100
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 1
+  resume_from: null

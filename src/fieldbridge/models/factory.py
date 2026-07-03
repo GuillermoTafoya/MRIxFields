@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 from fieldbridge.models.autoencoders.base import BaseDecoder, BaseEncoder
 from fieldbridge.models.autoencoders.cnn_autoencoder import CNNDecoder, CNNEncoder
 from fieldbridge.models.autoencoders.identity import IdentityDecoder, IdentityEncoder
+from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.models.translators.identity import IdentityTranslator
 
@@ -21,10 +22,12 @@ T = TypeVar("T")
 _ENCODERS: dict[str, Callable[..., BaseEncoder]] = {
     "identity": IdentityEncoder,
     "cnn_autoencoder": CNNEncoder,
+    "kl_vae": KLVAEEncoder,
 }
 _DECODERS: dict[str, Callable[..., BaseDecoder]] = {
     "identity": IdentityDecoder,
     "cnn_autoencoder": CNNDecoder,
+    "kl_vae": KLVAEDecoder,
 }
 _TRANSLATORS: dict[str, Callable[..., BaseTranslator]] = {
     "identity": IdentityTranslator,

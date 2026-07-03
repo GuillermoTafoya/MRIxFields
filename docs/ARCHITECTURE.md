@@ -73,11 +73,24 @@ field/contrast-specific subnetworks (disqualifying under the challenge rules).
 | `autoencoders/{base,identity}.py` | `BaseEncoder`/`BaseDecoder` contracts + pass-through identity implementation (smoke tests only). **No real VAE yet — that's Fase B.** |
 | `translators/base.py` | `BaseTranslator.forward(z, source_domain, target_domain, t=None)` — the contract every ladder translator implements. |
 | `translators/identity.py` | Pass-through with an optional learnable scale (smoke tests). |
+| `translators/conditional_cnn.py` | CPU-friendly conditional CNN baseline for `x_hat = G(x, source_domain, target_domain)` on 2D slices or 3D volumes. |
 | `translators/ot_cfm_stub.py`, `translators/sb_stub.py` | Intentional stubs — `raise NotImplementedError`. Real implementations replace these files in place (Fases D and E). |
 | `models/factory.py` | Name-based registry: `build_encoder/decoder/translator("identity", **kwargs)`. Extended with `"stargan_v2_latent"`, `"ot_cfm"`, `"schrodinger_bridge"` as those stages land. |
 
 No StarGAN-v2, OT-CFM, or SB model exists yet, not even as a partial stub beyond the two
 `NotImplementedError` placeholders above.
+
+### Conditional CNN field translator baseline
+
+`ConditionalCNNFieldTranslator` is the first implemented any-to-any field/sequence
+translation baseline. It encodes image content with source-domain conditioning, then
+decodes with source-target conditioning from `DomainEmbedding` and FiLM GroupNorm blocks.
+It supports same-domain reconstruction (`source_domain == target_domain`) and synthetic
+cross-domain interface tests, but it makes no scientific translation claim yet.
+
+This model is intentionally not a diffusion model, not a Schrodinger bridge, and not a
+VAE. It exists to prove the shared-parameter contract and training interface before the
+later ablation-ladder methods are implemented.
 
 ## 6. Training (`training/`)
 

@@ -281,6 +281,53 @@ training:
     assert len(list(checkpoint_dir.glob("*.pt"))) == 1
 
 
+def test_train_stage1_vae_cli_patches_per_volume_flag_runs_multiple_steps(tmp_path, capsys) -> None:
+    # 4 volumes x --patches-per-volume 3 = 12 patches per pass, enough for 4 steps at
+    # batch 2 without re-iterating; exercises the flag -> data.patches_per_volume override.
+    manifest_path = _write_synthetic_3d_manifest(tmp_path)
+    config_path = tmp_path / "stage1_vae_3d.yaml"
+    config_path.write_text(
+        """
+seed: 3
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 4
+  latent_channels: 3
+  spatial_dims: 3
+training:
+  steps: 1
+  batch_size: 2
+  lr: 0.001
+  loss_weights:
+    ssim: 0.0
+    nrmse: 1.0
+    lpips: 0.0
+    kl: 0.0001
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "train-stage1-vae",
+            "--config",
+            str(config_path),
+            "--manifest",
+            str(manifest_path),
+            "--steps",
+            "4",
+            "--patches-per-volume",
+            "3",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["steps"] == 4
+
+
 def test_train_stage2_diffuser_cli_runs_against_a_small_real_3d_manifest(tmp_path, capsys) -> None:
     manifest_path = _write_synthetic_3d_manifest(tmp_path)
     checkpoint_dir = tmp_path / "checkpoints"

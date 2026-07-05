@@ -80,6 +80,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_stage1_vae.add_argument("--steps", type=int, default=None)
     train_stage1_vae.add_argument("--batch-size", type=int, default=None)
+    train_stage1_vae.add_argument(
+        "--patches-per-volume",
+        type=int,
+        default=None,
+        help="Random patches drawn per volume before it is dropped (overrides "
+        "data.patches_per_volume). Higher = fewer disk reads per training step.",
+    )
     train_stage1_vae.add_argument("--seed", type=int, default=None)
     train_stage1_vae.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
@@ -131,6 +138,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_stage2_diffuser.add_argument("--steps", type=int, default=None)
     train_stage2_diffuser.add_argument("--batch-size", type=int, default=None)
+    train_stage2_diffuser.add_argument(
+        "--patches-per-volume",
+        type=int,
+        default=None,
+        help="Random patches drawn per volume before it is dropped (overrides "
+        "data.patches_per_volume). Higher = fewer disk reads per training step.",
+    )
     train_stage2_diffuser.add_argument("--seed", type=int, default=None)
     train_stage2_diffuser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
@@ -260,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         config = _load_optional_config(args.config)
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
+        _override(config, "data", "patches_per_volume", args.patches_per_volume)
         if args.seed is not None:
             config["seed"] = args.seed
         model_config = _model_config(config)
@@ -322,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         config = _load_optional_config(args.config)
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
+        _override(config, "data", "patches_per_volume", args.patches_per_volume)
         if args.seed is not None:
             config["seed"] = args.seed
         model_config = _model_config(config)

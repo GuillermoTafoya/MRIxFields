@@ -277,9 +277,10 @@ training loss curve.
     `loss_weights`, `checkpoint_dir`, `checkpoint_every_steps`, `resume_from`).
   - `stage1_vae.yaml` consumed by `Stage1VAEConfig.from_mapping`: adds `loss_weights`
     (`ssim`/`nrmse`/`lpips`/`kl`), `ssim_window_size`, `lpips_num_slices`,
-    `warm_start_checkpoint`, `checkpoint_at_end`, `checkpoint_max_bytes`,
-    `log_every_steps`; `device: cuda` (fail-fast, no silent CPU fallback) and
-    `training.num_workers` for the loader.
+    `grad_clip_norm` (gradient-norm clip, default 1.0), `warm_start_checkpoint`,
+    `checkpoint_at_end`, `checkpoint_max_bytes`, `log_every_steps`; `device: cuda`
+    (fail-fast, no silent CPU fallback) and `training.num_workers` for the loader. The
+    encoder also clamps `logvar` to `[-30, 20]` internally (KL/overflow guard).
   - `stage2_diffuser.yaml` consumed by `Stage2DiffuserConfig.from_mapping`: adds
     `num_timesteps`, `beta_start`, `beta_end`, `train_vae_jointly`, `vae_checkpoint`.
 

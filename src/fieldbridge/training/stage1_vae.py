@@ -65,6 +65,7 @@ class Stage1VAEConfig:
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_VAE_LOSS_WEIGHTS))
     ssim_window_size: int = 7
     lpips_num_slices: int = 8
+    grad_clip_norm: float = 1.0
     warm_start_checkpoint: Path | None = None
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -99,6 +100,9 @@ class Stage1VAEConfig:
             lpips_num_slices=int(
                 training.get("lpips_num_slices", data.get("lpips_num_slices", defaults.lpips_num_slices))
             ),
+            grad_clip_norm=float(
+                training.get("grad_clip_norm", data.get("grad_clip_norm", defaults.grad_clip_norm))
+            ),
             warm_start_checkpoint=Path(warm_start_checkpoint) if warm_start_checkpoint else None,
             checkpoint_dir=Path(checkpoint_dir) if checkpoint_dir else None,
             checkpoint_every_steps=int(
@@ -127,6 +131,7 @@ class Stage1VAEConfig:
             "loss_weights": dict(self.loss_weights),
             "ssim_window_size": self.ssim_window_size,
             "lpips_num_slices": self.lpips_num_slices,
+            "grad_clip_norm": self.grad_clip_norm,
             "checkpoint_at_end": self.checkpoint_at_end,
             "log_every_steps": self.log_every_steps,
         }
@@ -179,7 +184,8 @@ def run_stage1_vae_train(
         if "decoder" in state:
             load_state_dict_tolerant(decoder, state["decoder"])
 
-    optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=cfg.lr)
+    trainable_params = list(encoder.parameters()) + list(decoder.parameters())
+    optimizer = torch.optim.Adam(trainable_params, lr=cfg.lr)
 
     start_step = 0
     if cfg.resume_from is not None:
@@ -218,6 +224,8 @@ def run_stage1_vae_train(
         with autocast_ctx:
             total_loss = _compute_vae_loss(encoder, decoder, batch, cfg, lpips_net=lpips_net)
         total_loss.backward()
+        if cfg.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip_norm)
         optimizer.step()
         _sync_if_cuda(device)
         loss_value = float(total_loss.detach().cpu())

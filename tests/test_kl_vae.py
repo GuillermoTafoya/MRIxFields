@@ -5,7 +5,12 @@ from torch.utils.data import DataLoader, Dataset
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
-from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
+from fieldbridge.models.autoencoders.kl_vae import (
+    _LOGVAR_MAX,
+    _LOGVAR_MIN,
+    KLVAEDecoder,
+    KLVAEEncoder,
+)
 from fieldbridge.models.factory import build_decoder, build_encoder
 from fieldbridge.training.losses import kl_divergence
 from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
@@ -171,6 +176,37 @@ def test_vae_res_blocks_3d_forward_backward_no_nan() -> None:
     grads = [p.grad for p in list(encoder.parameters()) + list(decoder.parameters()) if p.grad is not None]
     assert grads, "expected gradients to flow"
     assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_encode_dist_clamps_logvar() -> None:
+    # Force a huge log-variance via the to_dist bias and confirm encode_dist clamps it,
+    # so exp(logvar) can't overflow / the KL term can't run away.
+    encoder = KLVAEEncoder(base_channels=8, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    with torch.no_grad():
+        encoder.to_dist.bias[encoder.latent_channels :] = 1e4  # logvar half of the output
+        encoder.to_dist.bias[: encoder.latent_channels] = -1e4  # mean half, unaffected by clamp
+    x = torch.randn(1, 1, 16, 16, 16)
+
+    _, logvar = encoder.encode_dist(x)
+
+    assert torch.isfinite(logvar).all()
+    assert logvar.max() <= _LOGVAR_MAX + 1e-4
+    assert logvar.min() >= _LOGVAR_MIN - 1e-4
+    assert torch.isclose(logvar.max(), torch.tensor(_LOGVAR_MAX), atol=1e-3)
+
+
+def test_grad_clip_norm_plumbs_and_trains() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
+    config = Stage1VAEConfig(
+        steps=2, batch_size=2, grad_clip_norm=0.5, loss_weights={"nrmse": 1.0, "kl": 1e-4}
+    )
+    assert config.grad_clip_norm == 0.5
+
+    result = run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
 def test_num_res_blocks_flows_through_factory() -> None:

@@ -29,6 +29,13 @@ SpatialDims = Literal[2, 3]
 
 _DOWNSAMPLE_FACTOR = 4  # 2 stride-2 blocks
 
+# Clamp the encoder's log-variance: keeps exp(logvar) finite (fp32 overflow guard) and
+# stops the KL term from running away during early, unstable training. The range covers
+# any well-behaved VAE log-variance with wide margin — a numerical safety rail, not a
+# swept hyperparameter.
+_LOGVAR_MIN = -30.0
+_LOGVAR_MAX = 20.0
+
 
 class KLVAEEncoder(BaseEncoder):
     """Residual strided-conv encoder producing a (mean, logvar) latent distribution.
@@ -86,6 +93,7 @@ class KLVAEEncoder(BaseEncoder):
         h = self.down2(h)
         h = self.res3(h)
         mean, logvar = self.to_dist(h).chunk(2, dim=1)
+        logvar = logvar.clamp(_LOGVAR_MIN, _LOGVAR_MAX)
         return mean, logvar
 
     def encode(self, x: torch.Tensor, domain: DomainBatch) -> torch.Tensor:

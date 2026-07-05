@@ -49,6 +49,10 @@ training:
   ssim_window_size: 7
   # Slices sampled along depth for the slice-based 3D LPIPS term.
   lpips_num_slices: 8
+  # Gradient-norm clip: bounds each update so an occasional large-gradient batch (e.g. a
+  # KL/logvar spike on a near-empty background patch) can't send the loss diverging.
+  # Standard VAE stabilizer; 0 disables.
+  grad_clip_norm: 1.0
   warm_start_checkpoint: null
   checkpoint_dir: outputs/stage1_vae/checkpoints
   checkpoint_every_steps: 100

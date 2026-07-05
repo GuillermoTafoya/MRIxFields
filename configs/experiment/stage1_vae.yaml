@@ -9,6 +9,12 @@ data:
   # patch cropping (see data/transforms.py:random_crop) is required, not optional, at
   # this scale. Must match stage2_diffuser.yaml's patch_size (same encoder is reused).
   patch_size: [64, 64, 64]
+  # Random patches drawn per volume per pass (StreamingPatchDataset). Each volume is
+  # read+decoded+normalized from disk once and this many 64^3 patches are drawn before it
+  # is dropped, amortizing that single ~231MB read (the old per-patch full-volume re-read
+  # starved the GPU on Drive-FUSE). The manifest is far larger than RAM, so volumes are
+  # streamed (one resident at a time), not cached.
+  patches_per_volume: 16
 model:
   name: kl_vae
   in_channels: 1
@@ -36,9 +42,10 @@ training:
   # to CPU and burning hours (the previous run trained on CPU without noticing).
   device: cuda
   precision: bf16
-  # Number of DataLoader workers for the real-manifest training path (NIfTI decode is I/O
-  # bound). 0 keeps it single-process for debugging.
-  num_workers: 2
+  # 0 (single process): a single reader hits Drive sequentially, which avoids Drive-FUSE's
+  # concurrent-read crashes (OSError 107) seen with >0 workers. StreamingPatchDataset owns
+  # its own shuffling, so DataLoader shuffle is off regardless.
+  num_workers: 0
   loss_weights:
     # Full SSIM+nRMSE+LPIPS+KL recipe now runs in 3D: ssim_loss dispatches to ssim3d
     # (avg_pool3d) and lpips uses the slice-averaged variant (lpips_num_slices below).

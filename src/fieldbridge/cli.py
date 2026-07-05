@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Mapping
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +12,15 @@ from torch.utils.data import DataLoader
 
 from fieldbridge.config import dump_yaml_config, load_yaml_config
 from fieldbridge.data.contracts import RawBatch
-from fieldbridge.data.datasets import ImageTransform, ManifestVolumeDataset, collate_raw_batches
+from fieldbridge.data.datasets import (
+    ImageTransform,
+    ManifestVolumeDataset,
+    StreamingPatchDataset,
+    collate_raw_batches,
+)
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
-from fieldbridge.data.transforms import compose, normalize_percentile_clip_to_unit_range, random_crop
+from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
 from fieldbridge.models.diffusion.denoising_unet import DenoisingUNet
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.official.data_manifest import (
@@ -262,11 +266,10 @@ def main(argv: list[str] | None = None) -> int:
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
         stage_config = Stage1VAEConfig.from_mapping(config)
-        loader = _build_manifest_loader(
+        loader = _build_streaming_patch_loader(
             args.manifest,
             batch_size=stage_config.batch_size,
-            transform=_manifest_transform(config),
-            shuffle=True,
+            config=config,
             num_workers=_num_workers(config),
         )
         result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
@@ -328,11 +331,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Config section 'vae_model' must be a mapping.")
         encoder = build_encoder("kl_vae", **dict(vae_model_config))
         stage_config = Stage2DiffuserConfig.from_mapping(config)
-        loader = _build_manifest_loader(
+        loader = _build_streaming_patch_loader(
             args.manifest,
             batch_size=stage_config.batch_size,
-            transform=_manifest_transform(config),
-            shuffle=True,
+            config=config,
             num_workers=_num_workers(config),
         )
         result = run_stage2_diffuser_train(stage_config, unet=unet, encoder=encoder, loader=loader)
@@ -434,10 +436,56 @@ def _build_manifest_loader(
     )
 
 
+def _build_streaming_patch_loader(
+    manifest_path: Path,
+    *,
+    batch_size: int,
+    config: Mapping[str, Any],
+    num_workers: int = 0,
+) -> "DataLoader[RawBatch]":
+    """Training loader that streams `data.patches_per_volume` random patches per volume,
+    reading each volume from disk once per pass — see StreamingPatchDataset.
+
+    Replaces the per-patch full-volume re-read of `_build_manifest_loader`, which starved
+    the GPU on Drive-FUSE. `shuffle=False` because the dataset owns the shuffling (a
+    manifest larger than RAM can't be map-indexed+shuffled cheaply); `num_workers` defaults
+    to 0 so a single reader hits Drive sequentially (avoiding Drive-FUSE's concurrent-read
+    crashes).
+    """
+
+    manifest = load_manifest(manifest_path)
+    dataset = StreamingPatchDataset(
+        manifest.records,
+        image_loader=nifti_image_loader,
+        patch_size=_data_patch_size(config),
+        patches_per_volume=_patches_per_volume(config),
+        volume_transform=normalize_percentile_clip_to_unit_range,
+        seed=int(config.get("seed", 0)) if isinstance(config.get("seed", 0), int) else 0,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_raw_batches,
+    )
+
+
 def _load_optional_config(path: Path) -> dict[str, Any]:
     if path.exists():
         return load_yaml_config(path)
     return {}
+
+
+def _data_patch_size(config: Mapping[str, Any]) -> tuple[int, ...] | None:
+    """Configured training patch size, or None if unset (train on whole volumes — used by
+    the small no-crop manifests in tests; real configs always set data.patch_size)."""
+
+    data_config = config.get("data", {})
+    patch_size = data_config.get("patch_size") if isinstance(data_config, Mapping) else None
+    if patch_size is None:
+        return None
+    return tuple(int(p) for p in patch_size)
 
 
 def _eval_patch_size(config: Mapping[str, Any]) -> tuple[int, int, int]:
@@ -446,6 +494,12 @@ def _eval_patch_size(config: Mapping[str, Any]) -> tuple[int, int, int]:
     if patch_size is None:
         patch_size = [64, 64, 64]
     return tuple(int(p) for p in patch_size)  # type: ignore[return-value]
+
+
+def _patches_per_volume(config: Mapping[str, Any]) -> int:
+    data_config = config.get("data", {})
+    value = data_config.get("patches_per_volume") if isinstance(data_config, Mapping) else None
+    return int(value) if value is not None else 1
 
 
 def _load_loss_curve(path: Path | None) -> list[float] | None:
@@ -519,21 +573,6 @@ def _top_level_component_kwargs(
         allowed = encoder_keys if component == "encoder" else decoder_keys
         return {key: value for key, value in top_level.items() if key in allowed}
     return top_level
-
-
-def _manifest_transform(config: Mapping[str, Any]) -> ImageTransform:
-    """Percentile-clip normalization, plus a random spatial patch crop if
-    data.patch_size is set in the config — required for full 3D volumes at typical
-    resolutions (e.g. 364x436x364), where decoding back toward full resolution with
-    enough latent channels for the diffuser OOMs on essentially any GPU otherwise. See
-    random_crop's docstring.
-    """
-
-    data_config = config.get("data", {})
-    patch_size = data_config.get("patch_size") if isinstance(data_config, Mapping) else None
-    if patch_size is None:
-        return normalize_percentile_clip_to_unit_range
-    return compose([normalize_percentile_clip_to_unit_range, partial(random_crop, patch_size=patch_size)])
 
 
 _KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "spatial_dims", "activation", "use_norm", "num_res_blocks"}

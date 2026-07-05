@@ -6,6 +6,9 @@ data:
   # Must match stage1_vae.yaml's patch_size — same reasoning (full 3D volumes OOM at full
   # resolution; see data/transforms.py:random_crop).
   patch_size: [64, 64, 64]
+  # See stage1_vae.yaml — StreamingPatchDataset reads each volume once per pass and draws
+  # this many random patches from it before dropping it, amortizing Drive I/O.
+  patches_per_volume: 16
 model:
   name: field_conditioned_unet
   # Diffuser in/out channels == VAE latent_channels. Must match stage1_vae.yaml (4).

@@ -59,6 +59,42 @@ def ssim(
     return (numerator / denominator).mean()
 
 
+def ssim3d(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float = 1.0,
+    window_size: int = 7,
+) -> torch.Tensor:
+    """Volumetric structural similarity (avg_pool3d), the 3D analogue of `ssim`.
+
+    Not the official 2D Task 3 metric — used as a training-time loss term for
+    spatial_dims=3 volumes, where the 2D `ssim` (avg_pool2d, 4D-only) can't apply.
+    """
+
+    if prediction.ndim != 5:
+        raise ValueError("ssim3d expects (B, C, D, H, W) tensors.")
+
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    pad = window_size // 2
+
+    def local_mean(x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool3d(x, kernel_size=window_size, stride=1, padding=pad)
+
+    mu_p = local_mean(prediction)
+    mu_t = local_mean(target)
+    mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
+
+    sigma_p_sq = local_mean(prediction**2) - mu_p_sq
+    sigma_t_sq = local_mean(target**2) - mu_t_sq
+    sigma_pt = local_mean(prediction * target) - mu_pt
+
+    numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
+    denominator = (mu_p_sq + mu_t_sq + c1) * (sigma_p_sq + sigma_t_sq + c2)
+    return (numerator / denominator).mean()
+
+
 def lpips_metric(
     prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.Module | None = None
 ) -> torch.Tensor:

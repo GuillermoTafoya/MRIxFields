@@ -1,6 +1,7 @@
 name: kl_vae
 in_channels: 1
 base_channels: 32
-latent_channels: 128
+latent_channels: 4
+num_res_blocks: 2
 spatial_dims: 3
 activation: silu

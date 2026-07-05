@@ -12,6 +12,7 @@ from fieldbridge.training.losses import (
     identity_loss,
     kl_divergence,
     lpips_loss,
+    lpips_loss_3d,
     masked_l1_loss,
     nrmse_loss,
     ssim_loss,
@@ -125,6 +126,33 @@ def test_lpips_loss_requires_optional_dependency() -> None:
 
     with pytest.raises(ImportError):
         lpips_loss(prediction, target)
+
+
+def test_lpips_loss_3d_rejects_non_5d() -> None:
+    prediction = torch.randn(1, 1, 8, 8)
+    target = torch.randn(1, 1, 8, 8)
+
+    with pytest.raises(ValueError):
+        lpips_loss_3d(prediction, target)
+
+
+def test_lpips_loss_3d_finite_scalar() -> None:
+    pytest.importorskip("lpips")
+    prediction = torch.randn(2, 1, 16, 16, 16, requires_grad=True)
+    target = torch.randn(2, 1, 16, 16, 16)
+
+    loss = lpips_loss_3d(prediction, target, num_slices=4)
+
+    _assert_finite_and_backprop(loss, prediction)
+
+
+def test_ssim_loss_dispatches_to_3d_for_volumes() -> None:
+    x = torch.rand(2, 1, 8, 8, 8, requires_grad=True)
+
+    loss = ssim_loss(x, x.detach())
+
+    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-4)
+    _assert_finite_and_backprop(loss, x)
 
 
 def test_synthseg_inloss_stub_fails_explicitly() -> None:

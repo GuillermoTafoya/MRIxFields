@@ -1,0 +1,106 @@
+import json
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from fieldbridge.data.contracts import RawBatch
+from fieldbridge.data.datasets import collate_raw_batches
+from fieldbridge.data.domains import Domain
+from fieldbridge.evaluation.stage1_report import run_stage1_eval, sliding_window_reconstruct
+from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
+
+
+class _FullVolumeDataset(Dataset[RawBatch]):
+    """Volumes larger than the patch, so the sliding window actually tiles (with edge overlap)."""
+
+    def __init__(self, *, num_samples: int = 2, volume_shape: tuple[int, int, int, int] = (1, 40, 40, 40)) -> None:
+        self.num_samples = num_samples
+        self.volume_shape = volume_shape
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, index: int) -> RawBatch:
+        generator = torch.Generator().manual_seed(index)
+        image = torch.rand(self.volume_shape, generator=generator) * 2.0 - 1.0
+        domain = Domain(1.5, "T2w")
+        return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"c{index}"})
+
+
+def _loader() -> DataLoader[RawBatch]:
+    return DataLoader(_FullVolumeDataset(), batch_size=1, shuffle=False, collate_fn=collate_raw_batches)
+
+
+def test_sliding_window_reconstruct_preserves_shape() -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    image = torch.rand(1, 1, 40, 40, 40) * 2.0 - 1.0
+
+    recon = sliding_window_reconstruct(encoder, decoder, image, patch_size=(16, 16, 16), domain=None)
+
+    assert recon.shape == image.shape
+    assert torch.isfinite(recon).all()
+    assert recon.min() >= -1.0 and recon.max() <= 1.0
+
+
+class _MultiDomainDataset(Dataset[RawBatch]):
+    """Volumes across several field strengths, with duplicates, to exercise per-domain dedup."""
+
+    def __init__(self) -> None:
+        self.fields = [1.5, 1.5, 3.0, 3.0, 7.0]  # 3 distinct domains, with repeats
+
+    def __len__(self) -> int:
+        return len(self.fields)
+
+    def __getitem__(self, index: int) -> RawBatch:
+        image = torch.rand(1, 24, 24, 24) * 2.0 - 1.0
+        domain = Domain(self.fields[index], "T2w")
+        return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"c{index}"})
+
+
+def test_run_stage1_eval_per_domain_dedups_field_strength(tmp_path) -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    loader = DataLoader(_MultiDomainDataset(), batch_size=1, shuffle=False, collate_fn=collate_raw_batches)
+
+    payload = run_stage1_eval(
+        encoder=encoder,
+        decoder=decoder,
+        loader=loader,
+        patch_size=(16, 16, 16),
+        out_dir=tmp_path,
+        num_samples=10,
+        device=torch.device("cpu"),
+        lpips_num_slices=0,
+        per_domain=True,
+    )
+
+    # 3 distinct field strengths -> exactly 3 samples despite 5 records.
+    assert payload["num_samples"] == 3
+    domains = {s["domain"] for s in payload["per_sample"]}
+    assert domains == {"1.5T/T2w", "3T/T2w", "7T/T2w"}
+
+
+def test_run_stage1_eval_writes_metrics_and_plots(tmp_path) -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+
+    payload = run_stage1_eval(
+        encoder=encoder,
+        decoder=decoder,
+        loader=_loader(),
+        patch_size=(16, 16, 16),
+        out_dir=tmp_path,
+        num_samples=2,
+        device=torch.device("cpu"),
+        lpips_num_slices=0,  # skips lpips net (LPIPS optional dep may be absent)
+        loss_curve=[3.0, 2.0, 1.0],
+    )
+
+    assert payload["num_samples"] == 2
+    assert set(payload["mean"]) >= {"nrmse", "ssim3d", "mse", "mae"}
+    assert (tmp_path / "metrics.json").exists()
+    assert (tmp_path / "diagnostics.png").exists()
+    assert (tmp_path / "loss_curve.png").exists()
+    written = json.loads((tmp_path / "metrics.json").read_text())
+    assert len(written["per_sample"]) == 2

@@ -148,6 +148,37 @@ def test_encode_decode_roundtrip_3d_volume() -> None:
     assert y.max() <= 1.0
 
 
+def test_vae_res_blocks_3d_forward_backward_no_nan() -> None:
+    # The real config: latent_channels=4 at /4 spatial on a 64^3 patch => 16^3 x 4 latent
+    # (16x compression), with residual blocks. Confirms shapes and a finite backward pass
+    # before spending GPU-hrs.
+    encoder = KLVAEEncoder(base_channels=8, latent_channels=4, spatial_dims=3, num_res_blocks=2)
+    decoder = KLVAEDecoder(base_channels=8, latent_channels=4, spatial_dims=3, num_res_blocks=2)
+    x = torch.randn(1, 1, 64, 64, 64)
+    domain = _domain_pair(1)
+
+    mean, logvar = encoder.encode_dist(x, domain)
+    assert mean.shape == (1, 4, 16, 16, 16)
+    assert torch.isfinite(mean).all() and torch.isfinite(logvar).all()
+
+    z = mean + torch.randn_like(mean) * torch.exp(0.5 * logvar)
+    y = decoder.decode(z, domain)
+    assert y.shape == x.shape
+    assert y.min() >= -1.0 and y.max() <= 1.0
+
+    loss = torch.nn.functional.mse_loss(y, x)
+    loss.backward()
+    grads = [p.grad for p in list(encoder.parameters()) + list(decoder.parameters()) if p.grad is not None]
+    assert grads, "expected gradients to flow"
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_num_res_blocks_flows_through_factory() -> None:
+    encoder = build_encoder("kl_vae", base_channels=8, latent_channels=4, spatial_dims=3, num_res_blocks=3)
+    assert isinstance(encoder, KLVAEEncoder)
+    assert encoder.num_res_blocks == 3
+
+
 def test_encoder_3d_rejects_4d_input() -> None:
     encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
     x = torch.randn(1, 1, 8, 8)
@@ -194,37 +225,40 @@ def test_run_stage1_vae_train_smoke_3d_volume() -> None:
     assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
-def test_run_stage1_vae_train_3d_volume_raises_if_ssim_weight_nonzero() -> None:
-    # evaluation.metrics.ssim is 2D-only by design (avg_pool2d-based) — confirms the
-    # guard in _compute_vae_loss is load-bearing, not just an optimization, and that
-    # spatial_dims=3 configs MUST keep ssim weight at 0 (nrmse+kl only, see the lpips
-    # test below — lpips has the same 2D-only limitation, so it's nrmse+kl, not +lpips).
+def test_run_stage1_vae_train_3d_volume_with_ssim3d() -> None:
+    # ssim_loss now dispatches to ssim3d (avg_pool3d) for 5D volumes — the 2D-only
+    # limitation is gone, so a spatial_dims=3 config with ssim weight > 0 trains fine.
     encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
     loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
     config = Stage1VAEConfig(
-        steps=1, batch_size=2, loss_weights={"ssim": 1.0, "nrmse": 0.0, "lpips": 0.0, "kl": 0.0}
+        steps=1, batch_size=2, loss_weights={"ssim": 1.0, "nrmse": 1.0, "lpips": 0.0, "kl": 1e-4}
     )
 
-    with pytest.raises(ValueError):
-        run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+    result = run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+    assert result.steps == 1
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
-def test_run_stage1_vae_train_3d_volume_raises_if_lpips_weight_nonzero() -> None:
-    # lpips_loss wraps a 2D VGG16 net — _to_three_channel's `.repeat(1, 3, 1, 1)`
-    # assumes a 4D (B,C,H,W) tensor and raises on 5D (B,C,D,H,W) volumes. Same
-    # "guard, don't just weight" requirement as ssim above; spatial_dims=3 configs
-    # MUST keep lpips weight at 0 too.
+def test_run_stage1_vae_train_3d_volume_with_slice_lpips() -> None:
+    # lpips now runs on 5D volumes via the slice-averaged variant (lpips_loss_3d) inside
+    # _compute_vae_loss — a spatial_dims=3 config with lpips weight > 0 trains fine.
     pytest.importorskip("lpips")
     encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
     loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
     config = Stage1VAEConfig(
-        steps=1, batch_size=2, loss_weights={"ssim": 0.0, "nrmse": 0.0, "lpips": 1.0, "kl": 0.0}
+        steps=1,
+        batch_size=2,
+        loss_weights={"ssim": 1.0, "nrmse": 1.0, "lpips": 1.0, "kl": 1e-4},
+        lpips_num_slices=4,
     )
 
-    with pytest.raises(RuntimeError):
-        run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+    result = run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+    assert result.steps == 1
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
 def test_run_stage1_vae_train_smoke_with_lpips() -> None:

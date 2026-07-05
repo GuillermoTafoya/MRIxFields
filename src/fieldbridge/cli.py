@@ -30,6 +30,8 @@ from fieldbridge.official.submissions import (
     build_submission_zip,
     validate_submission_dir,
 )
+from fieldbridge.evaluation.stage1_report import run_stage1_eval
+from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
 from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
@@ -76,6 +78,33 @@ def build_parser() -> argparse.ArgumentParser:
     train_stage1_vae.add_argument("--batch-size", type=int, default=None)
     train_stage1_vae.add_argument("--seed", type=int, default=None)
     train_stage1_vae.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    eval_stage1_vae = subparsers.add_parser(
+        "eval-stage1-vae",
+        help="Deterministic reconstruction eval + diagnostic plots for a stage-1 VAE checkpoint.",
+    )
+    eval_stage1_vae.add_argument("--checkpoint", type=Path, required=True, help="Trained VAE checkpoint (.pt).")
+    eval_stage1_vae.add_argument("--config", type=Path, default=Path("configs/experiment/stage1_vae.yaml"))
+    eval_stage1_vae.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Manifest of real NIfTI volumes to reconstruct (requires the 'nifti' extra).",
+    )
+    eval_stage1_vae.add_argument("--out", type=Path, required=True, help="Output directory for metrics + plots.")
+    eval_stage1_vae.add_argument("--num-samples", type=int, default=4)
+    eval_stage1_vae.add_argument(
+        "--per-domain",
+        action="store_true",
+        help="Reconstruct one volume per distinct field strength (0.1T..7T) instead of the "
+        "first N in manifest order.",
+    )
+    eval_stage1_vae.add_argument(
+        "--metrics-raw",
+        type=Path,
+        default=None,
+        help="Optional metrics_raw.json from training to also render the loss curve.",
+    )
 
     train_stage2_diffuser = subparsers.add_parser(
         "train-stage2-diffuser",
@@ -199,7 +228,16 @@ def main(argv: list[str] | None = None) -> int:
         decoder = build_decoder(decoder_name, **decoder_kwargs)
         translator = build_translator(translator_name, **translator_kwargs)
         loop_config = TrainLoopConfig.from_mapping(config)
-        loader = _build_manifest_loader(args.manifest, batch_size=loop_config.batch_size) if args.manifest else None
+        loader = (
+            _build_manifest_loader(
+                args.manifest,
+                batch_size=loop_config.batch_size,
+                shuffle=True,
+                num_workers=_num_workers(config),
+            )
+            if args.manifest
+            else None
+        )
         result = run_train_loop(loop_config, encoder=encoder, decoder=decoder, translator=translator, loader=loader)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -218,13 +256,55 @@ def main(argv: list[str] | None = None) -> int:
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
         stage_config = Stage1VAEConfig.from_mapping(config)
         loader = _build_manifest_loader(
-            args.manifest, batch_size=stage_config.batch_size, transform=_manifest_transform(config)
+            args.manifest,
+            batch_size=stage_config.batch_size,
+            transform=_manifest_transform(config),
+            shuffle=True,
+            num_workers=_num_workers(config),
         )
         result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train-stage1-vae completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "eval-stage1-vae":
+        import torch
+
+        config = _load_optional_config(args.config)
+        model_config = _model_config(config)
+        encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+        decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+        state = load_checkpoint(args.checkpoint)
+        encoder.load_state_dict(state["encoder"])
+        decoder.load_state_dict(state["decoder"])
+        # Full-volume reconstruction: normalize to [-1, 1] like training, but NO random
+        # crop (the sliding window in run_stage1_eval tiles the whole volume itself).
+        loader = _build_manifest_loader(
+            args.manifest,
+            batch_size=1,
+            transform=normalize_percentile_clip_to_unit_range,
+            shuffle=False,
+        )
+        patch_size = _eval_patch_size(config)
+        loss_curve = _load_loss_curve(args.metrics_raw)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        payload = run_stage1_eval(
+            encoder=encoder,
+            decoder=decoder,
+            loader=loader,
+            patch_size=patch_size,
+            out_dir=args.out,
+            num_samples=args.num_samples,
+            per_domain=args.per_domain,
+            device=device,
+            lpips_num_slices=int(config.get("training", {}).get("lpips_num_slices", 8))
+            if isinstance(config.get("training", {}), Mapping)
+            else 8,
+            loss_curve=loss_curve,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     if args.command == "train-stage2-diffuser":
@@ -241,7 +321,11 @@ def main(argv: list[str] | None = None) -> int:
         encoder = build_encoder("kl_vae", **dict(vae_model_config))
         stage_config = Stage2DiffuserConfig.from_mapping(config)
         loader = _build_manifest_loader(
-            args.manifest, batch_size=stage_config.batch_size, transform=_manifest_transform(config)
+            args.manifest,
+            batch_size=stage_config.batch_size,
+            transform=_manifest_transform(config),
+            shuffle=True,
+            num_workers=_num_workers(config),
         )
         result = run_stage2_diffuser_train(stage_config, unet=unet, encoder=encoder, loader=loader)
         if args.json:
@@ -325,16 +409,50 @@ def _build_manifest_loader(
     *,
     batch_size: int,
     transform: ImageTransform | None = normalize_percentile_clip_to_unit_range,
+    shuffle: bool = False,
+    num_workers: int = 0,
 ) -> "DataLoader[RawBatch]":
+    # shuffle defaults to False so non-training callers (audits, eval) keep manifest order;
+    # training paths pass shuffle=True — the previous fixed-order loader meant a short run
+    # only ever saw the first N records.
     manifest = load_manifest(manifest_path)
     dataset = ManifestVolumeDataset(manifest.records, image_loader=nifti_image_loader, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_raw_batches,
+    )
 
 
 def _load_optional_config(path: Path) -> dict[str, Any]:
     if path.exists():
         return load_yaml_config(path)
     return {}
+
+
+def _eval_patch_size(config: Mapping[str, Any]) -> tuple[int, int, int]:
+    data_config = config.get("data", {})
+    patch_size = data_config.get("patch_size") if isinstance(data_config, Mapping) else None
+    if patch_size is None:
+        patch_size = [64, 64, 64]
+    return tuple(int(p) for p in patch_size)  # type: ignore[return-value]
+
+
+def _load_loss_curve(path: Path | None) -> list[float] | None:
+    if path is None or not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    losses = data.get("losses") if isinstance(data, Mapping) else None
+    return [float(x) for x in losses] if isinstance(losses, list) else None
+
+
+def _num_workers(config: Mapping[str, Any]) -> int:
+    training = config.get("training", {})
+    if isinstance(training, Mapping) and "num_workers" in training:
+        return int(training["num_workers"])
+    return 0
 
 
 def _model_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -401,7 +519,7 @@ def _manifest_transform(config: Mapping[str, Any]) -> ImageTransform:
     return compose([normalize_percentile_clip_to_unit_range, partial(random_crop, patch_size=patch_size)])
 
 
-_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "spatial_dims", "activation", "use_norm"}
+_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "spatial_dims", "activation", "use_norm", "num_res_blocks"}
 
 
 def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str, Any]:

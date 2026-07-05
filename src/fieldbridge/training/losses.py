@@ -121,6 +121,9 @@ def kl_divergence(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
 def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
     """1 - ssim(...) — ssim is "higher is better", losses in this module are "minimize".
 
+    Dispatches by rank: 4D (B,C,H,W) -> 2D `ssim`, 5D (B,C,D,H,W) -> `ssim3d`. Lets the
+    same loss term drive both the 2D-slice and full-3D-volume training paths.
+
     Deferred import: evaluation/metrics.py imports training.losses.lpips_loss (also
     deferred, inside lpips_metric) — importing evaluation.metrics at module level here
     would work today (no actual cycle, since that import is function-local on the other
@@ -128,9 +131,10 @@ def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) 
     first.
     """
 
-    from fieldbridge.evaluation.metrics import ssim
+    from fieldbridge.evaluation.metrics import ssim, ssim3d
 
-    return 1.0 - ssim(prediction, target, **kwargs)
+    metric = ssim3d if prediction.ndim == 5 else ssim
+    return 1.0 - metric(prediction, target, **kwargs)
 
 
 def nrmse_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
@@ -183,6 +187,36 @@ def lpips_loss(prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.
     if net is None:
         net = _default_lpips_net(prediction.device)
     return net(_to_three_channel(prediction), _to_three_channel(target)).mean()
+
+
+def lpips_loss_3d(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    net: torch.nn.Module | None = None,
+    num_slices: int = 8,
+    axis: int = 2,
+) -> torch.Tensor:
+    """Slice-based LPIPS for 3D volumes: average 2D LPIPS over sampled slices.
+
+    LPIPS wraps a 2D VGG net (`_to_three_channel` assumes 4D). For (B,C,D,H,W) volumes we
+    sample `num_slices` equispaced slices along `axis` (default the depth axis, index 2),
+    fold them into the batch, and run the 2D LPIPS once. Equispaced (not random) so the
+    term is deterministic per forward — no seed coupling with the reparameterization.
+    """
+
+    if prediction.ndim != 5:
+        raise ValueError(f"lpips_loss_3d expects 5D (B,C,D,H,W) tensors, got {prediction.ndim}D.")
+    _validate_same_shape(prediction, target)
+    depth = int(prediction.shape[axis])
+    count = min(num_slices, depth)
+    idx = torch.linspace(0, depth - 1, count, device=prediction.device).round().long().unique()
+    pred_slices = prediction.index_select(axis, idx)
+    target_slices = target.index_select(axis, idx)
+    # Fold the sampled-slice axis into the batch -> (B*S, C, H, W) for the 2D net.
+    pred_2d = pred_slices.movedim(axis, 1).flatten(0, 1)
+    target_2d = target_slices.movedim(axis, 1).flatten(0, 1)
+    return lpips_loss(pred_2d, target_2d, net=net)
 
 
 def _default_lpips_net(device: torch.device) -> torch.nn.Module:

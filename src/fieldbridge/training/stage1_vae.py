@@ -28,7 +28,7 @@ from fieldbridge.data.contracts import RawBatch
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.batch import move_raw_batch
 from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
-from fieldbridge.training.losses import kl_divergence, lpips_loss, nrmse_loss, ssim_loss
+from fieldbridge.training.losses import kl_divergence, lpips_loss, lpips_loss_3d, nrmse_loss, ssim_loss
 from fieldbridge.training.warm_start import load_state_dict_tolerant
 from fieldbridge.utils.seeding import seed_everything
 
@@ -57,6 +57,7 @@ class Stage1VAEConfig:
     precision: Precision = "fp32"
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_VAE_LOSS_WEIGHTS))
     ssim_window_size: int = 7
+    lpips_num_slices: int = 8
     warm_start_checkpoint: Path | None = None
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -88,6 +89,9 @@ class Stage1VAEConfig:
             ssim_window_size=int(
                 training.get("ssim_window_size", data.get("ssim_window_size", defaults.ssim_window_size))
             ),
+            lpips_num_slices=int(
+                training.get("lpips_num_slices", data.get("lpips_num_slices", defaults.lpips_num_slices))
+            ),
             warm_start_checkpoint=Path(warm_start_checkpoint) if warm_start_checkpoint else None,
             checkpoint_dir=Path(checkpoint_dir) if checkpoint_dir else None,
             checkpoint_every_steps=int(
@@ -115,6 +119,7 @@ class Stage1VAEConfig:
             "precision": self.precision,
             "loss_weights": dict(self.loss_weights),
             "ssim_window_size": self.ssim_window_size,
+            "lpips_num_slices": self.lpips_num_slices,
             "checkpoint_at_end": self.checkpoint_at_end,
             "log_every_steps": self.log_every_steps,
         }
@@ -262,12 +267,18 @@ def _compute_vae_loss(
 
     total = weights.get("nrmse", 0.0) * nrmse_loss(reconstructed, batch.image)
     if weights.get("ssim", 0.0) > 0:
-        # evaluation.metrics.ssim hard-rejects non-4D tensors ("this project is
-        # 2D-only") — guarded, not just weighted, so spatial_dims=3 volumes (5D
-        # tensors) don't crash even when this weight is 0 in the config.
+        # ssim_loss dispatches on rank: 5D volumes -> ssim3d (avg_pool3d), 4D -> 2D ssim.
         total = total + weights["ssim"] * ssim_loss(reconstructed, batch.image, window_size=cfg.ssim_window_size)
     if weights.get("lpips", 0.0) > 0:
-        total = total + weights["lpips"] * lpips_loss(reconstructed, batch.image, net=lpips_net)
+        # LPIPS wraps a 2D VGG net: for 5D volumes use the slice-averaged variant, for 4D
+        # (2D slices) the plain one.
+        if reconstructed.ndim == 5:
+            lpips_value = lpips_loss_3d(
+                reconstructed, batch.image, net=lpips_net, num_slices=cfg.lpips_num_slices
+            )
+        else:
+            lpips_value = lpips_loss(reconstructed, batch.image, net=lpips_net)
+        total = total + weights["lpips"] * lpips_value
     total = total + weights.get("kl", 0.0) * kl_divergence(mean, logvar)
     return total
 

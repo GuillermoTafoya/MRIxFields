@@ -3,12 +3,13 @@ data:
   name: nifti_manifest
   root: ${MRIXFIELDS_DATA_ROOT}
   manifest: ${MRIXFIELDS_MANIFEST}
-  # Must match stage1_vae.yaml's patch_size — same reasoning (full 3D volumes at
-  # latent_channels=128 OOM at full resolution; see data/transforms.py:random_crop).
+  # Must match stage1_vae.yaml's patch_size — same reasoning (full 3D volumes OOM at full
+  # resolution; see data/transforms.py:random_crop).
   patch_size: [64, 64, 64]
 model:
   name: field_conditioned_unet
-  latent_channels: 128
+  # Diffuser in/out channels == VAE latent_channels. Must match stage1_vae.yaml (4).
+  latent_channels: 4
   base_channels: 128
   # Must match KLVAEEncoder's spatial_dims below (the diffuser operates on that
   # encoder's latent grid) — see kl_vae.py / denoising_unet.py docstrings for why 3D.
@@ -24,7 +25,8 @@ model:
 vae_model:
   in_channels: 1
   base_channels: 32
-  latent_channels: 128
+  latent_channels: 4
+  num_res_blocks: 2
   spatial_dims: 3
   activation: silu
 training:

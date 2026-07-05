@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from fieldbridge.evaluation.metrics import lpips_metric, nrmse, ssim
+from fieldbridge.evaluation.metrics import lpips_metric, nrmse, ssim, ssim3d
 
 
 def test_nrmse_zero_for_identical_tensors() -> None:
@@ -30,6 +30,21 @@ def test_ssim_rejects_non_2d_batches() -> None:
 
     with pytest.raises(ValueError):
         ssim(x, x)
+
+
+def test_ssim3d_one_for_identical_volumes() -> None:
+    x = torch.rand(2, 1, 16, 16, 16)
+
+    value = ssim3d(x, x)
+
+    assert torch.isclose(value, torch.tensor(1.0), atol=1e-4)
+
+
+def test_ssim3d_rejects_non_5d_batches() -> None:
+    x = torch.rand(2, 1, 16, 16)
+
+    with pytest.raises(ValueError):
+        ssim3d(x, x)
 
 
 def test_lpips_metric_requires_optional_dependency() -> None:

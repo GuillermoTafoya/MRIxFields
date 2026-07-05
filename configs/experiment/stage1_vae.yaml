@@ -13,7 +13,15 @@ model:
   name: kl_vae
   in_channels: 1
   base_channels: 32
-  latent_channels: 128
+  # latent_channels=4 at /4 spatial => 16x compression on a 64^3 patch (16^3*4 vs 64^3).
+  # The old 128 was a *2x expansion* (no bottleneck), which OOM'd eval and left nothing
+  # useful for the stage-2 diffuser. 4 channels is the medical-3D consensus (SD kl-f8: 4;
+  # Pinaya brain LDM / MONAI: 3), /4 spatial chosen over /8 for anatomical fidelity
+  # (Medical Diffusion: /8 loses fine detail). Must match stage2_diffuser.yaml.
+  latent_channels: 4
+  # Residual blocks per resolution level (MONAI AutoencoderKL-style capacity). The old
+  # single-conv-per-level encoder had too low a reconstruction ceiling.
+  num_res_blocks: 2
   # Full 3D volumes (matching the real manifest's NIfTI files and the CNN autoencoder's
   # already-proven 3D path) — no slice-extraction step exists in this pipeline, and
   # compute cost was explicitly waved off. Reverses fase-b-vae.md's original "2D
@@ -24,23 +32,23 @@ training:
   steps: 1000
   batch_size: 8
   lr: 0.0001
-  device: auto
+  # 'cuda' (not 'auto'): fail-fast at step 0 if no GPU, instead of silently falling back
+  # to CPU and burning hours (the previous run trained on CPU without noticing).
+  device: cuda
   precision: bf16
+  # Number of DataLoader workers for the real-manifest training path (NIfTI decode is I/O
+  # bound). 0 keeps it single-process for debugging.
+  num_workers: 2
   loss_weights:
-    # evaluation.metrics.ssim is 2D-only by design (avg_pool2d-based) and raises on
-    # non-4D tensors — MUST stay 0 with spatial_dims=3 above, or every step crashes.
-    ssim: 0.0
+    # Full SSIM+nRMSE+LPIPS+KL recipe now runs in 3D: ssim_loss dispatches to ssim3d
+    # (avg_pool3d) and lpips uses the slice-averaged variant (lpips_num_slices below).
+    ssim: 1.0
     nrmse: 1.0
-    # lpips wraps a 2D VGG16 net (via the `lpips` package) — same 2D-only limitation as
-    # ssim, just a different crash site (_to_three_channel's .repeat assumes 4D). MUST
-    # also stay 0 with spatial_dims=3. Net effect: with full 3D volumes, only nrmse+kl
-    # of the requested SSIM+nRMSE+LPIPS+KL recipe are usable as currently implemented —
-    # a real degradation, not just a config tweak. A 3D-adapted SSIM (avg_pool3d) and a
-    # slice-based LPIPS (average over sampled 2D slices) are the follow-up if this
-    # matters for the actual results, not implemented here.
-    lpips: 0.0
+    lpips: 1.0
     kl: 0.0001
   ssim_window_size: 7
+  # Slices sampled along depth for the slice-based 3D LPIPS term.
+  lpips_num_slices: 8
   warm_start_checkpoint: null
   checkpoint_dir: outputs/stage1_vae/checkpoints
   checkpoint_every_steps: 100

@@ -28,7 +28,14 @@ from fieldbridge.data.contracts import RawBatch
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.batch import move_raw_batch
 from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
-from fieldbridge.training.losses import kl_divergence, lpips_loss, lpips_loss_3d, nrmse_loss, ssim_loss
+from fieldbridge.training.losses import (
+    build_lpips_net,
+    kl_divergence,
+    lpips_loss,
+    lpips_loss_3d,
+    nrmse_loss,
+    ssim_loss,
+)
 from fieldbridge.training.warm_start import load_state_dict_tolerant
 from fieldbridge.utils.seeding import seed_everything
 
@@ -184,7 +191,7 @@ def run_stage1_vae_train(
 
     lpips_net: nn.Module | None = None
     if cfg.loss_weights.get("lpips", 0.0) > 0:
-        lpips_net = _build_lpips_net(device)
+        lpips_net = build_lpips_net(device)
 
     iterator = iter(loader)
     autocast_ctx = _autocast_context(device, cfg.precision)
@@ -281,17 +288,6 @@ def _compute_vae_loss(
         total = total + weights["lpips"] * lpips_value
     total = total + weights.get("kl", 0.0) * kl_divergence(mean, logvar)
     return total
-
-
-def _build_lpips_net(device: torch.device) -> nn.Module:
-    try:
-        import lpips
-    except ImportError as exc:
-        raise ImportError(
-            "lpips weight > 0 requires the optional 'lpips' package. "
-            "Install with `pip install -e '.[perceptual]'`."
-        ) from exc
-    return lpips.LPIPS(net="vgg").to(device)
 
 
 def _save_step_checkpoint(

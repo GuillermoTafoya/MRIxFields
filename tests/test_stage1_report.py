@@ -1,13 +1,61 @@
 import json
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
-from fieldbridge.evaluation.stage1_report import run_stage1_eval, sliding_window_reconstruct
+from fieldbridge.evaluation.stage1_report import (
+    _hann_window_3d,
+    run_stage1_eval,
+    sliding_window_reconstruct,
+)
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
+
+
+class _IdentityEncoder:
+    """Duck-typed encoder whose latent mean IS the input tile (for blending-math tests)."""
+
+    def encode_dist(self, x: torch.Tensor, domain: object) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, torch.zeros_like(x)
+
+
+class _IdentityDecoder:
+    def decode(self, z: torch.Tensor, domain: object) -> torch.Tensor:
+        return z
+
+
+@pytest.mark.parametrize("overlap", [0.0, 0.25, 0.5])
+def test_sliding_window_blending_reconstructs_identity_exactly(overlap: float) -> None:
+    # With identity encode/decode, the overlap + Hann weighting is a partition of unity:
+    # the blended output must equal the input exactly (no seams introduced by the window).
+    torch.manual_seed(0)
+    image = torch.rand(1, 1, 40, 40, 40) * 2.0 - 1.0
+
+    recon = sliding_window_reconstruct(
+        _IdentityEncoder(), _IdentityDecoder(), image, patch_size=(16, 16, 16), domain=None, overlap=overlap
+    )
+
+    assert recon.shape == image.shape
+    assert torch.allclose(recon, image, atol=1e-5)
+
+
+def test_sliding_window_rejects_out_of_range_overlap() -> None:
+    image = torch.rand(1, 1, 32, 32, 32)
+    with pytest.raises(ValueError):
+        sliding_window_reconstruct(
+            _IdentityEncoder(), _IdentityDecoder(), image, patch_size=(16, 16, 16), domain=None, overlap=1.0
+        )
+
+
+def test_hann_window_tapers_from_center_to_face() -> None:
+    window = _hann_window_3d((16, 16, 16), torch.device("cpu"), torch.float32)
+    assert window.shape == (16, 16, 16)
+    # Center weight is (near) the max; the faces taper to the clamp floor.
+    assert torch.isclose(window[8, 8, 8], window.max(), atol=1e-4)
+    assert window[0, 8, 8] < window[8, 8, 8]
 
 
 class _FullVolumeDataset(Dataset[RawBatch]):

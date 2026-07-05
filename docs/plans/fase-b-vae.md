@@ -1,8 +1,24 @@
 # Fase B — KL-VAE-GAN (Etapa 1, domain-agnostic)
 
-Status: **proposed, not yet implemented**. This is the detailed breakdown of Fase B from
-the approved development plan (see chat history / `mrixfields-project` skill for the
-full ladder). Confirm the open decisions in §7 before coding starts.
+> **SUPERSEDED (2026-07-02).** After a PI meeting, Etapa 1 was redesigned from this
+> KL-VAE-GAN (patchGAN + L1/KL/adversarial/LPIPS) to a **VAE + conditional latent
+> diffuser**, reference: Zhang et al., "Development-Driven Diffusion Model for
+> Longitudinal Prediction of Fetal Brain MRI With Unpaired Data" (DDM, IEEE TMI, Sep
+> 2025). Adversarial/PatchGAN training was dropped entirely. See
+> `docs/ARCHITECTURE.md` §5–§7 and the `mrixfields-project` skill for the current
+> design and implementation status. Kept below for historical reference only — do not
+> implement against this file.
+>
+> **Two decisions in §3/§1 were later resolved the opposite way for the shipped VAE:**
+> (1) the "2D estricto" rule (§3) was reversed — `KLVAEEncoder`/`Decoder` train on full
+> 3D volumes (patch-cropped), and the SSIM/LPIPS losses were adapted to 3D (`ssim3d` via
+> avg_pool3d; slice-averaged LPIPS) rather than kept 2D-only. (2) After a detour through
+> `latent_channels=128`, the design returned to the **~4 latent channels** this plan
+> originally specified (§1), at `/4` spatial ⇒ 16× compression.
+
+Status (historical): **proposed, not yet implemented**. This was the detailed breakdown of
+Fase B from the original development plan. Confirm the open decisions in §7 before coding
+starts.
 
 ## 1. Goal
 

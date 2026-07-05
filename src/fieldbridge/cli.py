@@ -100,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
         "first N in manifest order.",
     )
     eval_stage1_vae.add_argument(
+        "--overlap",
+        type=float,
+        default=0.5,
+        help="Sliding-window overlap fraction in [0, 1) (default 0.5). Overlap + Hann "
+        "blending removes the panel seams from non-overlapping tiles.",
+    )
+    eval_stage1_vae.add_argument(
         "--metrics-raw",
         type=Path,
         default=None,
@@ -298,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out,
             num_samples=args.num_samples,
             per_domain=args.per_domain,
+            overlap=args.overlap,
             device=device,
             lpips_num_slices=int(config.get("training", {}).get("lpips_num_slices", 8))
             if isinstance(config.get("training", {}), Mapping)
@@ -441,9 +449,18 @@ def _eval_patch_size(config: Mapping[str, Any]) -> tuple[int, int, int]:
 
 
 def _load_loss_curve(path: Path | None) -> list[float] | None:
+    # The loss curve is a nice-to-have overlay: an empty/malformed metrics file (e.g. a
+    # training run whose stdout never reached the redirect) must not crash the eval.
     if path is None or not path.exists():
         return None
-    data = json.loads(path.read_text())
+    text = path.read_text().strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        print(f"warning: could not parse loss curve from {path} (invalid JSON); skipping.")
+        return None
     losses = data.get("losses") if isinstance(data, Mapping) else None
     return [float(x) for x in losses] if isinstance(losses, list) else None
 

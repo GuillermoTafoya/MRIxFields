@@ -128,6 +128,35 @@ def test_lpips_loss_requires_optional_dependency() -> None:
         lpips_loss(prediction, target)
 
 
+def test_build_lpips_net_keeps_stdout_clean(monkeypatch, capsys) -> None:
+    # lpips.LPIPS prints "Setting up [LPIPS]..." to stdout; under --json that corrupts the
+    # machine-readable output. build_lpips_net must redirect that chatter to stderr.
+    import sys
+    import types
+
+    fake = types.ModuleType("lpips")
+
+    class _FakeLPIPS(torch.nn.Module):
+        def __init__(self, net: str = "vgg") -> None:
+            super().__init__()
+            print("Setting up [LPIPS] perceptual loss: trunk [vgg]")
+
+        def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return (a - b).abs().mean()
+
+    fake.LPIPS = _FakeLPIPS
+    monkeypatch.setitem(sys.modules, "lpips", fake)
+
+    from fieldbridge.training.losses import build_lpips_net
+
+    net = build_lpips_net(torch.device("cpu"))
+    captured = capsys.readouterr()
+
+    assert captured.out == ""  # nothing leaked to stdout
+    assert "Setting up [LPIPS]" in captured.err  # redirected to stderr
+    assert isinstance(net, _FakeLPIPS)
+
+
 def test_lpips_loss_3d_rejects_non_5d() -> None:
     prediction = torch.randn(1, 1, 8, 8)
     target = torch.randn(1, 1, 8, 8)

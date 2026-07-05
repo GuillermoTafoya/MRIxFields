@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from collections.abc import Mapping
 
 import torch
@@ -219,7 +221,15 @@ def lpips_loss_3d(
     return lpips_loss(pred_2d, target_2d, net=net)
 
 
-def _default_lpips_net(device: torch.device) -> torch.nn.Module:
+def build_lpips_net(device: torch.device) -> torch.nn.Module:
+    """Construct the pretrained LPIPS(vgg) net, keeping its chatter off stdout.
+
+    `lpips.LPIPS(...)` prints "Setting up [LPIPS]..." / "Loading model from..." to stdout.
+    Under `--json` (stdout is the machine-readable channel, redirected to a file) that
+    corrupts the JSON — so we redirect the constructor's stdout to stderr, where all other
+    diagnostics already go.
+    """
+
     try:
         import lpips
     except ImportError as exc:
@@ -227,7 +237,13 @@ def _default_lpips_net(device: torch.device) -> torch.nn.Module:
             "lpips_loss requires the optional 'lpips' package. "
             "Install with `pip install -e '.[perceptual]'`."
         ) from exc
-    return lpips.LPIPS(net="vgg").to(device)
+    with contextlib.redirect_stdout(sys.stderr):
+        net = lpips.LPIPS(net="vgg")
+    return net.to(device)
+
+
+def _default_lpips_net(device: torch.device) -> torch.nn.Module:
+    return build_lpips_net(device)
 
 
 def _to_three_channel(x: torch.Tensor) -> torch.Tensor:

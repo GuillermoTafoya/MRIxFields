@@ -5,8 +5,25 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fieldbridge.cli import _build_manifest_loader, main
+from fieldbridge.cli import _build_manifest_loader, _load_loss_curve, main
 from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+
+
+def test_load_loss_curve_tolerates_empty_and_invalid_json(tmp_path: Path) -> None:
+    # A training run whose stdout never reached the redirect leaves an empty metrics file;
+    # the loss-curve overlay is optional and must not crash eval-stage1-vae.
+    empty = tmp_path / "empty.json"
+    empty.write_text("")
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("not json{")
+    valid = tmp_path / "valid.json"
+    valid.write_text(json.dumps({"losses": [3.0, 2.0, 1.0]}))
+
+    assert _load_loss_curve(empty) is None
+    assert _load_loss_curve(invalid) is None
+    assert _load_loss_curve(tmp_path / "missing.json") is None
+    assert _load_loss_curve(valid) == [3.0, 2.0, 1.0]
+
 
 nibabel = pytest.importorskip("nibabel")
 

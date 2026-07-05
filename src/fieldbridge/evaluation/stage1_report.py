@@ -10,6 +10,7 @@ Inputs are normalized with the exact same [-1, 1] transform as training.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,7 +21,7 @@ from torch.utils.data import DataLoader
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.evaluation.metrics import mae, mse, nrmse, ssim3d
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
-from fieldbridge.training.losses import lpips_loss_3d
+from fieldbridge.training.losses import build_lpips_net, lpips_loss_3d
 
 # Inputs live in [-1, 1] (decoder Tanh / normalize_percentile_clip_to_unit_range contract),
 # so the intensity range for range-normalized metrics is 2.0, not 1.0.
@@ -49,15 +50,34 @@ class SampleMetrics:
         }
 
 
-def _tiled_starts(dim: int, patch: int) -> list[int]:
-    """Tile starts covering [0, dim) with `patch`-sized windows; last tile clamps to the edge."""
+def _tiled_starts(dim: int, patch: int, stride: int) -> list[int]:
+    """Tile starts covering [0, dim) with `patch`-sized windows at `stride`; last clamps to the edge."""
 
     if patch >= dim:
         return [0]
-    starts = list(range(0, dim - patch + 1, patch))
+    starts = list(range(0, dim - patch + 1, stride))
     if starts[-1] != dim - patch:
         starts.append(dim - patch)
     return starts
+
+
+def _hann_window_3d(patch: tuple[int, int, int], device: "Any", dtype: "Any") -> torch.Tensor:
+    """Separable 3D Hann weight window (tapers to ~0 at tile faces) for overlap blending.
+
+    Clamped away from exactly 0 so a voxel covered by a single tile (its face lands on the
+    volume boundary) still normalizes cleanly — with single coverage the weight cancels in
+    the num/den ratio, so its magnitude is irrelevant there anyway.
+    """
+
+    axes: list[torch.Tensor] = []
+    for size in patch:
+        if size <= 1:
+            axes.append(torch.ones(max(size, 1), device=device, dtype=dtype))
+            continue
+        n = torch.arange(size, device=device, dtype=dtype)
+        axes.append(0.5 - 0.5 * torch.cos(2.0 * math.pi * n / (size - 1)))
+    window = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
+    return window.clamp_min(1e-3)
 
 
 @torch.no_grad()
@@ -68,28 +88,37 @@ def sliding_window_reconstruct(
     *,
     patch_size: Sequence[int],
     domain: Any,
+    overlap: float = 0.5,
 ) -> torch.Tensor:
     """Reconstruct a full (B, C, D, H, W) volume from latent means, tile by tile.
 
-    Overlapping edge tiles are averaged (count map). Uses `encode_dist(...)[0]` (the mean)
-    — no sampling — so the reconstruction is deterministic.
+    Each tile is encoded/decoded independently (no cross-tile context), so with stride ==
+    patch (overlap 0) the tile faces show up as hard seams — a regular panel grid every
+    `patch` voxels. `overlap` (fraction in [0, 1)) shrinks the stride so tiles overlap, and
+    a Hann weight window tapers each tile's contribution to ~0 at its faces, blending the
+    seams away. Uses `encode_dist(...)[0]` (the mean) — no sampling — so it's deterministic.
     """
 
     if image.ndim != 5:
         raise ValueError(f"sliding_window_reconstruct expects 5D (B,C,D,H,W), got {image.ndim}D.")
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError(f"overlap must be in [0, 1), got {overlap}.")
     pd, ph, pw = (int(p) for p in patch_size)
     _, _, depth, height, width = image.shape
-    out = torch.zeros_like(image)
-    counts = torch.zeros_like(image)
-    for z in _tiled_starts(depth, pd):
-        for y in _tiled_starts(height, ph):
-            for x in _tiled_starts(width, pw):
+    strides = tuple(max(1, round(p * (1.0 - overlap))) for p in (pd, ph, pw))
+    window = _hann_window_3d((pd, ph, pw), image.device, image.dtype)
+
+    weighted_sum = torch.zeros_like(image)
+    weight_sum = torch.zeros_like(image)
+    for z in _tiled_starts(depth, pd, strides[0]):
+        for y in _tiled_starts(height, ph, strides[1]):
+            for x in _tiled_starts(width, pw, strides[2]):
                 tile = image[..., z : z + pd, y : y + ph, x : x + pw]
                 mean, _ = encoder.encode_dist(tile, domain)
                 rec = decoder.decode(mean, domain)
-                out[..., z : z + pd, y : y + ph, x : x + pw] += rec
-                counts[..., z : z + pd, y : y + ph, x : x + pw] += 1.0
-    return out / counts.clamp_min(1.0)
+                weighted_sum[..., z : z + pd, y : y + ph, x : x + pw] += rec * window
+                weight_sum[..., z : z + pd, y : y + ph, x : x + pw] += window
+    return weighted_sum / weight_sum.clamp_min(1e-8)
 
 
 def run_stage1_eval(
@@ -103,6 +132,7 @@ def run_stage1_eval(
     device: torch.device | None = None,
     lpips_num_slices: int = 8,
     per_domain: bool = False,
+    overlap: float = 0.5,
     loss_curve: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate deterministic reconstruction over up to `num_samples` volumes.
@@ -122,6 +152,15 @@ def run_stage1_eval(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build the LPIPS net once (not per sample) and reuse it; None if disabled or the
+    # optional dependency is missing.
+    lpips_net = None
+    if lpips_num_slices > 0:
+        try:
+            lpips_net = build_lpips_net(device)
+        except ImportError:
+            lpips_net = None
+
     samples: list[dict[str, torch.Tensor]] = []
     metrics: list[SampleMetrics] = []
     seen_domains: set[float] = set()
@@ -135,7 +174,9 @@ def run_stage1_eval(
             seen_domains.add(key)
         image = batch.image.to(device)
         domain = batch.source_domain
-        recon = sliding_window_reconstruct(encoder, decoder, image, patch_size=patch_size, domain=domain)
+        recon = sliding_window_reconstruct(
+            encoder, decoder, image, patch_size=patch_size, domain=domain, overlap=overlap
+        )
 
         case_id, domain_label = _batch_labels(batch)
         metrics.append(
@@ -144,7 +185,7 @@ def run_stage1_eval(
                 domain=domain_label,
                 nrmse=float(nrmse(recon, image, data_range=_DATA_RANGE)),
                 ssim3d=float(ssim3d(recon, image, data_range=_DATA_RANGE)),
-                lpips=_maybe_lpips(recon, image, lpips_num_slices),
+                lpips=_maybe_lpips(recon, image, lpips_num_slices, lpips_net),
                 mse=float(mse(recon, image)),
                 mae=float(mae(recon, image)),
             )
@@ -174,15 +215,14 @@ def _domain_field_key(domain: Any) -> float:
     return float(field) if field is not None else float("nan")
 
 
-def _maybe_lpips(recon: torch.Tensor, image: torch.Tensor, num_slices: int) -> float:
-    """Slice-based LPIPS, or NaN if disabled (num_slices<=0) or the optional dep is absent."""
+def _maybe_lpips(
+    recon: torch.Tensor, image: torch.Tensor, num_slices: int, net: "Any"
+) -> float:
+    """Slice-based LPIPS, or NaN if disabled (num_slices<=0) or the LPIPS net is unavailable."""
 
-    if num_slices <= 0:
+    if num_slices <= 0 or net is None:
         return float("nan")
-    try:
-        return float(lpips_loss_3d(recon, image, num_slices=num_slices))
-    except ImportError:
-        return float("nan")
+    return float(lpips_loss_3d(recon, image, num_slices=num_slices, net=net))
 
 
 def _batch_labels(batch: RawBatch) -> tuple[str, str]:

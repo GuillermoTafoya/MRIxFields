@@ -79,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
         "fallback for this stage — never commit a real manifest to the repo.",
     )
     train_stage1_vae.add_argument("--steps", type=int, default=None)
+    train_stage1_vae.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of full passes over the manifest. Overrides --steps (steps = "
+        "epochs * ceil(num_volumes * patches_per_volume / batch_size)).",
+    )
     train_stage1_vae.add_argument("--batch-size", type=int, default=None)
     train_stage1_vae.add_argument(
         "--patches-per-volume",
@@ -275,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "data", "patches_per_volume", args.patches_per_volume)
+        # Compute steps_per_epoch from the manifest so the loop can log epoch/step-in-epoch
+        # (the streaming loader is length-less). --epochs, if given, sets steps from it.
+        steps_per_epoch = _steps_per_epoch(config, args.manifest)
+        _override(config, "training", "steps_per_epoch", steps_per_epoch)
+        if args.epochs is not None:
+            _override(config, "training", "steps", args.epochs * steps_per_epoch)
         if args.seed is not None:
             config["seed"] = args.seed
         model_config = _model_config(config)
@@ -516,6 +529,16 @@ def _patches_per_volume(config: Mapping[str, Any]) -> int:
     data_config = config.get("data", {})
     value = data_config.get("patches_per_volume") if isinstance(data_config, Mapping) else None
     return int(value) if value is not None else 1
+
+
+def _steps_per_epoch(config: Mapping[str, Any], manifest_path: Path) -> int:
+    """ceil(num_volumes * patches_per_volume / batch_size). Reads only manifest metadata
+    (no image arrays), so it's cheap even though the loader re-reads it."""
+    num_volumes = len(load_manifest(manifest_path).records)
+    training = config.get("training", {})
+    batch_size = int(training.get("batch_size", 2)) if isinstance(training, Mapping) else 2
+    patches = num_volumes * _patches_per_volume(config)
+    return max(1, -(-patches // max(1, batch_size)))
 
 
 def _load_loss_curve(path: Path | None) -> list[float] | None:

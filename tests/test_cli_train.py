@@ -328,6 +328,51 @@ training:
     assert payload["steps"] == 4
 
 
+def test_train_stage1_vae_cli_epochs_flag_sets_steps_from_manifest(tmp_path, capsys) -> None:
+    # 4 volumes, patches_per_volume default 1, batch 2 => steps_per_epoch = ceil(4/2) = 2.
+    # --epochs 2 must therefore run exactly 4 steps.
+    manifest_path = _write_synthetic_3d_manifest(tmp_path)
+    config_path = tmp_path / "stage1_vae_3d.yaml"
+    config_path.write_text(
+        """
+seed: 3
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 4
+  latent_channels: 3
+  spatial_dims: 3
+training:
+  batch_size: 2
+  lr: 0.001
+  loss_weights:
+    ssim: 0.0
+    nrmse: 1.0
+    lpips: 0.0
+    kl: 0.0001
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "train-stage1-vae",
+            "--config",
+            str(config_path),
+            "--manifest",
+            str(manifest_path),
+            "--epochs",
+            "2",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["steps"] == 4
+    assert payload["stopped_early"] is False
+
+
 def test_train_stage2_diffuser_cli_runs_against_a_small_real_3d_manifest(tmp_path, capsys) -> None:
     manifest_path = _write_synthetic_3d_manifest(tmp_path)
     checkpoint_dir = tmp_path / "checkpoints"

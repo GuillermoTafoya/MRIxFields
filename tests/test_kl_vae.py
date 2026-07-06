@@ -209,6 +209,37 @@ def test_grad_clip_norm_plumbs_and_trains() -> None:
     assert all(torch.isfinite(torch.tensor(loss)) for loss in result.losses)
 
 
+def test_early_stopping_halts_run_and_persists_state(tmp_path) -> None:
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
+    loader = _make_synthetic_3d_loader(num_samples=4, batch_size=2)
+    # min_delta=10.0 makes any real improvement fail the (1 - min_delta) threshold, so every
+    # checkpoint after the baseline counts as "bad" -> deterministic stop after patience,
+    # regardless of the actual loss trajectory. Verifies the loop actually breaks + persists.
+    config = Stage1VAEConfig(
+        steps=50,
+        batch_size=2,
+        loss_weights={"nrmse": 1.0, "kl": 1e-4},
+        early_stopping=True,
+        early_stopping_min_delta=10.0,
+        early_stopping_patience=2,
+        early_stopping_ema_decay=0.0,
+        checkpoint_dir=tmp_path,
+        checkpoint_every_steps=1,
+        checkpoint_max_bytes=200_000_000,
+    )
+
+    result = run_stage1_vae_train(config, encoder=encoder, decoder=decoder, loader=loader)
+
+    assert result.stopped_early is True
+    assert result.steps < 50  # stopped well before the step budget
+    # The final checkpoint carries the tracker state so resume_from can continue the count.
+    last_ckpt = max(tmp_path.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+    state = torch.load(last_ckpt, weights_only=False)
+    assert "early_stop" in state
+    assert state["early_stop"]["num_bad_checkpoints"] >= 2
+
+
 def test_num_res_blocks_flows_through_factory() -> None:
     encoder = build_encoder("kl_vae", base_channels=8, latent_channels=4, spatial_dims=3, num_res_blocks=3)
     assert isinstance(encoder, KLVAEEncoder)

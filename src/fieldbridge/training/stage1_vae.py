@@ -66,6 +66,19 @@ class Stage1VAEConfig:
     ssim_window_size: int = 7
     lpips_num_slices: int = 8
     grad_clip_norm: float = 1.0
+    # Steps that make up one full pass over the manifest, = ceil(num_volumes *
+    # patches_per_volume / batch_size). 0 means unknown (the loader is an IterableDataset
+    # with no __len__); the CLI computes it from the manifest and injects it so the loop
+    # can log epoch/step-in-epoch. Purely cosmetic — does not gate training length.
+    steps_per_epoch: int = 0
+    # Training-loss EMA early stopping. A safety net against burning GPU-hours on a
+    # plateaued run, NOT a precise convergence detector (training loss can flatten while
+    # the model still improves, since each step samples different volumes). Checked once
+    # per checkpoint; state persists in the checkpoint so resume_from does not reset it.
+    early_stopping: bool = False
+    early_stopping_patience: int = 5  # checkpoints without improvement before stopping
+    early_stopping_min_delta: float = 0.005  # relative improvement (0.5%) that counts
+    early_stopping_ema_decay: float = 0.98  # EMA smoothing of the noisy per-step loss
     warm_start_checkpoint: Path | None = None
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -103,6 +116,29 @@ class Stage1VAEConfig:
             grad_clip_norm=float(
                 training.get("grad_clip_norm", data.get("grad_clip_norm", defaults.grad_clip_norm))
             ),
+            steps_per_epoch=int(
+                training.get("steps_per_epoch", data.get("steps_per_epoch", defaults.steps_per_epoch))
+            ),
+            early_stopping=bool(
+                training.get("early_stopping", data.get("early_stopping", defaults.early_stopping))
+            ),
+            early_stopping_patience=int(
+                training.get(
+                    "early_stopping_patience", data.get("early_stopping_patience", defaults.early_stopping_patience)
+                )
+            ),
+            early_stopping_min_delta=float(
+                training.get(
+                    "early_stopping_min_delta",
+                    data.get("early_stopping_min_delta", defaults.early_stopping_min_delta),
+                )
+            ),
+            early_stopping_ema_decay=float(
+                training.get(
+                    "early_stopping_ema_decay",
+                    data.get("early_stopping_ema_decay", defaults.early_stopping_ema_decay),
+                )
+            ),
             warm_start_checkpoint=Path(warm_start_checkpoint) if warm_start_checkpoint else None,
             checkpoint_dir=Path(checkpoint_dir) if checkpoint_dir else None,
             checkpoint_every_steps=int(
@@ -132,6 +168,11 @@ class Stage1VAEConfig:
             "ssim_window_size": self.ssim_window_size,
             "lpips_num_slices": self.lpips_num_slices,
             "grad_clip_norm": self.grad_clip_norm,
+            "steps_per_epoch": self.steps_per_epoch,
+            "early_stopping": self.early_stopping,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
+            "early_stopping_ema_decay": self.early_stopping_ema_decay,
             "checkpoint_at_end": self.checkpoint_at_end,
             "log_every_steps": self.log_every_steps,
         }
@@ -142,6 +183,7 @@ class Stage1VAETrainResult:
     steps: int
     losses: list[float] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    stopped_early: bool = False
 
     @property
     def final_loss(self) -> float:
@@ -156,9 +198,51 @@ class Stage1VAETrainResult:
             "steps": self.steps,
             "losses": self.losses,
             "final_loss": self.final_loss,
+            "stopped_early": self.stopped_early,
             "elapsed_seconds": self.elapsed_seconds,
             "seconds_per_step": self.seconds_per_step,
         }
+
+
+@dataclass
+class _EarlyStopTracker:
+    """EMA of the (noisy) per-step training loss + patience-based stop decision.
+
+    The per-step loss is very noisy here — each step samples a different volume/domain —
+    so a raw-loss stop criterion would fire on noise. We smooth with an EMA and only judge
+    at checkpoint cadence. State is (de)serializable so resume_from continues the patience
+    count instead of restarting it every Colab session.
+    """
+
+    decay: float
+    min_delta: float
+    patience: int
+    ema: float | None = None
+    best: float | None = None
+    num_bad_checkpoints: int = 0
+
+    def update_step(self, loss: float) -> None:
+        self.ema = loss if self.ema is None else self.decay * self.ema + (1.0 - self.decay) * loss
+
+    def should_stop(self) -> bool:
+        """Call once per checkpoint. True once the EMA has failed to improve by min_delta
+        for `patience` consecutive checkpoints."""
+        if self.ema is None:
+            return False
+        if self.best is None or self.ema < self.best * (1.0 - self.min_delta):
+            self.best = self.ema
+            self.num_bad_checkpoints = 0
+            return False
+        self.num_bad_checkpoints += 1
+        return self.num_bad_checkpoints >= self.patience
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"ema": self.ema, "best": self.best, "num_bad_checkpoints": self.num_bad_checkpoints}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        self.ema = state.get("ema")
+        self.best = state.get("best")
+        self.num_bad_checkpoints = int(state.get("num_bad_checkpoints", 0))
 
 
 def run_stage1_vae_train(
@@ -187,6 +271,14 @@ def run_stage1_vae_train(
     trainable_params = list(encoder.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.lr)
 
+    tracker: _EarlyStopTracker | None = None
+    if cfg.early_stopping:
+        tracker = _EarlyStopTracker(
+            decay=cfg.early_stopping_ema_decay,
+            min_delta=cfg.early_stopping_min_delta,
+            patience=cfg.early_stopping_patience,
+        )
+
     start_step = 0
     if cfg.resume_from is not None:
         state = load_checkpoint(cfg.resume_from, map_location=device)
@@ -194,6 +286,8 @@ def run_stage1_vae_train(
         decoder.load_state_dict(state["decoder"])
         optimizer.load_state_dict(state["optimizer"])
         start_step = int(state.get("step", 0))
+        if tracker is not None and isinstance(state.get("early_stop"), Mapping):
+            tracker.load_state_dict(state["early_stop"])
 
     lpips_net: nn.Module | None = None
     if cfg.loss_weights.get("lpips", 0.0) > 0:
@@ -201,15 +295,20 @@ def run_stage1_vae_train(
 
     iterator = iter(loader)
     autocast_ctx = _autocast_context(device, cfg.precision)
-    batches_per_epoch = _loader_length(loader)
     if cfg.log_every_steps > 0:
+        epochs_label = (
+            f"~{(start_step + cfg.steps) / cfg.steps_per_epoch:.2f} epochs (steps_per_epoch={cfg.steps_per_epoch})"
+            if cfg.steps_per_epoch > 0
+            else "epoch size unknown"
+        )
         _log_training_progress(
             f"stage1_vae train start: steps={cfg.steps} batch_size={cfg.batch_size} "
-            f"device={device.type} batches_per_epoch={batches_per_epoch or 'unknown'}"
+            f"device={device.type} {epochs_label} early_stopping={cfg.early_stopping}"
         )
 
     losses: list[float] = []
     last_checkpoint_step: int | None = None
+    stopped_early = False
     train_start = time.perf_counter()
     for step in range(start_step, start_step + cfg.steps):
         step_start = time.perf_counter()
@@ -230,25 +329,42 @@ def run_stage1_vae_train(
         _sync_if_cuda(device)
         loss_value = float(total_loss.detach().cpu())
         losses.append(loss_value)
-
-        if (
-            cfg.checkpoint_dir is not None
-            and cfg.checkpoint_every_steps
-            and (step + 1) % cfg.checkpoint_every_steps == 0
-        ):
-            _save_step_checkpoint(cfg, encoder, decoder, optimizer, step + 1)
-            last_checkpoint_step = step + 1
+        if tracker is not None:
+            tracker.update_step(loss_value)
 
         current_step = step + 1
+        is_checkpoint_step = bool(cfg.checkpoint_every_steps) and current_step % cfg.checkpoint_every_steps == 0
+
+        # Evaluate the stop decision *before* saving, so the checkpoint persists the
+        # post-decision tracker state (patience count) — resume_from must not be a step behind.
+        should_stop = tracker is not None and is_checkpoint_step and tracker.should_stop()
+
+        if cfg.checkpoint_dir is not None and is_checkpoint_step:
+            _save_step_checkpoint(
+                cfg, encoder, decoder, optimizer, current_step,
+                early_stop_state=tracker.state_dict() if tracker is not None else None,
+            )
+            last_checkpoint_step = current_step
+
         if cfg.log_every_steps > 0 and (
             len(losses) == 1 or current_step % cfg.log_every_steps == 0 or len(losses) == cfg.steps
         ):
             elapsed = time.perf_counter() - train_start
             step_elapsed = time.perf_counter() - step_start
+            ema_str = f" ema={tracker.ema:.6f}" if tracker is not None and tracker.ema is not None else ""
             _log_training_progress(
-                f"stage1_vae step={current_step}/{start_step + cfg.steps} loss={loss_value:.6f} "
+                f"stage1_vae {_epoch_label(current_step, cfg.steps_per_epoch)} "
+                f"step={current_step}/{start_step + cfg.steps} loss={loss_value:.6f}{ema_str} "
                 f"step_sec={step_elapsed:.3f} avg_sec_per_step={elapsed / len(losses):.3f}"
             )
+
+        if should_stop:
+            _log_training_progress(
+                f"stage1_vae early-stop at step={current_step}: EMA loss {tracker.ema:.6f} did not improve "
+                f">{cfg.early_stopping_min_delta:.1%} for {cfg.early_stopping_patience} checkpoints."
+            )
+            stopped_early = True
+            break
 
     final_step = start_step + len(losses)
     if (
@@ -257,10 +373,15 @@ def run_stage1_vae_train(
         and losses
         and last_checkpoint_step != final_step
     ):
-        _save_step_checkpoint(cfg, encoder, decoder, optimizer, final_step)
+        _save_step_checkpoint(
+            cfg, encoder, decoder, optimizer, final_step,
+            early_stop_state=tracker.state_dict() if tracker is not None else None,
+        )
 
     elapsed_seconds = time.perf_counter() - train_start
-    return Stage1VAETrainResult(steps=len(losses), losses=losses, elapsed_seconds=elapsed_seconds)
+    return Stage1VAETrainResult(
+        steps=len(losses), losses=losses, elapsed_seconds=elapsed_seconds, stopped_early=stopped_early
+    )
 
 
 def _compute_vae_loss(
@@ -304,21 +425,37 @@ def _save_step_checkpoint(
     decoder: KLVAEDecoder,
     optimizer: torch.optim.Optimizer,
     step: int,
+    *,
+    early_stop_state: Mapping[str, Any] | None = None,
 ) -> None:
     assert cfg.checkpoint_dir is not None
     filename = checkpoint_filename("vae", "kl_vae", step)
+    payload: dict[str, Any] = {
+        "encoder": encoder.state_dict(),
+        "decoder": decoder.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+    }
+    if early_stop_state is not None:
+        # Persist so resume_from continues the patience count instead of restarting it.
+        payload["early_stop"] = dict(early_stop_state)
     save_checkpoint(
         cfg.checkpoint_dir / filename,
-        {
-            "encoder": encoder.state_dict(),
-            "decoder": decoder.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step": step,
-        },
+        payload,
         max_bytes=cfg.checkpoint_max_bytes,
         seed=cfg.seed,
         config=cfg.to_dict(),
     )
+
+
+def _epoch_label(current_step: int, steps_per_epoch: int) -> str:
+    """Human-readable 'epoch E step s/steps_per_epoch' tag, or a bare step if the epoch
+    size is unknown (the streaming loader has no __len__ so the CLI injects it)."""
+    if steps_per_epoch <= 0:
+        return "epoch=?"
+    epoch = (current_step - 1) // steps_per_epoch + 1
+    step_in_epoch = (current_step - 1) % steps_per_epoch + 1
+    return f"epoch={epoch} [{step_in_epoch}/{steps_per_epoch}]"
 
 
 def _coerce_config(config: Stage1VAEConfig | Mapping[str, Any] | None) -> Stage1VAEConfig:
@@ -327,13 +464,6 @@ def _coerce_config(config: Stage1VAEConfig | Mapping[str, Any] | None) -> Stage1
     if isinstance(config, Stage1VAEConfig):
         return config
     return Stage1VAEConfig.from_mapping(config)
-
-
-def _loader_length(loader: DataLoader[RawBatch]) -> int | None:
-    try:
-        return len(loader)
-    except TypeError:
-        return None
 
 
 def _log_training_progress(message: str) -> None:

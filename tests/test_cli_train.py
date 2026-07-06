@@ -373,6 +373,68 @@ training:
     assert payload["stopped_early"] is False
 
 
+def test_build_patch_bank_then_train_from_bank_cli(tmp_path, capsys) -> None:
+    manifest_path = _write_synthetic_3d_manifest(tmp_path)
+    bank_dir = tmp_path / "bank"
+    config_path = tmp_path / "stage1_vae_3d.yaml"
+    config_path.write_text(
+        """
+seed: 3
+data:
+  patch_size: [4, 4, 4]
+  patches_per_volume: 3
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 4
+  latent_channels: 3
+  spatial_dims: 3
+training:
+  batch_size: 2
+  lr: 0.001
+  loss_weights:
+    ssim: 0.0
+    nrmse: 1.0
+    lpips: 0.0
+    kl: 0.0001
+""",
+        encoding="utf-8",
+    )
+
+    build_code = main(
+        ["build-patch-bank", "--config", str(config_path), "--manifest", str(manifest_path), "--out", str(bank_dir)]
+    )
+    assert build_code == 0
+    assert (bank_dir / "bank_index.jsonl").exists()
+    capsys.readouterr()  # flush build stdout so the JSON parse below sees only the train output
+
+    # Train straight from the bank — no --manifest needed.
+    train_code = main(
+        [
+            "train-stage1-vae",
+            "--config",
+            str(config_path),
+            "--patch-bank",
+            str(bank_dir),
+            "--epochs",
+            "1",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert train_code == 0
+    # 4 volumes * 3 patches / batch 2 = 6 steps per epoch.
+    assert payload["steps"] == 6
+
+
+def test_train_stage1_vae_requires_manifest_or_bank() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="requires --manifest"):
+        main(["train-stage1-vae", "--json"])
+
+
 def test_train_stage2_diffuser_cli_runs_against_a_small_real_3d_manifest(tmp_path, capsys) -> None:
     manifest_path = _write_synthetic_3d_manifest(tmp_path)
     checkpoint_dir = tmp_path / "checkpoints"

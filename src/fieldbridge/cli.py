@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,11 @@ from fieldbridge.data.datasets import (
     ManifestVolumeDataset,
     StreamingPatchDataset,
     collate_raw_batches,
+)
+from fieldbridge.data.patch_bank import (
+    PatchBankDataset,
+    build_patch_bank,
+    patch_bank_size,
 )
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.sources import nifti_image_loader
@@ -74,9 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_stage1_vae.add_argument(
         "--manifest",
         type=Path,
-        required=True,
-        help="Manifest of real NIfTI volumes (requires the 'nifti' extra). No synthetic "
-        "fallback for this stage — never commit a real manifest to the repo.",
+        default=None,
+        help="Manifest of real NIfTI volumes (requires the 'nifti' extra). Required unless "
+        "--patch-bank is given. No synthetic fallback for this stage — never commit a real "
+        "manifest to the repo.",
     )
     train_stage1_vae.add_argument("--steps", type=int, default=None)
     train_stage1_vae.add_argument(
@@ -95,7 +102,31 @@ def build_parser() -> argparse.ArgumentParser:
         "data.patches_per_volume). Higher = fewer disk reads per training step.",
     )
     train_stage1_vae.add_argument("--seed", type=int, default=None)
+    train_stage1_vae.add_argument(
+        "--patch-bank",
+        type=Path,
+        default=None,
+        help="Train from a prebuilt patch bank (see build-patch-bank) loaded into RAM "
+        "instead of streaming volumes from disk. Zero per-epoch I/O; --manifest is ignored.",
+    )
     train_stage1_vae.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    build_bank = subparsers.add_parser(
+        "build-patch-bank",
+        help="Preprocess a manifest into a reusable float16 patch bank (read each volume "
+        "from disk once). Resumable and read-error tolerant.",
+    )
+    build_bank.add_argument("--config", type=Path, default=Path("configs/experiment/stage1_vae.yaml"))
+    build_bank.add_argument("--manifest", type=Path, required=True, help="Manifest of real NIfTI volumes.")
+    build_bank.add_argument("--out", type=Path, required=True, help="Output bank directory (created/resumed).")
+    build_bank.add_argument(
+        "--patches-per-volume",
+        type=int,
+        default=None,
+        help="Patches to extract per volume (default: data.patches_per_volume from config). "
+        "This fixes the bank size: num_volumes * ppv * patch_bytes.",
+    )
+    build_bank.add_argument("--seed", type=int, default=None)
 
     eval_stage1_vae = subparsers.add_parser(
         "eval-stage1-vae",
@@ -278,13 +309,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "train-stage1-vae":
+        if args.patch_bank is None and args.manifest is None:
+            raise ValueError("train-stage1-vae requires --manifest, or --patch-bank to train from a prebuilt bank.")
         config = _load_optional_config(args.config)
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "data", "patches_per_volume", args.patches_per_volume)
-        # Compute steps_per_epoch from the manifest so the loop can log epoch/step-in-epoch
-        # (the streaming loader is length-less). --epochs, if given, sets steps from it.
-        steps_per_epoch = _steps_per_epoch(config, args.manifest)
+        # Compute steps_per_epoch so the loop can log epoch/step-in-epoch (both loaders are
+        # length-less to the config). --epochs, if given, sets steps from it.
+        if args.patch_bank is not None:
+            num_volumes, ppv = patch_bank_size(args.patch_bank)
+            batch_size = int(config.get("training", {}).get("batch_size", 2))
+            steps_per_epoch = max(1, -(-num_volumes * ppv // max(1, batch_size)))
+        else:
+            steps_per_epoch = _steps_per_epoch(config, args.manifest)
         _override(config, "training", "steps_per_epoch", steps_per_epoch)
         if args.epochs is not None:
             _override(config, "training", "steps", args.epochs * steps_per_epoch)
@@ -294,17 +332,46 @@ def main(argv: list[str] | None = None) -> int:
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
         stage_config = Stage1VAEConfig.from_mapping(config)
-        loader = _build_streaming_patch_loader(
-            args.manifest,
-            batch_size=stage_config.batch_size,
-            config=config,
-            num_workers=_num_workers(config),
-        )
+        if args.patch_bank is not None:
+            loader = DataLoader(
+                PatchBankDataset(args.patch_bank),
+                batch_size=stage_config.batch_size,
+                shuffle=True,
+                num_workers=_num_workers(config),
+                collate_fn=collate_raw_batches,
+            )
+        else:
+            loader = _build_streaming_patch_loader(
+                args.manifest,
+                batch_size=stage_config.batch_size,
+                config=config,
+                num_workers=_num_workers(config),
+            )
         result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train-stage1-vae completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "build-patch-bank":
+        config = _load_optional_config(args.config)
+        seed = int(args.seed) if args.seed is not None else int(config.get("seed", 13))
+        ppv = int(args.patches_per_volume) if args.patches_per_volume is not None else _patches_per_volume(config)
+        manifest = load_manifest(args.manifest)
+        result = build_patch_bank(
+            manifest.records,
+            image_loader=nifti_image_loader,
+            out_dir=args.out,
+            patch_size=_data_patch_size(config) or (64, 64, 64),
+            patches_per_volume=ppv,
+            seed=seed,
+            logger=lambda message: print(message, file=sys.stderr, flush=True),
+        )
+        print(
+            f"build-patch-bank done: wrote={result.num_volumes_written} skipped={result.num_volumes_skipped} "
+            f"failed={result.num_volumes_failed} total_patches={result.total_patches} out={result.out_dir}"
+        )
         return 0
 
     if args.command == "eval-stage1-vae":

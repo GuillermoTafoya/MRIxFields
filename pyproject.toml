@@ -13,12 +13,17 @@ license = { text = "MIT" }
 authors = [{ name = "FieldBridge contributors" }]
 dependencies = [
   "torch>=2.0",
+  "numpy>=1.23.5,<3",
   "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "matplotlib>=3.7,<4",
   "pytest>=8.0",
+]
+evaluation = [
+  "matplotlib>=3.7,<4",
 ]
 quality = [
   "mypy>=1.10",

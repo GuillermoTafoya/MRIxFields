@@ -26,6 +26,7 @@ from fieldbridge.training.losses import build_lpips_net, lpips_loss_3d
 # Inputs live in [-1, 1] (decoder Tanh / normalize_percentile_clip_to_unit_range contract),
 # so the intensity range for range-normalized metrics is 2.0, not 1.0.
 _DATA_RANGE = 2.0
+_REAL_EVALUATION_INSTALL = 'pip install -e ".[nifti,evaluation]"'
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,16 +254,28 @@ def _mid_slice(volume: torch.Tensor) -> "Any":
     return np.rot90(array[mid])
 
 
+def _matplotlib_pyplot() -> Any:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "Stage-1 diagnostic rendering requires Matplotlib from the 'evaluation' extra. "
+            f"For real Stage-1 evaluation, run: {_REAL_EVALUATION_INSTALL}"
+        ) from exc
+    return plt
+
+
 def _plot_diagnostics(
     samples: Sequence[dict[str, torch.Tensor]],
     metrics: Sequence[SampleMetrics],
     path: Path,
 ) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import numpy as np
+
+    plt = _matplotlib_pyplot()
 
     rows = max(len(samples), 1)
     fig, axes = plt.subplots(rows, 4, figsize=(20, 5 * rows), squeeze=False)
@@ -304,10 +317,7 @@ def _plot_diagnostics(
 
 
 def _plot_loss_curve(losses: Sequence[float], path: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(list(losses), marker="o", markersize=3, color="forestgreen")

@@ -1,3 +1,4 @@
+import builtins
 import json
 
 import pytest
@@ -9,6 +10,7 @@ from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
 from fieldbridge.evaluation.stage1_report import (
     _hann_window_3d,
+    _matplotlib_pyplot,
     run_stage1_eval,
     sliding_window_reconstruct,
 )
@@ -152,3 +154,21 @@ def test_run_stage1_eval_writes_metrics_and_plots(tmp_path) -> None:
     assert (tmp_path / "loss_curve.png").exists()
     written = json.loads((tmp_path / "metrics.json").read_text())
     assert len(written["per_sample"]) == 2
+
+
+def test_missing_matplotlib_names_evaluation_extra(monkeypatch) -> None:
+    real_import = builtins.__import__
+
+    def missing_matplotlib(name, *args, **kwargs):
+        if name == "matplotlib":
+            raise ModuleNotFoundError("No module named 'matplotlib'", name="matplotlib")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_matplotlib)
+
+    with pytest.raises(ImportError) as exc_info:
+        _matplotlib_pyplot()
+
+    message = str(exc_info.value)
+    assert "'evaluation' extra" in message
+    assert 'pip install -e ".[nifti,evaluation]"' in message

@@ -59,7 +59,11 @@ from fieldbridge.official.submissions import (
 from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_pseudo_pairs
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
 from fieldbridge.training.checkpoints import load_checkpoint
-from fieldbridge.training.pseudo_pair_epochs import PseudoPairEpochConfig, train_pseudo_pair_epochs
+from fieldbridge.training.pseudo_pair_epochs import (
+    PSEUDO_PAIR_PIPELINE_VERSION,
+    PseudoPairEpochConfig,
+    train_pseudo_pair_epochs,
+)
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
 from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
@@ -106,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_pseudo.add_argument("--slices-per-volume", type=int, default=None)
     train_pseudo.add_argument("--slice-start", type=int, default=None)
     train_pseudo.add_argument("--slice-end", type=int, default=None)
+    train_pseudo.add_argument("--slice-axis", choices=("x", "y", "z"), default=None)
     train_pseudo.add_argument("--output-height", type=int, default=None)
     train_pseudo.add_argument("--output-width", type=int, default=None)
     train_pseudo.add_argument("--epochs", type=int, default=None)
@@ -137,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_pseudo.add_argument("--split", choices=("validation", "test"), default="test")
     eval_pseudo.add_argument("--batch-size", type=int, default=None)
     eval_pseudo.add_argument("--workers", type=int, default=None)
+    eval_pseudo.add_argument("--slice-axis", choices=("x", "y", "z"), default=None)
     eval_pseudo.add_argument("--seed", type=int, default=None)
     eval_pseudo.add_argument("--max-pilot-records", type=int, default=None)
     eval_pseudo.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
@@ -509,6 +515,11 @@ def main(argv: list[str] | None = None) -> int:
         state = load_checkpoint(args.checkpoint)
         if state.get("trainer") != "pseudo_pair_epochs":
             raise ValueError("Checkpoint is not compatible with eval-pseudo-pairs.")
+        if int(state.get("pseudo_pair_pipeline_version", 1)) < PSEUDO_PAIR_PIPELINE_VERSION:
+            raise ValueError(
+                "Checkpoint was produced before the pseudo-pair loss/axis correction; "
+                "rerun train-pseudo-pairs from scratch before evaluation."
+            )
         manifest_path = _pseudo_pair_manifest_path(config)
         records = _pseudo_pair_records(config, manifest_path)
         preprocessing = _pseudo_pair_preprocessing(config)
@@ -832,6 +843,7 @@ def _apply_pseudo_pair_overrides(config: dict[str, Any], args: argparse.Namespac
     _override(config, "data", "split_json", str(args.split_json) if getattr(args, "split_json", None) else None)
     _override_nested(config, "data", "preprocessing", "slice_start", getattr(args, "slice_start", None))
     _override_nested(config, "data", "preprocessing", "slice_end", getattr(args, "slice_end", None))
+    _override_nested(config, "data", "preprocessing", "slice_axis", getattr(args, "slice_axis", None))
     _override_nested(
         config,
         "data",
@@ -1018,9 +1030,19 @@ def _pseudo_pair_preflight_payload(
         "validation_batches": len(val_loader),
         "preprocessing": {
             **preprocessing.to_dict(),
+            "raw_volume_order": "C,X,Y,Z",
+            "slice_plane": _pseudo_pair_slice_plane(preprocessing),
             "selected_slice_indices": list(selected_slice_indices(preprocessing)),
         },
     }
+
+
+def _pseudo_pair_slice_plane(preprocessing: SlicePreprocessingSpec) -> str:
+    if preprocessing.slice_axis == "x":
+        return "Y,Z"
+    if preprocessing.slice_axis == "y":
+        return "X,Z"
+    return "X,Y"
 
 
 def _pseudo_pair_dataset_summary(dataset: PseudoPairSliceDataset) -> dict[str, Any]:

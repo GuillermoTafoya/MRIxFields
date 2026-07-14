@@ -99,7 +99,10 @@ def test_steps_per_epoch_and_small_epoch_complete(tmp_path) -> None:
     assert len(train_loader) == 2
     assert result.global_step == 2
     assert result.epochs_completed == 1
+    assert result.history[0]["train"]["loss"] == result.history[0]["train"]["total"]
+    assert set(result.history[0]["validation"]) >= {"loss", "total", "masked_l1", "gradient", "background"}
     assert state["run_metadata"]["split_sha256"] == "abc123"
+    assert state["pseudo_pair_pipeline_version"] == 2
 
 
 def test_validation_runs_without_gradients_and_checkpoints_are_written(tmp_path) -> None:

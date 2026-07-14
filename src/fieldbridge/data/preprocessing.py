@@ -12,6 +12,8 @@ from torch.nn import functional as F
 NormalizationMode = Literal["official_01", "none"]
 ModelRange = Literal["zero_one", "minus_one_one"]
 ResizeMode = Literal["native", "fit_pad"]
+SliceAxis = Literal["x", "y", "z"]
+_AXIS_TO_DIM: dict[SliceAxis, int] = {"x": 1, "y": 2, "z": 3}
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +26,7 @@ class SlicePreprocessingSpec:
     resize_mode: ResizeMode = "fit_pad"
     output_height: int | None = 256
     output_width: int | None = 320
+    slice_axis: SliceAxis = "z"
 
     @classmethod
     def from_mapping(cls, data: object) -> "SlicePreprocessingSpec":
@@ -45,6 +48,7 @@ class SlicePreprocessingSpec:
             output_width=None
             if data.get("output_width", defaults.output_width) is None
             else int(data.get("output_width", defaults.output_width)),
+            slice_axis=data.get("slice_axis", defaults.slice_axis),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -57,6 +61,7 @@ class SlicePreprocessingSpec:
             "resize_mode": self.resize_mode,
             "output_height": self.output_height,
             "output_width": self.output_width,
+            "slice_axis": self.slice_axis,
         }
 
 
@@ -78,6 +83,7 @@ class SliceGeometry:
     resize_mode: ResizeMode = "native"
     model_range: ModelRange = "minus_one_one"
     normalization: NormalizationMode = "official_01"
+    slice_axis: SliceAxis = "z"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -95,6 +101,7 @@ class SliceGeometry:
             "resize_mode": self.resize_mode,
             "model_range": self.model_range,
             "normalization": self.normalization,
+            "slice_axis": self.slice_axis,
         }
 
 
@@ -130,10 +137,11 @@ def selected_slice_indices(
 
 
 def preprocess_volume_slices(volume: torch.Tensor, spec: SlicePreprocessingSpec) -> PreprocessedSliceBatch:
-    """Extract and preprocess axial slices from a ``(C, D, H, W)`` volume."""
+    """Extract and preprocess slices from a raw ``(C, X, Y, Z)`` NIfTI volume."""
 
     _validate_volume(volume)
-    indices = selected_slice_indices(spec, depth=int(volume.shape[1]))
+    axis_dim = _slice_axis_dim(spec)
+    indices = selected_slice_indices(spec, depth=int(volume.shape[axis_dim]))
     images: list[torch.Tensor] = []
     geometry: list[SliceGeometry] = []
     for slice_index in indices:
@@ -150,17 +158,18 @@ def preprocess_volume_slice(
     *,
     apply_model_range: bool = True,
 ) -> tuple[torch.Tensor, SliceGeometry]:
-    """Preprocess one axial slice from a ``(C, D, H, W)`` volume."""
+    """Preprocess one configured-axis slice from a raw ``(C, X, Y, Z)`` volume."""
 
     _validate_volume(volume)
     _validate_spec(spec)
-    depth = int(volume.shape[1])
+    axis_dim = _slice_axis_dim(spec)
+    depth = int(volume.shape[axis_dim])
     index = int(slice_index)
     if index < spec.slice_start or index >= spec.slice_end:
         raise ValueError(f"slice_index {index} is outside [{spec.slice_start}, {spec.slice_end}).")
     if index >= depth:
         raise ValueError(f"slice_index {index} exceeds volume depth {depth}.")
-    image = volume[:, index, :, :].detach().clone().to(dtype=torch.float32)
+    image = _extract_slice(volume, index, spec.slice_axis).detach().clone().to(dtype=torch.float32)
     _validate_intensity(image, spec, context=f"slice {index}")
     image, geometry = _resize_slice(image, spec, slice_index=index)
     if apply_model_range:
@@ -226,6 +235,7 @@ def _resize_slice(image: torch.Tensor, spec: SlicePreprocessingSpec, *, slice_in
             resize_mode=spec.resize_mode,
             model_range=spec.model_range,
             normalization=spec.normalization,
+            slice_axis=spec.slice_axis,
         )
     if spec.resize_mode != "fit_pad":
         raise ValueError(f"resize_mode must be 'native' or 'fit_pad', got {spec.resize_mode!r}.")
@@ -264,6 +274,7 @@ def _resize_slice(image: torch.Tensor, spec: SlicePreprocessingSpec, *, slice_in
         resize_mode=spec.resize_mode,
         model_range=spec.model_range,
         normalization=spec.normalization,
+        slice_axis=spec.slice_axis,
     )
 
 
@@ -280,15 +291,32 @@ def _validate_spec(spec: SlicePreprocessingSpec) -> None:
         raise ValueError(f"Unsupported model_range {spec.model_range!r}.")
     if spec.resize_mode not in ("native", "fit_pad"):
         raise ValueError(f"Unsupported resize_mode {spec.resize_mode!r}.")
+    if spec.slice_axis not in ("x", "y", "z"):
+        raise ValueError(f"Unsupported slice_axis {spec.slice_axis!r}.")
 
 
 def _validate_volume(volume: torch.Tensor) -> None:
     if volume.ndim != 4:
-        raise ValueError(f"Expected volume tensor shaped (C,D,H,W), got {tuple(volume.shape)}.")
+        raise ValueError(f"Expected volume tensor shaped (C,X,Y,Z), got {tuple(volume.shape)}.")
     if any(int(dim) <= 0 for dim in volume.shape):
         raise ValueError(f"Volume dimensions must be positive, got {tuple(volume.shape)}.")
     if not torch.isfinite(volume).all():
         raise ValueError("Volume contains non-finite values.")
+
+
+def _slice_axis_dim(spec: SlicePreprocessingSpec) -> int:
+    _validate_spec(spec)
+    return _AXIS_TO_DIM[spec.slice_axis]
+
+
+def _extract_slice(volume: torch.Tensor, index: int, axis: SliceAxis) -> torch.Tensor:
+    if axis == "x":
+        return volume[:, index, :, :]
+    if axis == "y":
+        return volume[:, :, index, :]
+    if axis == "z":
+        return volume[:, :, :, index]
+    raise ValueError(f"Unsupported slice_axis {axis!r}.")
 
 
 def _validate_intensity(image: torch.Tensor, spec: SlicePreprocessingSpec, *, context: str) -> None:

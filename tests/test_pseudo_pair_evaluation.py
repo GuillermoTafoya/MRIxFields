@@ -17,7 +17,7 @@ class _EvalDataset(Dataset[PseudoPairSliceSample]):
 
     def __getitem__(self, index: int) -> PseudoPairSliceSample:
         field = 1.5 if index % 2 == 0 else 3.0
-        target_value = field / 3.0
+        target_value = field / 7.0
         return PseudoPairSliceSample(
             x_low=torch.zeros(1, 8, 8),
             x_high=torch.full((1, 8, 8), target_value),
@@ -49,7 +49,7 @@ class _TargetValueTranslator(BaseTranslator):
     def forward(self, z, source_domain, target_domain, t=None):  # type: ignore[no-untyped-def]
         del source_domain, t
         domains = target_domain if isinstance(target_domain, list) else [target_domain] * int(z.shape[0])
-        values = [domain.field_strength_t / 3.0 for domain in domains]
+        values = [domain.field_strength_t / 7.0 for domain in domains]
         stacked = torch.stack(
             [torch.full_like(z[index], float(value)) for index, value in enumerate(values)],
             dim=0,
@@ -70,7 +70,7 @@ def test_evaluation_reports_degraded_predicted_and_per_field_metrics() -> None:
     payload = evaluate_pseudo_pairs(
         _TargetValueTranslator(),
         _loader(),
-        PseudoPairEvalConfig(model_range="zero_one", lpips="off", target_fields=(1.5, 3.0)),
+        PseudoPairEvalConfig(model_range="zero_one", lpips="off", target_fields=(1.5, 3.0, 5.0)),
     )
 
     assert payload["num_samples"] == 4
@@ -88,15 +88,20 @@ def test_target_label_permutation_audit_executes_and_detects_improvement() -> No
     payload = evaluate_pseudo_pairs(
         _TargetValueTranslator(),
         _loader(),
-        PseudoPairEvalConfig(model_range="zero_one", lpips="off", target_fields=(1.5, 3.0)),
+        PseudoPairEvalConfig(model_range="zero_one", lpips="off", target_fields=(1.5, 3.0, 5.0)),
     )
 
     audit = payload["target_conditioning_audit"]
 
-    assert "correct_vs_wrong_improvement" in audit
-    assert "correct_vs_permuted_improvement" in audit
-    assert audit["correct_conditioning_improves_nrmse"] is True
-    assert audit["correct_conditioning_beats_permuted_nrmse"] is True
+    assert audit["correct_vs_wrong_improvement"]["absolute"]["nrmse"] > 0.0
+    assert audit["correct_vs_wrong_improvement"]["relative"]["nrmse"] > 0.0
+    assert audit["correct_vs_permuted_improvement"]["absolute"]["nrmse"] > 0.0
+    assert audit["sample_level"]["fraction_correct_best_nrmse"] == 1.0
+    assert audit["sample_level"]["mean_margin_vs_best_wrong_nrmse"] > 0.0
+    assert audit["by_true_target_field"]["1.5T"]["fraction_correct_best_nrmse"] == 1.0
+    assert audit["by_wrong_target_field"]["5T"]["samples"] == 4
+    assert "correct_conditioning_improves_nrmse" not in audit
+    assert "correct_conditioning_beats_permuted_nrmse" not in audit
 
 
 def test_lpips_gracefully_skips_when_optional_dependency_is_unavailable(monkeypatch) -> None:

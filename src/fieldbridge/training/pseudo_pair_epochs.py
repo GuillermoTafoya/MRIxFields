@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from fieldbridge.data.pseudo_pairs import PseudoPairSliceBatch
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.training.checkpoints import load_checkpoint, save_checkpoint
-from fieldbridge.training.losses import combined_reconstruction_loss
+from fieldbridge.training.losses import combined_reconstruction_loss_components
 from fieldbridge.utils.seeding import seed_everything
 
 Device = Literal["auto", "cpu", "cuda"]
@@ -28,6 +28,8 @@ DEFAULT_PSEUDO_PAIR_LOSS_WEIGHTS: dict[str, float] = {
     "gradient": 0.2,
     "background": 0.5,
 }
+PSEUDO_PAIR_PIPELINE_VERSION = 2
+_LOSS_COMPONENT_KEYS = ("total", "masked_l1", "gradient", "background")
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +229,8 @@ def train_pseudo_pair_epochs(
             )
         _log(
             f"pseudo_pair epoch={epoch_index + 1}/{cfg.epochs} "
-            f"train_loss={train_summary['loss']:.6f} validation_loss={validation_loss:.6f}"
+            f"train_{_format_loss_components(train_summary)} "
+            f"validation_{_format_loss_components(validation_summary)}"
         )
 
     elapsed_seconds = time.perf_counter() - start_time
@@ -254,7 +257,7 @@ def _run_train_epoch(
     steps_per_epoch: int,
 ) -> tuple[dict[str, float], int]:
     model.train()
-    total_loss = 0.0
+    totals = {key: 0.0 for key in _LOSS_COMPONENT_KEYS}
     total_samples = 0
     autocast_ctx = _autocast_context(device, cfg.amp)
     for step_in_epoch, raw_batch in enumerate(loader, start=1):
@@ -262,12 +265,13 @@ def _run_train_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
             prediction = model(batch.x_low, batch.source_domain, batch.target_domain)
-            loss = combined_reconstruction_loss(
+            components = combined_reconstruction_loss_components(
                 prediction,
                 batch.x_high,
                 batch.mask,
                 cfg.loss_weights,
             )
+            loss = components["total"]
         scaler.scale(loss).backward()
         if cfg.grad_clip_norm > 0:
             scaler.unscale_(optimizer)
@@ -276,8 +280,9 @@ def _run_train_epoch(
         scaler.update()
         _sync_if_cuda(device)
         batch_size = int(batch.x_low.shape[0])
-        loss_value = float(loss.detach().cpu())
-        total_loss += loss_value * batch_size
+        component_values = _component_values(components)
+        for key in _LOSS_COMPONENT_KEYS:
+            totals[key] += component_values[key] * batch_size
         total_samples += batch_size
         global_step += 1
         if cfg.log_every_steps > 0 and (
@@ -285,9 +290,9 @@ def _run_train_epoch(
         ):
             _log(
                 f"pseudo_pair epoch={epoch} step={step_in_epoch}/{steps_per_epoch} "
-                f"global_step={global_step} loss={loss_value:.6f}"
+                f"global_step={global_step} {_format_loss_components(component_values)}"
             )
-    return {"loss": total_loss / max(1, total_samples), "samples": float(total_samples)}, global_step
+    return _summarize_loss_components(totals, total_samples), global_step
 
 
 def _run_validation_epoch(
@@ -297,17 +302,24 @@ def _run_validation_epoch(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    total_loss = 0.0
+    totals = {key: 0.0 for key in _LOSS_COMPONENT_KEYS}
     total_samples = 0
     with torch.no_grad():
         for raw_batch in loader:
             batch = _move_batch(raw_batch, device)
             prediction = model(batch.x_low, batch.source_domain, batch.target_domain)
-            loss = combined_reconstruction_loss(prediction, batch.x_high, batch.mask, cfg.loss_weights)
+            components = combined_reconstruction_loss_components(
+                prediction,
+                batch.x_high,
+                batch.mask,
+                cfg.loss_weights,
+            )
             batch_size = int(batch.x_low.shape[0])
-            total_loss += float(loss.detach().cpu()) * batch_size
+            component_values = _component_values(components)
+            for key in _LOSS_COMPONENT_KEYS:
+                totals[key] += component_values[key] * batch_size
             total_samples += batch_size
-    return {"loss": total_loss / max(1, total_samples), "samples": float(total_samples)}
+    return _summarize_loss_components(totals, total_samples)
 
 
 def _save_epoch_checkpoint(
@@ -326,6 +338,7 @@ def _save_epoch_checkpoint(
         return
     state: dict[str, Any] = {
         "trainer": "pseudo_pair_epochs",
+        "pseudo_pair_pipeline_version": PSEUDO_PAIR_PIPELINE_VERSION,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": None if scheduler is None else scheduler.state_dict(),
@@ -450,9 +463,35 @@ def _checkpoint_path(cfg: PseudoPairEpochConfig, name: str) -> Path | None:
 def _validate_resume_state(state: Mapping[str, Any]) -> None:
     if state.get("trainer") != "pseudo_pair_epochs":
         raise ValueError("Resume checkpoint is not a pseudo-pair epoch checkpoint.")
+    if int(state.get("pseudo_pair_pipeline_version", 1)) < PSEUDO_PAIR_PIPELINE_VERSION:
+        raise ValueError(
+            "Resume checkpoint was produced before the pseudo-pair loss/axis correction; "
+            "start a fresh run instead of resuming it."
+        )
     for key in ("model", "optimizer", "epoch", "global_step"):
         if key not in state:
             raise ValueError(f"Resume checkpoint is missing required key {key!r}.")
+
+
+def _component_values(components: Mapping[str, torch.Tensor]) -> dict[str, float]:
+    return {key: float(components[key].detach().cpu()) for key in _LOSS_COMPONENT_KEYS}
+
+
+def _summarize_loss_components(totals: Mapping[str, float], total_samples: int) -> dict[str, float]:
+    denominator = max(1, total_samples)
+    summary = {key: float(totals[key]) / denominator for key in _LOSS_COMPONENT_KEYS}
+    summary["loss"] = summary["total"]
+    summary["samples"] = float(total_samples)
+    return summary
+
+
+def _format_loss_components(values: Mapping[str, float]) -> str:
+    return (
+        f"loss={values['total']:.6f} "
+        f"masked_l1={values['masked_l1']:.6f} "
+        f"gradient={values['gradient']:.6f} "
+        f"background={values['background']:.6f}"
+    )
 
 
 def _coerce_config(config: PseudoPairEpochConfig | Mapping[str, Any] | None) -> PseudoPairEpochConfig:

@@ -22,6 +22,7 @@ data:
     resize_mode: fit_pad
     output_height: 128
     output_width: 160
+    slice_axis: z
 
 model:
   name: conditional_unet_field_translator

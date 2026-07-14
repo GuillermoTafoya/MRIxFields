@@ -205,7 +205,8 @@ def make_field_balanced_sampler(
 def _validate_loaded_volume(volume: torch.Tensor, record: VolumeRecord) -> None:
     if volume.ndim != 4:
         raise ValueError(
-            f"Loader for record {record.case_id} must return (C,D,H,W), got {tuple(volume.shape)}."
+            f"Loader for record {record.case_id} must return raw NIfTI order (C,X,Y,Z), "
+            f"got {tuple(volume.shape)}."
         )
     if not torch.isfinite(volume).all():
         raise ValueError(f"Loader returned non-finite values for record {record.case_id}.")

@@ -43,6 +43,7 @@ data:
     normalization: official_01
     model_range: zero_one
     resize_mode: native
+    slice_axis: x
 model:
   name: conditional_unet_field_translator
   in_channels: 1
@@ -105,6 +106,9 @@ def test_train_and_eval_pseudo_pairs_cli_with_injected_loader(tmp_path, monkeypa
     assert preflight_payload["datasets"]["validation"]["samples"] == 2
     assert preflight_payload["leakage_audit"]["ok"] is True
     assert Path(preflight_payload["split_json"]).exists()
+    assert preflight_payload["preprocessing"]["raw_volume_order"] == "C,X,Y,Z"
+    assert preflight_payload["preprocessing"]["slice_axis"] == "x"
+    assert preflight_payload["preprocessing"]["slice_plane"] == "Y,Z"
 
     train_code = main(
         [

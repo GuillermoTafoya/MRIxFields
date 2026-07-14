@@ -131,10 +131,15 @@ The data path is volume-first. `build_volume_splits(...)` assigns retrospective 
 to train/validation/test before slice expansion, audits case/path/subject leakage, and
 persists the exact split JSON. Slice preprocessing follows the official released
 `[0, 1]` intensity range: no per-slice z-score, optional model-boundary mapping to
-`[-1, 1]`, axial slices in the configured range, and aspect-preserving fit/pad instead
-of square stretching. Training uses dynamic degradation; validation/test use stable
-per-item seeds. Prospective data must be evaluated at subject level, not by slice or
-volume leakage.
+`[-1, 1]`, slices in the configured range, and aspect-preserving fit/pad instead of
+square stretching. The NIfTI loader returns raw nibabel array order as `(C, X, Y, Z)`;
+the official pseudo-pair configs set `slice_axis: z`, so an axial sample is
+`volume[:, :, :, z]` with model tensor shape `(C, X, Y)`. Training uses dynamic
+degradation; validation/test use stable per-item seeds. The outside-support loss is
+target-aware, so outside-mask prediction is compared with outside-mask target rather
+than forced to numeric zero; this matters because `0` in `[-1, 1]` model space is gray,
+not black. Prospective data must be evaluated at subject level, not by slice or volume
+leakage.
 
 Pseudo-pair commands consume the standard FieldBridge `Manifest` JSON/YAML schema, not
 the MRIxFields audit JSONL: top-level `records`, each with `case_id`, `image_path`,
@@ -214,8 +219,9 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
   `evaluation/stage1_report.py`'s sliding window (§8) rather than cropping.
 - `compose(transforms)` — chains transforms in order.
 - `data/preprocessing.py` owns the pseudo-pair slice path: official `[0, 1]` validation,
-  uniform axial slice selection, model-boundary range mapping, and reversible fit/pad
-  geometry metadata for visualization or volume reconstruction.
+  uniform configured-axis slice selection from raw `(C, X, Y, Z)` tensors,
+  model-boundary range mapping, and reversible fit/pad geometry metadata for
+  visualization or volume reconstruction.
 
 ## 8. Evaluation (`evaluation/metrics.py`, `evaluation/stage1_report.py`)
 
@@ -299,15 +305,18 @@ training loss curve.
 `eval-pseudo-pairs` reports degraded `x_low` versus `x_high` and predicted `x_pred`
 versus `x_high`, with aggregate and per-target-field metrics plus improvement over the
 degraded baseline. It also runs a target-conditioning audit by evaluating correct target
-domains and intentionally permuted target domains. LPIPS is optional; when the dependency
-or local weights are unavailable, the report marks LPIPS skipped instead of failing the
-core package.
+domains, every supported wrong target field, and one intentionally permuted target
+assignment. The audit reports absolute/relative effect sizes, sample-level best-target
+fractions, and margins; it does not declare success from tiny floating-point deltas.
+LPIPS is optional; when the dependency or local weights are unavailable, the report marks
+LPIPS skipped instead of failing the core package.
 
 `train-pseudo-pairs --preflight` constructs/persists the split, audits leakage, builds the
 datasets, loads one sample per non-empty split, and reports derived dataset lengths,
-steps per epoch, configured preprocessing geometry/range, and sample intensity ranges
-without running an optimizer step. This is the intended Colab check before GPU training
-against a Drive-backed manifest.
+steps per epoch, raw volume order `(C, X, Y, Z)`, configured slice axis/plane,
+preprocessing geometry/range, and sample intensity ranges without running an optimizer
+step. This is the intended Colab check before GPU training against a Drive-backed
+manifest.
 
 ## 11. Configuration schema
 

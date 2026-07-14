@@ -74,17 +74,57 @@ def gradient_loss(
     return torch.stack(losses).mean()
 
 
-def background_penalty(prediction: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    """Penalize nonzero prediction values outside the foreground mask."""
+def background_penalty(
+    prediction: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    target: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Penalize prediction error outside the foreground mask.
 
+    When ``target`` is omitted this preserves the historical behavior of penalizing
+    nonzero predictions. Pseudo-pair training passes the target explicitly so the
+    outside-support term is correct in both ``[0, 1]`` and ``[-1, 1]`` model ranges.
+    """
+
+    if target is not None:
+        _validate_same_shape(prediction, target)
+    residual = prediction if target is None else prediction - target
     if mask is None:
-        return torch.abs(prediction).mean()
+        return torch.abs(residual).mean()
     prepared_mask = _prepare_mask(mask, prediction)
     outside_mask = (1.0 - prepared_mask).clamp_min(0.0)
     denominator = outside_mask.sum()
     if not bool(torch.any(outside_mask > 0).detach().cpu().item()):
         return prediction.sum() * 0.0
-    return (torch.abs(prediction) * outside_mask).sum() / denominator
+    return (torch.abs(residual) * outside_mask).sum() / denominator
+
+
+def combined_reconstruction_loss_components(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Return unweighted pseudo-pair reconstruction components plus weighted total."""
+
+    _validate_same_shape(prediction, target)
+    active_weights = {"masked_l1": 1.0, "gradient": 0.1, "background": 0.05}
+    if weights is not None:
+        active_weights.update(dict(weights))
+
+    masked = masked_l1_loss(prediction, target, mask)
+    gradient = gradient_loss(prediction, target, mask)
+    background = background_penalty(prediction, mask, target=target)
+    total = prediction.sum() * 0.0
+    total = total + active_weights.get("masked_l1", 0.0) * masked
+    total = total + active_weights.get("gradient", 0.0) * gradient
+    total = total + active_weights.get("background", 0.0) * background
+    return {
+        "masked_l1": masked,
+        "gradient": gradient,
+        "background": background,
+        "total": total,
+    }
 
 
 def combined_reconstruction_loss(
@@ -99,18 +139,7 @@ def combined_reconstruction_loss(
     dependency-free implementation is needed for training.
     """
 
-    _validate_same_shape(prediction, target)
-    active_weights = {"masked_l1": 1.0, "gradient": 0.1, "background": 0.05}
-    if weights is not None:
-        active_weights.update(dict(weights))
-    total = prediction.sum() * 0.0
-    if active_weights.get("masked_l1", 0.0):
-        total = total + active_weights["masked_l1"] * masked_l1_loss(prediction, target, mask)
-    if active_weights.get("gradient", 0.0):
-        total = total + active_weights["gradient"] * gradient_loss(prediction, target, mask)
-    if active_weights.get("background", 0.0):
-        total = total + active_weights["background"] * background_penalty(prediction, mask)
-    return total
+    return combined_reconstruction_loss_components(prediction, target, mask, weights)["total"]
 
 
 def kl_divergence(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

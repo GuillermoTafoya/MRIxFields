@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -19,14 +20,29 @@ from fieldbridge.data.datasets import (
     StreamingPatchDataset,
     collate_raw_batches,
 )
+from fieldbridge.data.pseudo_pairs import (
+    PseudoPairSliceDataset,
+    collate_pseudo_pair_slices,
+    make_field_balanced_sampler,
+)
 from fieldbridge.data.patch_bank import (
     PatchBankDataset,
     build_patch_bank,
     patch_bank_size,
 )
 from fieldbridge.data.manifests import audit_manifest, load_manifest
+from fieldbridge.data.preprocessing import SlicePreprocessingSpec, from_model_range, selected_slice_indices
 from fieldbridge.data.sources import nifti_image_loader
 from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+from fieldbridge.data.volume_splits import (
+    audit_volume_splits,
+    build_volume_splits,
+    load_volume_splits,
+    save_volume_splits,
+    summarize_volume_splits,
+    validate_pseudo_pair_manifest_records,
+    volume_splits_fingerprint,
+)
 from fieldbridge.models.diffusion.denoising_unet import DenoisingUNet
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.official.data_manifest import (
@@ -40,8 +56,10 @@ from fieldbridge.official.submissions import (
     build_submission_zip,
     validate_submission_dir,
 )
+from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_pseudo_pairs
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
 from fieldbridge.training.checkpoints import load_checkpoint
+from fieldbridge.training.pseudo_pair_epochs import PseudoPairEpochConfig, train_pseudo_pair_epochs
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
 from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
@@ -72,6 +90,56 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of the synthetic loader. Never commit a real manifest to the repo.",
     )
     train.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train_pseudo = subparsers.add_parser(
+        "train-pseudo-pairs",
+        help="Train the epoch-based T2-FLAIR pseudo-pair conditional U-Net baseline.",
+    )
+    train_pseudo.add_argument("--config", type=Path, default=Path("configs/experiment/pseudo_pair_t2flair_pilot.yaml"))
+    train_pseudo.add_argument("--manifest", type=Path, default=None)
+    train_pseudo.add_argument("--sequence", default=None)
+    train_pseudo.add_argument("--source-field", type=float, default=None)
+    train_pseudo.add_argument("--target-fields", nargs="+", type=float, default=None)
+    train_pseudo.add_argument("--train-volumes-per-field", type=int, default=None)
+    train_pseudo.add_argument("--val-volumes-per-field", type=int, default=None)
+    train_pseudo.add_argument("--test-volumes-per-field", type=int, default=None)
+    train_pseudo.add_argument("--slices-per-volume", type=int, default=None)
+    train_pseudo.add_argument("--slice-start", type=int, default=None)
+    train_pseudo.add_argument("--slice-end", type=int, default=None)
+    train_pseudo.add_argument("--output-height", type=int, default=None)
+    train_pseudo.add_argument("--output-width", type=int, default=None)
+    train_pseudo.add_argument("--epochs", type=int, default=None)
+    train_pseudo.add_argument("--batch-size", type=int, default=None)
+    train_pseudo.add_argument("--workers", type=int, default=None)
+    train_pseudo.add_argument("--learning-rate", "--lr", dest="lr", type=float, default=None)
+    train_pseudo.add_argument("--checkpoint-dir", type=Path, default=None)
+    train_pseudo.add_argument("--resume-checkpoint", type=Path, default=None)
+    train_pseudo.add_argument("--seed", type=int, default=None)
+    train_pseudo.add_argument("--max-pilot-records", type=int, default=None)
+    train_pseudo.add_argument("--split-json", type=Path, default=None)
+    train_pseudo.add_argument(
+        "--preflight",
+        "--dry-run",
+        dest="preflight",
+        action="store_true",
+        help="Validate manifest/splits/datasets and print counts without optimization.",
+    )
+    train_pseudo.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    eval_pseudo = subparsers.add_parser(
+        "eval-pseudo-pairs",
+        help="Evaluate degraded and predicted pseudo-pair baselines from a checkpoint.",
+    )
+    eval_pseudo.add_argument("--config", type=Path, default=Path("configs/experiment/pseudo_pair_t2flair_pilot.yaml"))
+    eval_pseudo.add_argument("--manifest", type=Path, default=None)
+    eval_pseudo.add_argument("--checkpoint", type=Path, required=True)
+    eval_pseudo.add_argument("--split-json", type=Path, default=None)
+    eval_pseudo.add_argument("--split", choices=("validation", "test"), default="test")
+    eval_pseudo.add_argument("--batch-size", type=int, default=None)
+    eval_pseudo.add_argument("--workers", type=int, default=None)
+    eval_pseudo.add_argument("--seed", type=int, default=None)
+    eval_pseudo.add_argument("--max-pilot-records", type=int, default=None)
+    eval_pseudo.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     train_stage1_vae = subparsers.add_parser(
         "train-stage1-vae", help="Run Etapa 1 VAE-only training (KLVAEEncoder/Decoder, SSIM+nRMSE+LPIPS+KL)."
@@ -306,6 +374,191 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "train-pseudo-pairs":
+        config = _load_optional_config(args.config)
+        _apply_pseudo_pair_overrides(config, args, training=True)
+        manifest_path = _pseudo_pair_manifest_path(config)
+        records = _pseudo_pair_records(config, manifest_path)
+        preprocessing = _pseudo_pair_preprocessing(config)
+        slice_count = len(selected_slice_indices(preprocessing))
+        split_path = _pseudo_pair_split_path(config)
+        splits = _build_or_load_pseudo_pair_splits(config, records, split_path)
+        leakage_audit = audit_volume_splits(splits)
+        leakage_audit.raise_for_leakage()
+        split_summary = summarize_volume_splits(splits, slices_per_volume=slice_count)
+        save_volume_splits(splits, split_path)
+        split_sha256 = volume_splits_fingerprint(splits)
+        checkpoint_dir = _pseudo_pair_checkpoint_dir(config)
+        if checkpoint_dir is None:
+            raise ValueError("train-pseudo-pairs requires training.checkpoint_dir or --checkpoint-dir.")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        _override(config, "training", "checkpoint_dir", str(checkpoint_dir))
+        if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume_checkpoint}")
+
+        train_config = PseudoPairEpochConfig.from_mapping(config)
+        train_dataset = PseudoPairSliceDataset(
+            splits.train,
+            image_loader=nifti_image_loader,
+            source_field=_pseudo_pair_source_field(config),
+            sequence=_pseudo_pair_sequence(config),
+            preprocessing=preprocessing,
+            mode="train",
+            seed=train_config.seed,
+            cache_size=_pseudo_pair_cache_size(config),
+        )
+        val_dataset = PseudoPairSliceDataset(
+            splits.validation,
+            image_loader=nifti_image_loader,
+            source_field=_pseudo_pair_source_field(config),
+            sequence=_pseudo_pair_sequence(config),
+            preprocessing=preprocessing,
+            mode="validation",
+            seed=train_config.seed,
+            cache_size=_pseudo_pair_cache_size(config),
+        )
+        test_dataset = PseudoPairSliceDataset(
+            splits.test,
+            image_loader=nifti_image_loader,
+            source_field=_pseudo_pair_source_field(config),
+            sequence=_pseudo_pair_sequence(config),
+            preprocessing=preprocessing,
+            mode="test",
+            seed=train_config.seed,
+            cache_size=_pseudo_pair_cache_size(config),
+        )
+        if len(train_dataset) == 0 or len(val_dataset) == 0:
+            raise ValueError("train-pseudo-pairs produced empty train or validation slice splits.")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_config.batch_size,
+            sampler=make_field_balanced_sampler(train_dataset, seed=train_config.seed),
+            num_workers=_num_workers(config),
+            collate_fn=collate_pseudo_pair_slices,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            num_workers=_num_workers(config),
+            collate_fn=collate_pseudo_pair_slices,
+        )
+        steps_per_epoch = len(train_loader)
+        _print_pseudo_pair_summary(split_summary, batch_size=train_config.batch_size, steps_per_epoch=steps_per_epoch)
+        run_metadata = {
+            "manifest_validation": _pseudo_pair_manifest_validation(config, records).to_dict(),
+            "split_json": str(split_path),
+            "split_sha256": split_sha256,
+            "split_summary": split_summary,
+            "preprocessing": preprocessing.to_dict(),
+        }
+        if args.preflight:
+            payload = _pseudo_pair_preflight_payload(
+                manifest_path=manifest_path,
+                split_path=split_path,
+                split_sha256=split_sha256,
+                split_summary=split_summary,
+                leakage_audit=leakage_audit.to_dict(),
+                preprocessing=preprocessing,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                test_dataset=test_dataset,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                batch_size=train_config.batch_size,
+                num_workers=_num_workers(config),
+                manifest_validation=run_metadata["manifest_validation"],
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+
+        model = _build_pseudo_pair_translator(config)
+        result = train_pseudo_pair_epochs(
+            train_config,
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            run_metadata=run_metadata,
+        )
+        payload = {
+            **result.to_dict(),
+            "split_json": str(split_path),
+            "split_summary": split_summary,
+            "steps_per_epoch": steps_per_epoch,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                "train-pseudo-pairs completed: "
+                f"epochs={result.epochs_completed} global_step={result.global_step} "
+                f"best_checkpoint={result.best_checkpoint} last_checkpoint={result.last_checkpoint}"
+            )
+        return 0
+
+    if args.command == "eval-pseudo-pairs":
+        config = _load_optional_config(args.config)
+        _apply_pseudo_pair_overrides(config, args, training=False)
+        if not args.checkpoint.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+        state = load_checkpoint(args.checkpoint)
+        if state.get("trainer") != "pseudo_pair_epochs":
+            raise ValueError("Checkpoint is not compatible with eval-pseudo-pairs.")
+        manifest_path = _pseudo_pair_manifest_path(config)
+        records = _pseudo_pair_records(config, manifest_path)
+        preprocessing = _pseudo_pair_preprocessing(config)
+        split_path = _pseudo_pair_split_path(config, checkpoint=args.checkpoint)
+        if split_path.exists():
+            splits = load_volume_splits(split_path)
+        else:
+            splits = _build_or_load_pseudo_pair_splits(config, records, split_path)
+            save_volume_splits(splits, split_path)
+        split_sha256 = volume_splits_fingerprint(splits)
+        checkpoint_split_sha256 = (
+            state.get("run_metadata", {}).get("split_sha256")
+            if isinstance(state.get("run_metadata"), Mapping)
+            else None
+        )
+        if checkpoint_split_sha256 is not None and checkpoint_split_sha256 != split_sha256:
+            raise ValueError(
+                "Checkpoint split identity does not match the loaded split JSON: "
+                f"{checkpoint_split_sha256} != {split_sha256}."
+            )
+        records_for_eval = splits.records_for(args.split)
+        if not records_for_eval:
+            raise ValueError(f"eval-pseudo-pairs split {args.split!r} is empty.")
+        model = _build_pseudo_pair_translator(config)
+        model.load_state_dict(state["model"])
+        eval_config = PseudoPairEvalConfig.from_mapping(config)
+        dataset = PseudoPairSliceDataset(
+            records_for_eval,
+            image_loader=nifti_image_loader,
+            source_field=_pseudo_pair_source_field(config),
+            sequence=_pseudo_pair_sequence(config),
+            preprocessing=preprocessing,
+            mode="test" if args.split == "test" else "validation",
+            seed=int(config.get("seed", 13)),
+            cache_size=_pseudo_pair_cache_size(config),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=int(config.get("training", {}).get("batch_size", 8))
+            if isinstance(config.get("training", {}), Mapping)
+            else 8,
+            shuffle=False,
+            num_workers=_num_workers(config),
+            collate_fn=collate_pseudo_pair_slices,
+        )
+        payload = evaluate_pseudo_pairs(model, loader, eval_config)
+        payload["checkpoint"] = str(args.checkpoint)
+        payload["split_json"] = str(split_path)
+        payload["split"] = args.split
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     if args.command == "train-stage1-vae":
@@ -567,6 +820,248 @@ def _build_streaming_patch_loader(
     )
 
 
+def _apply_pseudo_pair_overrides(config: dict[str, Any], args: argparse.Namespace, *, training: bool) -> None:
+    _override(config, "data", "manifest", str(args.manifest) if getattr(args, "manifest", None) else None)
+    _override(config, "data", "sequence", getattr(args, "sequence", None))
+    _override(config, "data", "source_field", getattr(args, "source_field", None))
+    _override(config, "data", "target_fields", getattr(args, "target_fields", None))
+    _override(config, "data", "train_volumes_per_field", getattr(args, "train_volumes_per_field", None))
+    _override(config, "data", "val_volumes_per_field", getattr(args, "val_volumes_per_field", None))
+    _override(config, "data", "test_volumes_per_field", getattr(args, "test_volumes_per_field", None))
+    _override(config, "data", "max_pilot_records", getattr(args, "max_pilot_records", None))
+    _override(config, "data", "split_json", str(args.split_json) if getattr(args, "split_json", None) else None)
+    _override_nested(config, "data", "preprocessing", "slice_start", getattr(args, "slice_start", None))
+    _override_nested(config, "data", "preprocessing", "slice_end", getattr(args, "slice_end", None))
+    _override_nested(
+        config,
+        "data",
+        "preprocessing",
+        "slices_per_volume",
+        getattr(args, "slices_per_volume", None),
+    )
+    _override_nested(config, "data", "preprocessing", "output_height", getattr(args, "output_height", None))
+    _override_nested(config, "data", "preprocessing", "output_width", getattr(args, "output_width", None))
+    _override(config, "training", "batch_size", getattr(args, "batch_size", None))
+    _override(config, "training", "num_workers", getattr(args, "workers", None))
+    if getattr(args, "seed", None) is not None:
+        config["seed"] = args.seed
+    if training:
+        _override(config, "training", "epochs", getattr(args, "epochs", None))
+        _override(config, "training", "lr", getattr(args, "lr", None))
+        _override(
+            config,
+            "training",
+            "checkpoint_dir",
+            str(args.checkpoint_dir) if getattr(args, "checkpoint_dir", None) else None,
+        )
+        _override(
+            config,
+            "training",
+            "resume_from",
+            str(args.resume_checkpoint) if getattr(args, "resume_checkpoint", None) else None,
+        )
+
+
+def _pseudo_pair_manifest_path(config: Mapping[str, Any]) -> Path:
+    data_config = _data_mapping(config)
+    value = data_config.get("manifest")
+    if not value:
+        raise ValueError("Pseudo-pair commands require data.manifest or --manifest.")
+    path = Path(os.path.expandvars(str(value)))
+    if not path.exists():
+        raise FileNotFoundError(f"Manifest not found: {path}")
+    return path
+
+
+def _pseudo_pair_records(config: Mapping[str, Any], manifest_path: Path) -> list[Any]:
+    records = list(load_manifest(manifest_path).records)
+    max_records = _data_mapping(config).get("max_pilot_records")
+    if max_records is not None:
+        records = records[: int(max_records)]
+    _pseudo_pair_manifest_validation(config, records).raise_for_errors()
+    return records
+
+
+def _pseudo_pair_manifest_validation(config: Mapping[str, Any], records: list[Any]):
+    return validate_pseudo_pair_manifest_records(
+        records,
+        sequence=_pseudo_pair_sequence(config),
+        target_fields=_pseudo_pair_target_fields(config),
+    )
+
+
+def _pseudo_pair_preprocessing(config: Mapping[str, Any]) -> SlicePreprocessingSpec:
+    data_config = _data_mapping(config)
+    preprocessing = data_config.get("preprocessing", {})
+    return SlicePreprocessingSpec.from_mapping(preprocessing)
+
+
+def _pseudo_pair_sequence(config: Mapping[str, Any]) -> str:
+    return str(_data_mapping(config).get("sequence", "T2-FLAIR"))
+
+
+def _pseudo_pair_source_field(config: Mapping[str, Any]) -> float:
+    return float(_data_mapping(config).get("source_field", 0.1))
+
+
+def _pseudo_pair_target_fields(config: Mapping[str, Any]) -> tuple[float, ...]:
+    raw = _data_mapping(config).get("target_fields", (1.5, 3.0, 5.0, 7.0))
+    return tuple(float(field) for field in raw)
+
+
+def _pseudo_pair_cache_size(config: Mapping[str, Any]) -> int:
+    return int(_data_mapping(config).get("cache_size", 2))
+
+
+def _pseudo_pair_checkpoint_dir(config: Mapping[str, Any]) -> Path | None:
+    training = config.get("training", {})
+    if not isinstance(training, Mapping):
+        return None
+    value = training.get("checkpoint_dir")
+    return Path(os.path.expandvars(str(value))) if value else None
+
+
+def _pseudo_pair_split_path(config: Mapping[str, Any], *, checkpoint: Path | None = None) -> Path:
+    data_config = _data_mapping(config)
+    configured = data_config.get("split_json")
+    if configured:
+        return Path(os.path.expandvars(str(configured)))
+    checkpoint_dir = _pseudo_pair_checkpoint_dir(config)
+    if checkpoint_dir is not None:
+        return checkpoint_dir / "volume_splits.json"
+    if checkpoint is not None:
+        return checkpoint.parent / "volume_splits.json"
+    return Path("volume_splits.json")
+
+
+def _build_or_load_pseudo_pair_splits(config: Mapping[str, Any], records: list[Any], path: Path):
+    if path.exists():
+        return load_volume_splits(path)
+    data_config = _data_mapping(config)
+    return build_volume_splits(
+        records,
+        sequence=_pseudo_pair_sequence(config),
+        target_fields=_pseudo_pair_target_fields(config),
+        train_volumes_per_field=int(data_config.get("train_volumes_per_field", 16)),
+        val_volumes_per_field=int(data_config.get("val_volumes_per_field", 4)),
+        test_volumes_per_field=int(data_config.get("test_volumes_per_field", 4)),
+        seed=int(config.get("seed", 13)),
+    )
+
+
+def _build_pseudo_pair_translator(config: Mapping[str, Any]):
+    model_config = _model_config(config)
+    nested = model_config.get("translator")
+    if isinstance(nested, Mapping):
+        translator_config = dict(nested)
+        default_name = str(model_config.get("name", "conditional_unet_field_translator"))
+    else:
+        translator_config = {
+            key: value
+            for key, value in model_config.items()
+            if key not in {"encoder", "decoder", "translator", "variant"}
+        }
+        default_name = "conditional_unet_field_translator"
+    name = str(translator_config.pop("name", default_name))
+    return build_translator(name, **translator_config)
+
+
+def _print_pseudo_pair_summary(
+    summary: Mapping[str, Any],
+    *,
+    batch_size: int,
+    steps_per_epoch: int,
+) -> None:
+    train_summary = summary["splits"]["train"]
+    print(
+        "pseudo_pair split summary: "
+        f"train_volumes={train_summary['volumes']} train_slices={train_summary['slices']} "
+        f"batch_size={batch_size} steps_per_epoch={steps_per_epoch}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _pseudo_pair_preflight_payload(
+    *,
+    manifest_path: Path,
+    split_path: Path,
+    split_sha256: str,
+    split_summary: Mapping[str, Any],
+    leakage_audit: Mapping[str, Any],
+    preprocessing: SlicePreprocessingSpec,
+    train_dataset: PseudoPairSliceDataset,
+    val_dataset: PseudoPairSliceDataset,
+    test_dataset: PseudoPairSliceDataset,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    batch_size: int,
+    num_workers: int,
+    manifest_validation: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "manifest": str(manifest_path),
+        "manifest_validation": dict(manifest_validation),
+        "split_json": str(split_path),
+        "split_sha256": split_sha256,
+        "leakage_audit": dict(leakage_audit),
+        "split_summary": split_summary,
+        "datasets": {
+            "train": _pseudo_pair_dataset_summary(train_dataset),
+            "validation": _pseudo_pair_dataset_summary(val_dataset),
+            "test": _pseudo_pair_dataset_summary(test_dataset),
+        },
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "steps_per_epoch": len(train_loader),
+        "validation_batches": len(val_loader),
+        "preprocessing": {
+            **preprocessing.to_dict(),
+            "selected_slice_indices": list(selected_slice_indices(preprocessing)),
+        },
+    }
+
+
+def _pseudo_pair_dataset_summary(dataset: PseudoPairSliceDataset) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "samples": len(dataset),
+        "volumes": len(dataset.records),
+        "slices_per_volume": len(dataset.slice_indices),
+        "fields": {},
+    }
+    for record in dataset.records:
+        field_label = f"{record.domain.field_strength_t:g}T"
+        summary["fields"][field_label] = int(summary["fields"].get(field_label, 0)) + len(dataset.slice_indices)
+    if len(dataset) == 0:
+        return summary
+    sample = dataset[0]
+    x_high_01 = from_model_range(sample.x_high, dataset.preprocessing.model_range)
+    x_low_01 = from_model_range(sample.x_low, dataset.preprocessing.model_range)
+    summary["sample"] = {
+        "record_id": sample.record_id,
+        "target_domain": sample.target_domain.label,
+        "source_domain": sample.source_domain.label,
+        "slice_index": sample.slice_index,
+        "x_high_shape": list(sample.x_high.shape),
+        "x_low_shape": list(sample.x_low.shape),
+        "mask_shape": list(sample.mask.shape),
+        "x_high_01_min": float(x_high_01.min().item()),
+        "x_high_01_max": float(x_high_01.max().item()),
+        "x_low_01_min": float(x_low_01.min().item()),
+        "x_low_01_max": float(x_low_01.max().item()),
+        "geometry": sample.geometry.to_dict(),
+    }
+    return summary
+
+
+def _data_mapping(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        raise ValueError("Config section 'data' must be a mapping.")
+    return data_config
+
+
 def _load_optional_config(path: Path) -> dict[str, Any]:
     if path.exists():
         return load_yaml_config(path)
@@ -700,6 +1195,24 @@ def _override(config: dict[str, Any], section: str, key: str, value: Any | None)
     if not isinstance(section_config, dict):
         raise ValueError(f"Config section {section!r} must be a mapping.")
     section_config[key] = value
+
+
+def _override_nested(
+    config: dict[str, Any],
+    section: str,
+    nested: str,
+    key: str,
+    value: Any | None,
+) -> None:
+    if value is None:
+        return
+    section_config = config.setdefault(section, {})
+    if not isinstance(section_config, dict):
+        raise ValueError(f"Config section {section!r} must be a mapping.")
+    nested_config = section_config.setdefault(nested, {})
+    if not isinstance(nested_config, dict):
+        raise ValueError(f"Config section {section}.{nested} must be a mapping.")
+    nested_config[key] = value
 
 
 if __name__ == "__main__":

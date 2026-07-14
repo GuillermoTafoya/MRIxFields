@@ -205,6 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     eval_stage1_vae = subparsers.add_parser(
         "eval-stage1-vae",
         help="Deterministic reconstruction eval + diagnostic plots for a stage-1 VAE checkpoint.",
+        description="Deterministic reconstruction eval + diagnostic plots for a stage-1 VAE checkpoint. "
+        'Real Stage-1 evaluation requires: pip install -e ".[nifti,evaluation]"',
     )
     eval_stage1_vae.add_argument("--checkpoint", type=Path, required=True, help="Trained VAE checkpoint (.pt).")
     eval_stage1_vae.add_argument("--config", type=Path, default=Path("configs/experiment/stage1_vae.yaml"))
@@ -212,7 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--manifest",
         type=Path,
         required=True,
-        help="Manifest of real NIfTI volumes to reconstruct (requires the 'nifti' extra).",
+        help="Manifest of real NIfTI volumes to reconstruct. Install requirements with: "
+        'pip install -e ".[nifti,evaluation]"',
     )
     eval_stage1_vae.add_argument("--out", type=Path, required=True, help="Output directory for metrics + plots.")
     eval_stage1_vae.add_argument("--num-samples", type=int, default=4)

@@ -110,6 +110,8 @@ def _metadata() -> str:
         "Provides-Extra: dev",
         'Requires-Dist: matplotlib>=3.7,<4; extra == "dev"',
         'Requires-Dist: pytest>=8.0; extra == "dev"',
+        "Provides-Extra: evaluation",
+        'Requires-Dist: matplotlib>=3.7,<4; extra == "evaluation"',
         "Provides-Extra: quality",
         'Requires-Dist: mypy>=1.10; extra == "quality"',
         'Requires-Dist: ruff>=0.6; extra == "quality"',

@@ -26,6 +26,18 @@ def test_build_backend_metadata_matches_pyproject_dependencies() -> None:
     assert backend_extras == project_extras
 
 
+def test_matplotlib_is_declared_for_dev_and_evaluation() -> None:
+    lines = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+    requirement = "matplotlib>=3.7,<4"
+
+    assert requirement in _read_toml_array(lines, "dev")
+    assert _read_toml_array(lines, "evaluation") == [requirement]
+
+    metadata_lines = _build_backend()._metadata().splitlines()
+    assert "Provides-Extra: evaluation" in metadata_lines
+    assert f'Requires-Dist: {requirement}; extra == "evaluation"' in metadata_lines
+
+
 def _pyproject_requirements() -> tuple[list[str], list[str]]:
     lines = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
     requirements = _read_toml_array(lines, "dependencies")

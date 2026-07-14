@@ -7,6 +7,7 @@ from fieldbridge.training.losses import (
     adversarial_hinge_loss_generator,
     background_penalty,
     combined_reconstruction_loss,
+    combined_reconstruction_loss_components,
     cycle_consistency_loss,
     gradient_loss,
     identity_loss,
@@ -88,6 +89,30 @@ def test_background_penalty_penalizes_outside_mask_prediction() -> None:
     _assert_finite_and_backprop(loss, prediction)
 
 
+def test_background_penalty_matches_minus_one_one_target_outside_mask() -> None:
+    target = torch.tensor([[[[0.0, -1.0], [0.0, -1.0]]]])
+    mask = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
+    matching_prediction = target.detach().clone().requires_grad_(True)
+    gray_prediction = torch.tensor([[[[0.0, 0.0], [0.0, 0.0]]]], requires_grad=True)
+
+    matching_loss = background_penalty(matching_prediction, mask, target=target)
+    gray_loss = background_penalty(gray_prediction, mask, target=target)
+
+    assert torch.isclose(matching_loss, torch.tensor(0.0))
+    assert gray_loss > 0.0
+    _assert_finite_and_backprop(gray_loss, gray_prediction)
+
+
+def test_background_penalty_zero_one_behavior_matches_target_outside_mask() -> None:
+    target = torch.tensor([[[[0.5, 0.0], [0.5, 0.0]]]])
+    mask = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
+    matching_prediction = target.detach().clone().requires_grad_(True)
+    bright_prediction = torch.tensor([[[[0.5, 0.25], [0.5, 0.25]]]], requires_grad=True)
+
+    assert torch.isclose(background_penalty(matching_prediction, mask, target=target), torch.tensor(0.0))
+    assert background_penalty(bright_prediction, mask, target=target) > 0.0
+
+
 def test_gradient_loss_returns_nonnegative_scalar() -> None:
     prediction = torch.randn(1, 1, 4, 4, requires_grad=True)
     target = torch.randn(1, 1, 4, 4)
@@ -107,6 +132,17 @@ def test_combined_reconstruction_loss_backpropagates() -> None:
     loss = combined_reconstruction_loss(prediction, target, mask)
 
     _assert_finite_and_backprop(loss, prediction)
+
+
+def test_combined_reconstruction_loss_components_backpropagate() -> None:
+    prediction = torch.randn(1, 1, 4, 4, requires_grad=True)
+    target = torch.randn(1, 1, 4, 4)
+    mask = torch.ones(1, 1, 4, 4)
+
+    components = combined_reconstruction_loss_components(prediction, target, mask)
+
+    assert set(components) == {"masked_l1", "gradient", "background", "total"}
+    _assert_finite_and_backprop(components["total"], prediction)
 
 
 def test_adversarial_hinge_losses() -> None:

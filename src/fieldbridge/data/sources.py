@@ -100,7 +100,7 @@ def _resolve_relative_paths(manifest: Manifest, root: Path) -> Manifest:
 
 
 def nifti_image_loader(path: Path, record: VolumeRecord) -> torch.Tensor:
-    """Load an official MRIxFields NIfTI volume as a `(1, D, H, W)` float32 tensor.
+    """Load an official MRIxFields NIfTI volume as a raw `(1, X, Y, Z)` float32 tensor.
 
     Requires the optional `nibabel` dependency (`pip install -e ".[nifti]"`); it is not
     part of the core install so CPU/synthetic-only workflows never need it.

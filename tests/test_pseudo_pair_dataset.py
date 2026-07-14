@@ -31,6 +31,7 @@ def _spec(model_range: str = "zero_one") -> SlicePreprocessingSpec:
         slices_per_volume=2,
         model_range=model_range,  # type: ignore[arg-type]
         resize_mode="native",
+        slice_axis="x",
     )
 
 
@@ -128,6 +129,7 @@ def test_default_mask_keeps_dark_anatomy_inside_geometry() -> None:
             resize_mode="fit_pad",
             output_height=8,
             output_width=8,
+            slice_axis="x",
         ),
         mode="validation",
     )

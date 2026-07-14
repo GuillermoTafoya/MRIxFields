@@ -1,0 +1,66 @@
+seed: 13
+
+data:
+  name: pseudo_pair_slices
+  # Override with --manifest or set MRIXFIELDS_MANIFEST outside the repo.
+  manifest: ${MRIXFIELDS_MANIFEST}
+  sequence: T2FLAIR
+  source_field: 0.1
+  target_fields: [1.5, 3.0, 5.0, 7.0]
+  train_volumes_per_field: 16
+  val_volumes_per_field: 4
+  test_volumes_per_field: 4
+  max_pilot_records: null
+  cache_size: 2
+  split_json: outputs/pseudo_pair_t2flair/volume_splits.json
+  preprocessing:
+    slice_start: 72
+    slice_end: 292
+    slices_per_volume: 32
+    normalization: official_01
+    model_range: minus_one_one
+    resize_mode: fit_pad
+    output_height: 256
+    output_width: 320
+
+model:
+  name: conditional_unet_field_translator
+  in_channels: 1
+  out_channels: 1
+  hidden_channels: [16, 32, 64]
+  latent_channels: 128
+  cond_dim: 128
+  spatial_dims: 2
+  upsample_mode: interpolate
+  skip_mode: gated
+  final_activation: tanh
+  pad_to_multiple: true
+
+training:
+  epochs: 10
+  batch_size: 8
+  num_workers: 0
+  lr: 0.0001
+  weight_decay: 0.01
+  amp: true
+  grad_clip_norm: 1.0
+  scheduler:
+    name: cosine
+    t_max: 10
+    eta_min: 0.0
+  checkpoint_dir: outputs/pseudo_pair_t2flair/checkpoints
+  checkpoint_max_bytes: 200000000
+  resume_from: null
+  log_every_steps: 25
+  loss_weights:
+    masked_l1: 1.0
+    gradient: 0.2
+    background: 0.5
+
+evaluation:
+  lpips: auto
+
+# With the defaults above, the CLI computes and prints:
+# 4 target fields * 16 train volumes/field = 64 train volumes
+# 64 train volumes * 32 slices/volume = 2048 train examples
+# 2048 train examples / batch size 8 = 256 optimizer steps per epoch

@@ -119,6 +119,29 @@ high-resolution anatomy without making the skip path an unconditional source-dom
 back toward a bottleneck translator. This is still a deterministic baseline, not
 diffusion, a Schrodinger bridge, adversarial training, or a VAE.
 
+### Epoch pseudo-pair baseline
+
+`train-pseudo-pairs` replaces the old eight-slice notebook-style overfit with an
+epoch-based pseudo-pair pipeline around `ConditionalUNetFieldTranslator`. It is still a
+deterministic synthetic-pretraining baseline: high-field T2-FLAIR target volumes are
+degraded to synthetic 0.1T inputs, and the model learns to invert that synthetic
+corruption. This is not evidence of learning the real low-field distribution.
+
+The data path is volume-first. `build_volume_splits(...)` assigns retrospective volumes
+to train/validation/test before slice expansion, audits case/path/subject leakage, and
+persists the exact split JSON. Slice preprocessing follows the official released
+`[0, 1]` intensity range: no per-slice z-score, optional model-boundary mapping to
+`[-1, 1]`, axial slices in the configured range, and aspect-preserving fit/pad instead
+of square stretching. Training uses dynamic degradation; validation/test use stable
+per-item seeds. Prospective data must be evaluated at subject level, not by slice or
+volume leakage.
+
+Pseudo-pair commands consume the standard FieldBridge `Manifest` JSON/YAML schema, not
+the MRIxFields audit JSONL: top-level `records`, each with `case_id`, `image_path`,
+`domain.field_strength_t`, `domain.contrast`, and `subject_id`. `subject_id` is required
+for this path so train/validation/test leakage can be rejected at subject level. Real
+manifest files and any absolute Drive/local paths stay outside Git.
+
 ## 6. Diffusion (`models/diffusion/`) — Etapa 1's conditional latent diffuser
 
 Sits between `KLVAEEncoder` and `KLVAEDecoder` (§5): `z ~ encoder.encode(x)` →
@@ -148,6 +171,7 @@ Trained by `training/stage2_diffuser.py` (§7) with a standard noise-prediction 
 | `checkpoints.py` | `save_checkpoint`/`load_checkpoint` with a size guardrail, **explicit overwrite protection** (`FileExistsError` unless `overwrite=True`), and run metadata (`seed`, `config`, `git_commit`) stored under `state["_meta"]`. `checkpoint_filename(stage, variant, step)` builds `{stage}_{variant}_{YYYYMMDD}_step{N}.pt` names. |
 | `smoke_train.py` | Fixed CPU smoke test: identity encoder/decoder/translator, 2 steps, synthetic data. **Do not extend this — it's a stability tripwire, not a real trainer.** |
 | `train_loop.py` | The real, reusable Etapa 2 training loop. Config-driven precision (`fp32`/`bf16` via `torch.autocast`), optional gradient checkpointing on the translator's forward, configurable loss weights (`reconstruction`, `transport_cost`, `cycle`, `identity` — default only `reconstruction=1.0`, rest `0.0`), resume-from-checkpoint (model + optimizer state, not dataloader position — see note in the module), and `assert_frozen(module)` to verify the Etapa 1 VAE is frozen before Etapa 2 training. |
+| `pseudo_pair_epochs.py` | Real epoch-based pseudo-pair trainer for the deterministic conditional U-Net baseline: finite DataLoader epochs, AdamW, optional CUDA AMP, gradient clipping, scheduler, validation after every epoch, JSONL history, best/last checkpoints, and resume with optimizer/scheduler/global-step state. |
 | `stage1_vae.py` | Etapa 1 VAE-only training (`KLVAEEncoder`/`KLVAEDecoder`, no diffuser, no translator). Loss composition is **all four terms active by default** (unlike Etapa 2's "0 except reconstruction" ladder convention) — `ssim`+`nrmse`+`lpips`+`kl` (default weights `1.0/1.0/1.0/1e-4`), relative weights swept experimentally rather than turned on term-by-term. The full recipe now runs on **3D volumes**: `ssim_loss` dispatches to `ssim3d` (avg_pool3d) and `lpips` uses `lpips_loss_3d` (slice-averaged, `lpips_num_slices` config). The LPIPS net is built once via `build_lpips_net`. Supports warm-start (`training/warm_start.py`) and resume-from-checkpoint. |
 | `stage2_diffuser.py` | Etapa 1's conditional-diffuser training (`DenoisingUNet` on top of a trained `KLVAEEncoder`, §6). VAE frozen by default (`train_vae_jointly=False`, reuses `assert_frozen` from `train_loop.py`); standard DDPM noise-prediction MSE loss, `num_timesteps`/`beta_start`/`beta_end` config-driven. |
 | `warm_start.py` | `load_state_dict_tolerant(module, state_dict)` — tolerant checkpoint loading for external (e.g. MAISI/Pinaya) warm-start weights: filters out shape-mismatched keys before calling `load_state_dict(strict=False)` (which alone still raises on shape mismatch) and logs skipped/missing/unexpected keys separately. |
@@ -168,6 +192,12 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
 - `data/sampling.py`'s `domain_oversampling_weights(records, *, boost_by_field)` — per-record
   weights for `torch.utils.data.WeightedRandomSampler` (e.g. `{0.1: 3.0}` to oversample
   0.1T 3x). No default map ships — the ratio is an experiment hyperparameter, not a guess.
+- `data/pseudo_pairs.py`'s `PseudoPairSliceDataset` expands persisted volume splits into
+  slices lazily with a tiny LRU volume cache and an injected loader. `make_field_balanced_sampler`
+  uses inverse target-field frequency so 1.5T/3T/5T/7T examples contribute approximately
+  equally within each epoch.
+- `data/volume_splits.py` builds, saves, reloads, summarizes, and audits volume-disjoint
+  splits before slice expansion.
 
 ### Transforms (`data/transforms.py`)
 
@@ -183,6 +213,9 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
   (`cli.py`'s `_manifest_transform`). Eval reconstructs full volumes tile-by-tile via
   `evaluation/stage1_report.py`'s sliding window (§8) rather than cropping.
 - `compose(transforms)` — chains transforms in order.
+- `data/preprocessing.py` owns the pseudo-pair slice path: official `[0, 1]` validation,
+  uniform axial slice selection, model-boundary range mapping, and reversible fit/pad
+  geometry metadata for visualization or volume reconstruction.
 
 ## 8. Evaluation (`evaluation/metrics.py`, `evaluation/stage1_report.py`)
 
@@ -231,6 +264,8 @@ zip; do not reimplement naming or validation logic elsewhere.
 ```powershell
 fieldbridge smoke-train [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
 fieldbridge train        [--config PATH] [--steps N] [--batch-size N] [--seed N] [--manifest PATH] [--json]
+fieldbridge train-pseudo-pairs [--config PATH] --manifest PATH [--epochs N] [--batch-size N] [--checkpoint-dir DIR] [--preflight] [--json]
+fieldbridge eval-pseudo-pairs --checkpoint PATH --manifest PATH [--config PATH] [--split validation|test] [--json]
 fieldbridge train-stage1-vae --manifest PATH [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
 fieldbridge eval-stage1-vae --checkpoint PATH --manifest PATH --out DIR [--config PATH] [--num-samples N] [--per-domain] [--overlap F] [--metrics-raw PATH]
 fieldbridge train-stage2-diffuser --manifest PATH [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
@@ -261,6 +296,19 @@ non-training callers keep the deterministic manifest order.
 (`--overlap`), `--per-domain` field sampling, optional `--metrics-raw` to overlay the
 training loss curve.
 
+`eval-pseudo-pairs` reports degraded `x_low` versus `x_high` and predicted `x_pred`
+versus `x_high`, with aggregate and per-target-field metrics plus improvement over the
+degraded baseline. It also runs a target-conditioning audit by evaluating correct target
+domains and intentionally permuted target domains. LPIPS is optional; when the dependency
+or local weights are unavailable, the report marks LPIPS skipped instead of failing the
+core package.
+
+`train-pseudo-pairs --preflight` constructs/persists the split, audits leakage, builds the
+datasets, loads one sample per non-empty split, and reports derived dataset lengths,
+steps per epoch, configured preprocessing geometry/range, and sample intensity ranges
+without running an optimizer step. This is the intended Colab check before GPU training
+against a Drive-backed manifest.
+
 ## 11. Configuration schema
 
 - `configs/data/*.yaml` — dataset config (`num_samples`, `volume_shape`,
@@ -283,6 +331,13 @@ training loss curve.
     encoder also clamps `logvar` to `[-30, 20]` internally (KL/overflow guard).
   - `stage2_diffuser.yaml` consumed by `Stage2DiffuserConfig.from_mapping`: adds
     `num_timesteps`, `beta_start`, `beta_end`, `train_vae_jointly`, `vae_checkpoint`.
+  - `pseudo_pair_t2flair_pilot.yaml` consumed by `train-pseudo-pairs`/`eval-pseudo-pairs`:
+    volume counts per target field, `SlicePreprocessingSpec`, shared conditional U-Net
+    kwargs, epoch count, batch size, AdamW/scheduler settings, checkpoint directory, and
+    pseudo-pair loss weights.
+  - `pseudo_pair_t2flair_micro.yaml` is the Colab preflight/micro-run variant: 2 train
+    volumes per target field, 1 validation, 1 test, 8 slices/volume, `128x160` fit/pad,
+    batch size 4, `num_workers=0`, and 1 epoch.
 
 No magic numbers in code — every hyperparameter above is config-driven with an explicit
 default in the corresponding dataclass.
@@ -312,6 +367,11 @@ files:
 - `test_train_loop.py` — finite losses, `assert_frozen`, checkpoint + resume (Etapa 2).
 - `test_conditional_cnn_translator.py`, `test_conditional_unet_translator.py` — the two
   Etapa 2 baseline translators.
+- `test_pseudo_pair_preprocessing.py`, `test_volume_splits.py`,
+  `test_pseudo_pair_dataset.py`, `test_pseudo_pair_training.py`,
+  `test_pseudo_pair_evaluation.py` — official `[0, 1]` slice preprocessing,
+  volume-disjoint split persistence/leakage audits, lazy pseudo-pair slices, balanced
+  sampling, epoch checkpoints/resume, and degraded/predicted evaluation reports.
 - `test_cli_train.py` — the `train` command end-to-end on the default smoke config.
 - `test_mrixfields2026_*.py` — the official challenge layer (spec, submission,
   validation, CLI, data manifest) — untouched, already exhaustive.

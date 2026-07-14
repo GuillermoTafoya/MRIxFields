@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -8,7 +9,7 @@ from fieldbridge.data.pseudo_pairs import (
     collate_pseudo_pair_slices,
 )
 from fieldbridge.models.translators.base import BaseTranslator
-from fieldbridge.training.checkpoints import load_checkpoint
+from fieldbridge.training.checkpoints import load_checkpoint, save_checkpoint
 from fieldbridge.training.pseudo_pair_epochs import (
     PseudoPairEpochConfig,
     train_pseudo_pair_epochs,
@@ -158,3 +159,19 @@ def test_loss_decreases_in_tiny_synthetic_setup(tmp_path) -> None:
     )
 
     assert result.history[-1]["train"]["loss"] < result.history[0]["train"]["loss"]
+
+
+def test_resume_rejects_pseudo_pair_v1_checkpoint(tmp_path) -> None:
+    checkpoint = tmp_path / "pseudo-pair-v1.pt"
+    save_checkpoint(
+        checkpoint,
+        {"trainer": "pseudo_pair_epochs", "pseudo_pair_pipeline_version": 1},
+    )
+
+    with pytest.raises(ValueError, match="start a fresh run"):
+        train_pseudo_pair_epochs(
+            _config(tmp_path, epochs=2, resume_from=checkpoint),
+            model=_AdditiveTranslator(),
+            train_loader=_loader(),
+            val_loader=_loader(),
+        )

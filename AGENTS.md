@@ -5,9 +5,9 @@ Repository guidance for Codex and other coding agents working on FieldBridge.
 ## Project Purpose
 
 FieldBridge is a research scaffold for polymorphic MRI field and contrast translation.
-The current codebase is intentionally synthetic-data-only and CPU-friendly. It defines
-contracts, interfaces, stubs, configs, tests, and a smoke training path, but it must
-not include real MRI data or generated research artifacts.
+Repository tests and fixtures are synthetic-only and CPU-friendly. Real-data execution
+is supported through external manifests consumed by the same package contracts. Real
+MRI data and generated research artifacts must never be committed to this repository.
 
 ## Repo Layout
 
@@ -21,8 +21,8 @@ not include real MRI data or generated research artifacts.
 - `src/fieldbridge/evaluation/`: lightweight tensor metrics.
 - `src/fieldbridge/config/`: YAML config loading helpers.
 - `configs/`: checked-in synthetic/model/experiment YAML examples.
-- `docs/`: architecture reference (`ARCHITECTURE.md`) and per-phase implementation
-  plans (`docs/plans/`).
+- `docs/`: architecture reference, evaluation protocol, current research status,
+  architecture decision records, and per-phase implementation plans.
 - `notebooks/`: lightweight bootstrap scripts only. Do not add executed notebooks
   or outputs.
 - `tests/`: pytest coverage for domains, datasets, model interfaces, and smoke
@@ -75,6 +75,24 @@ Do not install or download dependencies unless the user explicitly approves it.
   `NotImplementedError` until real behavior is added.
 - Preserve the CLI commands `smoke-train`, `print-config`, and `audit-manifest`.
 - Keep changes scoped. Avoid unrelated refactors when making feature or bug fixes.
+
+## Scientific And Data Invariants
+
+- Repository tests and fixtures must remain synthetic-only. Real-data execution is
+  supported only through external manifests that are not committed to the repository.
+- The raw NIfTI loader tensor order is `(C, X, Y, Z)`.
+- Do not infer anatomical plane names from tensor axes without orientation or affine
+  metadata.
+- The pseudo-pair axial convention is `volume[:, :, :, z]`.
+- Subject and volume splitting must happen before slice or patch expansion.
+- Real data, checkpoints, run outputs, and machine-specific absolute paths stay outside
+  the repository.
+- Every run must record the Git commit, resolved config, split
+  fingerprint, seed, and checkpoint version.
+- Pseudo-pair v1 checkpoints predate the axis and background-loss corrections and must
+  not be used as scientific evidence.
+- Slice metrics alone do not support complete-volume or challenge-level translation
+  claims.
 
 ## Data And Artifact Rules
 

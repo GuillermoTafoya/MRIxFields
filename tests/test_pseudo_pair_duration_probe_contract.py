@@ -1,5 +1,7 @@
 import ast
 import json
+import re
+import statistics
 from copy import deepcopy
 from pathlib import Path
 
@@ -97,6 +99,13 @@ def test_duration_probe_notebook_is_unexecuted_and_enforces_run_contract() -> No
     assert 'STATE.get("epoch", -1)' in source
     assert 'STATE.get("global_step", -1)' in source
     assert "EXPECTED_GLOBAL_STEPS / TRAIN_WALL_SECONDS" in source
+    install_index = source.index('"pip", "install"')
+    source_path_index = source.index("sys.path.insert(0, SOURCE_DIR)")
+    invalidate_index = source.index("importlib.invalidate_caches()")
+    package_import_index = source.index("import fieldbridge as installed_fieldbridge")
+    assert install_index < source_path_index < invalidate_index < package_import_index
+    assert 'module_name.startswith("fieldbridge.")' in source
+    assert "REPO_DIR not in PACKAGE_FILE.parents" in source
 
     for telemetry_field in (
         "utilization.gpu",
@@ -107,6 +116,11 @@ def test_duration_probe_notebook_is_unexecuted_and_enforces_run_contract() -> No
     ):
         assert telemetry_field in source
     assert '"--loop=5"' in source
+    assert '"gpu_utilization_percent"' in source
+    assert '"memory_used_mib"' in source
+    assert '"power_draw_watts"' in source
+    assert '"p95"' in source
+    assert '"gpu_telemetry": GPU_TELEMETRY_SUMMARY' in source
     assert "codex_handoff_sanitized.json" in source
     assert '"scaled_pilot": "BLOCKED_PENDING_REVIEW"' in source
     assert "pseudo_pair_t2flair_pilot.yaml" not in source
@@ -148,6 +162,60 @@ def test_duration_probe_handoff_literal_contains_no_private_identity_or_artifact
     assert "split_sha256" in constants
     assert "development_reuse_not_confirmatory" in constants
     assert "sampled_slice_per_volume_exploratory" in constants
+    assert "gpu_telemetry" in constants
+
+
+def test_duration_probe_telemetry_summary_is_numeric_and_sanitized() -> None:
+    notebook = json.loads(NOTEBOOK_PATH.read_text(encoding="utf-8"))
+    telemetry_cell = next(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+        and "def summarize_nvidia_smi" in "".join(cell["source"])
+    )
+    tree = ast.parse(telemetry_cell)
+    functions = ast.Module(
+        body=[node for node in tree.body if isinstance(node, ast.FunctionDef)],
+        type_ignores=[],
+    )
+    namespace = {"re": re, "statistics": statistics}
+    exec(compile(functions, "duration_probe_telemetry", "exec"), namespace)
+
+    rows = [
+        {
+            "utilization.gpu [%]": "10 %",
+            "memory.used [MiB]": "100 MiB",
+            "power.draw [W]": "50 W",
+        },
+        {
+            "utilization.gpu [%]": "20 %",
+            "memory.used [MiB]": "400 MiB",
+            "power.draw [W]": "60 W",
+        },
+        {
+            "utilization.gpu [%]": "30 %",
+            "memory.used [MiB]": "300 MiB",
+            "power.draw [W]": "70 W",
+        },
+        {
+            "utilization.gpu [%]": "40 %",
+            "memory.used [MiB]": "200 MiB",
+            "power.draw [W]": "80 W",
+        },
+    ]
+    summary = namespace["summarize_nvidia_smi"](rows)
+
+    assert summary == {
+        "gpu_utilization_percent": {
+            "mean": 25.0,
+            "median": 25.0,
+            "p95": 38.5,
+            "max": 40.0,
+        },
+        "memory_used_mib": {"max": 400.0},
+        "power_draw_watts": {"mean": 65.0, "max": 80.0},
+    }
+    assert not any("path" in key for key in summary)
 
 
 def test_status_records_user_supplied_negative_result_without_overclaiming() -> None:
@@ -161,4 +229,9 @@ def test_status_records_user_supplied_negative_result_without_overclaiming() -> 
     assert "No target field improved nRMSE (`0/4`)" in status
     assert "valid negative evidence" in status
     assert "scaled pilot remains blocked" in status
-    assert "cannot itself satisfy promotion or final-volume gates" in status
+    assert "cannot satisfy promotion or\nfinal-volume gates" in status
+    assert "Macro nRMSE | 0.05404807 | 0.03838583" in status
+    assert "Macro SSIM | 0.87432381 | 0.53409448" in status
+    assert "Increasing duration rescued nRMSE" in status
+    assert "did not\nrescue SSIM or target conditioning" in status
+    assert "observed development split; not confirmatory evidence" in status

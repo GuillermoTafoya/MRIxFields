@@ -245,8 +245,12 @@ def _aggregate(metrics: Sequence[SampleMetrics]) -> dict[str, float]:
     return {key: float(sum(getattr(m, key) for m in metrics) / len(metrics)) for key in keys}
 
 
-def _mid_slice(volume: torch.Tensor) -> "Any":
-    # volume: (B, C, D, H, W) -> central axial slice of the first item/channel.
+def _central_first_spatial_axis_slice(volume: torch.Tensor) -> "Any":
+    """Return a display-rotated center slice along the first raw spatial axis.
+
+    No anatomical plane is implied without orientation or affine metadata.
+    """
+
     import numpy as np
 
     array = volume[0, 0].numpy()
@@ -280,8 +284,8 @@ def _plot_diagnostics(
     rows = max(len(samples), 1)
     fig, axes = plt.subplots(rows, 4, figsize=(20, 5 * rows), squeeze=False)
     for row, (sample, metric) in enumerate(zip(samples, metrics)):
-        original = _mid_slice(sample["original"])
-        recon = _mid_slice(sample["recon"])
+        original = _central_first_spatial_axis_slice(sample["original"])
+        recon = _central_first_spatial_axis_slice(sample["recon"])
         error = np.abs(original - recon)
 
         axes[row][0].imshow(original, cmap="gray", vmin=-1, vmax=1)

@@ -12,11 +12,14 @@ from fieldbridge.models.translators.base import BaseTranslator
 
 
 class _EvalDataset(Dataset[PseudoPairSliceSample]):
+    def __init__(self, fields: tuple[float, ...] = (1.5, 3.0, 1.5, 3.0)) -> None:
+        self.fields = fields
+
     def __len__(self) -> int:
-        return 4
+        return len(self.fields)
 
     def __getitem__(self, index: int) -> PseudoPairSliceSample:
-        field = 1.5 if index % 2 == 0 else 3.0
+        field = self.fields[index]
         target_value = field / 7.0
         return PseudoPairSliceSample(
             x_low=torch.zeros(1, 8, 8),
@@ -57,9 +60,11 @@ class _TargetValueTranslator(BaseTranslator):
         return stacked + self.anchor * 0.0
 
 
-def _loader() -> DataLoader[PseudoPairSliceSample]:
+def _loader(
+    fields: tuple[float, ...] = (1.5, 3.0, 1.5, 3.0),
+) -> DataLoader[PseudoPairSliceSample]:
     return DataLoader(
-        _EvalDataset(),
+        _EvalDataset(fields),
         batch_size=2,
         shuffle=False,
         collate_fn=collate_pseudo_pair_slices,
@@ -121,3 +126,24 @@ def test_lpips_gracefully_skips_when_optional_dependency_is_unavailable(monkeypa
 
     assert payload["lpips"]["skipped"] is True
     assert "lpips unavailable" in payload["lpips"]["reason"]
+
+
+def test_conditioning_audit_covers_all_four_target_fields() -> None:
+    fields = (1.5, 3.0, 5.0, 7.0)
+    payload = evaluate_pseudo_pairs(
+        _TargetValueTranslator(),
+        _loader(fields),
+        PseudoPairEvalConfig(model_range="zero_one", lpips="off", target_fields=fields),
+    )
+
+    audit = payload["target_conditioning_audit"]
+    labels = {"1.5T", "3T", "5T", "7T"}
+
+    assert set(payload["per_target_field"]) == labels
+    assert set(audit["by_true_target_field"]) == labels
+    assert set(audit["by_wrong_target_field"]) == labels
+    assert audit["sample_level"]["samples_with_wrong_targets"] == 4
+    assert audit["sample_level"]["fraction_correct_best_nrmse"] == 1.0
+    for label in labels:
+        assert audit["by_true_target_field"][label]["samples_with_wrong_targets"] == 1
+        assert audit["by_wrong_target_field"][label]["samples"] == 3

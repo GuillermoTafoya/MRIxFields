@@ -1,6 +1,7 @@
 import builtins
 import json
 
+import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -9,6 +10,7 @@ from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
 from fieldbridge.evaluation.stage1_report import (
+    _central_first_spatial_axis_slice,
     _hann_window_3d,
     _matplotlib_pyplot,
     run_stage1_eval,
@@ -172,3 +174,20 @@ def test_missing_matplotlib_names_evaluation_extra(monkeypatch) -> None:
     message = str(exc_info.value)
     assert "'evaluation' extra" in message
     assert 'pip install -e ".[nifti,evaluation]"' in message
+
+
+def test_diagnostic_slice_uses_first_raw_spatial_axis_without_plane_claim() -> None:
+    volume = torch.empty(1, 1, 3, 4, 5)
+    coordinates = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    for axis_index in range(3):
+        volume[0, 0, axis_index] = coordinates + axis_index * 100
+
+    selected = _central_first_spatial_axis_slice(volume)
+    expected = np.rot90(volume[0, 0, 1].numpy())
+
+    assert np.array_equal(selected, expected)
+    assert not np.array_equal(selected, np.rot90(volume[0, 0, 0].numpy()))
+    contract = _central_first_spatial_axis_slice.__doc__ or ""
+    assert "first raw spatial axis" in contract
+    assert "anatomical plane" in contract
+    assert "axial" not in contract.lower()

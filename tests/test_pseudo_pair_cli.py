@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from fieldbridge.cli import main
+from fieldbridge.training.checkpoints import save_checkpoint
 
 
 def _write_manifest(tmp_path: Path) -> Path:
@@ -147,3 +149,28 @@ def test_train_and_eval_pseudo_pairs_cli_with_injected_loader(tmp_path, monkeypa
     assert eval_payload["num_samples"] == 2
     assert "degraded" in eval_payload["aggregate"]
     assert "predicted" in eval_payload["aggregate"]
+
+
+def test_eval_pseudo_pairs_rejects_v1_checkpoint(tmp_path) -> None:
+    manifest = _write_manifest(tmp_path)
+    config = _write_config(tmp_path)
+    checkpoint = tmp_path / "pseudo-pair-v1.pt"
+    save_checkpoint(
+        checkpoint,
+        {"trainer": "pseudo_pair_epochs", "pseudo_pair_pipeline_version": 1},
+    )
+
+    with pytest.raises(ValueError, match="rerun train-pseudo-pairs from scratch"):
+        main(
+            [
+                "eval-pseudo-pairs",
+                "--config",
+                str(config),
+                "--manifest",
+                str(manifest),
+                "--checkpoint",
+                str(checkpoint),
+                "--split",
+                "validation",
+            ]
+        )

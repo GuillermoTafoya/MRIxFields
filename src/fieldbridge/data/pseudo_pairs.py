@@ -36,6 +36,7 @@ class PseudoPairSliceSample:
     source_domain: Domain
     target_domain: Domain
     record_id: str
+    subject_id: str
     volume_path: str
     slice_index: int
     degradation_seed: int
@@ -51,6 +52,7 @@ class PseudoPairSliceBatch:
     source_domain: list[Domain]
     target_domain: list[Domain]
     record_id: list[str]
+    subject_id: list[str]
     volume_path: list[str]
     slice_index: torch.Tensor
     degradation_seed: list[int]
@@ -77,6 +79,11 @@ class PseudoPairSliceDataset(Dataset[PseudoPairSliceSample]):
         if mode not in ("train", "validation", "test"):
             raise ValueError("mode must be 'train', 'validation', or 'test'.")
         self.records = tuple(records)
+        for record in self.records:
+            if record.subject_id is None or not str(record.subject_id).strip():
+                raise ValueError(
+                    f"Pseudo-pair record {record.case_id!r} requires a non-empty subject_id."
+                )
         self.image_loader = image_loader
         self.source_domain = Domain(source_field, sequence)
         self.preprocessing = preprocessing or SlicePreprocessingSpec()
@@ -120,6 +127,7 @@ class PseudoPairSliceDataset(Dataset[PseudoPairSliceSample]):
             source_domain=self.source_domain,
             target_domain=target_domain,
             record_id=record.case_id,
+            subject_id=str(record.subject_id),
             volume_path=str(record.image_path),
             slice_index=slice_index,
             degradation_seed=degradation_seed,
@@ -167,6 +175,7 @@ def collate_pseudo_pair_slices(items: Sequence[PseudoPairSliceSample]) -> Pseudo
         source_domain=[item.source_domain for item in items],
         target_domain=[item.target_domain for item in items],
         record_id=[item.record_id for item in items],
+        subject_id=[item.subject_id for item in items],
         volume_path=[item.volume_path for item in items],
         slice_index=torch.tensor([item.slice_index for item in items], dtype=torch.long),
         degradation_seed=[item.degradation_seed for item in items],

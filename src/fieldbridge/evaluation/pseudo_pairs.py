@@ -96,6 +96,14 @@ def evaluate_pseudo_pairs(
                 mask = batch.mask[index : index + 1].to(device)
                 target_field = float(target_domain.field_strength_t)
                 target_field_label = _field_label(target_field)
+                slice_identity = {
+                    "record_id": batch.record_id[index],
+                    "subject_id": batch.subject_id[index],
+                    "volume_path": batch.volume_path[index],
+                    "slice_index": int(batch.slice_index[index].detach().cpu()),
+                    "degradation_seed": int(batch.degradation_seed[index]),
+                    "target_field": target_field_label,
+                }
                 degraded_metrics = _compute_metrics(
                     x_low[index : index + 1],
                     target,
@@ -122,7 +130,7 @@ def evaluate_pseudo_pairs(
                     wrong_metrics_by_field[wrong_field_label] = wrong_metrics
                     wrong_rows.append(
                         {
-                            "target_field": target_field_label,
+                            **slice_identity,
                             "wrong_target_field": wrong_field_label,
                             "predicted": predicted_metrics,
                             "wrong_conditioned": wrong_metrics,
@@ -138,7 +146,7 @@ def evaluate_pseudo_pairs(
                 correct_nrmse = predicted_metrics["nrmse"]
                 rows.append(
                     {
-                        "target_field": target_field_label,
+                        **slice_identity,
                         "degraded": degraded_metrics,
                         "predicted": predicted_metrics,
                         "wrong_conditioned": wrong_summary,
@@ -178,7 +186,13 @@ def evaluate_pseudo_pairs(
     improvement = _metric_delta(aggregate["degraded"], aggregate["predicted"])
     conditioning_effect = _metric_effect(aggregate["wrong_conditioned"], aggregate["predicted"])
     permuted_effect = _metric_effect(aggregate["permuted_conditioned"], aggregate["predicted"])
+    volume_summary = _sampled_slice_per_volume_summary(rows, cfg.target_fields)
     return {
+        "aggregation_unit": "slice",
+        "evidence_scope": volume_summary["evidence_scope"],
+        "complete_volume": False,
+        "counts": volume_summary["counts"],
+        "selected_slice_rows": rows,
         "num_samples": len(rows),
         "aggregate": aggregate,
         "macro_average": macro_average,
@@ -186,12 +200,14 @@ def evaluate_pseudo_pairs(
         "improvement_over_degraded": improvement,
         "target_conditioning_audit": {
             "metric": "nrmse",
+            "aggregation_unit": "slice",
             "correct_vs_wrong_improvement": conditioning_effect,
             "correct_vs_permuted_improvement": permuted_effect,
             "sample_level": _conditioning_sample_summary(rows),
             "by_true_target_field": _conditioning_summary_by_true_field(rows),
             "by_wrong_target_field": _conditioning_summary_by_wrong_field(wrong_rows),
         },
+        "sampled_slice_per_volume": volume_summary,
         "lpips": lpips_status,
     }
 
@@ -257,6 +273,338 @@ def _aggregate_by_field(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         }
     return payload
 
+
+
+def _sampled_slice_per_volume_summary(
+    rows: Sequence[Mapping[str, Any]],
+    target_fields: Sequence[float],
+) -> dict[str, Any]:
+    volume_rows = _average_selected_slices_by_volume(rows)
+    observed_fields = {str(row["target_field"]) for row in volume_rows}
+    expected_fields = {_field_label(field) for field in target_fields}
+    if not expected_fields:
+        expected_fields = set(observed_fields)
+    missing_fields = sorted(expected_fields - observed_fields)
+    excluded_fields = sorted(observed_fields - expected_fields)
+    included_rows = [
+        row for row in volume_rows if str(row["target_field"]) in expected_fields
+    ]
+
+    aggregate = {
+        "degraded": _aggregate(included_rows, "degraded"),
+        "predicted": _aggregate(included_rows, "predicted"),
+        "wrong_conditioned": _aggregate(included_rows, "wrong_conditioned"),
+        "permuted_conditioned": _aggregate(included_rows, "permuted_conditioned"),
+    }
+    per_field = _aggregate_volumes_by_field(included_rows)
+    macro_average = {
+        "degraded": _macro_average(per_field, "degraded"),
+        "predicted": _macro_average(per_field, "predicted"),
+        "wrong_conditioned": _macro_average(per_field, "wrong_conditioned"),
+        "permuted_conditioned": _macro_average(per_field, "permuted_conditioned"),
+    }
+    volume_wrong_rows = _volume_wrong_rows(included_rows)
+    counts = {
+        "subjects": len({str(row["subject_id"]) for row in included_rows}),
+        "volumes": len(included_rows),
+        "selected_slices": sum(int(row["selected_slices"]) for row in included_rows),
+        "slices_per_volume": {
+            str(row["record_id"]): int(row["selected_slices"]) for row in included_rows
+        },
+        "expected_fields": sorted(expected_fields),
+        "observed_fields": sorted(observed_fields),
+        "missing_fields": missing_fields,
+        "excluded_fields": excluded_fields,
+    }
+    macro_effect = _metric_effect(
+        macro_average["degraded"],
+        macro_average["predicted"],
+    )
+    return {
+        "evidence_scope": "sampled_slice_per_volume_exploratory",
+        "aggregation_unit": "sampled_slice_per_volume",
+        "complete_volume": False,
+        "counts": counts,
+        "per_volume": included_rows,
+        "aggregate": aggregate,
+        "per_target_field": per_field,
+        "macro_average": macro_average,
+        "macro_improvement_over_degraded": macro_effect,
+        "primary_exploratory_macro": {
+            "weighting": (
+                "unweighted_across_fields_after_equal_volume_weighting_within_field"
+            ),
+            "metrics": macro_average,
+            "improvement_over_degraded": macro_effect,
+        },
+        "target_conditioning_audit": {
+            "metric": "mean_selected_slice_nrmse",
+            "correct_vs_wrong_improvement": _metric_effect(
+                macro_average["wrong_conditioned"],
+                macro_average["predicted"],
+            ),
+            "correct_vs_permuted_improvement": _metric_effect(
+                macro_average["permuted_conditioned"],
+                macro_average["predicted"],
+            ),
+            "volume_level": _conditioning_volume_summary(included_rows),
+            "by_true_target_field": _conditioning_volume_summary_by_true_field(
+                included_rows
+            ),
+            "by_wrong_target_field": _conditioning_volume_summary_by_wrong_field(
+                volume_wrong_rows
+            ),
+        },
+    }
+
+
+def _average_selected_slices_by_volume(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped = _group_slice_rows_by_volume(rows)
+    volume_rows: list[dict[str, Any]] = []
+    for record_id, raw_volume_rows in sorted(grouped.items()):
+        slice_rows = sorted(
+            raw_volume_rows,
+            key=lambda row: (int(row["slice_index"]), int(row["degradation_seed"])),
+        )
+        first = slice_rows[0]
+        wrong_fields = sorted(
+            {
+                str(field)
+                for row in slice_rows
+                for field in _wrong_metrics_by_field(row)
+            }
+        )
+        wrong_by_field = {
+            field: _mean_metric_dict(
+                _wrong_metrics_by_field(row)[field]
+                for row in slice_rows
+                if field in _wrong_metrics_by_field(row)
+            )
+            for field in wrong_fields
+        }
+        predicted = _aggregate(slice_rows, "predicted")
+        wrong_conditioned = (
+            _mean_metric_dict(wrong_by_field.values())
+            if wrong_by_field
+            else dict(predicted)
+        )
+        best_wrong_nrmse = (
+            min(metrics["nrmse"] for metrics in wrong_by_field.values())
+            if wrong_by_field
+            else None
+        )
+        correct_nrmse = predicted.get("nrmse")
+        margin = (
+            None
+            if best_wrong_nrmse is None or correct_nrmse is None
+            else best_wrong_nrmse - correct_nrmse
+        )
+        volume_rows.append(
+            {
+                "volume_id": record_id,
+                "record_id": record_id,
+                "subject_id": str(first["subject_id"]),
+                "volume_path": str(first["volume_path"]),
+                "target_field": str(first["target_field"]),
+                "selected_slices": len(slice_rows),
+                "slice_indices": [int(row["slice_index"]) for row in slice_rows],
+                "degradation_seeds": [
+                    int(row["degradation_seed"]) for row in slice_rows
+                ],
+                "degraded": _aggregate(slice_rows, "degraded"),
+                "predicted": predicted,
+                "wrong_conditioned": wrong_conditioned,
+                "wrong_conditioned_by_target_field": wrong_by_field,
+                "permuted_conditioned": _aggregate(
+                    slice_rows,
+                    "permuted_conditioned",
+                ),
+                "conditioning": {
+                    "correct_mean_selected_slice_nrmse": correct_nrmse,
+                    "best_wrong_mean_selected_slice_nrmse": best_wrong_nrmse,
+                    "margin_vs_best_wrong_nrmse": margin,
+                    "correct_has_best_nrmse": (
+                        None
+                        if margin is None
+                        else margin >= 0.0
+                    ),
+                },
+            }
+        )
+    return volume_rows
+
+
+def _group_slice_rows_by_volume(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, list[Mapping[str, Any]]]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    record_metadata: dict[str, tuple[str, str, str]] = {}
+    path_metadata: dict[str, tuple[str, str, str]] = {}
+    for row in rows:
+        record_id = _required_identity_text(row, "record_id")
+        subject_id = _required_identity_text(row, "subject_id")
+        volume_path = _required_identity_text(row, "volume_path")
+        target_field = _required_identity_text(row, "target_field")
+        metadata = (volume_path, subject_id, target_field)
+        existing_record = record_metadata.get(record_id)
+        if existing_record is not None and existing_record != metadata:
+            raise ValueError(
+                "Conflicting volume identity metadata for "
+                f"record_id {record_id!r}: {existing_record!r} != {metadata!r}."
+            )
+        path_owner = (record_id, subject_id, target_field)
+        existing_path = path_metadata.get(volume_path)
+        if existing_path is not None and existing_path != path_owner:
+            raise ValueError(
+                "Conflicting volume identity metadata for "
+                f"volume_path {volume_path!r}: {existing_path!r} != {path_owner!r}."
+            )
+        record_metadata[record_id] = metadata
+        path_metadata[volume_path] = path_owner
+        grouped[record_id].append(row)
+    return grouped
+
+
+def _required_identity_text(row: Mapping[str, Any], key: str) -> str:
+    value = row.get(key)
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise ValueError(
+            f"Evaluator row requires non-empty volume identity field {key!r}."
+        )
+    return text
+
+
+def _wrong_metrics_by_field(
+    row: Mapping[str, Any],
+) -> Mapping[str, Mapping[str, float]]:
+    value = row.get("wrong_conditioned_by_target_field", {})
+    if not isinstance(value, Mapping):
+        raise ValueError("wrong_conditioned_by_target_field must be a mapping.")
+    return value
+
+
+def _aggregate_volumes_by_field(
+    volume_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in volume_rows:
+        grouped[str(row["target_field"])].append(row)
+    payload: dict[str, Any] = {}
+    for field, field_rows in sorted(grouped.items()):
+        degraded = _aggregate(field_rows, "degraded")
+        predicted = _aggregate(field_rows, "predicted")
+        wrong_conditioned = _aggregate(field_rows, "wrong_conditioned")
+        permuted_conditioned = _aggregate(field_rows, "permuted_conditioned")
+        payload[field] = {
+            "subjects": len({str(row["subject_id"]) for row in field_rows}),
+            "volumes": len(field_rows),
+            "selected_slices": sum(
+                int(row["selected_slices"]) for row in field_rows
+            ),
+            "degraded": degraded,
+            "predicted": predicted,
+            "wrong_conditioned": wrong_conditioned,
+            "permuted_conditioned": permuted_conditioned,
+            "improvement_over_degraded": _metric_effect(degraded, predicted),
+            "target_conditioning_audit": {
+                "correct_vs_wrong_improvement": _metric_effect(
+                    wrong_conditioned,
+                    predicted,
+                ),
+                "correct_vs_permuted_improvement": _metric_effect(
+                    permuted_conditioned,
+                    predicted,
+                ),
+                "volume_level": _conditioning_volume_summary(field_rows),
+            },
+        }
+    return payload
+
+
+def _volume_wrong_rows(
+    volume_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    wrong_rows: list[dict[str, Any]] = []
+    for row in volume_rows:
+        for wrong_field, wrong_metrics in _wrong_metrics_by_field(row).items():
+            wrong_rows.append(
+                {
+                    "record_id": str(row["record_id"]),
+                    "subject_id": str(row["subject_id"]),
+                    "volume_path": str(row["volume_path"]),
+                    "target_field": str(row["target_field"]),
+                    "wrong_target_field": str(wrong_field),
+                    "selected_slices": int(row["selected_slices"]),
+                    "predicted": row["predicted"],
+                    "wrong_conditioned": wrong_metrics,
+                }
+            )
+    return wrong_rows
+
+
+def _conditioning_volume_summary(
+    volume_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    flags: list[bool] = []
+    margins: list[float] = []
+    for row in volume_rows:
+        conditioning = row.get("conditioning", {})
+        if not isinstance(conditioning, Mapping):
+            continue
+        flag = conditioning.get("correct_has_best_nrmse")
+        margin = conditioning.get("margin_vs_best_wrong_nrmse")
+        if flag is not None:
+            flags.append(bool(flag))
+        if margin is not None:
+            margins.append(float(margin))
+    return {
+        "volumes_with_wrong_targets": len(flags),
+        "fraction_volumes_correct_best_nrmse": (
+            None if not flags else sum(flags) / len(flags)
+        ),
+        "mean_margin_vs_best_wrong_nrmse": _mean_or_none(margins),
+        "median_margin_vs_best_wrong_nrmse": _median_or_none(margins),
+    }
+
+
+def _conditioning_volume_summary_by_true_field(
+    volume_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in volume_rows:
+        grouped[str(row["target_field"])].append(row)
+    return {
+        field: {
+            "volumes": len(field_rows),
+            **_conditioning_volume_summary(field_rows),
+        }
+        for field, field_rows in sorted(grouped.items())
+    }
+
+
+def _conditioning_volume_summary_by_wrong_field(
+    wrong_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in wrong_rows:
+        grouped[str(row["wrong_target_field"])].append(row)
+    payload: dict[str, Any] = {}
+    for wrong_field, field_rows in sorted(grouped.items()):
+        predicted = _aggregate(field_rows, "predicted")
+        wrong_conditioned = _aggregate(field_rows, "wrong_conditioned")
+        payload[wrong_field] = {
+            "volumes": len(field_rows),
+            "predicted": predicted,
+            "wrong_conditioned": wrong_conditioned,
+            "correct_vs_wrong_improvement": _metric_effect(
+                wrong_conditioned,
+                predicted,
+            ),
+        }
+    return payload
 
 def _macro_average(per_field: Mapping[str, Mapping[str, Any]], key: str) -> dict[str, float]:
     values: dict[str, list[float]] = defaultdict(list)
@@ -449,6 +797,7 @@ def _move_batch(batch: PseudoPairSliceBatch, device: torch.device) -> PseudoPair
         source_domain=batch.source_domain,
         target_domain=batch.target_domain,
         record_id=batch.record_id,
+        subject_id=batch.subject_id,
         volume_path=batch.volume_path,
         slice_index=batch.slice_index.to(device),
         degradation_seed=batch.degradation_seed,

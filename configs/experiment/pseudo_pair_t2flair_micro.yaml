@@ -58,6 +58,18 @@ training:
 
 evaluation:
   lpips: auto
+  # Frozen before the micro-v2 run. These are exploratory viability gates only;
+  # failure is valid negative evidence and does not authorize post-hoc changes.
+  evidence_scope: sampled_slice_per_volume_exploratory
+  evaluation_after_epoch: 2
+  min_macro_relative_nrmse_improvement: 0.02
+  min_macro_absolute_ssim_improvement: 0.005
+  min_fields_with_nrmse_improvement: 3
+  min_fraction_volumes_correct_best_nrmse: 0.50
+  min_mean_margin_vs_best_wrong_nrmse: 0.001
+  min_relative_correct_vs_wrong_nrmse_improvement: 0.01
+  min_relative_correct_vs_permuted_nrmse_improvement: 0.005
+  max_macro_outside_mask_mean_abs: 0.05
 
 # Expected training count:
 # 4 fields * 2 train volumes/field * 8 slices/volume = 64 train examples

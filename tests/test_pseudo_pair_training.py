@@ -32,6 +32,7 @@ class _FixedPseudoPairDataset(Dataset[PseudoPairSliceSample]):
             source_domain=Domain(0.1, "T2-FLAIR"),
             target_domain=Domain(field, "T2-FLAIR"),
             record_id=f"case-{index}",
+            subject_id=f"subject-{index}",
             volume_path=f"case-{index}.nii.gz",
             slice_index=index,
             degradation_seed=index,

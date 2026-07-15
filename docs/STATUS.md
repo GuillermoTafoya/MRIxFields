@@ -3,15 +3,15 @@
 Snapshot date: 2026-07-14
 
 Repository baseline: `origin/main` at
-`8631962f96ea07d1dfe51bbfa486ddac266cb828`.
+`c9ee9dd738f8d9fee7acf9340dc4325c47a639cd`.
 
 The shared north star is one shared-parameter conditional model that emits complete 3D
 MRI volumes. The current tracks test different risks and are intentionally separate.
 
 ## Track A: Deterministic Pseudo-Pair Baseline
 
-Status: corrected implementation available; micro-v2 produced valid negative
-development evidence; duration-only probe pending.
+Status: corrected implementation available; micro-v2 and duration-probe development
+evidence recorded; scientific promotion gate remains failed.
 
 Track A is the 2D axial `ConditionalUNetFieldTranslator` experiment for T2-FLAIR. It
 uses retrospective high-field targets, synthetic 0.1T degradation, volume/subject-first
@@ -56,6 +56,34 @@ The observed split is now development evidence because its test summaries have b
 examined. Reusing it for the predeclared duration probe controls the split while testing
 one variable, but no result from that reuse is confirmatory evidence.
 
+### Ten-Epoch Duration-Probe Development Result
+
+The following is also user-supplied evidence from the private Colab/Drive run. The
+repository does not have access to the duration-probe JSON, split, checkpoint, logs, or
+telemetry and has not independently verified them.
+
+- Code commit: `fe02d866deb060863f539cb30c08db608623cd69`.
+- Endpoint: epoch 10, global step 160.
+- Engineering gate: passed.
+- Scientific gate: failed.
+- Evidence scope: sampled-slice/per-volume exploratory; `complete_volume: false`.
+- Split role: observed development split; not confirmatory evidence.
+
+| Metric | Degraded input | Prediction |
+| --- | ---: | ---: |
+| Macro nRMSE | 0.05404807 | 0.03838583 |
+| Macro SSIM | 0.87432381 | 0.53409448 |
+
+All four fields improved nRMSE. Correct conditioning had the best mean selected-slice
+nRMSE for only `1/4` volumes, with mean margin `-0.00278850` versus the best wrong
+target. Relative correct-versus-wrong and correct-versus-permuted nRMSE effects were
+`-0.03584306` and `-0.04334417`, respectively.
+
+Increasing duration rescued nRMSE relative to the degraded-input baseline, but did not
+rescue SSIM or target conditioning. The probe therefore remains a scientific failure
+under the predeclared joint viability gates. It does not justify a scaled pilot,
+confirmatory claim, complete-volume claim, or real 0.1T translation claim.
+
 ## Track B: Volumetric Stage-1 Stack
 
 Status: infrastructure implemented; scientific and challenge evidence pending.
@@ -77,9 +105,10 @@ evidence. They must not be resumed or compared as if they were v2 results.
 
 ## Current Blockers
 
-- Track A micro-v2 failed its predeclared sampled-slice/per-volume scientific gate.
-- It is not yet known whether the negative result is a short-duration optimization
-  failure or a limitation of the deterministic conditional baseline.
+- Track A's 10-epoch duration probe rescued nRMSE but failed SSIM and conditioning
+  gates on the observed development split.
+- It remains unknown whether an identity-preserving residual parameterization can
+  retain the degraded baseline while learning useful restoration and conditioning.
 - The development split has been observed and cannot support a confirmatory claim.
 - Track A does not yet reconstruct and evaluate complete held-out NIfTI volumes.
 - Track B still needs controlled real-data reconstruction evidence and runtime/resource
@@ -89,16 +118,15 @@ evidence. They must not be resumed or compared as if they were v2 results.
 
 ## Next Decision Gate
 
-Run one fresh-initialization, 10-epoch duration probe with the same model, seed,
-degradation, preprocessing, target fields, losses, and development split after the
-launcher matches its supplied fingerprint. Evaluate the test split once at epoch 10,
-record GPU telemetry and throughput, and apply the already frozen micro-v2 viability
-thresholds without post-hoc changes.
+The scaled pilot remains blocked. The next allowed Track A development experiment is a
+separately named, fresh-initialization residual probe that starts exactly at the degraded
+input and changes only translator parameterization. It must retain the same observed
+split, seed, degradation, preprocessing, losses, duration, and frozen evaluation gates,
+and must report restoration gates separately from conditioning gates.
 
-The scaled pilot remains blocked. A failed duration probe is further valid negative
-development evidence. A passing probe may justify designing a new confirmatory run, but
-cannot itself satisfy promotion or final-volume gates because it reuses the observed
-split and still evaluates selected slices only.
+Any residual-probe result remains development evidence and cannot satisfy promotion or
+final-volume gates because the split has been observed and evaluation still uses
+selected slices only.
 
 Track B proceeds independently through its volumetric reconstruction gate.
 

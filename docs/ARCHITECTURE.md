@@ -85,6 +85,7 @@ field/contrast-specific subnetworks (disqualifying under the challenge rules).
 | `translators/identity.py` | Pass-through with an optional learnable scale (smoke tests). |
 | `translators/conditional_cnn.py` | CPU-friendly conditional CNN baseline for `x_hat = G(x, source_domain, target_domain)` on 2D slices or 3D volumes. |
 | `translators/conditional_unet.py` | Sharper deterministic U-Net baseline with conditioned decoder blocks and optional gated skips. |
+| `translators/conditional_residual_unet.py` | Development-only additive residual variant that composes the conditional U-Net, zero-initializes its residual head for exact step-zero identity, and clamps predictions to the configured model range. |
 | `translators/ot_cfm_stub.py`, `translators/sb_stub.py` | Intentional stubs — `raise NotImplementedError`. Real implementations replace these files in place (Fases D and E). |
 | `models/factory.py` | Name-based registry: `build_encoder/decoder/translator("identity", **kwargs)`. Extended with `"stargan_v2_latent"`, `"ot_cfm"`, `"schrodinger_bridge"` as those stages land. |
 
@@ -118,6 +119,14 @@ high-resolution anatomy without making the skip path an unconditional source-dom
 `skip_mode="concat"` provides ordinary U-Net concatenation, and `skip_mode="none"` falls
 back toward a bottleneck translator. This is still a deterministic baseline, not
 diffusion, a Schrodinger bridge, adversarial training, or a VAE.
+
+`ConditionalResidualUNetFieldTranslator` is a separately registered development-probe
+variant. It predicts `clamp(x_low + residual)` and zero-initializes only the residual
+output projection, making every target condition exactly equal to `x_low` at step zero.
+The first update reaches the residual head; once that head is nonzero, gradients also
+reach the residual feature and conditioning paths. The existing
+`ConditionalUNetFieldTranslator` implementation, factory names, state-dict keys, and
+checkpoint behavior remain unchanged.
 
 ### Epoch pseudo-pair baseline
 
@@ -347,6 +356,13 @@ manifest.
   - `pseudo_pair_t2flair_micro.yaml` is the Colab preflight/micro-run variant: 2 train
     volumes per target field, 1 validation, 1 test, 8 slices/volume, `128x160` fit/pad,
     batch size 4, `num_workers=0`, and 1 epoch.
+  - `pseudo_pair_t2flair_duration_probe_10epoch.yaml` freezes a development-only
+    10-epoch duration probe on the observed split.
+  - `pseudo_pair_t2flair_residual_probe_10epoch.yaml` keeps that duration probe's data,
+    seed, degradation, preprocessing, optimizer, losses, and thresholds fixed while
+    changing only to the identity-initialized residual translator and a separate output
+    namespace. Restoration and conditioning gates are reported separately; the scaled
+    pilot remains blocked.
 
 No magic numbers in code — every hyperparameter above is config-driven with an explicit
 default in the corresponding dataclass.
@@ -381,6 +397,9 @@ files:
   `test_pseudo_pair_evaluation.py` — official `[0, 1]` slice preprocessing,
   volume-disjoint split persistence/leakage audits, lazy pseudo-pair slices, balanced
   sampling, epoch checkpoints/resume, and degraded/predicted evaluation reports.
+- `test_pseudo_pair_duration_probe_contract.py` and
+  `test_pseudo_pair_residual_probe_contract.py` cover frozen development-probe configs,
+  unexecuted Colab launchers, sanitized telemetry/handoffs, and endpoint/gate contracts.
 - `test_cli_train.py` — the `train` command end-to-end on the default smoke config.
 - `test_mrixfields2026_*.py` — the official challenge layer (spec, submission,
   validation, CLI, data manifest) — untouched, already exhaustive.

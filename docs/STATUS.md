@@ -1,9 +1,9 @@
 # Research Status
 
-Snapshot date: 2026-07-14
+Snapshot date: 2026-07-15
 
 Repository baseline: `origin/main` at
-`c9ee9dd738f8d9fee7acf9340dc4325c47a639cd`.
+`3c2022939291ce3c040737a49e3936fa319c037d`.
 
 The shared north star is one shared-parameter conditional model that emits complete 3D
 MRI volumes. The current tracks test different risks and are intentionally separate.
@@ -11,7 +11,8 @@ MRI volumes. The current tracks test different risks and are intentionally separ
 ## Track A: Deterministic Pseudo-Pair Baseline
 
 Status: corrected implementation available; micro-v2 and duration-probe development
-evidence recorded; scientific promotion gate remains failed.
+evidence recorded; residual development probe predeclared; scientific promotion gate
+remains failed.
 
 Track A is the 2D axial `ConditionalUNetFieldTranslator` experiment for T2-FLAIR. It
 uses retrospective high-field targets, synthetic 0.1T degradation, volume/subject-first
@@ -123,6 +124,13 @@ separately named, fresh-initialization residual probe that starts exactly at the
 input and changes only translator parameterization. It must retain the same observed
 split, seed, degradation, preprocessing, losses, duration, and frozen evaluation gates,
 and must report restoration gates separately from conditioning gates.
+
+The checked-in residual-probe config and unexecuted Colab launcher implement that
+predeclaration. No private residual-probe run evidence has been supplied yet. The probe
+uses a zero-initialized residual output head, so step-zero prediction equals the degraded
+input for every target condition; its output is bounded to the configured model range.
+This is a new model variant and does not alter the existing conditional U-Net or its
+checkpoint layout.
 
 Any residual-probe result remains development evidence and cannot satisfy promotion or
 final-volume gates because the split has been observed and evaluation still uses

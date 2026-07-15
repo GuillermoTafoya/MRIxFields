@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fieldbridge.data.contracts import VolumeRecord
@@ -51,8 +52,28 @@ def test_pseudo_pair_slice_dataset_length_and_metadata() -> None:
     assert sample.record_id == "case-7"
     assert sample.slice_index in (0, 3)
     assert sample.x_low.shape == sample.x_high.shape == sample.mask.shape
+    assert sample.subject_id == "subject-7"
     assert sample.source_domain == Domain(0.1, "T2-FLAIR")
     assert sample.target_domain == Domain(7.0, "T2-FLAIR")
+
+
+def test_pseudo_pair_slice_dataset_requires_subject_identity() -> None:
+    record = VolumeRecord(
+        case_id="case-missing-subject",
+        image_path="case-missing-subject.nii.gz",
+        domain=Domain(7.0, "T2-FLAIR"),
+        subject_id=None,
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty subject_id"):
+        PseudoPairSliceDataset(
+            [record],
+            image_loader=_loader,
+            source_field=0.1,
+            sequence="T2-FLAIR",
+            preprocessing=_spec(),
+            mode="validation",
+        )
 
 
 def test_train_degradation_changes_between_accesses() -> None:

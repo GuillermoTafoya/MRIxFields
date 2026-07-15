@@ -410,6 +410,7 @@ def _move_batch(batch: PseudoPairSliceBatch, device: torch.device) -> PseudoPair
         source_domain=batch.source_domain,
         target_domain=batch.target_domain,
         record_id=batch.record_id,
+        subject_id=batch.subject_id,
         volume_path=batch.volume_path,
         slice_index=batch.slice_index.to(device),
         degradation_seed=batch.degradation_seed,

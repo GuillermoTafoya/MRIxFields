@@ -92,6 +92,12 @@ Slice-level summaries may be retained for diagnostics, but they do not replace
 macro-per-volume reporting and must not give larger volumes more weight merely because
 they contribute more slices.
 
+A selected-slice experiment may also average its selected-slice metrics once within each
+volume, then average volumes within each field, then macro-average fields. This is an
+exploratory sampled-slice/per-volume diagnostic and must be labeled
+`complete_volume: false`. It is not full-volume nRMSE or SSIM and does not satisfy the
+final-volume gate.
+
 ## Baselines And Metrics
 
 Every pseudo-pair report includes two comparisons against the unmodified high-field

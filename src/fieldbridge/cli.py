@@ -220,10 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
     eval_stage1_vae.add_argument("--out", type=Path, required=True, help="Output directory for metrics + plots.")
     eval_stage1_vae.add_argument("--num-samples", type=int, default=4)
     eval_stage1_vae.add_argument(
+        "--per-field-contrast",
         "--per-domain",
+        dest="per_field_contrast",
         action="store_true",
-        help="Reconstruct one volume per distinct field strength (0.1T..7T) instead of the "
-        "first N in manifest order.",
+        help="Reconstruct one volume per distinct field-strength and contrast pair instead "
+        "of the first N in manifest order. --per-domain remains a compatibility alias.",
     )
     eval_stage1_vae.add_argument(
         "--overlap",
@@ -669,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
             patch_size=patch_size,
             out_dir=args.out,
             num_samples=args.num_samples,
-            per_domain=args.per_domain,
+            per_field_contrast=args.per_field_contrast,
             overlap=args.overlap,
             device=device,
             lpips_num_slices=int(config.get("training", {}).get("lpips_num_slices", 8))

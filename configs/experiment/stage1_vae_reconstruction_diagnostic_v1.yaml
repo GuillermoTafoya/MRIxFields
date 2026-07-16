@@ -1,0 +1,29 @@
+diagnostic:
+  contract_version: 1
+  evidence_scope: stage1_reconstruction_engineering_diagnostic
+  held_out: false
+  confirmatory: false
+  fixed_patch_index: 13
+  fixed_volume_index: 0
+  sampled_latent_seed: 13
+  overlap_sweep: [0.25, 0.5, 0.75]
+  reference_overlap: 0.5
+  # Stage-1 tensors are in [-1,1]; exact background is near -1, not model-space 0.
+  background_threshold_minus_one_one: -0.95
+  mask_kernel_size: 3
+  mask_closing_iterations: 1
+  histogram_bins: 20
+  lpips_num_slices: 8
+  identity_tolerance: 0.00001
+  direct_tiled_tolerance: 0.00001
+  # Engineering triage only; these are not scientific promotion thresholds.
+  collapse_std_ratio_threshold: 0.5
+  overlap_nrmse_span_threshold: 0.01
+  seam_ratio_span_threshold: 0.1
+  checkpoint_step_sweep_policy: report_all_chronologically_no_best_selection
+  training_allowed: false
+  stage2_allowed: false
+
+# This config controls diagnosis only. The external resolved Stage-1 run config remains
+# authoritative for model construction and patch-bank compatibility. No model capacity,
+# training duration, optimizer, loss weight, patch-bank, or Stage-2 setting is changed.

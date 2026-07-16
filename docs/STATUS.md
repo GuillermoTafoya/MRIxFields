@@ -3,7 +3,7 @@
 Snapshot date: 2026-07-15
 
 Repository baseline: `origin/main` at
-`3c2022939291ce3c040737a49e3936fa319c037d`.
+`dea6735cbda1770381f107bd9817e44e24a30716`.
 
 The shared north star is one shared-parameter conditional model that emits complete 3D
 MRI volumes. The current tracks test different risks and are intentionally separate.
@@ -87,7 +87,8 @@ confirmatory claim, complete-volume claim, or real 0.1T translation claim.
 
 ## Track B: Volumetric Stage-1 Stack
 
-Status: infrastructure implemented; scientific and challenge evidence pending.
+Status: infrastructure implemented; negative reconstruction engineering evidence recorded;
+diagnostic v1 pending; scientific and challenge evidence pending.
 
 Track B contains the 3D patch-based KL-VAE, resumable patch bank, sliding-window
 full-volume reconstruction, and conditional latent diffuser. It addresses volumetric
@@ -96,6 +97,44 @@ question owned by Track A.
 
 The Stage-1 patch bank is not a pseudo-pair dataset. Its current provenance contract does
 not establish paired targets, degradation parameters, or pseudo-pair slice geometry.
+
+### Stage-1 Reconstruction Engineering Evidence
+
+The following is user-supplied evidence from a private run. Repository maintainers and
+coding agents do not have access to its checkpoint, patch bank, manifest, volumes, logs,
+or rendered reconstructions and have not independently verified the artifacts or metrics.
+
+- Patch bank: 1,984 volumes, 63,488 patches, 32 patches per volume.
+- Training endpoint: 54,000 steps; reported 3,968 steps per epoch; early stop at
+  approximately epoch 13.6.
+- Evaluation: five T1W full volumes from the same manifest used to build the training
+  bank; therefore not held out or confirmatory.
+- Manifest composition: 1,939 retrospective and 45 prospective volumes.
+- Generic manifest audit: duplicate case IDs and `ok=false` under the notebook-mutated
+  identity mapping.
+- Evaluation command: overlap `0.25`, despite notebook prose stating `0.5`.
+
+| Mean full-volume metric | Supplied value |
+| --- | ---: |
+| nRMSE | 0.48881893 |
+| SSIM3D | -0.00149328 |
+| LPIPS | 0.62425638 |
+| MAE | 0.90241840 |
+| MSE | 0.95595611 |
+
+The supplied visual assessment reports retained coarse anatomy alongside gray background,
+collapsed intensity distribution, and a regular tile grid. Taken together, this is valid
+negative engineering evidence for the evaluated reconstruction path, not evidence from a
+held-out subject set and not a basis for Stage 2. It does not isolate whether the dominant
+failure is checkpoint reconstruction, latent sampling, normalization/background handling,
+or sliding-window inference.
+
+The predeclared diagnostic v1 addresses that isolation without training: it audits the
+official manifest, uses official `sample_id` as unique volume identity, validates bank and
+config provenance, compares latent-mean and sampled patch reconstructions, verifies the
+identity tiler, and reports full-volume overlap/seam sensitivity at `0.25`, `0.5`, and
+`0.75`. It reports every supplied checkpoint step chronologically and does not select a
+best checkpoint post hoc.
 
 ## Invalid Evidence
 
@@ -112,8 +151,10 @@ evidence. They must not be resumed or compared as if they were v2 results.
   retain the degraded baseline while learning useful restoration and conditioning.
 - The development split has been observed and cannot support a confirmatory claim.
 - Track A does not yet reconstruct and evaluate complete held-out NIfTI volumes.
-- Track B still needs controlled real-data reconstruction evidence and runtime/resource
-  profiling before promotion.
+- Track B's supplied Stage-1 reconstruction evidence is negative, non-held-out, and
+  confounded by a failed generic manifest audit and overlap-protocol mismatch.
+- Track B diagnostic v1 must isolate patch reconstruction from tiled inference before any
+  new training experiment or Stage-2 decision.
 - A shared 3D paired/degradation provenance contract does not yet exist between tracks.
 - Eventual anatomical metrics require a validated toolchain and documented protocol.
 

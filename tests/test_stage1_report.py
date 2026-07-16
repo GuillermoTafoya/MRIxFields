@@ -133,6 +133,62 @@ def test_run_stage1_eval_per_domain_dedups_field_strength(tmp_path) -> None:
     assert domains == {"1.5T/T2w", "3T/T2w", "7T/T2w"}
 
 
+class _FieldContrastDataset(Dataset[RawBatch]):
+    def __init__(self) -> None:
+        self.domains = [
+            Domain(3.0, "T1w"),
+            Domain(3.0, "T2w"),
+            Domain(3.0, "T2w"),
+        ]
+
+    def __len__(self) -> int:
+        return len(self.domains)
+
+    def __getitem__(self, index: int) -> RawBatch:
+        image = torch.rand(1, 16, 16, 16) * 2.0 - 1.0
+        domain = self.domains[index]
+        return RawBatch(
+            image=image,
+            source_domain=domain,
+            target_domain=domain,
+            metadata={"case_id": f"field-contrast-{index}"},
+        )
+
+
+def test_run_stage1_eval_coverage_unit_is_field_by_contrast(tmp_path) -> None:
+    encoder = KLVAEEncoder(
+        base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1
+    )
+    decoder = KLVAEDecoder(
+        base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1
+    )
+    loader = DataLoader(
+        _FieldContrastDataset(),
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_raw_batches,
+    )
+
+    payload = run_stage1_eval(
+        encoder=encoder,
+        decoder=decoder,
+        loader=loader,
+        patch_size=(16, 16, 16),
+        out_dir=tmp_path,
+        num_samples=10,
+        device=torch.device("cpu"),
+        lpips_num_slices=0,
+        per_field_contrast=True,
+    )
+
+    assert payload["sampling_coverage_unit"] == "field_contrast"
+    assert payload["num_samples"] == 2
+    assert {sample["domain"] for sample in payload["per_sample"]} == {
+        "3T/T1w",
+        "3T/T2w",
+    }
+
+
 def test_run_stage1_eval_writes_metrics_and_plots(tmp_path) -> None:
     encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)

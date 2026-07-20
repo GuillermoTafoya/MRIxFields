@@ -210,6 +210,13 @@ def adversarial_hinge_loss_discriminator(real_logits: torch.Tensor, fake_logits:
 def lpips_loss(prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.Module | None = None) -> torch.Tensor:
     """Perceptual loss via LPIPS. Requires the optional `lpips` package.
 
+    Inputs are the project's official [0, 1] volumes; `lpips.LPIPS` with its default
+    `normalize=False` expects [-1, 1], so they are affine-mapped here. This is a
+    metric-space conversion inside the perceptual net, NOT a rescaling of the data (which
+    the official format forbids) — the tensors the losses and metrics see stay in [0, 1].
+    Skipping it would silently halve the effective input contrast and report an LPIPS
+    that is not the challenge's LPIPS.
+
     Constructing the default net loads pretrained VGG weights, which is expensive —
     build it once (e.g. in the training loop) and pass it in via `net` on every call
     rather than relying on the lazy default in a hot loop.
@@ -217,7 +224,16 @@ def lpips_loss(prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.
 
     if net is None:
         net = _default_lpips_net(prediction.device)
-    return net(_to_three_channel(prediction), _to_three_channel(target)).mean()
+    return net(
+        _to_three_channel(_unit_range_to_signed(prediction)),
+        _to_three_channel(_unit_range_to_signed(target)),
+    ).mean()
+
+
+def _unit_range_to_signed(x: torch.Tensor) -> torch.Tensor:
+    """[0, 1] -> [-1, 1], the input convention of `lpips.LPIPS(normalize=False)`."""
+
+    return x * 2.0 - 1.0
 
 
 def lpips_loss_3d(
@@ -257,6 +273,13 @@ def build_lpips_net(device: torch.device) -> torch.nn.Module:
     Under `--json` (stdout is the machine-readable channel, redirected to a file) that
     corrupts the JSON — so we redirect the constructor's stdout to stderr, where all other
     diagnostics already go.
+
+    All parameters are frozen: LPIPS is a fixed perceptual *metric*, never a trained
+    component. `lpips.LPIPS` already freezes the VGG trunk but leaves its `lin` calibration
+    convs trainable, which (a) makes eval's `float(lpips_value)` warn about reading a
+    grad-tracking tensor and (b) makes training backprop into params no optimizer owns.
+    Gradients still reach the VAE through the *input* activations, which is the only path
+    the perceptual term needs.
     """
 
     try:
@@ -268,7 +291,9 @@ def build_lpips_net(device: torch.device) -> torch.nn.Module:
         ) from exc
     with contextlib.redirect_stdout(sys.stderr):
         net = lpips.LPIPS(net="vgg")
-    return net.to(device)
+    for parameter in net.parameters():
+        parameter.requires_grad_(False)
+    return net.to(device).eval()
 
 
 def _default_lpips_net(device: torch.device) -> torch.nn.Module:

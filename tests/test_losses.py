@@ -6,6 +6,7 @@ from fieldbridge.training.losses import (
     adversarial_hinge_loss_discriminator,
     adversarial_hinge_loss_generator,
     background_penalty,
+    build_lpips_net,
     combined_reconstruction_loss,
     combined_reconstruction_loss_components,
     cycle_consistency_loss,
@@ -156,7 +157,13 @@ def test_adversarial_hinge_losses() -> None:
     _assert_finite_and_backprop(discriminator_loss, real_logits, fake_logits)
 
 
-def test_lpips_loss_requires_optional_dependency() -> None:
+def test_lpips_loss_requires_optional_dependency(monkeypatch) -> None:
+    # Simulate the dependency being absent instead of relying on the env: Colab//any run
+    # that installs the 'perceptual' extra has lpips present, and this test would then fall
+    # through to a real VGG forward instead of exercising the ImportError path it is about.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "lpips", None)  # makes `import lpips` raise ImportError
     prediction = torch.randn(1, 1, 8, 8)
     target = torch.randn(1, 1, 8, 8)
 
@@ -253,3 +260,23 @@ def test_nrmse_loss_matches_evaluation_metric() -> None:
 
     assert torch.isclose(loss, expected)
     _assert_finite_and_backprop(loss, prediction)
+
+
+def test_build_lpips_net_freezes_params_but_keeps_input_gradient_path() -> None:
+    # LPIPS is a fixed metric, but the VAE's perceptual term still has to backprop through
+    # it. Freezing must cut grads to the *net's* params without cutting the path to the
+    # input — a silent no-op perceptual loss would train fine and look fine.
+    pytest.importorskip("lpips")
+    net = build_lpips_net(torch.device("cpu"))
+
+    assert not any(parameter.requires_grad for parameter in net.parameters())
+    assert not net.training
+
+    prediction = torch.rand(1, 1, 4, 16, 16, requires_grad=True)
+    target = torch.rand(1, 1, 4, 16, 16)
+
+    loss = lpips_loss_3d(prediction, target, net=net, num_slices=2)
+
+    assert loss.requires_grad
+    _assert_finite_and_backprop(loss, prediction)
+    assert prediction.grad.abs().sum() > 0

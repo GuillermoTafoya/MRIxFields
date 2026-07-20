@@ -39,8 +39,13 @@ class _Synthetic3DDataset(Dataset[RawBatch]):
         return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"s{index}"})
 
 
-def _make_synthetic_3d_loader(*, num_samples: int = 4, batch_size: int = 2) -> DataLoader[RawBatch]:
-    dataset = _Synthetic3DDataset(num_samples=num_samples)
+def _make_synthetic_3d_loader(
+    *,
+    num_samples: int = 4,
+    batch_size: int = 2,
+    volume_shape: tuple[int, int, int, int] = (1, 8, 8, 8),
+) -> DataLoader[RawBatch]:
+    dataset = _Synthetic3DDataset(num_samples=num_samples, volume_shape=volume_shape)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_raw_batches)
 
 
@@ -105,16 +110,28 @@ def test_encode_decode_roundtrip_preserves_shape() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_decoder_output_is_bounded_by_tanh() -> None:
+def test_decoder_default_head_is_linear_and_unbounded() -> None:
+    """The default head must NOT saturate: the official contract puts background at
+    exactly 0, which a sigmoid/tanh head can only approach asymptotically. Bounding
+    happens at the eval boundary (sliding_window_reconstruct clamps), not here."""
+
     decoder = KLVAEDecoder(base_channels=8, latent_channels=6)
-    # Large-magnitude latent, to confirm Tanh() actually clamps the range rather than
-    # just happening to land in [-1, 1] for small inputs.
     z = torch.randn(2, 6, 8, 8) * 100.0
     domain = _domain_pair(2)
 
     y = decoder.decode(z, domain)
 
-    assert y.min() >= -1.0
+    assert torch.isfinite(y).all()
+    assert y.min() < 0.0 or y.max() > 1.0, "a linear head should not stay inside [0, 1] here"
+
+
+def test_decoder_bounded_head_opt_in_clamps_range() -> None:
+    decoder = KLVAEDecoder(base_channels=8, latent_channels=6, output_activation="sigmoid")
+    z = torch.randn(2, 6, 8, 8) * 100.0
+
+    y = decoder.decode(z, _domain_pair(2))
+
+    assert y.min() >= 0.0
     assert y.max() <= 1.0
 
 
@@ -149,8 +166,6 @@ def test_encode_decode_roundtrip_3d_volume() -> None:
     assert z.shape == (1, 3, 2, 2, 2)
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
-    assert y.min() >= -1.0
-    assert y.max() <= 1.0
 
 
 def test_vae_res_blocks_3d_forward_backward_no_nan() -> None:
@@ -169,7 +184,7 @@ def test_vae_res_blocks_3d_forward_backward_no_nan() -> None:
     z = mean + torch.randn_like(mean) * torch.exp(0.5 * logvar)
     y = decoder.decode(z, domain)
     assert y.shape == x.shape
-    assert y.min() >= -1.0 and y.max() <= 1.0
+    assert torch.isfinite(y).all()
 
     loss = torch.nn.functional.mse_loss(y, x)
     loss.backward()
@@ -311,10 +326,13 @@ def test_run_stage1_vae_train_3d_volume_with_ssim3d() -> None:
 def test_run_stage1_vae_train_3d_volume_with_slice_lpips() -> None:
     # lpips now runs on 5D volumes via the slice-averaged variant (lpips_loss_3d) inside
     # _compute_vae_loss — a spatial_dims=3 config with lpips weight > 0 trains fine.
+    # 64x64 in-plane, not the 8x8 default: lpips wraps VGG16, whose five 2x2 pools need at
+    # least 32px per slice — an 8x8 slice collapses to a 0x0 feature map and raises. The
+    # real patches are 64^3, so this is the shape that actually exercises the path.
     pytest.importorskip("lpips")
     encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3)
-    loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2)
+    loader = _make_synthetic_3d_loader(num_samples=2, batch_size=2, volume_shape=(1, 8, 64, 64))
     config = Stage1VAEConfig(
         steps=1,
         batch_size=2,

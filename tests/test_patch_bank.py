@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -11,6 +12,22 @@ from fieldbridge.data.patch_bank import (
     build_patch_bank,
     patch_bank_size,
 )
+
+
+@pytest.mark.parametrize("open_bank", [PatchBankDataset, patch_bank_size])
+def test_missing_bank_directory_names_the_build_command(tmp_path, open_bank) -> None:
+    with pytest.raises(FileNotFoundError, match="build-patch-bank"):
+        open_bank(tmp_path / "patch_bank_ppv32")
+
+
+@pytest.mark.parametrize("open_bank", [PatchBankDataset, patch_bank_size])
+def test_half_built_bank_reports_missing_files(tmp_path, open_bank) -> None:
+    # Directory exists (an interrupted build) but has no meta/index: must say so rather
+    # than raising a bare FileNotFoundError on bank_meta.json.
+    bank = tmp_path / "patch_bank_ppv32"
+    bank.mkdir()
+    with pytest.raises(FileNotFoundError, match="bank_meta.json"):
+        open_bank(bank)
 
 
 def _records(count: int) -> list[VolumeRecord]:

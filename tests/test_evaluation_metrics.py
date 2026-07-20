@@ -47,7 +47,13 @@ def test_ssim3d_rejects_non_5d_batches() -> None:
         ssim3d(x, x)
 
 
-def test_lpips_metric_requires_optional_dependency() -> None:
+def test_lpips_metric_requires_optional_dependency(monkeypatch) -> None:
+    # Simulate the dependency being absent instead of relying on the env: any run that
+    # installs the 'perceptual' extra (Colab does) has lpips present, and this test would
+    # then fall through to a real VGG forward instead of the ImportError path it is about.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "lpips", None)  # makes `import lpips` raise ImportError
     prediction = torch.rand(1, 1, 8, 8)
     target = torch.rand(1, 1, 8, 8)
 

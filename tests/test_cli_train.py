@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from fieldbridge.cli import _build_manifest_loader, _load_loss_curve, main
-from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+from fieldbridge.data.transforms import assert_official_unit_range
 
 
 def test_load_loss_curve_tolerates_empty_and_invalid_json(tmp_path: Path) -> None:
@@ -32,7 +32,9 @@ def _write_synthetic_2d_manifest(tmp_path: Path, *, num_records: int = 4) -> Pat
     records = []
     for index in range(num_records):
         image_path = tmp_path / f"case_{index}.nii.gz"
-        array = np.random.default_rng(index).normal(size=(16, 16)).astype("float32")
+        # [0, 1], matching the official format (volumes ship pre-normalized and the
+        # loaders now assert that contract instead of rescaling).
+        array = np.random.default_rng(index).random(size=(16, 16)).astype("float32")
         nibabel.save(nibabel.Nifti1Image(array, affine=np.eye(4)), str(image_path))
         records.append(
             {
@@ -52,7 +54,7 @@ def _write_synthetic_3d_manifest(
     records = []
     for index in range(num_records):
         image_path = tmp_path / f"volume_{index}.nii.gz"
-        array = np.random.default_rng(index).normal(size=volume_shape).astype("float32")
+        array = np.random.default_rng(index).random(size=volume_shape).astype("float32")
         nibabel.save(nibabel.Nifti1Image(array, affine=np.eye(4)), str(image_path))
         records.append(
             {
@@ -66,10 +68,13 @@ def _write_synthetic_3d_manifest(
     return manifest_path
 
 
-def test_build_manifest_loader_defaults_to_percentile_clip_transform() -> None:
+def test_build_manifest_loader_defaults_to_official_unit_range_passthrough() -> None:
+    """The official format forbids rescaling intensity — the default must be the checked
+    no-op, not the percentile-clip transform that remaps to [-1, 1]."""
+
     default_transform = inspect.signature(_build_manifest_loader).parameters["transform"].default
 
-    assert default_transform is normalize_percentile_clip_to_unit_range
+    assert default_transform is assert_official_unit_range
 
 
 def test_train_cli_runs_with_default_smoke_config(capsys) -> None:
@@ -431,7 +436,7 @@ training:
 def test_train_stage1_vae_requires_manifest_or_bank() -> None:
     import pytest
 
-    with pytest.raises(ValueError, match="requires --manifest"):
+    with pytest.raises(ValueError, match="requires one of --manifest, --split-json, or --patch-bank"):
         main(["train-stage1-vae", "--json"])
 
 

@@ -36,7 +36,7 @@ def test_sliding_window_blending_reconstructs_identity_exactly(overlap: float) -
     # With identity encode/decode, the overlap + Hann weighting is a partition of unity:
     # the blended output must equal the input exactly (no seams introduced by the window).
     torch.manual_seed(0)
-    image = torch.rand(1, 1, 40, 40, 40) * 2.0 - 1.0
+    image = torch.rand(1, 1, 40, 40, 40)
 
     recon = sliding_window_reconstruct(
         _IdentityEncoder(), _IdentityDecoder(), image, patch_size=(16, 16, 16), domain=None, overlap=overlap
@@ -74,7 +74,7 @@ class _FullVolumeDataset(Dataset[RawBatch]):
 
     def __getitem__(self, index: int) -> RawBatch:
         generator = torch.Generator().manual_seed(index)
-        image = torch.rand(self.volume_shape, generator=generator) * 2.0 - 1.0
+        image = torch.rand(self.volume_shape, generator=generator)
         domain = Domain(1.5, "T2w")
         return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"c{index}"})
 
@@ -86,13 +86,13 @@ def _loader() -> DataLoader[RawBatch]:
 def test_sliding_window_reconstruct_preserves_shape() -> None:
     encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
     decoder = KLVAEDecoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
-    image = torch.rand(1, 1, 40, 40, 40) * 2.0 - 1.0
+    image = torch.rand(1, 1, 40, 40, 40)
 
     recon = sliding_window_reconstruct(encoder, decoder, image, patch_size=(16, 16, 16), domain=None)
 
     assert recon.shape == image.shape
     assert torch.isfinite(recon).all()
-    assert recon.min() >= -1.0 and recon.max() <= 1.0
+    assert recon.min() >= 0.0 and recon.max() <= 1.0
 
 
 class _MultiDomainDataset(Dataset[RawBatch]):
@@ -105,7 +105,7 @@ class _MultiDomainDataset(Dataset[RawBatch]):
         return len(self.fields)
 
     def __getitem__(self, index: int) -> RawBatch:
-        image = torch.rand(1, 24, 24, 24) * 2.0 - 1.0
+        image = torch.rand(1, 24, 24, 24)
         domain = Domain(self.fields[index], "T2w")
         return RawBatch(image=image, source_domain=domain, target_domain=domain, metadata={"case_id": f"c{index}"})
 
@@ -156,6 +156,98 @@ def test_run_stage1_eval_writes_metrics_and_plots(tmp_path) -> None:
     assert (tmp_path / "loss_curve.png").exists()
     written = json.loads((tmp_path / "metrics.json").read_text())
     assert len(written["per_sample"]) == 2
+
+
+class _ConstantDecoder(torch.nn.Module):
+    """Collapsed decoder: emits a constant, no structure (a model/training fault)."""
+
+    def decode(self, z: torch.Tensor, domain: object) -> torch.Tensor:
+        shape = (z.shape[0], 1, *(int(s) * 4 for s in z.shape[2:]))
+        return torch.full(shape, 0.08)
+
+
+class _SquashedDecoder(torch.nn.Module):
+    """Perfect anatomy squashed into a narrow band that never reaches the 0 background.
+
+    A pure calibration fault: structure is intact (correlation ~1) but the floor is wrong.
+    """
+
+    def __init__(self, volume: torch.Tensor) -> None:
+        super().__init__()
+        self._volume = volume
+
+    def decode(self, z: torch.Tensor, domain: object) -> torch.Tensor:
+        return self._volume * 0.25 + 0.4
+
+
+def _single_volume_loader(volume: torch.Tensor) -> list[RawBatch]:
+    domain = Domain(3.0, "T1w")
+    return [
+        collate_raw_batches(
+            [RawBatch(image=volume[0], source_domain=domain, target_domain=domain, metadata={"case_id": "c0"})]
+        )
+    ]
+
+
+def test_correlation_separates_constant_collapse_from_range_compression(tmp_path) -> None:
+    # Both faults score SSIM3D ~ 0 and so are indistinguishable by the challenge metrics:
+    # a recon whose DC level is wrong distorts SSIM's luminance term regardless of whether
+    # structure is present. Correlation is the term that tells them apart.
+    torch.manual_seed(0)
+    coords = torch.linspace(-1, 1, 16)
+    z, y, x = torch.meshgrid(coords, coords, coords, indexing="ij")
+    # Official [0, 1] contract: background is exactly 0, anatomy fills (0, 1].
+    anatomy = (torch.sin(6 * x) * torch.cos(6 * y) + 1.0) / 2.0
+    volume = torch.where((x**2 + y**2 + z**2).sqrt() < 0.7, anatomy, torch.zeros_like(x))
+    volume = volume[None, None]
+
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+
+    def evaluate(decoder: object) -> dict:
+        return run_stage1_eval(
+            encoder=encoder,
+            decoder=decoder,
+            loader=_single_volume_loader(volume),
+            patch_size=(16, 16, 16),
+            out_dir=tmp_path,
+            num_samples=1,
+            device=torch.device("cpu"),
+            lpips_num_slices=0,
+            overlap=0.0,
+        )["mean"]
+
+    constant = evaluate(_ConstantDecoder())
+    squashed = evaluate(_SquashedDecoder(volume))
+
+    # SSIM cannot tell them apart: both sit low (~0.06 and ~0.14), so neither the value
+    # nor the gap between them identifies which fault occurred. The threshold is looser
+    # than on the old [-1, 1] contract, where the luminance-term sign flip pinned SSIM
+    # harder; the point of the test is the *lack* of separation, not the exact value.
+    assert abs(constant["ssim3d"]) < 0.2
+    assert abs(squashed["ssim3d"]) < 0.2
+    # Correlation does, decisively.
+    assert abs(constant["correlation"]) < 0.05
+    assert squashed["correlation"] > 0.95
+
+
+def test_range_guard_rejects_denormalized_target(tmp_path) -> None:
+    # A target left in raw scanner intensities must fail loudly rather than silently
+    # producing meaningless metrics against a [0, 1] recon.
+    raw_volume = torch.rand(1, 1, 16, 16, 16) * 800.0
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1)
+
+    with pytest.raises(ValueError, match=r"\[0, 1\] contract"):
+        run_stage1_eval(
+            encoder=encoder,
+            decoder=_ConstantDecoder(),
+            loader=_single_volume_loader(raw_volume),
+            patch_size=(16, 16, 16),
+            out_dir=tmp_path,
+            num_samples=1,
+            device=torch.device("cpu"),
+            lpips_num_slices=0,
+            overlap=0.0,
+        )
 
 
 def test_missing_matplotlib_names_evaluation_extra(monkeypatch) -> None:

@@ -4,13 +4,15 @@ Deliberately does NOT reuse the training forward pass: eval reconstructs from th
 *mean* (no reparameterization sampling — the sampled `mean + eps*sigma` path is what made
 the notebook reconstructions look like noise), under no_grad, and tiles the full volume
 with a sliding window so a real 3D volume never gets decoded whole (the OOM/RAM blowup).
-Inputs are normalized with the exact same [-1, 1] transform as training.
+Inputs are the official [0, 1] volumes, passed through unchanged exactly as in training
+(the official format forbids rescaling intensity).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,14 +21,20 @@ import torch
 from torch.utils.data import DataLoader
 
 from fieldbridge.data.contracts import RawBatch
-from fieldbridge.evaluation.metrics import mae, mse, nrmse, ssim3d
+from fieldbridge.evaluation.metrics import mae, mse, normalized_cross_correlation, nrmse, ssim3d
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.losses import build_lpips_net, lpips_loss_3d
 
-# Inputs live in [-1, 1] (decoder Tanh / normalize_percentile_clip_to_unit_range contract),
-# so the intensity range for range-normalized metrics is 2.0, not 1.0.
-_DATA_RANGE = 2.0
+# Official MRIxFields2026 volumes ship in [0, 1] and must not be rescaled (see
+# data/transforms.py:assert_official_unit_range), so the intensity range for
+# range-normalized metrics is 1.0. This is the range the challenge scores against —
+# changing it makes the reported nRMSE/SSIM incomparable to the leaderboard.
+_DATA_RANGE = 1.0
 _REAL_EVALUATION_INSTALL = 'pip install -e ".[nifti,evaluation]"'
+
+# Tolerance on the [0, 1] contract before the range guard fires. Loose enough for fp/bf16
+# round-off, tight enough to catch a de-normalized tensor.
+_RANGE_TOLERANCE = 1e-3
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +46,15 @@ class SampleMetrics:
     lpips: float
     mse: float
     mae: float
+    # Pearson correlation between recon and target. Reported because SSIM cannot separate
+    # "anatomy reconstructed but intensity range wrong" from "decoder emits a constant":
+    # on [0, 1] MRI the target mean is low (background = 0), so a recon with the wrong DC
+    # level distorts SSIM's luminance term whether or not structure is present. Correlation is invariant to any affine intensity change, so it
+    # separates them outright: ~1 => anatomy present (a pure calibration fault), ~0 => no
+    # structure at all (a model/training fault). Diagnostic only, not a challenge metric.
+    correlation: float
+    recon_stats: dict[str, float]
+    target_stats: dict[str, float]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,7 +65,71 @@ class SampleMetrics:
             "lpips": self.lpips,
             "mse": self.mse,
             "mae": self.mae,
+            "correlation": self.correlation,
+            "recon_stats": dict(self.recon_stats),
+            "target_stats": dict(self.target_stats),
         }
+
+
+def _tensor_stats(tensor: torch.Tensor) -> dict[str, float]:
+    return {
+        "min": float(tensor.min()),
+        "max": float(tensor.max()),
+        "mean": float(tensor.mean()),
+        "std": float(tensor.std()),
+    }
+
+
+def _assert_same_space(recon: torch.Tensor, target: torch.Tensor) -> None:
+    """Fail loudly if recon and target don't share shape and the [0, 1] contract.
+
+    A de-normalization mismatch (one side left in raw intensities, or a decoder whose
+    output stopped being bounded) otherwise shows up only as silently wrong metrics.
+    """
+
+    if recon.shape != target.shape:
+        raise ValueError(
+            f"recon and target must share shape; got {tuple(recon.shape)} and {tuple(target.shape)}."
+        )
+    low_limit, high_limit = -_RANGE_TOLERANCE, 1.0 + _RANGE_TOLERANCE
+    for name, tensor in (("recon", recon), ("target", target)):
+        low, high = float(tensor.min()), float(tensor.max())
+        if low < low_limit or high > high_limit:
+            raise ValueError(
+                f"{name} violates the [0, 1] contract: range [{low:.4f}, {high:.4f}]. "
+                "Official volumes ship in [0, 1] and must not be rescaled "
+                "(see data/transforms.py:assert_official_unit_range)."
+            )
+
+
+def _log_diagnostic(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _range_report(metric: SampleMetrics) -> str:
+    """One-line recon-vs-target range + correlation summary, for the Etapa-1 diagnostic gate.
+
+    `verdict` names what the numbers imply, so a broken run is legible from the log alone
+    without re-deriving the SSIM-luminance argument in `SampleMetrics.correlation`.
+    """
+
+    recon, target = metric.recon_stats, metric.target_stats
+    # Expressed as a fraction of the data range, not an absolute offset: the same 25%-of-
+    # range gap that flagged a compressed recon on the old [-1, 1] contract must keep
+    # flagging it on the official [0, 1] one.
+    floor_gap = 0.25 * _DATA_RANGE
+    if abs(metric.correlation) < 0.2:
+        verdict = "NO STRUCTURE (recon ~ constant; model/training fault, not calibration)"
+    elif recon["min"] > target["min"] + floor_gap:
+        verdict = "STRUCTURE OK but RANGE COMPRESSED (recon never reaches background; calibration fault)"
+    else:
+        verdict = "structure and range both plausible"
+    return (
+        f"stage1_eval {metric.domain} {metric.case_id}: "
+        f"recon[min={recon['min']:+.3f} max={recon['max']:+.3f} mean={recon['mean']:+.3f} std={recon['std']:.3f}] "
+        f"target[min={target['min']:+.3f} max={target['max']:+.3f} mean={target['mean']:+.3f} std={target['std']:.3f}] "
+        f"corr={metric.correlation:+.4f} ssim3d={metric.ssim3d:+.4f} -> {verdict}"
+    )
 
 
 def _tiled_starts(dim: int, patch: int, stride: int) -> list[int]:
@@ -119,7 +200,12 @@ def sliding_window_reconstruct(
                 rec = decoder.decode(mean, domain)
                 weighted_sum[..., z : z + pd, y : y + ph, x : x + pw] += rec * window
                 weight_sum[..., z : z + pd, y : y + ph, x : x + pw] += window
-    return weighted_sum / weight_sum.clamp_min(1e-8)
+    # Clamp only here, at the boundary where a bounded tensor is actually required. The
+    # decoder head is linear by default (KLVAEDecoder's docstring explains why a
+    # saturating head cannot reach the exact-0 background), so a raw reconstruction may
+    # overshoot [0, 1]; the challenge scores clipped images, and _assert_same_space
+    # enforces the contract downstream.
+    return (weighted_sum / weight_sum.clamp_min(1e-8)).clamp(0.0, 1.0)
 
 
 def run_stage1_eval(
@@ -179,18 +265,23 @@ def run_stage1_eval(
             encoder, decoder, image, patch_size=patch_size, domain=domain, overlap=overlap
         )
 
+        _assert_same_space(recon, image)
+
         case_id, domain_label = _batch_labels(batch)
-        metrics.append(
-            SampleMetrics(
-                case_id=case_id,
-                domain=domain_label,
-                nrmse=float(nrmse(recon, image, data_range=_DATA_RANGE)),
-                ssim3d=float(ssim3d(recon, image, data_range=_DATA_RANGE)),
-                lpips=_maybe_lpips(recon, image, lpips_num_slices, lpips_net),
-                mse=float(mse(recon, image)),
-                mae=float(mae(recon, image)),
-            )
+        sample_metrics = SampleMetrics(
+            case_id=case_id,
+            domain=domain_label,
+            nrmse=float(nrmse(recon, image, data_range=_DATA_RANGE)),
+            ssim3d=float(ssim3d(recon, image, data_range=_DATA_RANGE)),
+            lpips=_maybe_lpips(recon, image, lpips_num_slices, lpips_net),
+            mse=float(mse(recon, image)),
+            mae=float(mae(recon, image)),
+            correlation=float(normalized_cross_correlation(recon, image)),
+            recon_stats=_tensor_stats(recon),
+            target_stats=_tensor_stats(image),
         )
+        metrics.append(sample_metrics)
+        _log_diagnostic(_range_report(sample_metrics))
         samples.append({"original": image.detach().cpu(), "recon": recon.detach().cpu()})
 
     payload: dict[str, Any] = {
@@ -241,7 +332,7 @@ def _batch_labels(batch: RawBatch) -> tuple[str, str]:
 def _aggregate(metrics: Sequence[SampleMetrics]) -> dict[str, float]:
     if not metrics:
         return {}
-    keys = ("nrmse", "ssim3d", "lpips", "mse", "mae")
+    keys = ("nrmse", "ssim3d", "lpips", "mse", "mae", "correlation")
     return {key: float(sum(getattr(m, key) for m in metrics) / len(metrics)) for key in keys}
 
 
@@ -295,7 +386,8 @@ def _plot_diagnostics(
         axes[row][1].imshow(recon, cmap="gray", vmin=-1, vmax=1)
         axes[row][1].set_title(
             f"Recon (deterministic mean)\nnRMSE {metric.nrmse:.4f} | SSIM3D {metric.ssim3d:.4f} | "
-            f"LPIPS {metric.lpips:.4f}",
+            f"LPIPS {metric.lpips:.4f}\ncorr {metric.correlation:+.4f} | "
+            f"range [{metric.recon_stats['min']:+.2f}, {metric.recon_stats['max']:+.2f}]",
             fontsize=11,
         )
         axes[row][1].axis("off")
@@ -312,7 +404,7 @@ def _plot_diagnostics(
             sample["recon"].flatten().numpy()[::10], bins=60, alpha=0.5, label="Recon", color="tab:orange"
         )
         axes[row][3].set_yscale("log")
-        axes[row][3].set_title("Intensity Distribution [-1, 1] (log)", fontsize=11)
+        axes[row][3].set_title("Intensity Distribution [0, 1] (log)", fontsize=11)
         axes[row][3].legend()
 
     fig.tight_layout()

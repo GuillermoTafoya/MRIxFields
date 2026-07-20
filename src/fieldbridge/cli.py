@@ -6,14 +6,21 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from torch.utils.data import DataLoader
 
 from fieldbridge.config import dump_yaml_config, load_yaml_config
-from fieldbridge.data.contracts import RawBatch
+from fieldbridge.data.contracts import RawBatch, VolumeRecord
+from fieldbridge.data.vae_splits import (
+    build_vae_splits,
+    load_vae_splits,
+    save_vae_splits,
+    summarize_vae_splits,
+    vae_splits_fingerprint,
+)
 from fieldbridge.data.datasets import (
     ImageTransform,
     ManifestVolumeDataset,
@@ -33,7 +40,7 @@ from fieldbridge.data.patch_bank import (
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.preprocessing import SlicePreprocessingSpec, from_model_range, selected_slice_indices
 from fieldbridge.data.sources import nifti_image_loader
-from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range
+from fieldbridge.data.transforms import StratifiedCropConfig, assert_official_unit_range
 from fieldbridge.data.volume_splits import (
     audit_volume_splits,
     build_volume_splits,
@@ -156,8 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Manifest of real NIfTI volumes (requires the 'nifti' extra). Required unless "
-        "--patch-bank is given. No synthetic fallback for this stage — never commit a real "
-        "manifest to the repo.",
+        "--patch-bank or --split-json is given. No synthetic fallback for this stage — never "
+        "commit a real manifest to the repo.",
+    )
+    train_stage1_vae.add_argument(
+        "--split-json",
+        type=Path,
+        default=None,
+        help="VAE split file (see build-vae-splits). When given, trains on the 'train' split "
+        "and validates per-epoch on the 'validation' split (history.jsonl + best checkpoint). "
+        "Takes precedence over --manifest.",
     )
     train_stage1_vae.add_argument("--steps", type=int, default=None)
     train_stage1_vae.add_argument(
@@ -202,6 +217,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_bank.add_argument("--seed", type=int, default=None)
 
+    build_splits = subparsers.add_parser(
+        "build-vae-splits",
+        help="Build a subject-level, domain-stratified train/validation/test split for the "
+        "Etapa 1 VAE from a manifest, and write it (with a leakage audit + fingerprint) to JSON.",
+    )
+    build_splits.add_argument("--manifest", type=Path, required=True, help="Manifest of real NIfTI volumes.")
+    build_splits.add_argument("--out", type=Path, required=True, help="Output split JSON (contains real paths — do not commit).")
+    build_splits.add_argument("--train-frac", type=float, default=0.8)
+    build_splits.add_argument("--val-frac", type=float, default=0.1)
+    build_splits.add_argument("--test-frac", type=float, default=0.1)
+    build_splits.add_argument("--seed", type=int, default=13)
+    build_splits.add_argument("--json", action="store_true", help="Emit the split summary as JSON.")
+
     eval_stage1_vae = subparsers.add_parser(
         "eval-stage1-vae",
         help="Deterministic reconstruction eval + diagnostic plots for a stage-1 VAE checkpoint.",
@@ -213,9 +241,22 @@ def build_parser() -> argparse.ArgumentParser:
     eval_stage1_vae.add_argument(
         "--manifest",
         type=Path,
-        required=True,
-        help="Manifest of real NIfTI volumes to reconstruct. Install requirements with: "
-        'pip install -e ".[nifti,evaluation]"',
+        default=None,
+        help="Manifest of real NIfTI volumes to reconstruct. Required unless --split-json is "
+        'given. Install requirements with: pip install -e ".[nifti,evaluation]"',
+    )
+    eval_stage1_vae.add_argument(
+        "--split-json",
+        type=Path,
+        default=None,
+        help="VAE split file (see build-vae-splits); evaluate the --split subset. Use "
+        "--split test for the final held-out report. Takes precedence over --manifest.",
+    )
+    eval_stage1_vae.add_argument(
+        "--split",
+        choices=("train", "validation", "test"),
+        default="test",
+        help="Which subset of --split-json to evaluate (default: test).",
     )
     eval_stage1_vae.add_argument("--out", type=Path, required=True, help="Output directory for metrics + plots.")
     eval_stage1_vae.add_argument("--num-samples", type=int, default=4)
@@ -576,18 +617,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "train-stage1-vae":
-        if args.patch_bank is None and args.manifest is None:
-            raise ValueError("train-stage1-vae requires --manifest, or --patch-bank to train from a prebuilt bank.")
+        if args.patch_bank is None and args.manifest is None and args.split_json is None:
+            raise ValueError(
+                "train-stage1-vae requires one of --manifest, --split-json, or --patch-bank."
+            )
         config = _load_optional_config(args.config)
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "data", "patches_per_volume", args.patches_per_volume)
-        # Compute steps_per_epoch so the loop can log epoch/step-in-epoch (both loaders are
+        # A split provides its own train/validation record lists; --manifest / --patch-bank
+        # keep the original no-validation behavior.
+        split = load_vae_splits(args.split_json) if args.split_json is not None else None
+        # Compute steps_per_epoch so the loop can log epoch/step-in-epoch (loaders are
         # length-less to the config). --epochs, if given, sets steps from it.
         if args.patch_bank is not None:
             num_volumes, ppv = patch_bank_size(args.patch_bank)
             batch_size = int(config.get("training", {}).get("batch_size", 2))
             steps_per_epoch = max(1, -(-num_volumes * ppv // max(1, batch_size)))
+        elif split is not None:
+            steps_per_epoch = _steps_per_epoch_for_volumes(config, len(split.train))
         else:
             steps_per_epoch = _steps_per_epoch(config, args.manifest)
         _override(config, "training", "steps_per_epoch", steps_per_epoch)
@@ -599,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
         stage_config = Stage1VAEConfig.from_mapping(config)
+        val_loader: "DataLoader[RawBatch] | None" = None
         if args.patch_bank is not None:
             loader = DataLoader(
                 PatchBankDataset(args.patch_bank),
@@ -607,6 +656,19 @@ def main(argv: list[str] | None = None) -> int:
                 num_workers=_num_workers(config),
                 collate_fn=collate_raw_batches,
             )
+        elif split is not None:
+            loader = _build_streaming_patch_loader_from_records(
+                split.train, batch_size=stage_config.batch_size, config=config, num_workers=_num_workers(config)
+            )
+            if split.validation:
+                # seed_offset so the val loader draws different patches than train from the same base seed.
+                val_loader = _build_streaming_patch_loader_from_records(
+                    split.validation,
+                    batch_size=stage_config.batch_size,
+                    config=config,
+                    num_workers=_num_workers(config),
+                    seed_offset=10_000,
+                )
         else:
             loader = _build_streaming_patch_loader(
                 args.manifest,
@@ -614,11 +676,36 @@ def main(argv: list[str] | None = None) -> int:
                 config=config,
                 num_workers=_num_workers(config),
             )
-        result = run_stage1_vae_train(stage_config, encoder=encoder, decoder=decoder, loader=loader)
+        result = run_stage1_vae_train(
+            stage_config, encoder=encoder, decoder=decoder, loader=loader, val_loader=val_loader
+        )
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train-stage1-vae completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "build-vae-splits":
+        records = load_manifest(args.manifest).records
+        splits = build_vae_splits(
+            records,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+            seed=args.seed,
+        )
+        save_vae_splits(splits, args.out)
+        summary = summarize_vae_splits(splits)
+        summary["fingerprint"] = vae_splits_fingerprint(splits)
+        summary["out"] = str(args.out)
+        if args.json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            counts = {name: summary["splits"][name]["num_records"] for name in ("train", "validation", "test")}
+            print(
+                f"build-vae-splits wrote {args.out} (fingerprint {summary['fingerprint'][:12]}): "
+                f"train={counts['train']} validation={counts['validation']} test={counts['test']}"
+            )
         return 0
 
     if args.command == "build-patch-bank":
@@ -648,17 +735,28 @@ def main(argv: list[str] | None = None) -> int:
         model_config = _model_config(config)
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+        if args.manifest is None and args.split_json is None:
+            raise ValueError("eval-stage1-vae requires --manifest or --split-json.")
         state = load_checkpoint(args.checkpoint)
         encoder.load_state_dict(state["encoder"])
         decoder.load_state_dict(state["decoder"])
-        # Full-volume reconstruction: normalize to [-1, 1] like training, but NO random
-        # crop (the sliding window in run_stage1_eval tiles the whole volume itself).
-        loader = _build_manifest_loader(
-            args.manifest,
-            batch_size=1,
-            transform=normalize_percentile_clip_to_unit_range,
-            shuffle=False,
-        )
+        # Full-volume reconstruction: official [0, 1] volumes passed through unchanged
+        # (no rescaling, per the official format), and NO random crop — the sliding window
+        # in run_stage1_eval tiles the whole volume itself.
+        if args.split_json is not None:
+            records = load_vae_splits(args.split_json).records_for(args.split)
+            if not records:
+                raise ValueError(f"Split '{args.split}' in {args.split_json} is empty.")
+            loader = _build_manifest_loader_from_records(
+                records, batch_size=1, transform=assert_official_unit_range, shuffle=False
+            )
+        else:
+            loader = _build_manifest_loader(
+                args.manifest,
+                batch_size=1,
+                transform=assert_official_unit_range,
+                shuffle=False,
+            )
         patch_size = _eval_patch_size(config)
         loss_curve = _load_loss_curve(args.metrics_raw)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -781,15 +879,31 @@ def _build_manifest_loader(
     manifest_path: Path,
     *,
     batch_size: int,
-    transform: ImageTransform | None = normalize_percentile_clip_to_unit_range,
+    transform: ImageTransform | None = assert_official_unit_range,
     shuffle: bool = False,
     num_workers: int = 0,
 ) -> "DataLoader[RawBatch]":
     # shuffle defaults to False so non-training callers (audits, eval) keep manifest order;
     # training paths pass shuffle=True — the previous fixed-order loader meant a short run
     # only ever saw the first N records.
-    manifest = load_manifest(manifest_path)
-    dataset = ManifestVolumeDataset(manifest.records, image_loader=nifti_image_loader, transform=transform)
+    return _build_manifest_loader_from_records(
+        load_manifest(manifest_path).records,
+        batch_size=batch_size,
+        transform=transform,
+        shuffle=shuffle,
+        num_workers=num_workers,
+    )
+
+
+def _build_manifest_loader_from_records(
+    records: "Sequence[VolumeRecord]",
+    *,
+    batch_size: int,
+    transform: ImageTransform | None = assert_official_unit_range,
+    shuffle: bool = False,
+    num_workers: int = 0,
+) -> "DataLoader[RawBatch]":
+    dataset = ManifestVolumeDataset(records, image_loader=nifti_image_loader, transform=transform)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -816,14 +930,35 @@ def _build_streaming_patch_loader(
     crashes).
     """
 
-    manifest = load_manifest(manifest_path)
+    return _build_streaming_patch_loader_from_records(
+        load_manifest(manifest_path).records, batch_size=batch_size, config=config, num_workers=num_workers
+    )
+
+
+def _build_streaming_patch_loader_from_records(
+    records: "Sequence[VolumeRecord]",
+    *,
+    batch_size: int,
+    config: Mapping[str, Any],
+    num_workers: int = 0,
+    seed_offset: int = 0,
+) -> "DataLoader[RawBatch]":
+    """Same streaming loader, from an explicit record list (a split) instead of a manifest.
+
+    `seed_offset` shifts the dataset's shuffle/crop seed so a validation loader draws
+    different patches than the train loader from the same base seed.
+    """
+
+    base_seed = int(config.get("seed", 0)) if isinstance(config.get("seed", 0), int) else 0
     dataset = StreamingPatchDataset(
-        manifest.records,
+        records,
         image_loader=nifti_image_loader,
         patch_size=_data_patch_size(config),
         patches_per_volume=_patches_per_volume(config),
-        volume_transform=normalize_percentile_clip_to_unit_range,
-        seed=int(config.get("seed", 0)) if isinstance(config.get("seed", 0), int) else 0,
+        volume_transform=assert_official_unit_range,
+        seed=base_seed + seed_offset,
+        crop_config=_crop_config(config),
+        foreground_threshold=_foreground_threshold(config),
     )
     return DataLoader(
         dataset,
@@ -1118,10 +1253,35 @@ def _patches_per_volume(config: Mapping[str, Any]) -> int:
     return int(value) if value is not None else 1
 
 
+def _crop_config(config: Mapping[str, Any]) -> StratifiedCropConfig | None:
+    """`data.stratified_crop` -> StratifiedCropConfig, or None to keep uniform cropping."""
+
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        return None
+    return StratifiedCropConfig.from_mapping(data_config.get("stratified_crop"))
+
+
+def _foreground_threshold(config: Mapping[str, Any]) -> float:
+    """Intensity above which a voxel counts as foreground for stratified cropping.
+
+    0.0 on the official [0, 1] data: background is exactly 0, so `> 0` is the mask.
+    """
+
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        return 0.0
+    value = data_config.get("foreground_threshold")
+    return float(value) if value is not None else 0.0
+
+
 def _steps_per_epoch(config: Mapping[str, Any], manifest_path: Path) -> int:
     """ceil(num_volumes * patches_per_volume / batch_size). Reads only manifest metadata
     (no image arrays), so it's cheap even though the loader re-reads it."""
-    num_volumes = len(load_manifest(manifest_path).records)
+    return _steps_per_epoch_for_volumes(config, len(load_manifest(manifest_path).records))
+
+
+def _steps_per_epoch_for_volumes(config: Mapping[str, Any], num_volumes: int) -> int:
     training = config.get("training", {})
     batch_size = int(training.get("batch_size", 2)) if isinstance(training, Mapping) else 2
     patches = num_volumes * _patches_per_volume(config)
@@ -1210,6 +1370,9 @@ def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str,
         kwargs["in_channels"] = model_config["in_channels"]
     if component == "decoder" and "out_channels" in model_config:
         kwargs["out_channels"] = model_config["out_channels"]
+    # Decoder-only: the encoder has no output head.
+    if component == "decoder" and "output_activation" in model_config:
+        kwargs["output_activation"] = model_config["output_activation"]
     return kwargs
 
 

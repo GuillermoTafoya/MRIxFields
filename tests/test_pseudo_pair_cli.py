@@ -84,7 +84,10 @@ def test_train_and_eval_pseudo_pairs_cli_with_injected_loader(tmp_path, monkeypa
 
     def synthetic_loader(path, record):  # type: ignore[no-untyped-def]
         del path
-        base = torch.linspace(0.0, 1.0, 1 * 2 * 4 * 4, dtype=torch.float32).reshape(1, 2, 4, 4)
+        # Slice plane must be large enough to survive the translator's downsampling
+        # (a 4x4 plane collapsed a pooled feature map to size 0). Volume is (C, X, Y, Z);
+        # slice_axis=x keeps X=2 (two source slices) and gives 32x32 model inputs.
+        base = torch.linspace(0.0, 1.0, 1 * 2 * 32 * 32, dtype=torch.float32).reshape(1, 2, 32, 32)
         return (base * (record.domain.field_strength_t / 7.0)).clamp(0.0, 1.0)
 
     monkeypatch.setattr("fieldbridge.cli.nifti_image_loader", synthetic_loader)

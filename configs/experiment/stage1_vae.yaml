@@ -15,6 +15,21 @@ data:
   # starved the GPU on Drive-FUSE). The manifest is far larger than RAM, so volumes are
   # streamed (one resident at a time), not cached.
   patches_per_volume: 16
+  # Voxel intensity above which a voxel counts as brain. Official volumes are [0, 1] with
+  # background at exactly 0, so `> 0` is the mask.
+  foreground_threshold: 0.0
+  # Stratified patch sampling. Uniform random 64^3 crops on a 364x436x364 volume land
+  # >2/3 of the time on near-empty air (measured by simulation), so most of the compute
+  # reconstructed background and the loss plateau was dominated by trivially-easy patches.
+  # Brain-only cropping is NOT the fix: the challenge metrics score the whole volume, so
+  # the model must still learn air and the brain/air boundary. These are relative weights
+  # over the three strata — starting points to sweep, not derived constants.
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
 model:
   name: kl_vae
   in_channels: 1
@@ -47,13 +62,21 @@ training:
   # its own shuffling, so DataLoader shuffle is off regardless.
   num_workers: 0
   loss_weights:
-    # Full SSIM+nRMSE+LPIPS+KL recipe now runs in 3D: ssim_loss dispatches to ssim3d
-    # (avg_pool3d) and lpips uses the slice-averaged variant (lpips_num_slices below).
+    # Full L1+SSIM+nRMSE+LPIPS+KL recipe in 3D: ssim_loss dispatches to ssim3d (avg_pool3d)
+    # and lpips uses the slice-averaged variant (lpips_num_slices below). L1 is the flat
+    # absolute-intensity anchor (see stage1_vae.py:DEFAULT_VAE_LOSS_WEIGHTS) — the term the
+    # earlier run lacked, which left the background floating instead of at 0. Weight to be
+    # swept alongside the others.
+    l1: 1.0
     ssim: 1.0
     nrmse: 1.0
     lpips: 1.0
     kl: 0.0001
   ssim_window_size: 7
+  # Must equal evaluation/stage1_report.py's _DATA_RANGE (1.0 on the official [0, 1]
+  # contract). Previously left at the loss default of 1.0 while eval used 2.0, so the
+  # optimized SSIM and the reported SSIM were different functions.
+  data_range: 1.0
   # Slices sampled along depth for the slice-based 3D LPIPS term.
   lpips_num_slices: 8
   # Gradient-norm clip: bounds each update so an occasional large-gradient batch (e.g. a

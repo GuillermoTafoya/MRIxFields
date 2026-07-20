@@ -146,7 +146,7 @@ def train_pseudo_pair_epochs(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = _build_scheduler(optimizer, cfg.scheduler, cfg.epochs)
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
+    scaler = _make_grad_scaler(enabled=cfg.amp and device.type == "cuda")
 
     start_epoch = 0
     global_step = 0
@@ -358,6 +358,19 @@ def _save_epoch_checkpoint(
         seed=cfg.seed,
         config=cfg.to_dict(),
     )
+
+
+def _make_grad_scaler(*, enabled: bool):
+    """Construct an AMP GradScaler across torch versions.
+
+    torch>=2.4 exposes the unified `torch.amp.GradScaler(device, ...)`; older builds only
+    have `torch.cuda.amp.GradScaler(...)`. Support both so the suite is green regardless of
+    the environment's torch (e.g. 2.2.x locally vs 2.11 on the GPU box).
+    """
+
+    if hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def _build_scheduler(

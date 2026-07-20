@@ -27,7 +27,13 @@ from torch.utils.data import Dataset
 from fieldbridge.data.contracts import RawBatch, VolumeRecord
 from fieldbridge.data.datasets import ImageLoader, ImageTransform
 from fieldbridge.data.domains import Domain
-from fieldbridge.data.transforms import normalize_percentile_clip_to_unit_range, random_crop
+from fieldbridge.data.masks import threshold_mask
+from fieldbridge.data.transforms import (
+    StratifiedCropConfig,
+    assert_official_unit_range,
+    random_crop,
+    stratified_crop,
+)
 
 _META_NAME = "bank_meta.json"
 _INDEX_NAME = "bank_index.jsonl"
@@ -42,6 +48,31 @@ class PatchBankBuildResult:
     num_volumes_failed: int
     total_patches: int
     out_dir: Path
+
+
+def _require_bank(bank_dir: Path) -> None:
+    """Fail with an actionable message when a bank directory is missing or half-built.
+
+    Bare `FileNotFoundError: .../bank_meta.json` (what reading the meta raises directly)
+    names the missing file but not the cause — most often a bank that was never built, or
+    a `--patch-bank` pointing at the wrong Drive directory. Both are one command away from
+    fixed, so say so rather than making the reader infer it after a Colab session died.
+    """
+
+    if not bank_dir.exists():
+        raise FileNotFoundError(
+            f"Patch bank directory does not exist: {bank_dir}. "
+            "Build it with `fieldbridge build-patch-bank --manifest <manifest> --out <dir>`, "
+            "or point --patch-bank at an existing bank."
+        )
+    missing = [name for name in (_META_NAME, _INDEX_NAME) if not (bank_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Patch bank at {bank_dir} is missing {', '.join(missing)} — it is not a complete "
+            "bank (an interrupted or never-started build leaves the directory without these). "
+            "Rebuild with `fieldbridge build-patch-bank` (the build is resumable), or point "
+            "--patch-bank at a complete bank."
+        )
 
 
 def _read_done_indices(index_path: Path) -> set[int]:
@@ -63,8 +94,10 @@ def build_patch_bank(
     out_dir: Path | str,
     patch_size: Sequence[int],
     patches_per_volume: int,
-    volume_transform: ImageTransform | None = normalize_percentile_clip_to_unit_range,
+    volume_transform: ImageTransform | None = assert_official_unit_range,
     seed: int = 13,
+    crop_config: StratifiedCropConfig | None = None,
+    foreground_threshold: float = 0.0,
     max_read_retries: int = 2,
     log_every: int = 25,
     logger=None,
@@ -112,9 +145,18 @@ def build_patch_bank(
             if volume_transform is not None:
                 volume = volume_transform(volume)
             torch.manual_seed(seed + vol_index)  # reproducible + resume-consistent crops
-            patches = torch.stack(
-                [random_crop(volume, patch_size=patch) for _ in range(patches_per_volume)], dim=0
-            )
+            if crop_config is None:
+                crops = [random_crop(volume, patch_size=patch) for _ in range(patches_per_volume)]
+            else:
+                generator = torch.Generator().manual_seed(seed + vol_index)
+                mask = threshold_mask(volume.unsqueeze(0), threshold=foreground_threshold).squeeze(0)
+                crops = [
+                    stratified_crop(
+                        volume, patch_size=patch, mask=mask, config=crop_config, generator=generator
+                    )
+                    for _ in range(patches_per_volume)
+                ]
+            patches = torch.stack(crops, dim=0)
             shard_rel = f"{_SHARD_DIR}/{vol_index:06d}.npy"
             np.save(out_dir / shard_rel, patches.to(torch.float16).numpy())
 
@@ -192,6 +234,7 @@ class PatchBankDataset(Dataset[RawBatch]):
 
     def __init__(self, bank_dir: Path | str) -> None:
         bank_dir = Path(bank_dir)
+        _require_bank(bank_dir)
         meta = json.loads((bank_dir / _META_NAME).read_text(encoding="utf-8"))
         self.patches_per_volume = int(meta["patches_per_volume"])
         index_path = bank_dir / _INDEX_NAME
@@ -235,6 +278,7 @@ def patch_bank_size(bank_dir: Path | str) -> tuple[int, int]:
     """Return (num_volumes, patches_per_volume) from a bank's meta + index without loading
     shards — used by the CLI to compute steps_per_epoch."""
     bank_dir = Path(bank_dir)
+    _require_bank(bank_dir)
     meta = json.loads((bank_dir / _META_NAME).read_text(encoding="utf-8"))
     num_volumes = sum(1 for line in (bank_dir / _INDEX_NAME).read_text(encoding="utf-8").splitlines() if line.strip())
     return num_volumes, int(meta["patches_per_volume"])

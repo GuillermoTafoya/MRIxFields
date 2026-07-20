@@ -5,3 +5,9 @@ latent_channels: 4
 num_res_blocks: 2
 spatial_dims: 3
 activation: silu
+# Linear decoder head. The official contract puts background at exactly 0, which a
+# saturating head (sigmoid, or the previous tanh at -1) can only approach asymptotically —
+# that is the mechanism behind the "anatomy fine, background never reaches the floor"
+# failure. Eval clamps to [0, 1]; training leaves it unbounded so gradients survive an
+# overshoot. Alternatives for ablation: "sigmoid", "clamp".
+output_activation: none

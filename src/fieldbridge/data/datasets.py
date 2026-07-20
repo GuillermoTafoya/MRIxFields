@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_in
 
 from fieldbridge.data.contracts import RawBatch, VolumeRecord
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
-from fieldbridge.data.transforms import random_crop
+from fieldbridge.data.masks import threshold_mask
+from fieldbridge.data.transforms import StratifiedCropConfig, random_crop, stratified_crop
 
 ImageLoader = Callable[[Path, VolumeRecord], torch.Tensor]
 TargetDomainSelector = Callable[[VolumeRecord], Domain]
@@ -122,6 +123,8 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
         volume_transform: ImageTransform | None = None,
         target_domain_selector: TargetDomainSelector | None = None,
         seed: int = 0,
+        crop_config: StratifiedCropConfig | None = None,
+        foreground_threshold: float = 0.0,
     ) -> None:
         if patches_per_volume < 1:
             raise ValueError("patches_per_volume must be >= 1.")
@@ -135,6 +138,11 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
         self.volume_transform = volume_transform
         self.target_domain_selector = target_domain_selector or (lambda record: record.domain)
         self.seed = int(seed)
+        # None => uniform random cropping (the original behavior). A config switches on
+        # foreground/border/air stratified sampling; see transforms.StratifiedCropConfig
+        # for why uniform crops waste most of the compute on air at this volume size.
+        self.crop_config = crop_config
+        self.foreground_threshold = float(foreground_threshold)
         self._pass = 0
 
     def __iter__(self) -> "Iterator[RawBatch]":
@@ -154,8 +162,26 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
                 volume = self.volume_transform(volume)
             target_domain = self.target_domain_selector(record)
             metadata = {"case_id": record.case_id, **dict(record.metadata)}
+            # Computed once per volume, not per patch: thresholding a full 364^3 volume is
+            # far from free and the mask is patch-invariant.
+            mask = (
+                threshold_mask(volume.unsqueeze(0), threshold=self.foreground_threshold).squeeze(0)
+                if self.crop_config is not None and self.patch_size is not None
+                else None
+            )
             for _ in range(self.patches_per_volume):
-                patch = volume if self.patch_size is None else random_crop(volume, patch_size=self.patch_size)
+                if self.patch_size is None:
+                    patch = volume
+                elif mask is not None:
+                    patch = stratified_crop(
+                        volume,
+                        patch_size=self.patch_size,
+                        mask=mask,
+                        config=self.crop_config,
+                        generator=generator,
+                    )
+                else:
+                    patch = random_crop(volume, patch_size=self.patch_size)
                 yield RawBatch(
                     image=patch,
                     source_domain=record.domain,

@@ -103,7 +103,25 @@ class KLVAEEncoder(BaseEncoder):
 
 
 class KLVAEDecoder(BaseDecoder):
-    """Mirror decoder for `KLVAEEncoder` latents. Ends in an unconditional `Tanh()`."""
+    """Mirror decoder for `KLVAEEncoder` latents. Linear output head by default.
+
+    `output_activation` selects the head:
+
+    * ``"none"`` (default) — raw linear conv. The official data contract is [0, 1] with
+      background at *exactly* 0, and a saturating head cannot represent an endpoint: a
+      `Sigmoid` reaches 0 only as its pre-activation goes to -inf, exactly as the previous
+      `Tanh` head could never reach -1. That is the mechanism behind the observed
+      "anatomy reconstructed but background never reaches the floor" failure, so the
+      head must not saturate. Outputs are clamped to [0, 1] where a bounded tensor is
+      actually required (evaluation), not during training, so gradients stay alive when
+      the decoder overshoots and can pull it back.
+    * ``"sigmoid"`` / ``"clamp"`` — bounded heads, kept configurable for ablation.
+
+    Reverses the previous "do not make this optional" rule, which existed to protect a
+    [-1, 1] contract that the official format supersedes (see
+    `data/transforms.py:assert_official_unit_range`). `lpips_loss` now does its own
+    [0, 1] -> [-1, 1] mapping, so it no longer constrains this head.
+    """
 
     def __init__(
         self,
@@ -115,8 +133,10 @@ class KLVAEDecoder(BaseDecoder):
         activation: str = "silu",
         use_norm: bool = True,
         num_res_blocks: int = 2,
+        output_activation: str = "none",
     ) -> None:
         super().__init__()
+        self.output_activation = _validate_output_activation(output_activation)
         out = _positive_int(out_channels, "out_channels")
         self.latent_channels = _positive_int(latent_channels, "latent_channels")
         self.spatial_dims = _validate_spatial_dims(spatial_dims)
@@ -152,13 +172,11 @@ class KLVAEDecoder(BaseDecoder):
         h = self.up2(h)
         h = self.res3(h)
         out = self.to_image(h)
-        # Unconditional — do not make this an optional `final_activation` parameter like
-        # CNNDecoder's. The [-1, 1] normalization contract (data/transforms.py's
-        # normalize_percentile_clip_to_unit_range) and training/losses.py's lpips_loss
-        # (which assumes un-normalized [-1, 1] inputs, no `normalize=True` flag) both
-        # depend on the decoder output being bounded to [-1, 1]. Making this optional
-        # would silently reintroduce the original diagnostic's rango-descalibrado bug.
-        return torch.tanh(out)
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(out)
+        if self.output_activation == "clamp":
+            return out.clamp(0.0, 1.0)
+        return out
 
 
 class _ResBlock(nn.Module):
@@ -234,6 +252,16 @@ def _validate_input_tensor(x: torch.Tensor, *, spatial_dims: SpatialDims, channe
             f"KLVAEEncoder inputs must have spatial dimensions divisible by "
             f"{downsample_factor}; got {spatial_shape}."
         )
+
+
+_OUTPUT_ACTIVATIONS = ("none", "sigmoid", "clamp")
+
+
+def _validate_output_activation(name: str) -> str:
+    normalized = str(name).lower()
+    if normalized not in _OUTPUT_ACTIVATIONS:
+        raise ValueError(f"output_activation must be one of {_OUTPUT_ACTIVATIONS}, got {name!r}.")
+    return normalized
 
 
 def _validate_spatial_dims(spatial_dims: int) -> SpatialDims:

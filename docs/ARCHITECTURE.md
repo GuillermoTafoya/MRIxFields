@@ -80,7 +80,7 @@ field/contrast-specific subnetworks (disqualifying under the challenge rules).
 | Component | Status |
 |---|---|
 | `autoencoders/{base,identity}.py` | `BaseEncoder`/`BaseDecoder` contracts + pass-through identity implementation (smoke tests only). |
-| `autoencoders/kl_vae.py` | **Etapa 1's real VAE.** `KLVAEEncoder`/`KLVAEDecoder`, residual-block encoder/decoder (`num_res_blocks=2` per level, GroupNorm+SiLU pre-act, MONAI AutoencoderKL-style), `encode_dist()` → `(mean, logvar)`, `encode()` reparameterizes. Decoder upsamples with **nearest `Upsample` + conv** (the Odena et al. anti-checkerboard construction), *not* `ConvTranspose`. Blind to (field, contrast) — no FiLM inside the VAE; conditioning lives in the diffuser (§6). Decoder ends in unconditional `Tanh()` (bound to `[-1, 1]`, matching `normalize_percentile_clip_to_unit_range` and `lpips_loss`'s un-normalized-input assumption — do not make this activation optional). Supports `spatial_dims=2` (slices) or `spatial_dims=3` (full volumes) — 3D added as a deliberate, confirmed reversal of `fase-b-vae.md`'s original "2D estricto" rule for this component only, since the real manifest ships full NIfTI volumes and no slicing step exists in this pipeline. `latent_channels=4` default at `/4` spatial downsample ⇒ **16× compression** on a 64³ patch (16³×4 vs 64³) — the medical-3D consensus (SD kl-f8, Pinaya/MONAI use 3–4). The earlier `latent_channels=128` was a *2× expansion* (no bottleneck) that OOM'd eval and left nothing useful for the diffuser; reworked 2026-07-05. |
+| `autoencoders/kl_vae.py` | **Etapa 1's real VAE.** `KLVAEEncoder`/`KLVAEDecoder`, residual-block encoder/decoder (`num_res_blocks=2` per level, GroupNorm+SiLU pre-act, MONAI AutoencoderKL-style), `encode_dist()` → `(mean, logvar)`, `encode()` reparameterizes. Decoder upsamples with **nearest `Upsample` + conv** (the Odena et al. anti-checkerboard construction), *not* `ConvTranspose`. Blind to (field, contrast) — no FiLM inside the VAE; conditioning lives in the diffuser (§6). Decoder head is **linear by default** (`output_activation="none"`; `sigmoid`/`clamp` available for ablation): the official data contract is `[0, 1]` with background at *exactly* 0, which a saturating head (the previous `Tanh`, or a `Sigmoid`) can only approach asymptotically — that was the mechanism behind the "anatomy reconstructed but background floating" eval failure (reworked 2026-07-20). Eval clamps to `[0, 1]`; training leaves the output unbounded so gradients survive an overshoot. Supports `spatial_dims=2` (slices) or `spatial_dims=3` (full volumes) — 3D added as a deliberate, confirmed reversal of `fase-b-vae.md`'s original "2D estricto" rule for this component only, since the real manifest ships full NIfTI volumes and no slicing step exists in this pipeline. `latent_channels=4` default at `/4` spatial downsample ⇒ **16× compression** on a 64³ patch (16³×4 vs 64³) — the medical-3D consensus (SD kl-f8, Pinaya/MONAI use 3–4). The earlier `latent_channels=128` was a *2× expansion* (no bottleneck) that OOM'd eval and left nothing useful for the diffuser; reworked 2026-07-05. |
 | `translators/base.py` | `BaseTranslator.forward(z, source_domain, target_domain, t=None)` — the contract every ladder translator implements. |
 | `translators/identity.py` | Pass-through with an optional learnable scale (smoke tests). |
 | `translators/conditional_cnn.py` | CPU-friendly conditional CNN baseline for `x_hat = G(x, source_domain, target_domain)` on 2D slices or 3D volumes. |
@@ -186,7 +186,7 @@ Trained by `training/stage2_diffuser.py` (§7) with a standard noise-prediction 
 | `smoke_train.py` | Fixed CPU smoke test: identity encoder/decoder/translator, 2 steps, synthetic data. **Do not extend this — it's a stability tripwire, not a real trainer.** |
 | `train_loop.py` | The real, reusable Etapa 2 training loop. Config-driven precision (`fp32`/`bf16` via `torch.autocast`), optional gradient checkpointing on the translator's forward, configurable loss weights (`reconstruction`, `transport_cost`, `cycle`, `identity` — default only `reconstruction=1.0`, rest `0.0`), resume-from-checkpoint (model + optimizer state, not dataloader position — see note in the module), and `assert_frozen(module)` to verify the Etapa 1 VAE is frozen before Etapa 2 training. |
 | `pseudo_pair_epochs.py` | Real epoch-based pseudo-pair trainer for the deterministic conditional U-Net baseline: finite DataLoader epochs, AdamW, optional CUDA AMP, gradient clipping, scheduler, validation after every epoch, JSONL history, best/last checkpoints, and resume with optimizer/scheduler/global-step state. |
-| `stage1_vae.py` | Etapa 1 VAE-only training (`KLVAEEncoder`/`KLVAEDecoder`, no diffuser, no translator). Loss composition is **all four terms active by default** (unlike Etapa 2's "0 except reconstruction" ladder convention) — `ssim`+`nrmse`+`lpips`+`kl` (default weights `1.0/1.0/1.0/1e-4`), relative weights swept experimentally rather than turned on term-by-term. The full recipe now runs on **3D volumes**: `ssim_loss` dispatches to `ssim3d` (avg_pool3d) and `lpips` uses `lpips_loss_3d` (slice-averaged, `lpips_num_slices` config). The LPIPS net is built once via `build_lpips_net`. Supports warm-start (`training/warm_start.py`) and resume-from-checkpoint. |
+| `stage1_vae.py` | Etapa 1 VAE-only training (`KLVAEEncoder`/`KLVAEDecoder`, no diffuser, no translator). Loss composition is **all terms active by default** (unlike Etapa 2's "0 except reconstruction" ladder convention) — `l1`+`ssim`+`nrmse`+`lpips`+`kl` (default weights `1.0/1.0/1.0/1.0/1e-4`), relative weights swept experimentally rather than turned on term-by-term. `l1` is the flat absolute-intensity anchor added 2026-07-20 (nRMSE's global sqrt gives near-uniform per-voxel gradient, SSIM is blind to a DC offset, LPIPS is contrast-invariant — nothing else forced the background to the exact 0 the `[0, 1]` contract needs). The full recipe runs on **3D volumes**: `ssim_loss` dispatches to `ssim3d` (avg_pool3d) and `lpips` uses `lpips_loss_3d` (slice-averaged, `lpips_num_slices` config). The LPIPS net is built once via `build_lpips_net`. `data_range` is config-driven and must equal eval's (`1.0` on the official `[0, 1]` contract). When a `val_loader` is passed (via `--split-json`, §10), runs **per-epoch validation** (deterministic mean recon on the validation split), appends a per-term train+val breakdown to `history.jsonl`, and saves the `vae_kl_vae_best.pt` selected by validation total — this is the model-selection signal, distinct from the train-EMA early-stop (a GPU-saver only). `_compute_vae_loss` delegates to `_compute_vae_loss_components` so logging can show where the loss lives. Supports warm-start (`training/warm_start.py`) and resume-from-checkpoint. |
 | `stage2_diffuser.py` | Etapa 1's conditional-diffuser training (`DenoisingUNet` on top of a trained `KLVAEEncoder`, §6). VAE frozen by default (`train_vae_jointly=False`, reuses `assert_frozen` from `train_loop.py`); standard DDPM noise-prediction MSE loss, `num_timesteps`/`beta_start`/`beta_end` config-driven. |
 | `warm_start.py` | `load_state_dict_tolerant(module, state_dict)` — tolerant checkpoint loading for external (e.g. MAISI/Pinaya) warm-start weights: filters out shape-mismatched keys before calling `load_state_dict(strict=False)` (which alone still raises on shape mismatch) and logs skipped/missing/unexpected keys separately. |
 
@@ -206,6 +206,10 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
 - `data/sampling.py`'s `domain_oversampling_weights(records, *, boost_by_field)` — per-record
   weights for `torch.utils.data.WeightedRandomSampler` (e.g. `{0.1: 3.0}` to oversample
   0.1T 3x). No default map ships — the ratio is an experiment hyperparameter, not a guess.
+  **Not wired into Stage-1 VAE training** (deferred, see §11 status): `StreamingPatchDataset`
+  is an `IterableDataset` that owns its own volume shuffle, so a `WeightedRandomSampler`
+  cannot be attached — 0.1T oversampling there needs biasing the internal `randperm`, not
+  this helper. Currently used only by the Track-A pseudo-pair path.
 - `data/pseudo_pairs.py`'s `PseudoPairSliceDataset` expands persisted volume splits into
   slices lazily with a tiny LRU volume cache and an injected loader. `make_field_balanced_sampler`
   uses inverse target-field frequency so 1.5T/3T/5T/7T examples contribute approximately
@@ -215,11 +219,26 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
 
 ### Transforms (`data/transforms.py`)
 
+- `assert_official_unit_range(image)` — the **default** volume transform for every
+  manifest-backed loader (`cli.py`'s `_build_manifest_loader`). A *checked no-op*: the
+  official MRIxFields2026 data ships pre-normalized to `[0, 1]` and the format forbids
+  rescaling intensity in training or evaluation, so the correct transform does nothing —
+  but it raises if a volume is not already in `[0, 1]`, so a bad loader/manifest fails
+  loudly instead of producing metrics that are incomparable to the challenge leaderboard.
 - `normalize_percentile_clip_to_unit_range(image, lower_percentile=0.5, upper_percentile=99.5)`
-  — clips MRI's long-tailed intensity distribution then affine-maps to `[-1, 1]`, matching
-  `KLVAEDecoder`'s `Tanh()` output and `lpips_loss`'s un-normalized-input assumption. Used
-  by default for every manifest-backed loader (`cli.py`'s `_build_manifest_loader`).
-- `random_crop(image, patch_size)` — random spatial-patch crop over the trailing dims.
+  — clips MRI's long-tailed intensity distribution then affine-maps to `[-1, 1]`. **No
+  longer the default** and must NOT be used on official data (it both clips signal and
+  rescales); kept for external cohorts with raw scanner intensities.
+- `StratifiedCropConfig` / `stratified_crop(image, *, patch_size, mask, config)` — patch
+  sampling drawn from foreground / border / air strata by configurable quota (default
+  `0.7/0.2/0.1`). Uniform random 64³ crops on a 364×436×364 volume land >2/3 of the time
+  on near-empty air (measured), so most compute reconstructed background; brain-only
+  cropping is wrong too, since the challenge scores the whole volume and the model must
+  still learn air and the brain/air boundary. Wired into `StreamingPatchDataset` and the
+  patch bank when `data.stratified_crop` is set; the mask is computed once per volume via
+  `data/masks.py`'s `threshold_mask` (`data.foreground_threshold`, 0.0 on `[0, 1]` data).
+- `random_crop(image, patch_size)` — uniform random spatial-patch crop over the trailing
+  dims; the fallback when no `stratified_crop` config is set.
   Required once `spatial_dims=3` is combined with full-resolution volumes (e.g.
   `364x436x364`): decoding a full 3D volume back toward full resolution OOMs on
   essentially any GPU, so real 3D training crops patches instead of feeding whole
@@ -258,8 +277,12 @@ training forward pass:
   decoded whole (the OOM/RAM blowup). `overlap` (default 0.5) + a separable **Hann weight
   window** blend tile faces — with stride == patch (overlap 0) each tile is encoded
   independently and the faces show up as a regular panel grid every `patch` voxels.
-- `[-1, 1]` normalization identical to training; `--per-domain` samples one volume per
-  distinct field strength (0.1T..7T); metrics are nRMSE / `ssim3d` / slice-LPIPS.
+- Official `[0, 1]` volumes passed through unchanged, identical to training (`data_range`
+  `1.0`); a range guard (`_assert_same_space`) fails loudly if recon or target leaves
+  `[0, 1]`. `--per-domain` samples one volume per distinct field strength (0.1T..7T);
+  metrics are nRMSE / `ssim3d` / slice-LPIPS. A per-sample **correlation** diagnostic (not
+  a challenge metric) separates "anatomy present, calibration off" (corr ~1) from "recon
+  collapsed to a constant" (corr ~0), which SSIM alone cannot.
 
 ## 9. Official challenge layer (`official/`)
 
@@ -281,8 +304,9 @@ fieldbridge smoke-train [--config PATH] [--steps N] [--batch-size N] [--seed N] 
 fieldbridge train        [--config PATH] [--steps N] [--batch-size N] [--seed N] [--manifest PATH] [--json]
 fieldbridge train-pseudo-pairs [--config PATH] --manifest PATH [--epochs N] [--batch-size N] [--checkpoint-dir DIR] [--preflight] [--json]
 fieldbridge eval-pseudo-pairs --checkpoint PATH --manifest PATH [--config PATH] [--split validation|test] [--json]
-fieldbridge train-stage1-vae --manifest PATH [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
-fieldbridge eval-stage1-vae --checkpoint PATH --manifest PATH --out DIR [--config PATH] [--num-samples N] [--per-domain] [--overlap F] [--metrics-raw PATH]
+fieldbridge build-vae-splits --manifest PATH --out PATH.json [--train-frac F] [--val-frac F] [--test-frac F] [--seed N] [--json]
+fieldbridge train-stage1-vae (--manifest PATH | --split-json PATH | --patch-bank DIR) [--config PATH] [--steps N] [--epochs N] [--batch-size N] [--seed N] [--json]
+fieldbridge eval-stage1-vae --checkpoint PATH (--manifest PATH | --split-json PATH [--split train|validation|test]) --out DIR [--config PATH] [--num-samples N] [--per-domain] [--overlap F] [--metrics-raw PATH]
 fieldbridge train-stage2-diffuser --manifest PATH [--config PATH] [--steps N] [--batch-size N] [--seed N] [--json]
 fieldbridge print-config --config PATH
 fieldbridge audit-manifest MANIFEST [--strict-paths]
@@ -301,10 +325,22 @@ working unmodified per `AGENTS.md`.
 `train-stage1-vae`/`train-stage2-diffuser` require `--manifest` (real NIfTI volumes via
 the `nifti` extra) — there is no synthetic fallback for these two stages. Both build
 `KLVAEEncoder`/`Decoder` via `models/factory.py`'s `"kl_vae"` key and wire the manifest
-loader through `_manifest_transform` (percentile-clip normalize, plus `random_crop` when
+loader through `_manifest_transform` (official `[0, 1]` passthrough via
+`assert_official_unit_range`, plus stratified or uniform patch cropping when
 `data.patch_size` is set — see §7's Transforms note). The training paths pass
 `shuffle=True` + `num_workers` (from `training.num_workers`) to `_build_manifest_loader`;
 non-training callers keep the deterministic manifest order.
+
+`build-vae-splits` (`data/vae_splits.py`) carves a **subject-level, domain-stratified**
+train/validation/test split from a manifest and writes it (with a leakage audit +
+fingerprint) to JSON. Subject-level so a prospective traveller's 15 volumes never straddle
+splits; domain-stratified so validation/test cover every (field, contrast) — 0.1T in
+particular. `train-stage1-vae --split-json` then trains on `train` and validates per-epoch
+on `validation` (writing `history.jsonl` — per-term train+val losses — and a
+`vae_kl_vae_best.pt` selected by validation total, the model-selection signal); the
+`--manifest` / `--patch-bank` forms keep the original no-validation behavior.
+`eval-stage1-vae --split-json --split test` runs the final held-out report.
+`scripts/run_stage1_vae.bat` chains manifest → split → train → test-eval for a local box.
 
 `eval-stage1-vae` loads a checkpoint and writes `metrics.json` + diagnostic PNGs via
 `evaluation/stage1_report.py` (§8) — deterministic recon, sliding-window blending
@@ -377,6 +413,12 @@ files:
 - `test_datasets.py`, `test_sampling.py`, `test_transforms.py`, `test_sources.py` —
   synthetic dataset shapes, any-to-any sampler reproducibility, oversampling weights,
   percentile-clip/random-crop transforms, NIfTI loader.
+- `test_official_unit_range_contract.py` — the `[0, 1]` contract migration: passthrough
+  transform + range guard, stratified-crop quotas/fallback, the linear vs sigmoid/clamp
+  decoder heads, the L1 loss term, the per-term loss components, and per-epoch validation
+  (history.jsonl + best checkpoint).
+- `test_vae_splits.py` — subject-level split: leakage-free, traveller grouping,
+  determinism, domain-stratification coverage, save/load round-trip.
 - `test_losses.py`, `test_evaluation_metrics.py` — forward + backward sanity for every
   loss/metric, including the optional-dependency (`lpips`) failure path.
 - `test_kl_vae.py` — `KLVAEEncoder`/`KLVAEDecoder` shape/round-trip for both
@@ -412,7 +454,7 @@ touches package, CLI, data, model, or training code.
 | Stage | Status |
 |---|---|
 | Fase A — cross-cutting infra | **Done.** Field encoding, per-pair conditioner, FiLM, losses, metrics, checkpoint versioning, any-to-any sampler, real train loop, model factory, CLI `train`. |
-| Etapa 1 — VAE (`KLVAEEncoder`/`Decoder`) + conditional latent diffuser (`DenoisingUNet`) | **Core implemented, not GPU-validated.** VAE reworked 2026-07-05: `latent_channels=4` (16× compression) + residual blocks, full 3D loss recipe (nRMSE+SSIM3D+slice-LPIPS+KL), `eval-stage1-vae` with deterministic recon + sliding-window blending. A 150-step validation run confirmed the pipeline runs end-to-end (checkpoint valid, LPIPS active) but is far too short to judge reconstruction quality. **Open before the real run:** the validation run measured ~37 s/step — at that rate an 8k-step run is ~82 GPU-h (over budget), so per-step cost (full-volume NIfTI load per step, batch size, GPU placement) must be profiled first. Real reconstruction/diffusion quality on real data (0.1T in particular) not yet confirmed. Supersedes the original Fase B KL-VAE-GAN plan (`docs/plans/fase-b-vae.md`, superseded). |
+| Etapa 1 — VAE (`KLVAEEncoder`/`Decoder`) + conditional latent diffuser (`DenoisingUNet`) | **Core implemented, not GPU-validated.** VAE reworked 2026-07-05: `latent_channels=4` (16× compression) + residual blocks, `eval-stage1-vae` with deterministic recon + sliding-window blending. **Recipe overhaul 2026-07-20** after an eval showed anatomy reconstructed but background floating (SSIM3D~0, a calibration fault): (1) migrated to the official `[0, 1]` no-rescale contract — `assert_official_unit_range` passthrough, `lpips` maps `[0,1]→[-1,1]` internally, `data_range` aligned train/eval; (2) decoder head linear (was `Tanh`) so background can reach exactly 0; (3) added the L1 intensity anchor to the loss (`l1`+`ssim`+`nrmse`+`lpips`+`kl`); (4) stratified foreground/border/air patch sampling (uniform crops wasted ~2/3 of compute on air). **Deferred / out of scope** (were in the original plan, dropped for now): patchGAN discriminator, MAISI/Pinaya warm-start, 0.1T oversampling in Stage-1. **Open before the real run:** an earlier validation run measured ~37 s/step — an 8k-step run would be ~82 GPU-h (over budget), so per-step cost (full-volume NIfTI load per step, batch size, GPU placement) must be profiled first, and reconstruction quality on real data (0.1T especially) is not yet confirmed. Supersedes the original Fase B KL-VAE-GAN plan (`docs/plans/fase-b-vae.md`, superseded). |
 | Fase C — StarGAN-v2 latente (Etapa 2 ladder #1) | Not started. |
 | Fase D — OT-CFM (Etapa 2 ladder #2) | Not started (`translators/ot_cfm_stub.py` is a placeholder). |
 | Fase E — Entropic-OT bridge / SB (Etapa 2 ladder #3, primary) | Not started (`translators/sb_stub.py` is a placeholder). |

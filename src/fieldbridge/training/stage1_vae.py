@@ -12,6 +12,7 @@ latent, VAE frozen by default — staged, not end-to-end.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from collections.abc import Mapping
@@ -33,6 +34,7 @@ from fieldbridge.training.losses import (
     kl_divergence,
     lpips_loss,
     lpips_loss_3d,
+    masked_l1_loss,
     nrmse_loss,
     ssim_loss,
 )
@@ -42,11 +44,17 @@ from fieldbridge.utils.seeding import seed_everything
 Precision = Literal["fp32", "bf16"]
 Device = Literal["auto", "cpu", "cuda"]
 
-# Unlike Etapa 2's "everything 0 except reconstruction" ladder convention, all four
-# terms here are active by default: SSIM+nRMSE+LPIPS+KL is a fixed composition whose
-# *relative* weights get swept experimentally, not a term-by-term ladder to turn on one
-# at a time.
+# Unlike Etapa 2's "everything 0 except reconstruction" ladder convention, all terms here
+# are active by default: L1+SSIM+nRMSE+LPIPS+KL is a fixed composition whose *relative*
+# weights get swept experimentally, not a term-by-term ladder to turn on one at a time.
+#
+# L1 is the flat absolute-intensity anchor the recipe was missing: nRMSE has a single
+# global sqrt (near-uniform per-voxel gradient), SSIM is local and blind to a DC offset,
+# and LPIPS is deliberately contrast-invariant — so nothing forced the background to the
+# exact 0 the official [0, 1] contract requires. That is why the earlier run reconstructed
+# anatomy but left the background floating. L1 is the plan's Etapa-1 reconstruction term.
 DEFAULT_VAE_LOSS_WEIGHTS: dict[str, float] = {
+    "l1": 1.0,
     "ssim": 1.0,
     "nrmse": 1.0,
     "lpips": 1.0,
@@ -64,7 +72,17 @@ class Stage1VAEConfig:
     precision: Precision = "fp32"
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_VAE_LOSS_WEIGHTS))
     ssim_window_size: int = 7
+    # Intensity range the range-normalized losses assume. 1.0 on the official [0, 1]
+    # contract; must stay equal to evaluation/stage1_report.py's _DATA_RANGE.
+    data_range: float = 1.0
     lpips_num_slices: int = 8
+    # Per-epoch validation (runs only when a val loader is passed and steps_per_epoch>0).
+    # `val_max_batches`=0 uses the whole val loader; a positive cap bounds the per-epoch
+    # cost. History (per-term train+val losses) is appended to `history_filename` in the
+    # checkpoint dir, and the best-by-validation-total checkpoint is saved alongside — this
+    # is the model-selection signal, unlike the train-EMA early-stop (a GPU-saver only).
+    val_max_batches: int = 0
+    history_filename: str = "history.jsonl"
     grad_clip_norm: float = 1.0
     # Steps that make up one full pass over the manifest, = ceil(num_volumes *
     # patches_per_volume / batch_size). 0 means unknown (the loader is an IterableDataset
@@ -110,8 +128,15 @@ class Stage1VAEConfig:
             ssim_window_size=int(
                 training.get("ssim_window_size", data.get("ssim_window_size", defaults.ssim_window_size))
             ),
+            data_range=float(training.get("data_range", data.get("data_range", defaults.data_range))),
             lpips_num_slices=int(
                 training.get("lpips_num_slices", data.get("lpips_num_slices", defaults.lpips_num_slices))
+            ),
+            val_max_batches=int(
+                training.get("val_max_batches", data.get("val_max_batches", defaults.val_max_batches))
+            ),
+            history_filename=str(
+                training.get("history_filename", data.get("history_filename", defaults.history_filename))
             ),
             grad_clip_norm=float(
                 training.get("grad_clip_norm", data.get("grad_clip_norm", defaults.grad_clip_norm))
@@ -166,6 +191,9 @@ class Stage1VAEConfig:
             "precision": self.precision,
             "loss_weights": dict(self.loss_weights),
             "ssim_window_size": self.ssim_window_size,
+            "data_range": self.data_range,
+            "val_max_batches": self.val_max_batches,
+            "history_filename": self.history_filename,
             "lpips_num_slices": self.lpips_num_slices,
             "grad_clip_norm": self.grad_clip_norm,
             "steps_per_epoch": self.steps_per_epoch,
@@ -251,6 +279,7 @@ def run_stage1_vae_train(
     encoder: KLVAEEncoder,
     decoder: KLVAEDecoder,
     loader: DataLoader[RawBatch],
+    val_loader: DataLoader[RawBatch] | None = None,
 ) -> Stage1VAETrainResult:
     # Typed against KLVAEEncoder/KLVAEDecoder specifically (not BaseEncoder/BaseDecoder)
     # since this loop needs encode_dist(), which isn't part of the base ABC contract.
@@ -306,7 +335,15 @@ def run_stage1_vae_train(
             f"device={device.type} {epochs_label} early_stopping={cfg.early_stopping}"
         )
 
+    do_validation = val_loader is not None and cfg.steps_per_epoch > 0
+    history_path = (
+        cfg.checkpoint_dir / cfg.history_filename if cfg.checkpoint_dir is not None and do_validation else None
+    )
+    best_val_total = float("inf")
+
     losses: list[float] = []
+    epoch_sums: dict[str, float] = {}
+    epoch_batches = 0
     last_checkpoint_step: int | None = None
     stopped_early = False
     train_start = time.perf_counter()
@@ -321,7 +358,8 @@ def run_stage1_vae_train(
 
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
-            total_loss = _compute_vae_loss(encoder, decoder, batch, cfg, lpips_net=lpips_net)
+            components = _compute_vae_loss_components(encoder, decoder, batch, cfg, lpips_net=lpips_net)
+        total_loss = components["total"]
         total_loss.backward()
         if cfg.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip_norm)
@@ -329,11 +367,16 @@ def run_stage1_vae_train(
         _sync_if_cuda(device)
         loss_value = float(total_loss.detach().cpu())
         losses.append(loss_value)
+        # Accumulate per-term train means for the current epoch's history line.
+        for name, value in components.items():
+            epoch_sums[name] = epoch_sums.get(name, 0.0) + float(value.detach().cpu())
+        epoch_batches += 1
         if tracker is not None:
             tracker.update_step(loss_value)
 
         current_step = step + 1
         is_checkpoint_step = bool(cfg.checkpoint_every_steps) and current_step % cfg.checkpoint_every_steps == 0
+        is_epoch_end = do_validation and current_step % cfg.steps_per_epoch == 0
 
         # Evaluate the stop decision *before* saving, so the checkpoint persists the
         # post-decision tracker state (patience count) — resume_from must not be a step behind.
@@ -357,6 +400,39 @@ def run_stage1_vae_train(
                 f"step={current_step}/{start_step + cfg.steps} loss={loss_value:.6f}{ema_str} "
                 f"step_sec={step_elapsed:.3f} avg_sec_per_step={elapsed / len(losses):.3f}"
             )
+
+        if is_epoch_end:
+            assert val_loader is not None  # do_validation guarantees this
+            epoch_index = current_step // cfg.steps_per_epoch
+            train_means = {name: total / max(1, epoch_batches) for name, total in epoch_sums.items()}
+            val_means = _run_validation(encoder, decoder, val_loader, cfg, device, lpips_net, autocast_ctx)
+            epoch_sums, epoch_batches = {}, 0
+
+            val_total = val_means.get("total", float("nan"))
+            is_best = val_total == val_total and val_total < best_val_total  # NaN-safe
+            if is_best:
+                best_val_total = val_total
+            if history_path is not None:
+                _append_history(
+                    history_path,
+                    {
+                        "epoch": epoch_index,
+                        "step": current_step,
+                        "train": train_means,
+                        "validation": val_means,
+                        "lr": cfg.lr,
+                        "best": is_best,
+                        "seconds": time.perf_counter() - train_start,
+                    },
+                )
+            if is_best and cfg.checkpoint_dir is not None:
+                _save_best_checkpoint(cfg, encoder, decoder, optimizer, current_step)
+            _log_training_progress(
+                f"stage1_vae epoch={epoch_index} val_total={val_total:.6f} "
+                f"train_total={train_means.get('total', float('nan')):.6f}{' [best]' if is_best else ''}"
+            )
+            encoder.train()
+            decoder.train()
 
         if should_stop:
             _log_training_progress(
@@ -392,6 +468,27 @@ def _compute_vae_loss(
     *,
     lpips_net: nn.Module | None,
 ) -> torch.Tensor:
+    """Weighted total loss (backward target). See `_compute_vae_loss_components` for the
+    per-term breakdown used by logging/validation."""
+
+    return _compute_vae_loss_components(encoder, decoder, batch, cfg, lpips_net=lpips_net)["total"]
+
+
+def _compute_vae_loss_components(
+    encoder: KLVAEEncoder,
+    decoder: KLVAEDecoder,
+    batch: RawBatch,
+    cfg: Stage1VAEConfig,
+    *,
+    lpips_net: nn.Module | None,
+) -> dict[str, torch.Tensor]:
+    """Weighted `total` plus each *unweighted* term, so logging can show where the loss
+    lives (l1/ssim/nrmse/lpips/kl) rather than one opaque number.
+
+    Only the terms with positive weight are computed (LPIPS especially is expensive), so a
+    swept-off term is simply absent from the returned dict — callers read with `.get`.
+    """
+
     # Reparameterize once, here, rather than calling encode() and then encode_dist()
     # separately — that would run the encoder twice with two different random samples,
     # silently decorrelating the KL term from the reconstruction term.
@@ -401,22 +498,140 @@ def _compute_vae_loss(
     z = mean + eps * torch.exp(0.5 * logvar)
     reconstructed = decoder.decode(z, batch.source_domain)
 
-    total = weights.get("nrmse", 0.0) * nrmse_loss(reconstructed, batch.image)
+    components: dict[str, torch.Tensor] = {}
+    # data_range must match evaluation's (_DATA_RANGE in evaluation/stage1_report.py).
+    # It was previously left at the 1.0 default here while eval used 2.0, so the SSIM
+    # being optimized had different c1/c2 stabilizers than the SSIM being reported.
+    components["nrmse"] = nrmse_loss(reconstructed, batch.image, data_range=cfg.data_range)
+    if weights.get("l1", 0.0) > 0:
+        # Plain image-space L1 (no mask): the flat per-voxel absolute-error term that
+        # anchors the DC level and drives the background to exactly 0.
+        components["l1"] = masked_l1_loss(reconstructed, batch.image)
     if weights.get("ssim", 0.0) > 0:
         # ssim_loss dispatches on rank: 5D volumes -> ssim3d (avg_pool3d), 4D -> 2D ssim.
-        total = total + weights["ssim"] * ssim_loss(reconstructed, batch.image, window_size=cfg.ssim_window_size)
+        components["ssim"] = ssim_loss(
+            reconstructed, batch.image, window_size=cfg.ssim_window_size, data_range=cfg.data_range
+        )
     if weights.get("lpips", 0.0) > 0:
         # LPIPS wraps a 2D VGG net: for 5D volumes use the slice-averaged variant, for 4D
         # (2D slices) the plain one.
         if reconstructed.ndim == 5:
-            lpips_value = lpips_loss_3d(
+            components["lpips"] = lpips_loss_3d(
                 reconstructed, batch.image, net=lpips_net, num_slices=cfg.lpips_num_slices
             )
         else:
-            lpips_value = lpips_loss(reconstructed, batch.image, net=lpips_net)
-        total = total + weights["lpips"] * lpips_value
-    total = total + weights.get("kl", 0.0) * kl_divergence(mean, logvar)
-    return total
+            components["lpips"] = lpips_loss(reconstructed, batch.image, net=lpips_net)
+    components["kl"] = kl_divergence(mean, logvar)
+
+    total = reconstructed.sum() * 0.0
+    for name, value in components.items():
+        total = total + weights.get(name, 0.0) * value
+    components["total"] = total
+    return components
+
+
+@torch.no_grad()
+def _run_validation(
+    encoder: KLVAEEncoder,
+    decoder: KLVAEDecoder,
+    val_loader: DataLoader[RawBatch],
+    cfg: Stage1VAEConfig,
+    device: torch.device,
+    lpips_net: nn.Module | None,
+    autocast_ctx: Any,
+) -> dict[str, float]:
+    """Mean per-term loss over the validation loader, deterministic (latent mean, no
+    sampling). `val_max_batches`>0 caps the pass. `ssim3d`/`nrmse`/`lpips` are logged as
+    the challenge metrics too (ssim3d = 1 - ssim loss)."""
+
+    encoder.eval()
+    decoder.eval()
+    sums: dict[str, float] = {}
+    count = 0
+    for batch in val_loader:
+        if cfg.val_max_batches > 0 and count >= cfg.val_max_batches:
+            break
+        batch = move_raw_batch(batch, device)
+        with autocast_ctx:
+            # Deterministic: reconstruct from the latent mean, matching eval — not the
+            # sampled path, whose noise would make val loss jump epoch to epoch.
+            mean, logvar = encoder.encode_dist(batch.image, batch.source_domain)
+            reconstructed = decoder.decode(mean, batch.source_domain)
+            components = _reconstruction_components(reconstructed, batch.image, mean, logvar, cfg, lpips_net)
+        for name, value in components.items():
+            sums[name] = sums.get(name, 0.0) + float(value)
+        count += 1
+    means = {name: total / max(1, count) for name, total in sums.items()}
+    if "ssim" in means:
+        means["ssim3d"] = 1.0 - means["ssim"]  # challenge metric (higher better)
+    means["num_batches"] = count
+    return means
+
+
+def _reconstruction_components(
+    reconstructed: torch.Tensor,
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    logvar: torch.Tensor,
+    cfg: Stage1VAEConfig,
+    lpips_net: nn.Module | None,
+) -> dict[str, torch.Tensor]:
+    """Per-term losses from an already-decoded reconstruction (validation path shares the
+    exact term definitions with training's `_compute_vae_loss_components`)."""
+
+    weights = cfg.loss_weights
+    components: dict[str, torch.Tensor] = {"nrmse": nrmse_loss(reconstructed, target, data_range=cfg.data_range)}
+    if weights.get("l1", 0.0) > 0:
+        components["l1"] = masked_l1_loss(reconstructed, target)
+    if weights.get("ssim", 0.0) > 0:
+        components["ssim"] = ssim_loss(reconstructed, target, window_size=cfg.ssim_window_size, data_range=cfg.data_range)
+    if weights.get("lpips", 0.0) > 0:
+        components["lpips"] = (
+            lpips_loss_3d(reconstructed, target, net=lpips_net, num_slices=cfg.lpips_num_slices)
+            if reconstructed.ndim == 5
+            else lpips_loss(reconstructed, target, net=lpips_net)
+        )
+    components["kl"] = kl_divergence(mean, logvar)
+    total = reconstructed.sum() * 0.0
+    for name, value in components.items():
+        total = total + weights.get(name, 0.0) * value
+    components["total"] = total
+    return components
+
+
+def _append_history(history_path: Path, entry: Mapping[str, Any]) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def _save_best_checkpoint(
+    cfg: Stage1VAEConfig,
+    encoder: KLVAEEncoder,
+    decoder: KLVAEDecoder,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+) -> None:
+    """Overwrite the single stable-named best checkpoint (model selection by val total).
+
+    Fixed name (not step-stamped) so automation/eval always has one path to the best
+    model; `overwrite=True` because replacing the previous best is the intent here — this
+    is the one place a checkpoint is deliberately overwritten."""
+
+    assert cfg.checkpoint_dir is not None
+    save_checkpoint(
+        cfg.checkpoint_dir / "vae_kl_vae_best.pt",
+        {
+            "encoder": encoder.state_dict(),
+            "decoder": decoder.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        },
+        max_bytes=cfg.checkpoint_max_bytes,
+        overwrite=True,
+        seed=cfg.seed,
+        config=cfg.to_dict(),
+    )
 
 
 def _save_step_checkpoint(

@@ -218,16 +218,16 @@ def run_stage1_eval(
     num_samples: int = 4,
     device: torch.device | None = None,
     lpips_num_slices: int = 8,
-    per_domain: bool = False,
+    per_domain: bool | None = None,
+    per_field_contrast: bool = False,
     overlap: float = 0.5,
     loss_curve: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate deterministic reconstruction over up to `num_samples` volumes.
 
-    With `per_domain=True`, keep at most one volume per distinct field strength (the
-    cross-field "domain") — one 0.1T, one 1.5T, ... — instead of the first N in manifest
-    order, so the diagnostics cover the field range. `num_samples` then caps the number of
-    distinct domains collected.
+    With `per_field_contrast=True`, keep at most one volume per distinct field/contrast
+    pair instead of the first N in manifest order. ``per_domain`` remains a compatibility
+    alias for older callers, but no anatomical or scientific domain claim is inferred.
 
     Writes `metrics.json` and `diagnostics.png` (and `loss_curve.png` if a loss history is
     given) to `out_dir`. Returns the metrics payload.
@@ -250,15 +250,16 @@ def run_stage1_eval(
 
     samples: list[dict[str, torch.Tensor]] = []
     metrics: list[SampleMetrics] = []
-    seen_domains: set[float] = set()
+    select_field_contrast = per_field_contrast or bool(per_domain)
+    seen_field_contrasts: set[tuple[float, str]] = set()
     for batch in loader:
         if len(samples) >= num_samples:
             break
-        if per_domain:
-            key = _domain_field_key(batch.source_domain)
-            if key in seen_domains:
+        if select_field_contrast:
+            key = _domain_field_contrast_key(batch.source_domain)
+            if key in seen_field_contrasts:
                 continue
-            seen_domains.add(key)
+            seen_field_contrasts.add(key)
         image = batch.image.to(device)
         domain = batch.source_domain
         recon = sliding_window_reconstruct(
@@ -287,6 +288,7 @@ def run_stage1_eval(
     payload: dict[str, Any] = {
         "num_samples": len(metrics),
         "data_range": _DATA_RANGE,
+        "sampling_coverage_unit": "field_contrast" if select_field_contrast else "manifest_order",
         "per_sample": [m.to_dict() for m in metrics],
         "mean": _aggregate(metrics),
     }
@@ -298,13 +300,17 @@ def run_stage1_eval(
     return payload
 
 
-def _domain_field_key(domain: Any) -> float:
-    """Field strength of a (possibly batched) domain, used to dedup by cross-field domain."""
+def _domain_field_contrast_key(domain: Any) -> tuple[float, str]:
+    """Field and contrast of a possibly batched acquisition label."""
 
     if isinstance(domain, Sequence) and domain:
         domain = domain[0]
     field = getattr(domain, "field_strength_t", None)
-    return float(field) if field is not None else float("nan")
+    contrast = getattr(domain, "contrast", None)
+    return (
+        float(field) if field is not None else float("nan"),
+        str(contrast) if contrast is not None else "unknown",
+    )
 
 
 def _maybe_lpips(

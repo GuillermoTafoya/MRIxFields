@@ -25,13 +25,13 @@ from fieldbridge.evaluation.metrics import mae, masked_mae, masked_mse, mse, nrm
 from fieldbridge.evaluation.stage1_report import _tiled_starts, sliding_window_reconstruct
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.checkpoints import load_checkpoint
-from fieldbridge.training.losses import build_lpips_net, kl_divergence, lpips_loss_3d
-from fieldbridge.training.stage1_vae import Stage1VAEConfig
+from fieldbridge.training.losses import build_lpips_net, kl_divergence
 
 _DATA_RANGE = 2.0
 _SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 _BANK_META_NAME = "bank_meta.json"
 _BANK_INDEX_NAME = "bank_index.jsonl"
+_LEGACY_LOSS_WEIGHTS = {"ssim": 1.0, "nrmse": 1.0, "lpips": 1.0, "kl": 1e-4}
 
 DiagnosticLogger = Callable[[str], None]
 ImageLoader = Callable[[Path, VolumeRecord], torch.Tensor]
@@ -156,6 +156,13 @@ class _PatchBankState:
     fingerprint_sha256: str
 
 
+class _LegacySignedRangeDecoder(KLVAEDecoder):
+    """Restore the unconditional Tanh head used by diagnostic-v1 checkpoints."""
+
+    def decode(self, z: torch.Tensor, domain: Any) -> torch.Tensor:
+        return torch.tanh(super().decode(z, domain))
+
+
 def validate_minus_one_one_background_threshold(threshold: float) -> float:
     """Validate an anatomy/background threshold for tensors stored in ``[-1, 1]``."""
 
@@ -187,6 +194,7 @@ def minus_one_one_foreground_mask(
     )
 
 
+@torch.inference_mode()
 def identity_tiler_contract(
     *,
     overlaps: Sequence[float] = (0.25, 0.5, 0.75),
@@ -217,6 +225,7 @@ def identity_tiler_contract(
             patch_size=(8, 8, 8),
             domain=None,
             overlap=float(overlap),
+            clamp_output=False,
         )
         difference = torch.abs(reconstructed - values)
         maximum = float(difference.max())
@@ -283,6 +292,7 @@ def seam_gradient_metric(
     }
 
 
+@torch.inference_mode()
 def run_stage1_reconstruction_diagnostics(
     *,
     checkpoint_path: str | Path,
@@ -352,6 +362,7 @@ def run_stage1_reconstruction_diagnostics(
         patch_size=bank.patch_size,
         domain=fixed_patch.source_domain,
         overlap=spec.reference_overlap,
+        clamp_output=False,
     )
     direct_tiled_difference = torch.abs(tiled_patch - mean_reconstruction)
     direct_tiled_report = {
@@ -391,6 +402,7 @@ def run_stage1_reconstruction_diagnostics(
             patch_size=bank.patch_size,
             domain=volume_record.domain,
             overlap=overlap,
+            clamp_output=False,
         )
         overlap_reports[_overlap_key(overlap)] = {
             "overlap": overlap,
@@ -545,7 +557,6 @@ def _diagnose_fixed_patch(
         reconstructed_sample = decoder.decode(sampled, patch.source_domain)
         kl_value = float(kl_divergence(mean, logvar))
 
-    stage_config = Stage1VAEConfig.from_mapping(resolved_config)
     mean_metrics = _official_metrics(
         reconstructed_mean,
         image,
@@ -566,7 +577,7 @@ def _diagnose_fixed_patch(
         "ssim_loss": 1.0 - float(sampled_metrics["ssim3d"]),
         "lpips": sampled_metrics["lpips"],
         "kl": kl_value,
-        "weights": dict(stage_config.loss_weights),
+        "weights": dict(_legacy_training_config(resolved_config)["loss_weights"]),
     }
     report = {
         "selection": {
@@ -621,7 +632,7 @@ def _official_metrics(
         lpips_payload = {
             "status": "computed",
             "value": float(
-                lpips_loss_3d(
+                _legacy_signed_lpips_3d(
                     reconstruction,
                     target,
                     net=lpips_net,
@@ -637,6 +648,42 @@ def _official_metrics(
         "mae": float(mae(reconstruction, target)),
         "mse": float(mse(reconstruction, target)),
     }
+
+
+def _legacy_signed_lpips_3d(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    net: nn.Module,
+    num_slices: int,
+    axis: int = 2,
+) -> torch.Tensor:
+    """Evaluate diagnostic-v1 LPIPS on tensors that are already in ``[-1, 1]``."""
+
+    if prediction.ndim != 5 or prediction.shape != target.shape:
+        raise ValueError("Diagnostic-v1 LPIPS expects same-shaped 5D tensors.")
+    depth = int(prediction.shape[axis])
+    count = min(num_slices, depth)
+    indices = (
+        torch.linspace(0, depth - 1, count, device=prediction.device)
+        .round()
+        .long()
+        .unique()
+    )
+    prediction_2d = prediction.index_select(axis, indices).movedim(axis, 1).flatten(0, 1)
+    target_2d = target.index_select(axis, indices).movedim(axis, 1).flatten(0, 1)
+    return net(
+        _diagnostic_three_channel(prediction_2d),
+        _diagnostic_three_channel(target_2d),
+    ).mean()
+
+
+def _diagnostic_three_channel(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.shape[1] == 3:
+        return tensor
+    if tensor.shape[1] == 1:
+        return tensor.repeat(1, 3, 1, 1)
+    raise ValueError(f"Diagnostic-v1 LPIPS expects 1 or 3 channels, got {tensor.shape[1]}.")
 
 
 def _masked_errors(
@@ -729,12 +776,12 @@ def _load_checkpoint_contract(path: str | Path) -> tuple[dict[str, Any], dict[st
 def _validate_checkpoint_config(
     checkpoint_report: Mapping[str, Any], resolved_config: Mapping[str, Any]
 ) -> None:
-    recorded = checkpoint_report["config"]
-    expected = Stage1VAEConfig.from_mapping(resolved_config).to_dict()
+    recorded = dict(checkpoint_report["config"])
+    expected = _legacy_training_config(resolved_config)
     mismatches = [
         key
-        for key, value in recorded.items()
-        if key in expected and expected[key] != value
+        for key in sorted(set(recorded) | set(expected))
+        if recorded.get(key) != expected.get(key)
     ]
     if mismatches:
         raise ValueError(
@@ -764,7 +811,7 @@ def _models_from_config(
         encoder_kwargs["in_channels"] = model["in_channels"]
     if "out_channels" in model:
         decoder_kwargs["out_channels"] = model["out_channels"]
-    return KLVAEEncoder(**encoder_kwargs), KLVAEDecoder(**decoder_kwargs)
+    return KLVAEEncoder(**encoder_kwargs), _LegacySignedRangeDecoder(**decoder_kwargs)
 
 
 def _load_patch_bank_state(bank_dir: str | Path) -> _PatchBankState:
@@ -1031,7 +1078,66 @@ def _resolved_config_report(config: Mapping[str, Any]) -> dict[str, Any]:
             "normalization": "percentile_clip_to_minus_one_one",
         },
         "model": _json_safe(model),
-        "training": Stage1VAEConfig.from_mapping(config).to_dict(),
+        "training": _legacy_training_config(config),
+    }
+
+
+def _legacy_training_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a full run YAML onto the checkpoint-recorded diagnostic-v1 contract."""
+
+    raw_training = config.get("training", {})
+    if not isinstance(raw_training, Mapping):
+        raise ValueError("Resolved config training section must be a mapping.")
+    training = dict(raw_training)
+    weights = dict(_LEGACY_LOSS_WEIGHTS)
+    raw_weights = training.get("loss_weights", config.get("loss_weights", {}))
+    if not isinstance(raw_weights, Mapping):
+        raise ValueError("Resolved config loss_weights must be a mapping.")
+    weights.update({str(key): float(value) for key, value in raw_weights.items()})
+    return {
+        "steps": int(training.get("steps", config.get("steps", 2))),
+        "batch_size": int(training.get("batch_size", config.get("batch_size", 2))),
+        "seed": int(config.get("seed", training.get("seed", 13))),
+        "lr": float(training.get("lr", config.get("lr", 1e-4))),
+        "device": training.get("device", config.get("device", "auto")),
+        "precision": training.get("precision", config.get("precision", "fp32")),
+        "loss_weights": weights,
+        "ssim_window_size": int(
+            training.get("ssim_window_size", config.get("ssim_window_size", 7))
+        ),
+        "lpips_num_slices": int(
+            training.get("lpips_num_slices", config.get("lpips_num_slices", 8))
+        ),
+        "grad_clip_norm": float(
+            training.get("grad_clip_norm", config.get("grad_clip_norm", 1.0))
+        ),
+        "steps_per_epoch": int(
+            training.get("steps_per_epoch", config.get("steps_per_epoch", 0))
+        ),
+        "early_stopping": bool(
+            training.get("early_stopping", config.get("early_stopping", False))
+        ),
+        "early_stopping_patience": int(
+            training.get(
+                "early_stopping_patience", config.get("early_stopping_patience", 5)
+            )
+        ),
+        "early_stopping_min_delta": float(
+            training.get(
+                "early_stopping_min_delta", config.get("early_stopping_min_delta", 0.005)
+            )
+        ),
+        "early_stopping_ema_decay": float(
+            training.get(
+                "early_stopping_ema_decay", config.get("early_stopping_ema_decay", 0.98)
+            )
+        ),
+        "checkpoint_at_end": bool(
+            training.get("checkpoint_at_end", config.get("checkpoint_at_end", False))
+        ),
+        "log_every_steps": int(
+            training.get("log_every_steps", config.get("log_every_steps", 0))
+        ),
     }
 
 

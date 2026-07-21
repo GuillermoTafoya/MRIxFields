@@ -171,6 +171,7 @@ def sliding_window_reconstruct(
     patch_size: Sequence[int],
     domain: Any,
     overlap: float = 0.5,
+    clamp_output: bool = True,
 ) -> torch.Tensor:
     """Reconstruct a full (B, C, D, H, W) volume from latent means, tile by tile.
 
@@ -205,7 +206,8 @@ def sliding_window_reconstruct(
     # saturating head cannot reach the exact-0 background), so a raw reconstruction may
     # overshoot [0, 1]; the challenge scores clipped images, and _assert_same_space
     # enforces the contract downstream.
-    return (weighted_sum / weight_sum.clamp_min(1e-8)).clamp(0.0, 1.0)
+    reconstruction = weighted_sum / weight_sum.clamp_min(1e-8)
+    return reconstruction.clamp(0.0, 1.0) if clamp_output else reconstruction
 
 
 def run_stage1_eval(
@@ -404,10 +406,20 @@ def _plot_diagnostics(
         fig.colorbar(im, ax=axes[row][2], fraction=0.046, pad=0.04)
 
         axes[row][3].hist(
-            sample["original"].flatten().numpy()[::10], bins=60, alpha=0.5, label="Original", color="tab:blue"
+            sample["original"].flatten().numpy()[::10],
+            bins=60,
+            range=(0.0, 1.0),
+            alpha=0.5,
+            label="Original",
+            color="tab:blue",
         )
         axes[row][3].hist(
-            sample["recon"].flatten().numpy()[::10], bins=60, alpha=0.5, label="Recon", color="tab:orange"
+            sample["recon"].flatten().numpy()[::10],
+            bins=60,
+            range=(0.0, 1.0),
+            alpha=0.5,
+            label="Recon",
+            color="tab:orange",
         )
         axes[row][3].set_yscale("log")
         axes[row][3].set_title("Intensity Distribution [0, 1] (log)", fontsize=11)

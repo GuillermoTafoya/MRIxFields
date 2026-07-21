@@ -1,18 +1,18 @@
 # Research Status
 
-Snapshot date: 2026-07-20
+Snapshot date: 2026-07-21
 
 Repository baseline: `origin/main` at
-`5c5ef8efc37fa2877719c8cff9a342b7aa13bf89`.
+`dea5c27b9ad738a7f561ac2011ffec8f700b97c1`.
 
 The shared north star is one shared-parameter conditional model that emits complete 3D
 MRI volumes. The current tracks test different risks and are intentionally separate.
 
 ## Track A: Deterministic Pseudo-Pair Baseline
 
-Status: corrected implementation available; micro-v2 and duration-probe development
-evidence recorded; residual development probe predeclared; scientific promotion gate
-remains failed.
+Status: corrected implementation available; micro-v2, duration-probe, and prospective
+paired zero-shot development evidence recorded; a real-paired LOSO feasibility
+experiment is preregistered; no confirmatory or promotion claim is supported.
 
 Track A is the 2D axial `ConditionalUNetFieldTranslator` experiment for T2-FLAIR. It
 uses retrospective high-field targets, synthetic 0.1T degradation, volume/subject-first
@@ -84,6 +84,51 @@ Increasing duration rescued nRMSE relative to the degraded-input baseline, but d
 rescue SSIM or target conditioning. The probe therefore remains a scientific failure
 under the predeclared joint viability gates. It does not justify a scaled pilot,
 confirmatory claim, complete-volume claim, or real 0.1T translation claim.
+
+### Prospective Paired Zero-Shot Development Result
+
+The following sanitized result is user-supplied evidence from a private Colab execution.
+Repository maintainers and coding agents did not access the manifest, subjects, images,
+checkpoint file, private paths, or full outputs and have not independently verified the
+run or reported values.
+
+- Audit code commit: `a7ac99f40dcaea4811452172d363347997c504e1`.
+- Frozen training/checkpoint code commit:
+  `e1e526ea5fa0a58f5682823f85a3957d5cc8647c`.
+- Evidence scope: `prospective_paired_selected_slice_development`;
+  `complete_volume: false`.
+- Scope: 3 prospective cases, 4 actual paired target fields, and 8 fixed slices per
+  case/field; 96 paired comparisons and 384 conditioned predictions.
+- `scientific_thresholds: null`; this execution had no preregistered formal pass/fail
+  gate.
+
+| Macro selected-slice metric | Real 0.1T source | Correctly conditioned prediction |
+| --- | ---: | ---: |
+| nRMSE | 0.0773619951 | 0.0873034413 |
+| SSIM | 0.8645790890 | 0.8571345539 |
+| Masked MAE | 0.1286291652 | 0.1430917376 |
+| Signed foreground bias | 0.0288569646 | 0.0956241177 |
+
+| Actual target field | Source nRMSE | Prediction nRMSE |
+| --- | ---: | ---: |
+| 1.5T | 0.0549967966 | 0.0544251086 |
+| 3T | 0.0619403781 | 0.0562433123 |
+| 5T | 0.0502285822 | 0.0603846158 |
+| 7T | 0.1422822235 | 0.1781607283 |
+
+Only `4/12` held-out case-field units improved nRMSE. Correct conditioning was worse
+than the mean wrong condition in macro nRMSE (`0.0873034413` versus `0.0867206908`),
+and the correct requested field had the best aggregate nRMSE only for the true 1.5T
+target. Prediction also increased positive foreground bias substantially.
+
+This is negative observed-development evidence: the frozen synthetic residual model did
+not transfer reliably to real paired 0.1T inputs, particularly at 5T and 7T, and did not
+show useful target conditioning. Because thresholds were null, it is not described as a
+retrospective formal gate failure. It is selected-slice evidence, not complete-volume,
+held-out-confirmatory, or challenge evidence.
+
+This and other observed Track-A development results cannot satisfy promotion or
+final-volume gates.
 
 ## Track B: Volumetric Stage-1 Stack
 
@@ -195,8 +240,8 @@ evidence. They must not be resumed or compared as if they were v2 results.
 
 - Track A's 10-epoch duration probe rescued nRMSE but failed SSIM and conditioning
   gates on the observed development split.
-- It remains unknown whether an identity-preserving residual parameterization can
-  retain the degraded baseline while learning useful restoration and conditioning.
+- The frozen synthetic residual checkpoint did not reliably improve real paired 0.1T
+  inputs and did not show useful target conditioning in the zero-shot audit.
 - The development split has been observed and cannot support a confirmatory claim.
 - Track A does not yet reconstruct and evaluate complete held-out NIfTI volumes.
 - Track B diagnostic v1 is complete. Its negative, non-held-out engineering evidence
@@ -209,22 +254,22 @@ evidence. They must not be resumed or compared as if they were v2 results.
 
 ## Next Decision Gate
 
-The scaled pilot remains blocked. The next allowed Track A development experiment is a
-separately named, fresh-initialization residual probe that starts exactly at the degraded
-input and changes only translator parameterization. It must retain the same observed
-split, seed, degradation, preprocessing, losses, duration, and frozen evaluation gates,
-and must report restoration gates separately from conditioning gates.
+The scaled pilot remains blocked. The next Track-A development experiment is the
+preregistered three-fold, subject-level LOSO real-paired T2-FLAIR feasibility experiment
+in `prospective_paired_loso_residual_v1.yaml`. Each prospective case is held out once;
+the other two cases provide real 0.1T-to-target training pairs. It compares the unchanged
+source, a train-fold-only target-specific affine calibration, identity-initialized paired
+training, and paired fine-tuning initialized from the frozen synthetic checkpoint. The
+two neural arms share exactly the same architecture, real-paired examples, optimizer,
+losses, deterministic sampling, preprocessing, and fixed endpoint; synthetic examples
+are not mixed into paired training.
 
-The checked-in residual-probe config and unexecuted Colab launcher implement that
-predeclaration. No private residual-probe run evidence has been supplied yet. The probe
-uses a zero-initialized residual output head, so step-zero prediction equals the degraded
-input for every target condition; its output is bounded to the configured model range.
-This is a new model variant and does not alter the existing conditional U-Net or its
-checkpoint layout.
-
-Any residual-probe result remains development evidence and cannot satisfy promotion or
-final-volume gates because the split has been observed and evaluation still uses
-selected slices only.
+The experiment has no validation loader, early stopping, or held-out checkpoint
+selection. It trains on every predeclared brain-support slice, evaluates the frozen eight
+slices for direct comparison, and separately attempts every-z-slice reconstruction on
+the model and inverse-restored native grids. Complete-volume status is allowed only when
+coverage and every inverse geometry are verified. Results remain observed development
+evidence because all three prospective cases have already been examined.
 
 A diagnostic-only prospective paired Track-A audit is now implemented for a frozen
 residual checkpoint. It is limited to the predeclared T2-FLAIR cases, target fields, and

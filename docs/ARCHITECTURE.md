@@ -399,6 +399,14 @@ manifest.
     changing only to the identity-initialized residual translator and a separate output
     namespace. Restoration and conditioning gates are reported separately; the scaled
     pilot remains blocked.
+  - `prospective_paired_loso_residual_v1.yaml` preregisters a Track-A-only, three-fold
+    real-paired T2-FLAIR LOSO feasibility experiment. `data/paired_loso.py` owns
+    subject-first folds, real-paired slices, train-only affine fitting, and inverse
+    fit-pad volume reconstruction; `training/paired_loso.py` owns identical-arm,
+    resumable fixed-endpoint training without validation selection; and
+    `evaluation/paired_loso.py` owns selected-slice conditioning sweeps, hierarchical
+    aggregation, viability rules, separate model/native-grid evidence, and sanitized
+    handoff contracts. It does not consume Track B's patch bank or Stage-1 artifacts.
 
 No magic numbers in code — every hyperparameter above is config-driven with an explicit
 default in the corresponding dataclass.
@@ -442,6 +450,10 @@ files:
 - `test_pseudo_pair_duration_probe_contract.py` and
   `test_pseudo_pair_residual_probe_contract.py` cover frozen development-probe configs,
   unexecuted Colab launchers, sanitized telemetry/handoffs, and endpoint/gate contracts.
+- `test_paired_loso_experiment.py` covers the real-paired LOSO preregistration with
+  synthetic tensors: leakage, folds, train-only affine fitting, initialization arms,
+  fixed endpoint/resume, conditioning aggregation, every-slice/inverse geometry, and
+  sanitized notebook/runner contracts.
 - `test_cli_train.py` — the `train` command end-to-end on the default smoke config.
 - `test_mrixfields2026_*.py` — the official challenge layer (spec, submission,
   validation, CLI, data manifest) — untouched, already exhaustive.

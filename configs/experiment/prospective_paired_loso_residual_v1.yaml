@@ -1,0 +1,127 @@
+seed: 13
+
+experiment:
+  name: prospective_paired_loso_residual_v1
+  track: A
+  evidence_scope: prospective_paired_loso_development
+  evidence_role: observed_development_not_confirmatory
+  manifest_split: Training_prospective
+  modality: T2FLAIR
+  internal_contrast: T2-FLAIR
+  source_field: 0.1
+  target_fields: [1.5, 3.0, 5.0, 7.0]
+  case_ids: ["0006", "0007", "0009"]
+  folds:
+    - fold: 1
+      train_cases: ["0007", "0009"]
+      held_out_case: "0006"
+    - fold: 2
+      train_cases: ["0006", "0009"]
+      held_out_case: "0007"
+    - fold: 3
+      train_cases: ["0006", "0007"]
+      held_out_case: "0009"
+  neural_arms:
+    - identity_initialization
+    - synthetic_initialization
+  synthetic_examples_during_paired_training: false
+  checkpoint_selection: fixed_endpoint_only
+  early_stopping: false
+
+preprocessing:
+  slice_start: 72
+  slice_end: 292
+  slices_per_volume: null
+  normalization: official_01
+  model_range: minus_one_one
+  resize_mode: fit_pad
+  output_height: 128
+  output_width: 160
+  slice_axis: z
+
+evaluation:
+  selected_slice_indices: [72, 103, 135, 166, 197, 228, 260, 291]
+  full_volume_slice_coverage: every_z_slice
+  require_inverse_geometry: true
+  report_grids: [model_grid, reconstructed_native_grid]
+  conditioning_requests: [1.5, 3.0, 5.0, 7.0]
+  aggregation:
+    slice_to_case: equal_weight
+    case_fold_to_field: equal_weight
+    field_to_macro: equal_weight
+
+model:
+  name: conditional_residual_unet_field_translator
+  in_channels: 1
+  out_channels: 1
+  hidden_channels: [16, 32]
+  latent_channels: 64
+  cond_dim: 64
+  spatial_dims: 2
+  upsample_mode: interpolate
+  skip_mode: gated
+  pad_to_multiple: true
+  model_range: minus_one_one
+
+training:
+  epochs: 10
+  batch_size: 8
+  num_workers: 0
+  optimizer: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+  device: auto
+  amp: true
+  grad_clip_norm: 1.0
+  scheduler:
+    name: none
+  checkpoint_max_bytes: 200000000
+  checkpoint_every_epochs: 1
+  log_every_steps: 20
+  loss_weights:
+    masked_l1: 1.0
+    gradient: 0.2
+    background: 0.5
+  train_samples_per_fold: 1760
+  steps_per_epoch: 220
+  endpoint_global_step: 2200
+  sampling: all_predeclared_slices_once_per_epoch_deterministic_shuffle
+  validation_loader: null
+
+affine_baseline:
+  fit_scope: training_cases_only_per_target_field
+  fit_pixels: nonzero_target_support_within_fit_pad_frame
+  form: clamp(scale_times_source_plus_bias_0_1)
+
+synthetic_checkpoint_contract:
+  git_commit: e1e526ea5fa0a58f5682823f85a3957d5cc8647c
+  trainer: pseudo_pair_epochs
+  model_class: ConditionalResidualUNetFieldTranslator
+  pseudo_pair_pipeline_version: 2
+  epoch: 10
+  global_step: 160
+
+paired_checkpoint_contract:
+  trainer: paired_loso_fixed_endpoint
+  pipeline_version: 1
+  fixed_endpoint_only: true
+
+viability_rules:
+  neural_macro_nrmse_below_source: true
+  neural_macro_ssim_not_below_source: true
+  min_fields_improved_nrmse: 3
+  min_held_out_cases_improved_nrmse: 2
+  min_case_field_units_correct_best_nrmse: 9
+  require_positive_mean_conditioning_margin_every_field: true
+  max_absolute_nrmse_regression_per_field: 0.005
+  neural_must_beat_affine_macro_nrmse: true
+  neural_macro_ssim_not_below_affine: true
+  retain_synthetic_initialization_only_if_better_than_identity: true
+  synthetic_must_not_weaken_conditioning: true
+
+runtime:
+  copy_private_volumes_to_ephemeral_scratch: true
+  require_cuda: true
+  telemetry: nvidia_smi_periodic_aggregate
+  private_inputs_external: true
+  sanitized_outputs_use_anonymous_case_slots: true

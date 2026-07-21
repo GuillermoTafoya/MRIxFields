@@ -136,6 +136,47 @@ predeclare `num_workers=0`, but the checkpoint alone cannot independently attest
 Unknown historical training keys are errors rather than silently ignored fields; only
 explicit runtime/path overrides receive separate handling.
 
+### Prospective Paired LOSO Residual Feasibility v1
+
+The next Track-A experiment uses three subject-first folds: train 0007+0009/evaluate
+0006, train 0006+0009/evaluate 0007, and train 0006+0007/evaluate 0009. It uses only real
+paired T2-FLAIR examples with real 0.1T source and actual 1.5T, 3T, 5T, and 7T targets.
+No synthetic example enters paired training. Private manifests, NIfTIs, checkpoints,
+run directories, and reconstructed images remain external.
+
+Four frozen endpoint arms are compared: unchanged real 0.1T; per-target-field affine
+scale+bias fitted only on that fold's two training cases; an identity-initialized
+`ConditionalResidualUNetFieldTranslator`; and the identical model initialized from the
+frozen synthetic residual checkpoint. Neural arms share optimizer, loss, sampling,
+preprocessing, epochs, steps, and endpoint. There is no validation loader, early
+stopping, or held-out checkpoint selection; each fold is evaluated exactly once after
+its fixed endpoint.
+
+Training expands subjects only after the fold is fixed and uses every slice in the
+predeclared brain-support interval `[72, 292)`. Selected-slice evaluation retains
+`[72, 103, 135, 166, 197, 228, 260, 291]`. Complete-volume evaluation additionally
+processes every z index through the same fit-pad/model-range contract, records model-grid
+and inverse-restored native-grid metrics separately, and reports `complete_volume: true`
+only if slice coverage, paired geometry, output shape, and every inverse geometry check
+pass.
+
+The following relative viability rules are frozen before execution for each neural arm:
+
+- macro nRMSE must beat the real-0.1T source and macro SSIM must not decrease;
+- nRMSE improvement must occur in at least three of four fields and two of three held-out
+  cases;
+- correct conditioning must have the lowest nRMSE in at least nine of twelve held-out
+  case-field units and a positive mean margin in every field;
+- no field may regress from source by more than `0.005` absolute nRMSE;
+- the neural arm must beat the train-fold-only affine baseline in macro nRMSE without
+  reducing macro SSIM;
+- synthetic initialization is retained only if it beats identity initialization in
+  macro nRMSE without reducing SSIM or mean conditioning margin.
+
+Slices are averaged within held-out case-field, case/fold units are averaged within
+field, and fields are macro-averaged equally. These are feasibility rules on observed
+development subjects, not confirmatory claims.
+
 ## Baselines And Metrics
 
 Every pseudo-pair report includes two comparisons against the unmodified high-field

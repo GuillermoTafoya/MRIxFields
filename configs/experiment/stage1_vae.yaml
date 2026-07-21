@@ -57,10 +57,19 @@ training:
   # to CPU and burning hours (the previous run trained on CPU without noticing).
   device: cuda
   precision: bf16
-  # 0 (single process): a single reader hits Drive sequentially, which avoids Drive-FUSE's
-  # concurrent-read crashes (OSError 107) seen with >0 workers. StreamingPatchDataset owns
-  # its own shuffling, so DataLoader shuffle is off regardless.
-  num_workers: 0
+  # Background readers that overlap the ~231MB NIfTI decode + full-volume mask with GPU
+  # compute. At 0 the read is synchronous in the main process and the GPU starves (~10%
+  # util, step time alternating fast/slow as every 2nd batch waits on a new volume). The
+  # old `0` was for Drive-FUSE, whose concurrent reads crashed with OSError 107 — the
+  # training box reads from a local disk, so >0 is safe here. 4 is enough to hide one
+  # ~0.55s read behind ~0.33s compute; more gives diminishing returns and more RAM (each
+  # worker holds one resident volume). persistent_workers is forced on with >0 (see
+  # cli._build_streaming_patch_loader_from_records) — required so per-epoch reshuffling
+  # survives Windows spawn. If you ever run on a FUSE/network mount again, set this back
+  # to 0. StreamingPatchDataset owns its own shuffling, so DataLoader shuffle is off.
+  num_workers: 4
+  # Per-worker read-ahead depth (only used when num_workers>0).
+  prefetch_factor: 4
   loss_weights:
     # Full L1+SSIM+nRMSE+LPIPS+KL recipe in 3D: ssim_loss dispatches to ssim3d (avg_pool3d)
     # and lpips uses the slice-averaged variant (lpips_num_slices below). L1 is the flat

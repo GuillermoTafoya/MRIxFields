@@ -24,6 +24,16 @@ PairSampling = Literal["cycle", "random_any_to_any"]
 ALL_DOMAINS: tuple[Domain, ...] = tuple(Domain(field, contrast) for field in FIELD_STRENGTHS_T for contrast in CONTRASTS)
 
 
+def _identity_target_domain(record: VolumeRecord) -> Domain:
+    """Default `TargetDomainSelector`: target == source domain.
+
+    A module-level function, not a lambda: DataLoader worker `spawn` (the default on
+    Windows) pickles the dataset, and a lambda attribute makes it unpicklable, so
+    `num_workers>0` crashes at worker start. See StreamingPatchDataset.__init__.
+    """
+    return record.domain
+
+
 def random_any_to_any_selector(
     domains: Sequence[Domain] = ALL_DOMAINS, *, seed: int, allow_identity: bool = True
 ) -> TargetDomainSelector:
@@ -70,7 +80,7 @@ class ManifestVolumeDataset(Dataset[RawBatch]):
     ) -> None:
         self.records = tuple(records)
         self.image_loader = image_loader
-        self.target_domain_selector = target_domain_selector or (lambda record: record.domain)
+        self.target_domain_selector = target_domain_selector or _identity_target_domain
         self.transform = transform
 
     def __len__(self) -> int:
@@ -136,7 +146,7 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
         self.patch_size = tuple(int(p) for p in patch_size) if patch_size is not None else None
         self.patches_per_volume = int(patches_per_volume)
         self.volume_transform = volume_transform
-        self.target_domain_selector = target_domain_selector or (lambda record: record.domain)
+        self.target_domain_selector = target_domain_selector or _identity_target_domain
         self.seed = int(seed)
         # None => uniform random cropping (the original behavior). A config switches on
         # foreground/border/air stratified sampling; see transforms.StratifiedCropConfig

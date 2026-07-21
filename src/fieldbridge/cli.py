@@ -962,13 +962,23 @@ def _build_streaming_patch_loader_from_records(
         crop_config=_crop_config(config),
         foreground_threshold=_foreground_threshold(config),
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_raw_batches,
-    )
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "collate_fn": collate_raw_batches,
+    }
+    if num_workers > 0:
+        # persistent_workers is required, not just an optimization: this is an
+        # IterableDataset that increments its own `_pass` to reshuffle each epoch. Without
+        # persistence the DataLoader re-pickles the dataset (with `_pass=0`) for fresh
+        # workers every epoch, replaying the same volume order and crops every epoch. It
+        # also amortizes Windows `spawn` worker startup over the whole run instead of
+        # paying it per epoch. prefetch_factor lets each worker read ahead so the ~231MB
+        # NIfTI decode overlaps GPU compute (the num_workers=0 stall we are removing).
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = _prefetch_factor(config)
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def _apply_pseudo_pair_overrides(config: dict[str, Any], args: argparse.Namespace, *, training: bool) -> None:
@@ -1312,6 +1322,14 @@ def _num_workers(config: Mapping[str, Any]) -> int:
     if isinstance(training, Mapping) and "num_workers" in training:
         return int(training["num_workers"])
     return 0
+
+
+def _prefetch_factor(config: Mapping[str, Any]) -> int:
+    """DataLoader read-ahead per worker (only used when num_workers>0)."""
+    training = config.get("training", {})
+    if isinstance(training, Mapping) and "prefetch_factor" in training:
+        return int(training["prefetch_factor"])
+    return 4
 
 
 def _model_config(config: Mapping[str, Any]) -> dict[str, Any]:

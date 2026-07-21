@@ -127,6 +127,15 @@ Slices are weighted equally within case, cases equally within target field, and 
 fields equally in the macro summary. No scientific pass/fail threshold may be created
 after observing these cases.
 
+Checkpoint provenance validation compares the historical training YAML only after
+normalization through `PseudoPairEpochConfig.from_mapping().to_dict()`, the same contract
+used when the trainer saved `pseudo_pair_config` and `_meta.config`. Those two checkpoint
+copies must agree exactly. `num_workers` is a DataLoader runtime field and is not part of
+the legacy `PseudoPairEpochConfig` checkpoint schema: the historical YAML and launcher
+predeclare `num_workers=0`, but the checkpoint alone cannot independently attest it.
+Unknown historical training keys are errors rather than silently ignored fields; only
+explicit runtime/path overrides receive separate handling.
+
 ## Baselines And Metrics
 
 Every pseudo-pair report includes two comparisons against the unmodified high-field

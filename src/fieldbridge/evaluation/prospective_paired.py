@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from fieldbridge.evaluation.metrics import (
     ssim,
 )
 from fieldbridge.official.data_manifest import MRIxFieldsDataRecord
+from fieldbridge.training.pseudo_pair_epochs import PseudoPairEpochConfig
 
 EVIDENCE_SCOPE = "prospective_paired_selected_slice_development"
 SELECTED_SLICE_INDICES = (72, 103, 135, 166, 197, 228, 260, 291)
@@ -36,6 +37,9 @@ TARGET_FIELDS = (1.5, 3.0, 5.0, 7.0)
 ALL_FIELDS = (SOURCE_FIELD, *TARGET_FIELDS)
 CONTRAST = "T2-FLAIR"
 OFFICIAL_MODALITY = "T2FLAIR"
+_NON_CHECKPOINTED_TRAINING_RUNTIME_FIELDS = frozenset({"num_workers"})
+_NON_SERIALIZED_TRAINING_PATH_FIELDS = frozenset({"resume_from"})
+_SERIALIZED_RUNTIME_PATH_OVERRIDES = frozenset({"checkpoint_dir"})
 
 LOWER_IS_BETTER = {
     "masked_mae",
@@ -222,22 +226,62 @@ def validate_checkpoint_contract(
         raise ValueError("Checkpoint Git commit does not match the frozen residual commit.")
     recorded = state.get("pseudo_pair_config")
     saved = metadata.get("config")
-    expected_training = historical_training_config.get("training")
     if not isinstance(recorded, Mapping) or not isinstance(saved, Mapping):
         raise ValueError("Checkpoint is missing its recorded pseudo-pair training config.")
     if dict(recorded) != dict(saved):
         raise ValueError("Checkpoint training config copies disagree.")
-    if not isinstance(expected_training, Mapping):
-        raise ValueError("Historical training YAML is missing training configuration.")
-    # The epoch trainer serializes its normalized config, so compare the fields that
-    # originated in the historical YAML and fail on any changed value.
-    for key, value in expected_training.items():
-        if key in {"checkpoint_dir", "resume_from"}:
-            continue
-        if key not in recorded or recorded[key] != value:
+    expected_serialized = _normalized_historical_checkpoint_config(
+        historical_training_config,
+        recorded=recorded,
+    )
+    if set(recorded) != set(expected_serialized):
+        missing = sorted(set(expected_serialized) - set(recorded))
+        unexpected = sorted(set(recorded) - set(expected_serialized))
+        raise ValueError(
+            "Checkpoint recorded training config schema differs from "
+            f"PseudoPairEpochConfig v2 serialization; missing={missing}, "
+            f"unexpected={unexpected}."
+        )
+    for key, value in expected_serialized.items():
+        if recorded[key] != value:
             raise ValueError(f"Checkpoint recorded training config differs at {key!r}.")
     if "model" not in state:
         raise ValueError("Checkpoint is missing model state.")
+
+
+def _normalized_historical_checkpoint_config(
+    historical_training_config: Mapping[str, Any],
+    *,
+    recorded: Mapping[str, Any],
+) -> dict[str, Any]:
+    training = historical_training_config.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError("Historical training YAML is missing training configuration.")
+
+    trainer_fields = {field.name for field in fields(PseudoPairEpochConfig)}
+    accepted_fields = (
+        trainer_fields
+        | _NON_CHECKPOINTED_TRAINING_RUNTIME_FIELDS
+        | _NON_SERIALIZED_TRAINING_PATH_FIELDS
+    )
+    unknown = sorted(set(training) - accepted_fields)
+    if unknown:
+        raise ValueError(f"Historical training YAML has unknown fields: {unknown}.")
+
+    # num_workers is consumed by DataLoader construction, not PseudoPairEpochConfig.
+    # The historical YAML and run launcher both predeclare zero workers, but legacy
+    # checkpoint metadata cannot independently attest that runtime value.
+    if training.get("num_workers") != 0:
+        raise ValueError("Historical training YAML must predeclare num_workers=0.")
+    if training.get("resume_from") is not None:
+        raise ValueError("Frozen residual training must predeclare resume_from=null.")
+
+    expected = PseudoPairEpochConfig.from_mapping(historical_training_config).to_dict()
+    for key in _SERIALIZED_RUNTIME_PATH_OVERRIDES:
+        if key not in recorded:
+            raise ValueError(f"Checkpoint recorded training config is missing {key!r}.")
+        expected[key] = recorded[key]
+    return expected
 
 
 def foreground_and_outside_masks(

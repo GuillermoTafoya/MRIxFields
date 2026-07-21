@@ -271,6 +271,12 @@ the model and inverse-restored native grids. Complete-volume status is allowed o
 coverage and every inverse geometry are verified. Results remain observed development
 evidence because all three prospective cases have already been examined.
 
+The LOSO experiment remains unexecuted. Before private execution, its runtime handoff
+recovery was corrected so a global resume validates and skips completed endpoints,
+resumes partially completed arms from the last completed epoch, starts never-begun arms
+fresh, and fails closed on incompatible or inconsistent artifacts. This is an
+orchestration/reporting correction and does not add scientific evidence.
+
 A diagnostic-only prospective paired Track-A audit is now implemented for a frozen
 residual checkpoint. It is limited to the predeclared T2-FLAIR cases, target fields, and
 eight selected slices in `prospective_paired_zero_shot_v1.yaml`. The runner fails closed

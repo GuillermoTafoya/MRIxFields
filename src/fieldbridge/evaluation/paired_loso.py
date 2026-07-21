@@ -56,8 +56,11 @@ def evaluate_selected_case(
     preprocessing: SlicePreprocessingSpec,
     slice_indices: Sequence[int],
     device: torch.device,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    total = len(TARGET_FIELDS) * len(slice_indices)
+    completed = 0
     for field in TARGET_FIELDS:
         target_volume = target_volumes[field]
         for slice_index in slice_indices:
@@ -148,6 +151,9 @@ def evaluate_selected_case(
                     "conditioning": conditioning,
                 }
             )
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total)
     return rows
 
 
@@ -370,7 +376,8 @@ def reconstruct_complete_candidate(
         "model_grid": _complete_metrics(candidate_model_grid, target_model_grid),
         "reconstructed_native_grid": _complete_metrics(candidate_native, target_volume),
         "source_model_grid": _complete_metrics(source_model_grid, target_model_grid),
-        "source_reconstructed_native_grid": _complete_metrics(source_volume, target_volume),
+        "raw_native_source_baseline": _complete_metrics(source_volume, target_volume),
+        "roundtrip_native_source_baseline": _complete_metrics(source_native, target_volume),
     }
 
 

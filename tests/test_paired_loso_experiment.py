@@ -32,6 +32,7 @@ from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.paired_loso import (
     PAIRED_LOSO_PIPELINE_VERSION,
     initialize_residual_arm,
+    resolve_arm_recovery,
     train_fixed_endpoint,
     validate_endpoint_checkpoint,
 )
@@ -249,6 +250,27 @@ def test_fixed_endpoint_checkpoint_and_resume_contract(tmp_path: Path) -> None:
     assert state["optimizer_name"] == "AdamW"
     assert state["global_step"] == 2
     assert "data_loader_generator_state" in state
+    assert set(state) == {
+        "trainer",
+        "paired_loso_pipeline_version",
+        "model_class",
+        "model",
+        "optimizer",
+        "optimizer_name",
+        "scheduler",
+        "epoch",
+        "global_step",
+        "endpoint",
+        "fold_slot",
+        "initialization_arm",
+        "experiment_fingerprint",
+        "steps_per_epoch",
+        "expected_global_step",
+        "training_config",
+        "data_loader_generator_state",
+        "scaler",
+        "_meta",
+    }
     validate_endpoint_checkpoint(
         state,
         cfg=cfg,
@@ -259,31 +281,53 @@ def test_fixed_endpoint_checkpoint_and_resume_contract(tmp_path: Path) -> None:
         expected_global_step=2,
     )
 
-    resumed_loader = DataLoader(
-        dataset,
-        batch_size=4,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(999),
-        collate_fn=collate_pseudo_pair_slices,
-    )
-    resumed_model = initialize_residual_arm(
-        _tiny_model_config(),
+    recovery = resolve_arm_recovery(
+        tmp_path,
+        resume=True,
+        cfg=cfg,
+        fold_slot="fold_01",
         arm="identity_initialization",
+        experiment_fingerprint="a" * 64,
+        expected_steps_per_epoch=2,
+        expected_global_step=2,
     )
-    resumed = train_fixed_endpoint(
+    assert recovery.action == "endpoint"
+    assert recovery.global_step == 2
+    assert recovery.checkpoint_state is not None
+
+    result.endpoint_checkpoint.unlink()
+    final_epoch_recovery = resolve_arm_recovery(
+        tmp_path,
+        resume=True,
+        cfg=cfg,
+        fold_slot="fold_01",
+        arm="identity_initialization",
+        experiment_fingerprint="a" * 64,
+        expected_steps_per_epoch=2,
+        expected_global_step=2,
+    )
+    assert final_epoch_recovery.action == "resume"
+    recreated = train_fixed_endpoint(
         cfg,
-        model=resumed_model,
-        train_loader=resumed_loader,
+        model=initialize_residual_arm(
+            _tiny_model_config(), arm="identity_initialization"
+        ),
+        train_loader=DataLoader(
+            dataset,
+            batch_size=4,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(999),
+            collate_fn=collate_pseudo_pair_slices,
+        ),
         checkpoint_dir=tmp_path,
         fold_slot="fold_01",
         arm="identity_initialization",
         experiment_fingerprint="a" * 64,
         expected_steps_per_epoch=2,
         expected_global_step=2,
-        resume_from=tmp_path / "resume.pt",
+        resume_from=final_epoch_recovery.resume_path,
     )
-    assert resumed.global_step == 2
-    assert resumed.endpoint_checkpoint.is_file()
+    assert recreated.endpoint_checkpoint.is_file()
 
 
 def _metric(nrmse_value: float, ssim_value: float = 0.9):

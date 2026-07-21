@@ -59,7 +59,9 @@ from fieldbridge.evaluation.prospective_paired import (
 from fieldbridge.official.data_manifest import read_manifest_jsonl
 from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.paired_loso import (
+    SanitizedRunProgress,
     initialize_residual_arm,
+    resolve_arm_recovery,
     train_fixed_endpoint,
     validate_endpoint_checkpoint,
 )
@@ -161,6 +163,34 @@ def run_experiment(
     if _mapping(config, "runtime").get("require_cuda") and device.type != "cuda":
         raise RuntimeError("The preregistered LOSO run requires a CUDA runtime.")
     train_cfg = PseudoPairEpochConfig.from_mapping(config)
+    recovery_plans = {}
+    progress: SanitizedRunProgress | None = None
+    if not dry_run:
+        expected_steps = int(_mapping(config, "training")["steps_per_epoch"])
+        expected_global = int(_mapping(config, "training")["endpoint_global_step"])
+        for fold in folds:
+            for arm in NEURAL_ARMS:
+                arm_dir = output_dir / "checkpoints" / fold.fold_slot / arm
+                recovery_plans[(fold.fold_slot, arm)] = resolve_arm_recovery(
+                    arm_dir,
+                    resume=resume,
+                    cfg=train_cfg,
+                    fold_slot=fold.fold_slot,
+                    arm=arm,  # type: ignore[arg-type]
+                    experiment_fingerprint=experiment_fingerprint,
+                    expected_steps_per_epoch=expected_steps,
+                    expected_global_step=expected_global,
+                )
+        progress = SanitizedRunProgress(
+            output_dir / "run_progress_sanitized.json",
+            fold_case_slots={
+                fold.fold_slot: f"case_{index:02d}"
+                for index, fold in enumerate(folds, start=1)
+            },
+            resume=resume,
+        )
+        for (fold_slot, arm), plan in recovery_plans.items():
+            progress.validate_recovery(fold_slot, arm, plan.action)
     telemetry = NvidiaSmiTelemetry()
     telemetry.start()
     selected_rows: list[dict[str, Any]] = []
@@ -194,47 +224,95 @@ def run_experiment(
                 if dry_run:
                     models[arm] = model.to(device).eval()
                     continue
+                assert progress is not None
                 loader = _build_train_loader(
                     dataset,
                     train_cfg=train_cfg,
                     num_workers=int(_mapping(config, "training")["num_workers"]),
                 )
                 arm_dir = output_dir / "checkpoints" / fold.fold_slot / arm
-                resume_path = arm_dir / "resume.pt" if resume else None
-                if resume_path is not None and not resume_path.is_file():
-                    raise FileNotFoundError(
-                        "Resume requested but no checkpoint exists for "
-                        f"{fold.fold_slot}/{arm}."
-                    )
-                checkpoint_names = ("resume.pt", "endpoint.pt")
-                if not resume and any(
-                    (arm_dir / name).exists() for name in checkpoint_names
-                ):
-                    raise FileExistsError(
-                        f"Existing checkpoints require --resume for {fold.fold_slot}/{arm}."
-                    )
-                result = train_fixed_endpoint(
-                    train_cfg,
-                    model=model,
-                    train_loader=loader,
-                    checkpoint_dir=arm_dir,
-                    fold_slot=fold.fold_slot,
-                    arm=arm,  # type: ignore[arg-type]
-                    experiment_fingerprint=experiment_fingerprint,
-                    expected_steps_per_epoch=int(_mapping(config, "training")["steps_per_epoch"]),
-                    expected_global_step=int(_mapping(config, "training")["endpoint_global_step"]),
-                    resume_from=resume_path,
+                plan = recovery_plans[(fold.fold_slot, arm)]
+                elapsed_offset = progress.elapsed_seconds(fold.fold_slot, arm)
+                mode = {
+                    "fresh": "started fresh",
+                    "resume": "resumed",
+                    "endpoint": "loaded completed endpoint",
+                }[plan.action]
+                print(
+                    f"paired_loso fold={fold.fold_slot} case={case_slot} arm={arm} "
+                    f"orchestration={mode}",
+                    flush=True,
                 )
-                endpoint_state = load_checkpoint(result.endpoint_checkpoint, map_location=device)
-                validate_endpoint_checkpoint(
-                    endpoint_state,
-                    cfg=train_cfg,
-                    fold_slot=fold.fold_slot,
-                    arm=arm,  # type: ignore[arg-type]
-                    experiment_fingerprint=experiment_fingerprint,
-                    expected_steps_per_epoch=result.steps_per_epoch,
-                    expected_global_step=result.global_step,
-                )
+                if plan.action == "endpoint":
+                    endpoint_state = plan.checkpoint_state
+                    assert endpoint_state is not None
+                    progress.update(
+                        fold_slot=fold.fold_slot,
+                        case_slot=case_slot,
+                        arm=arm,  # type: ignore[arg-type]
+                        state="endpoint_complete",
+                        epoch=plan.epoch,
+                        global_step=plan.global_step,
+                        elapsed_seconds=elapsed_offset,
+                    )
+                else:
+                    progress.update(
+                        fold_slot=fold.fold_slot,
+                        case_slot=case_slot,
+                        arm=arm,  # type: ignore[arg-type]
+                        state="running",
+                        epoch=plan.epoch,
+                        global_step=plan.global_step,
+                        elapsed_seconds=elapsed_offset,
+                    )
+
+                    def record_epoch(epoch, global_step, elapsed, *, arm=arm):
+                        assert progress is not None
+                        progress.update(
+                            fold_slot=fold.fold_slot,
+                            case_slot=case_slot,
+                            arm=arm,  # type: ignore[arg-type]
+                            state="running",
+                            epoch=epoch,
+                            global_step=global_step,
+                            elapsed_seconds=elapsed_offset + elapsed,
+                        )
+
+                    result = train_fixed_endpoint(
+                        train_cfg,
+                        model=model,
+                        train_loader=loader,
+                        checkpoint_dir=arm_dir,
+                        fold_slot=fold.fold_slot,
+                        arm=arm,  # type: ignore[arg-type]
+                        experiment_fingerprint=experiment_fingerprint,
+                        expected_steps_per_epoch=expected_steps,
+                        expected_global_step=expected_global,
+                        resume_from=plan.resume_path,
+                        case_slot=case_slot,
+                        epoch_progress=record_epoch,
+                    )
+                    endpoint_state = load_checkpoint(
+                        result.endpoint_checkpoint, map_location=device
+                    )
+                    validate_endpoint_checkpoint(
+                        endpoint_state,
+                        cfg=train_cfg,
+                        fold_slot=fold.fold_slot,
+                        arm=arm,  # type: ignore[arg-type]
+                        experiment_fingerprint=experiment_fingerprint,
+                        expected_steps_per_epoch=expected_steps,
+                        expected_global_step=expected_global,
+                    )
+                    progress.update(
+                        fold_slot=fold.fold_slot,
+                        case_slot=case_slot,
+                        arm=arm,  # type: ignore[arg-type]
+                        state="endpoint_complete",
+                        epoch=train_cfg.epochs,
+                        global_step=expected_global,
+                        elapsed_seconds=progress.elapsed_seconds(fold.fold_slot, arm),
+                    )
                 model.load_state_dict(endpoint_state["model"], strict=True)
                 models[arm] = model.to(device).eval()
             if dry_run:
@@ -242,6 +320,21 @@ def run_experiment(
                 continue
 
             held_out = fold.held_out_case_id
+            assert progress is not None
+            evaluation_started = time.perf_counter()
+            training_elapsed = {
+                arm: progress.elapsed_seconds(fold.fold_slot, arm) for arm in NEURAL_ARMS
+            }
+            _transition_evaluation_progress(
+                progress,
+                fold_slot=fold.fold_slot,
+                case_slot=case_slot,
+                state="evaluating",
+                epoch=train_cfg.epochs,
+                global_step=expected_global,
+                elapsed_by_arm=training_elapsed,
+                phase="selected_slices",
+            )
             selected_rows.extend(
                 evaluate_selected_case(
                     fold_slot=fold.fold_slot,
@@ -253,7 +346,28 @@ def run_experiment(
                     preprocessing=preprocessing,
                     slice_indices=SELECTED_SLICE_INDICES,
                     device=device,
+                    progress_callback=lambda completed, total: _print_evaluation_progress(
+                        fold.fold_slot,
+                        case_slot,
+                        "selected_slices",
+                        completed,
+                        total,
+                    ),
                 )
+            )
+            current_elapsed = {
+                arm: training_elapsed[arm] + time.perf_counter() - evaluation_started
+                for arm in NEURAL_ARMS
+            }
+            _transition_evaluation_progress(
+                progress,
+                fold_slot=fold.fold_slot,
+                case_slot=case_slot,
+                state="evaluating",
+                epoch=train_cfg.epochs,
+                global_step=expected_global,
+                elapsed_by_arm=current_elapsed,
+                phase="complete_volume",
             )
             complete_rows.extend(
                 _evaluate_complete_fold(
@@ -264,7 +378,28 @@ def run_experiment(
                     models=models,
                     preprocessing=preprocessing,
                     device=device,
+                    progress_callback=lambda completed, total: _print_evaluation_progress(
+                        fold.fold_slot,
+                        case_slot,
+                        "complete_volume",
+                        completed,
+                        total,
+                    ),
                 )
+            )
+            final_elapsed = {
+                arm: training_elapsed[arm] + time.perf_counter() - evaluation_started
+                for arm in NEURAL_ARMS
+            }
+            _transition_evaluation_progress(
+                progress,
+                fold_slot=fold.fold_slot,
+                case_slot=case_slot,
+                state="complete",
+                epoch=train_cfg.epochs,
+                global_step=expected_global,
+                elapsed_by_arm=final_elapsed,
+                phase="fold_complete",
             )
     finally:
         telemetry.stop()
@@ -435,10 +570,57 @@ def _build_train_loader(dataset, *, train_cfg, num_workers):
     )
 
 
+def _transition_evaluation_progress(
+    progress,
+    *,
+    fold_slot,
+    case_slot,
+    state,
+    epoch,
+    global_step,
+    elapsed_by_arm,
+    phase,
+):
+    for arm in NEURAL_ARMS:
+        progress.update(
+            fold_slot=fold_slot,
+            case_slot=case_slot,
+            arm=arm,
+            state=state,
+            epoch=epoch,
+            global_step=global_step,
+            elapsed_seconds=elapsed_by_arm[arm],
+        )
+        print(
+            f"paired_loso fold={fold_slot} case={case_slot} arm={arm} "
+            f"evaluation_phase={phase} state={state}",
+            flush=True,
+        )
+
+
+def _print_evaluation_progress(fold_slot, case_slot, phase, completed, total):
+    print(
+        f"paired_loso fold={fold_slot} case={case_slot} "
+        f"arms=identity_initialization,synthetic_initialization "
+        f"evaluation_phase={phase} progress={completed}/{total}",
+        flush=True,
+    )
+
+
 def _evaluate_complete_fold(
-    *, fold_slot, case_slot, volumes, calibrations, models, preprocessing, device
+    *,
+    fold_slot,
+    case_slot,
+    volumes,
+    calibrations,
+    models,
+    preprocessing,
+    device,
+    progress_callback=None,
 ):
     rows = []
+    total = len(TARGET_FIELDS) * (2 + len(NEURAL_ARMS))
+    completed = 0
     source_volume = volumes[SOURCE_FIELD]
     for field in TARGET_FIELDS:
         target_volume = volumes[field]
@@ -475,6 +657,9 @@ def _evaluate_complete_fold(
                     **result,
                 }
             )
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total)
     return rows
 
 
@@ -499,6 +684,27 @@ def _aggregate_complete_rows(rows):
                 for arm in ("source", "affine", *NEURAL_ARMS)
             },
         }
+    source_rows = [row for row in rows if row["arm"] == "source"]
+    baseline_names = (
+        "raw_native_source_baseline",
+        "roundtrip_native_source_baseline",
+    )
+    per_field_baselines = {}
+    for field in sorted({row["target_field"] for row in source_rows}):
+        field_rows = [row for row in source_rows if row["target_field"] == field]
+        per_field_baselines[field] = {
+            name: _mean_metrics([row[name] for row in field_rows])
+            for name in baseline_names
+        }
+    output["native_source_baselines"] = {
+        "per_target_field": per_field_baselines,
+        "macro": {
+            name: _mean_metrics(
+                [per_field_baselines[field][name] for field in per_field_baselines]
+            )
+            for name in baseline_names
+        },
+    }
     return output
 
 

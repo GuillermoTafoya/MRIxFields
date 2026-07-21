@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ RUNNER_PATH = (
     PROJECT_ROOT / "notebooks" / "stage1_vae_reconstruction_diagnostic_runner.py"
 )
 STATUS_PATH = PROJECT_ROOT / "docs" / "STATUS.md"
-HISTORICAL_TRAINING_COMMIT = "c9ee9dd738f8d9fee7acf9340dc4325c47a639cd"
+EVIDENCE_TRAINING_COMMIT = "c9ee9dd738f8d9fee7acf9340dc4325c47a639cd"
 
 
 def _load_runner():  # type: ignore[no-untyped-def]
@@ -132,6 +133,48 @@ def test_stage1_diagnostic_runner_has_no_training_or_selection_path() -> None:
 
 def test_resolved_training_yaml_uses_historical_commit_checkpoint_and_bank(tmp_path) -> None:
     runner = _load_runner()
+    repo_dir = tmp_path / "historical-repo"
+    config_path = repo_dir / "configs" / "experiment" / "stage1_vae.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """seed: 13
+data:
+  patch_size: [32, 32, 32]
+  patches_per_volume: 16
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  loss_weights:
+    ssim: 1.0
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "FieldBridge Tests"], cwd=repo_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fieldbridge-tests@example.invalid"],
+        cwd=repo_dir,
+        check=True,
+    )
+    subprocess.run(["git", "add", "configs/experiment/stage1_vae.yaml"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "historical config"], cwd=repo_dir, check=True)
+    training_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+    ).strip()
     recorded_config = {
         "steps": 54_000,
         "batch_size": 8,
@@ -155,7 +198,7 @@ def test_resolved_training_yaml_uses_historical_commit_checkpoint_and_bank(tmp_p
     torch.save(
         {
             "_meta": {
-                "git_commit": HISTORICAL_TRAINING_COMMIT,
+                "git_commit": training_commit,
                 "seed": 13,
                 "config": recorded_config,
             }
@@ -171,10 +214,10 @@ def test_resolved_training_yaml_uses_historical_commit_checkpoint_and_bank(tmp_p
     output_path = tmp_path / "resolved.yaml"
 
     result = runner.reconstruct_resolved_training_yaml(
-        repo_dir=PROJECT_ROOT,
+        repo_dir=repo_dir,
         checkpoint_path=checkpoint_path,
         patch_bank_dir=bank_dir,
-        expected_training_commit=HISTORICAL_TRAINING_COMMIT,
+        expected_training_commit=training_commit,
         output_path=output_path,
     )
 
@@ -191,7 +234,7 @@ def test_resolved_training_yaml_uses_historical_commit_checkpoint_and_bank(tmp_p
 
     with pytest.raises(ValueError, match="does not equal"):
         runner.reconstruct_resolved_training_yaml(
-            repo_dir=PROJECT_ROOT,
+            repo_dir=repo_dir,
             checkpoint_path=checkpoint_path,
             patch_bank_dir=bank_dir,
             expected_training_commit="a" * 40,
@@ -216,7 +259,7 @@ def test_status_records_supplied_negative_engineering_evidence_without_overclaim
     assert "overlap `0.25`, despite notebook prose stating `0.5`" in status
     assert "did not select a\nbest checkpoint post hoc" in status
     assert "9b071cc17c545e126891ae77f7e0dd27c2815b1c" in status
-    assert HISTORICAL_TRAINING_COMMIT in status
+    assert EVIDENCE_TRAINING_COMMIT in status
     assert "held_out: false" in status
     assert "confirmatory: false" in status
     assert "complete_volume: true" in status

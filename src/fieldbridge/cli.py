@@ -276,6 +276,38 @@ def build_parser() -> argparse.ArgumentParser:
         "blending removes the panel seams from non-overlapping tiles.",
     )
     eval_stage1_vae.add_argument(
+        "--per-domain-samples",
+        type=int,
+        default=1,
+        help="Volumes kept per distinct field/contrast pair when selecting by domain "
+        "(default 1). Implies --per-field-contrast selection.",
+    )
+    eval_stage1_vae.add_argument(
+        "--oversample-field",
+        type=float,
+        default=None,
+        help="Field strength (T) to over-represent, e.g. 0.1 for ultra-low-field. Its "
+        "per-pair cap becomes per-domain-samples * oversample-factor.",
+    )
+    eval_stage1_vae.add_argument(
+        "--oversample-factor",
+        type=int,
+        default=3,
+        help="Multiplier applied to --oversample-field's per-pair cap (default 3).",
+    )
+    eval_stage1_vae.add_argument(
+        "--eval-seed",
+        type=int,
+        default=13,
+        help="Seed recorded for provenance (selection is loader-order-deterministic).",
+    )
+    eval_stage1_vae.add_argument(
+        "--no-latent-stats",
+        dest="latent_stats",
+        action="store_false",
+        help="Skip the posterior-collapse latent statistics.",
+    )
+    eval_stage1_vae.add_argument(
         "--metrics-raw",
         type=Path,
         default=None,
@@ -762,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         patch_size = _eval_patch_size(config)
         loss_curve = _load_loss_curve(args.metrics_raw)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        training_config = config.get("training", {}) if isinstance(config.get("training", {}), Mapping) else {}
         payload = run_stage1_eval(
             encoder=encoder,
             decoder=decoder,
@@ -770,11 +803,15 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out,
             num_samples=args.num_samples,
             per_field_contrast=args.per_field_contrast,
+            per_domain_samples=args.per_domain_samples,
+            oversample_field=args.oversample_field,
+            oversample_factor=args.oversample_factor,
+            eval_seed=args.eval_seed,
+            compute_latent_stats=args.latent_stats,
+            latent_active_kl_threshold=float(training_config.get("latent_active_kl_threshold", 0.01)),
             overlap=args.overlap,
             device=device,
-            lpips_num_slices=int(config.get("training", {}).get("lpips_num_slices", 8))
-            if isinstance(config.get("training", {}), Mapping)
-            else 8,
+            lpips_num_slices=int(training_config.get("lpips_num_slices", 8)),
             loss_curve=loss_curve,
         )
         print(json.dumps(payload, indent=2, sort_keys=True))

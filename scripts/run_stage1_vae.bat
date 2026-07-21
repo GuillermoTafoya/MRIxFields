@@ -13,8 +13,10 @@ setlocal enabledelayedexpansion
 ::
 :: Optional overrides (set before calling):
 ::   set WORK_DIR=D:\MRI_Field_2026     (default: parent of DATA_ROOT)
-::   set EPOCHS=30                       (default: 30)
+::   set EPOCHS=30                       (default: 100)
 ::   set CONFIG=configs\experiment\stage1_vae.yaml
+::   set CKPT=outputs\...\vae_kl_vae_best.pt   (must match CONFIG's checkpoint_dir; the
+::                                              final eval reads the trained best from here)
 :: ---------------------------------------------------------------------------
 
 if "%DATA_ROOT%"=="" (
@@ -32,7 +34,11 @@ cd /d "%~dp0.."
 
 set "MANIFEST=%WORK_DIR%manifest.json"
 set "SPLIT=%WORK_DIR%split.json"
-set "CKPT=outputs\stage1_vae\checkpoints\vae_kl_vae_best.pt"
+:: CKPT must point at the best checkpoint under CONFIG's checkpoint_dir. Overridable from the
+:: environment so a run with a non-default checkpoint_dir (e.g. the 75ep cosine config) still
+:: finds its trained model for the eval step.
+if not defined CKPT set "CKPT=outputs\stage1_vae\checkpoints\vae_kl_vae_best.pt"
+for %%D in ("%CKPT%") do set "CKPT_DIR=%%~dpD"
 set "OUTDIR=%WORK_DIR%runs\stage1_%RANDOM%"
 mkdir "%OUTDIR%" 2>nul
 
@@ -49,14 +55,17 @@ if not exist "%SPLIT%" (
 echo == [3/4] train (%EPOCHS% epochs, per-epoch validation -> history.jsonl + best checkpoint) ==
 python -m fieldbridge.cli train-stage1-vae --config "%CONFIG%" --split-json "%SPLIT%" --epochs %EPOCHS% || exit /b 1
 
-echo == [4/4] held-out test eval (diagnostics.png + metrics.json) ==
+echo == [4/4] held-out test eval (diagnostics.png + metrics.json + metrics.csv) ==
 if not exist "%CKPT%" ( echo [error] best checkpoint not found: %CKPT% & exit /b 1 )
+:: --num-samples 60 (not the default 4) so every field/contrast pair is actually covered,
+:: with 0.1T over-represented (x3) — the ultra-low-field failure mode we most need to see.
 python -m fieldbridge.cli eval-stage1-vae --config "%CONFIG%" --split-json "%SPLIT%" --split test ^
-  --checkpoint "%CKPT%" --out "%OUTDIR%" --per-domain || exit /b 1
+  --checkpoint "%CKPT%" --out "%OUTDIR%" --num-samples 60 ^
+  --oversample-field 0.1 --oversample-factor 3 || exit /b 1
 
 echo.
 echo == DONE ==
-echo   history:     outputs\stage1_vae\checkpoints\history.jsonl
+echo   history:     %CKPT_DIR%history.jsonl
 echo   best model:  %CKPT%
-echo   test report: %OUTDIR%\metrics.json  +  %OUTDIR%\diagnostics.png
+echo   test report: %OUTDIR%\metrics.json  +  %OUTDIR%\metrics.csv  +  %OUTDIR%\diagnostics.png
 endlocal

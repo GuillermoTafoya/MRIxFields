@@ -10,9 +10,11 @@ Inputs are the official [0, 1] volumes, passed through unchanged exactly as in t
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -21,8 +23,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from fieldbridge.data.contracts import RawBatch
-from fieldbridge.evaluation.metrics import mae, mse, normalized_cross_correlation, nrmse, ssim3d
+from fieldbridge.evaluation.metrics import mae, mse, normalized_cross_correlation, nrmse, psnr, ssim3d
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
+from fieldbridge.training.latent_stats import LatentStatsAccumulator
 from fieldbridge.training.losses import build_lpips_net, lpips_loss_3d
 
 # Official MRIxFields2026 volumes ship in [0, 1] and must not be rescaled (see
@@ -41,9 +44,14 @@ _RANGE_TOLERANCE = 1e-3
 class SampleMetrics:
     case_id: str
     domain: str
+    # Field strength (T) and contrast pulled out of the domain so per-field and
+    # per-contrast aggregation (and the CSV) don't have to re-parse the "0.1T/T1w" label.
+    field_strength_t: float
+    contrast: str
     nrmse: float
     ssim3d: float
     lpips: float
+    psnr: float
     mse: float
     mae: float
     # Pearson correlation between recon and target. Reported because SSIM cannot separate
@@ -60,11 +68,15 @@ class SampleMetrics:
         return {
             "case_id": self.case_id,
             "domain": self.domain,
+            "field_strength_t": self.field_strength_t,
+            "contrast": self.contrast,
             "nrmse": self.nrmse,
             "ssim3d": self.ssim3d,
             "lpips": self.lpips,
+            "psnr": self.psnr,
             "mse": self.mse,
             "mae": self.mae,
+            "l1": self.mae,  # L1 == MAE; surfaced under both names for the requested table
             "correlation": self.correlation,
             "recon_stats": dict(self.recon_stats),
             "target_stats": dict(self.target_stats),
@@ -222,17 +234,33 @@ def run_stage1_eval(
     lpips_num_slices: int = 8,
     per_domain: bool | None = None,
     per_field_contrast: bool = False,
+    per_domain_samples: int = 1,
+    oversample_field: float | None = None,
+    oversample_factor: int = 1,
+    eval_seed: int = 13,
+    compute_latent_stats: bool = True,
+    latent_active_kl_threshold: float = 0.01,
+    write_csv: bool = True,
+    print_tables: bool = True,
     overlap: float = 0.5,
     loss_curve: Sequence[float] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate deterministic reconstruction over up to `num_samples` volumes.
+    """Evaluate deterministic reconstruction over a fixed, domain-balanced set of volumes.
 
-    With `per_field_contrast=True`, keep at most one volume per distinct field/contrast
-    pair instead of the first N in manifest order. ``per_domain`` remains a compatibility
-    alias for older callers, but no anatomical or scientific domain claim is inferred.
+    Selection (when `per_field_contrast=True`, the alias `per_domain=True`, or any
+    oversampling is requested): keep up to `per_domain_samples` volumes per distinct
+    field/contrast pair, in the loader's (deterministic) order, so coverage spans every
+    domain present. `oversample_field` (e.g. 0.1 for 0.1T) raises that cap to
+    `per_domain_samples * oversample_factor` for the hardest field. With the defaults
+    (`per_domain_samples=1`, `oversample_field=None`) this reduces to one volume per pair —
+    the historical behavior. `num_samples` is an overall cap. `eval_seed` is recorded for
+    provenance (selection itself is loader-order-deterministic, not random).
 
-    Writes `metrics.json` and `diagnostics.png` (and `loss_curve.png` if a loss history is
-    given) to `out_dir`. Returns the metrics payload.
+    Metrics per sample: L1(=MAE), PSNR, SSIM3D, nRMSE, LPIPS, correlation. Reconstruction is
+    full-volume (sliding window from latent means). Writes `metrics.json`, `metrics.csv`,
+    `diagnostics.png` (input/recon/|error| panel with a fixed center slice), plus per-field
+    and per-contrast aggregate tables to stdout, and posterior-collapse latent stats.
+    Returns the metrics payload.
     """
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,18 +278,28 @@ def run_stage1_eval(
         except ImportError:
             lpips_net = None
 
+    latent_channels = getattr(encoder, "latent_channels", None)
+    latent_acc = (
+        LatentStatsAccumulator(int(latent_channels))
+        if compute_latent_stats and latent_channels
+        else None
+    )
+
+    select_field_contrast = per_field_contrast or bool(per_domain) or oversample_field is not None
     samples: list[dict[str, torch.Tensor]] = []
     metrics: list[SampleMetrics] = []
-    select_field_contrast = per_field_contrast or bool(per_domain)
-    seen_field_contrasts: set[tuple[float, str]] = set()
+    per_key_counts: dict[tuple[float, str], int] = {}
     for batch in loader:
         if len(samples) >= num_samples:
             break
         if select_field_contrast:
             key = _domain_field_contrast_key(batch.source_domain)
-            if key in seen_field_contrasts:
+            cap = per_domain_samples
+            if oversample_field is not None and math.isclose(key[0], float(oversample_field), abs_tol=1e-6):
+                cap = per_domain_samples * max(1, oversample_factor)
+            if per_key_counts.get(key, 0) >= cap:
                 continue
-            seen_field_contrasts.add(key)
+            per_key_counts[key] = per_key_counts.get(key, 0) + 1
         image = batch.image.to(device)
         domain = batch.source_domain
         recon = sliding_window_reconstruct(
@@ -270,13 +308,23 @@ def run_stage1_eval(
 
         _assert_same_space(recon, image)
 
+        if latent_acc is not None:
+            center = _center_crop(image, patch_size)
+            with torch.no_grad():
+                latent_mean, latent_logvar = encoder.encode_dist(center, domain)
+            latent_acc.update(latent_mean, latent_logvar)
+
         case_id, domain_label = _batch_labels(batch)
+        field_t, contrast = _domain_field_contrast_labels(batch.source_domain)
         sample_metrics = SampleMetrics(
             case_id=case_id,
             domain=domain_label,
+            field_strength_t=field_t,
+            contrast=contrast,
             nrmse=float(nrmse(recon, image, data_range=_DATA_RANGE)),
             ssim3d=float(ssim3d(recon, image, data_range=_DATA_RANGE)),
             lpips=_maybe_lpips(recon, image, lpips_num_slices, lpips_net),
+            psnr=float(psnr(recon, image, data_range=_DATA_RANGE)),
             mse=float(mse(recon, image)),
             mae=float(mae(recon, image)),
             correlation=float(normalized_cross_correlation(recon, image)),
@@ -287,19 +335,186 @@ def run_stage1_eval(
         _log_diagnostic(_range_report(sample_metrics))
         samples.append({"original": image.detach().cpu(), "recon": recon.detach().cpu()})
 
+    by_field = _aggregate_by(metrics, lambda m: f"{m.field_strength_t:g}T")
+    by_contrast = _aggregate_by(metrics, lambda m: m.contrast)
     payload: dict[str, Any] = {
         "num_samples": len(metrics),
         "data_range": _DATA_RANGE,
+        "eval_seed": eval_seed,
         "sampling_coverage_unit": "field_contrast" if select_field_contrast else "manifest_order",
+        "oversample_field": oversample_field,
+        "oversample_factor": oversample_factor,
         "per_sample": [m.to_dict() for m in metrics],
         "mean": _aggregate(metrics),
+        "by_field_strength": by_field,
+        "by_contrast": by_contrast,
+        "by_field_contrast": _aggregate_by(metrics, lambda m: m.domain),
     }
+    if latent_acc is not None and metrics:
+        payload["latent"] = latent_acc.compute(active_threshold=latent_active_kl_threshold)
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    if write_csv:
+        _write_metrics_csv(metrics, out_dir / "metrics.csv")
+    if print_tables:
+        _print_metric_tables(by_field, by_contrast, payload.get("latent"))
 
     _plot_diagnostics(samples, metrics, out_dir / "diagnostics.png")
     if loss_curve is not None:
         _plot_loss_curve(loss_curve, out_dir / "loss_curve.png")
     return payload
+
+
+def _center_crop(image: torch.Tensor, patch_size: Sequence[int]) -> torch.Tensor:
+    """Center crop of `patch_size` from a 5D volume (for representative latent encoding).
+
+    Clamps each requested extent to the actual spatial size, so a volume smaller than the
+    patch along an axis is simply used whole on that axis."""
+
+    if image.ndim != 5:
+        raise ValueError(f"_center_crop expects a 5D (B,C,D,H,W) tensor, got {image.ndim}D.")
+    starts_sizes: list[tuple[int, int]] = []
+    for spatial, want in zip(image.shape[2:], patch_size):
+        size = min(int(want), int(spatial))
+        start = (int(spatial) - size) // 2
+        starts_sizes.append((start, size))
+    (sd, nd), (sh, nh), (sw, nw) = starts_sizes
+    return image[..., sd : sd + nd, sh : sh + nh, sw : sw + nw]
+
+
+def _domain_field_contrast_labels(domain: Any) -> tuple[float, str]:
+    """(field strength as float, contrast as its clean value string) from a domain."""
+
+    if isinstance(domain, Sequence) and not isinstance(domain, (str, bytes)) and domain:
+        domain = domain[0]
+    field = getattr(domain, "field_strength_t", None)
+    contrast = getattr(domain, "contrast", None)
+    contrast_str = getattr(contrast, "value", str(contrast)) if contrast is not None else "unknown"
+    return (float(field) if field is not None else float("nan"), contrast_str)
+
+
+def _aggregate_by(
+    metrics: Sequence[SampleMetrics], key_fn: "Any"
+) -> dict[str, dict[str, float]]:
+    """Group metrics by `key_fn(sample)` and average each group (nan-aware, plus a count)."""
+
+    groups: dict[str, list[SampleMetrics]] = {}
+    for metric in metrics:
+        groups.setdefault(key_fn(metric), []).append(metric)
+    aggregated: dict[str, dict[str, float]] = {}
+    for label in sorted(groups):
+        group = groups[label]
+        summary = {key: _nanmean([getattr(m, key) for m in group]) for key in _AGG_KEYS}
+        summary["l1"] = summary["mae"]
+        summary["count"] = float(len(group))
+        aggregated[label] = summary
+    return aggregated
+
+
+def _nanmean(values: Sequence[float]) -> float:
+    finite = [float(v) for v in values if v == v]  # drop NaN
+    return float(sum(finite) / len(finite)) if finite else float("nan")
+
+
+def _write_metrics_csv(metrics: Sequence[SampleMetrics], path: Path) -> None:
+    fields = ["case_id", "domain", "field_strength_t", "contrast", "l1", "psnr", "ssim3d", "nrmse", "lpips", "correlation"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for metric in metrics:
+            writer.writerow(
+                {
+                    "case_id": metric.case_id,
+                    "domain": metric.domain,
+                    "field_strength_t": f"{metric.field_strength_t:g}",
+                    "contrast": metric.contrast,
+                    "l1": f"{metric.mae:.6f}",
+                    "psnr": f"{metric.psnr:.4f}",
+                    "ssim3d": f"{metric.ssim3d:.6f}",
+                    "nrmse": f"{metric.nrmse:.6f}",
+                    "lpips": f"{metric.lpips:.6f}",
+                    "correlation": f"{metric.correlation:.6f}",
+                }
+            )
+
+
+def _print_metric_tables(
+    by_field: Mapping[str, Mapping[str, float]],
+    by_contrast: Mapping[str, Mapping[str, float]],
+    latent: Mapping[str, Any] | None,
+) -> None:
+    """Human-readable per-field / per-contrast tables (L1, PSNR, SSIM, LPIPS) to stdout."""
+
+    def render(title: str, table: Mapping[str, Mapping[str, float]]) -> None:
+        print(f"\n== {title} ==")
+        print(f"{'group':<12} {'n':>3} {'L1':>10} {'PSNR':>8} {'SSIM':>8} {'nRMSE':>8} {'LPIPS':>8}")
+        for label, row in table.items():
+            print(
+                f"{label:<12} {int(row['count']):>3} {row['l1']:>10.5f} {row['psnr']:>8.3f} "
+                f"{row['ssim3d']:>8.4f} {row['nrmse']:>8.4f} {row['lpips']:>8.4f}"
+            )
+
+    render("metrics by field strength", by_field)
+    render("metrics by contrast", by_contrast)
+    if latent:
+        print(
+            f"\n== latent ==\nactive_units={latent['active_units']}/{latent['num_dims']} "
+            f"global_std={latent['global_std']:.3f} "
+            f"per_dim_std(min/mean/max)={latent['min_per_dim_std']:.3f}/"
+            f"{latent['mean_per_dim_std']:.3f}/{latent['max_per_dim_std']:.3f}"
+        )
+
+
+def render_reconstruction_panel(
+    originals: torch.Tensor,
+    reconstructions: torch.Tensor,
+    *,
+    labels: Sequence[str],
+    path: Path,
+) -> None:
+    """Render input / reconstruction / |error| rows for a batch to `path` (one row/sample).
+
+    Handles 4D (B,C,H,W) and 5D (B,C,D,H,W) tensors — for volumes a fixed center slice
+    along the first spatial axis is shown. Used both by the offline eval and the in-training
+    recon hook, so the visual is defined once. Requires matplotlib (the 'evaluation' extra).
+    """
+
+    import numpy as np
+
+    plt = _matplotlib_pyplot()
+    batch = int(originals.shape[0])
+    fig, axes = plt.subplots(batch, 3, figsize=(12, 4 * batch), squeeze=False)
+    for row in range(batch):
+        original = _panel_slice(originals[row : row + 1])
+        recon = _panel_slice(reconstructions[row : row + 1])
+        error = np.abs(original - recon)
+        label = labels[row] if row < len(labels) else f"sample {row}"
+
+        axes[row][0].imshow(original, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[row][0].set_title(f"Input — {label}", fontsize=11)
+        axes[row][0].axis("off")
+        axes[row][1].imshow(recon, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[row][1].set_title(
+            f"Recon\nL1 {float(np.abs(original - recon).mean()):.4f}", fontsize=11
+        )
+        axes[row][1].axis("off")
+        image = axes[row][2].imshow(error, cmap="hot")
+        axes[row][2].set_title("|error|", fontsize=11)
+        axes[row][2].axis("off")
+        fig.colorbar(image, ax=axes[row][2], fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def _panel_slice(volume: torch.Tensor) -> "Any":
+    """Display-rotated center slice for a single (1,C,...) sample, 2D or 3D."""
+
+    import numpy as np
+
+    if volume.ndim == 5:
+        return _central_first_spatial_axis_slice(volume)
+    array = volume[0, 0].numpy()
+    return np.rot90(array)
 
 
 def _domain_field_contrast_key(domain: Any) -> tuple[float, str]:
@@ -337,11 +552,14 @@ def _batch_labels(batch: RawBatch) -> tuple[str, str]:
     return case_id, domain_label
 
 
+# Numeric SampleMetrics fields averaged in the overall + per-group aggregates.
+_AGG_KEYS = ("nrmse", "ssim3d", "lpips", "psnr", "mse", "mae", "correlation")
+
+
 def _aggregate(metrics: Sequence[SampleMetrics]) -> dict[str, float]:
     if not metrics:
         return {}
-    keys = ("nrmse", "ssim3d", "lpips", "mse", "mae", "correlation")
-    return {key: float(sum(getattr(m, key) for m in metrics) / len(metrics)) for key in keys}
+    return {key: float(sum(getattr(m, key) for m in metrics) / len(metrics)) for key in _AGG_KEYS}
 
 
 def _central_first_spatial_axis_slice(volume: torch.Tensor) -> "Any":
@@ -387,14 +605,16 @@ def _plot_diagnostics(
         recon = _central_first_spatial_axis_slice(sample["recon"])
         error = np.abs(original - recon)
 
-        axes[row][0].imshow(original, cmap="gray", vmin=-1, vmax=1)
+        # Official [0, 1] contract: display on [0, 1], not [-1, 1] (which halved the
+        # apparent brightness of every panel and washed the anatomy out).
+        axes[row][0].imshow(original, cmap="gray", vmin=0.0, vmax=1.0)
         axes[row][0].set_title(f"Original — {metric.domain}\n{metric.case_id}", fontsize=11)
         axes[row][0].axis("off")
 
-        axes[row][1].imshow(recon, cmap="gray", vmin=-1, vmax=1)
+        axes[row][1].imshow(recon, cmap="gray", vmin=0.0, vmax=1.0)
         axes[row][1].set_title(
-            f"Recon (deterministic mean)\nnRMSE {metric.nrmse:.4f} | SSIM3D {metric.ssim3d:.4f} | "
-            f"LPIPS {metric.lpips:.4f}\ncorr {metric.correlation:+.4f} | "
+            f"Recon (deterministic mean)\nL1 {metric.mae:.4f} | PSNR {metric.psnr:.2f} | "
+            f"SSIM3D {metric.ssim3d:.4f} | LPIPS {metric.lpips:.4f}\ncorr {metric.correlation:+.4f} | "
             f"range [{metric.recon_stats['min']:+.2f}, {metric.recon_stats['max']:+.2f}]",
             fontsize=11,
         )

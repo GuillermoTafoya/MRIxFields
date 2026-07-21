@@ -1,0 +1,89 @@
+# Etapa-1 KL-VAE, full 75-epoch run with cosine LR + best-checkpoint selection.
+#
+# Same model/data/loss as stage1_vae.yaml (weights and math unchanged — this is the run
+# config, not a tuning change). Differences vs. stage1_vae.yaml, all instrumentation:
+#   * early_stopping OFF: run the whole schedule and keep the best-by-validation checkpoint
+#     rather than aborting on a training-EMA plateau.
+#   * lr_schedule: cosine with a short warmup, decaying to lr_min_factor * lr by the end.
+#   * per-epoch validation (val_every_epochs=1) + latent posterior-collapse stats.
+#   * reconstruction panels dumped every 5 epochs over a fixed validation batch.
+#   * foreground-weighted L1 wired but OFF (measure before enabling).
+#
+# Launch (75 epochs is set via --epochs, which also fixes the cosine horizon):
+#   python -m fieldbridge.cli train-stage1-vae \
+#     --config configs/experiment/stage1_vae_75ep_cosine.yaml \
+#     --split-json <SPLIT.json> --epochs 75
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+  patch_size: [64, 64, 64]
+  patches_per_volume: 16
+  foreground_threshold: 0.0
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  # steps is set from --epochs (epochs * steps_per_epoch); left here as a fallback only.
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  loss_weights:
+    l1: 1.0
+    ssim: 1.0
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+  ssim_window_size: 7
+  data_range: 1.0
+  lpips_num_slices: 8
+  grad_clip_norm: 1.0
+  # Model selection = best by validation total, NOT the training-EMA early stop (which is a
+  # GPU-saver that can abort a still-improving run). Off for the full schedule.
+  early_stopping: false
+  # Validate + select best every epoch; latent collapse stats logged on the same pass.
+  val_every_epochs: 1
+  latent_active_kl_threshold: 0.01
+  # Dump input/recon/|error| panels over a fixed validation batch every N epochs.
+  recon_dump_every_epochs: 5
+  # Cosine LR: linear warmup 0 -> lr over lr_warmup_steps, then cosine decay to
+  # lr_min_factor * lr by the end of the run. lr_cosine_total_steps=0 => the horizon is the
+  # whole run (start_step + steps); set it explicitly to 75*steps_per_epoch only if you
+  # resume, so the curve stays continuous across resumes.
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_factor: 0.05
+  lr_cosine_total_steps: 0
+  # Foreground-weighted reconstruction L1 (item 7) — wired but OFF. Flip enabled to true and
+  # sweep foreground_weight to test the "background-dominated batches deflate the loss" fix.
+  foreground_loss_weighting: false
+  foreground_weight: 5.0
+  foreground_threshold: 0.0
+  warm_start_checkpoint: null
+  # Isolated from the previous run's outputs/stage1_vae/checkpoints so this fresh cosine run
+  # (a) never collides with its same-date step-stamped checkpoints — save_checkpoint refuses
+  # silent overwrites, which would crash the run at the first checkpoint step — and (b) keeps
+  # the earlier run's artifacts intact for comparison. run_stage1_vae.bat reads CKPT from env
+  # so its final eval step points here (see launch_stage1.bat).
+  checkpoint_dir: outputs/stage1_vae_75ep_cosine/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 50
+  resume_from: null

@@ -33,6 +33,32 @@ def masked_l1_loss(
     return (torch.abs(prediction - target) * prepared_mask).sum() / denominator
 
 
+def foreground_weighted_l1_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    threshold: float = 0.0,
+    foreground_weight: float = 1.0,
+) -> torch.Tensor:
+    """L1 with foreground voxels up-weighted relative to background, target-derived.
+
+    Foreground is `target > threshold` (on the official [0, 1] contract, background is
+    exactly 0, so threshold 0 selects brain). Each voxel's error is weighted
+    `1 + (foreground_weight - 1) * is_foreground`, then normalized by the total weight —
+    so `foreground_weight == 1.0` reduces *exactly* to the plain mean L1 (the property
+    that keeps this a no-op when the feature flag is off). Motivation: uniform L1 lets a
+    black-background-dominated patch produce a trivially low loss; up-weighting foreground
+    stops those batches from masking real reconstruction error. Diagnostic/opt-in — see
+    Stage1VAEConfig.foreground_loss_weighting.
+    """
+
+    _validate_same_shape(prediction, target)
+    absolute_error = torch.abs(prediction - target)
+    foreground = (target > threshold).to(prediction.dtype)
+    weight = 1.0 + (float(foreground_weight) - 1.0) * foreground
+    return (absolute_error * weight).sum() / weight.sum().clamp_min(1.0)
+
+
 def masked_mse_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,

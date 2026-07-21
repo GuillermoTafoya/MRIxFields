@@ -13,6 +13,7 @@ latent, VAE frozen by default — staged, not end-to-end.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from collections.abc import Mapping
@@ -29,8 +30,10 @@ from fieldbridge.data.contracts import RawBatch
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.batch import move_raw_batch
 from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
+from fieldbridge.training.latent_stats import LatentStatsAccumulator, summarize_latent_stats
 from fieldbridge.training.losses import (
     build_lpips_net,
+    foreground_weighted_l1_loss,
     kl_divergence,
     lpips_loss,
     lpips_loss_3d,
@@ -40,6 +43,10 @@ from fieldbridge.training.losses import (
 )
 from fieldbridge.training.warm_start import load_state_dict_tolerant
 from fieldbridge.utils.seeding import seed_everything
+
+# Order in which per-term losses appear in the per-step console line (only terms with a
+# positive weight are actually computed/printed). `total` is logged separately.
+_LOSS_TERM_ORDER = ("l1", "ssim", "nrmse", "lpips", "kl")
 
 Precision = Literal["fp32", "bf16"]
 Device = Literal["auto", "cpu", "cuda"]
@@ -83,6 +90,17 @@ class Stage1VAEConfig:
     # is the model-selection signal, unlike the train-EMA early-stop (a GPU-saver only).
     val_max_batches: int = 0
     history_filename: str = "history.jsonl"
+    # Run validation (and best-checkpoint selection) every N epochs. 1 = every epoch
+    # (unchanged). Raise it to spend fewer GPU-minutes on validation in a long run.
+    val_every_epochs: int = 1
+    # Per-epoch latent posterior-collapse diagnostics (std/KL per latent dim + active-unit
+    # count), computed over the same validation pass. A latent channel counts as "active"
+    # when its per-dim KL exceeds this threshold. Diagnostic only — never affects the loss.
+    latent_active_kl_threshold: float = 0.01
+    # Dump an input/reconstruction/error panel over a FIXED validation batch every N epochs
+    # (0 disables). The batch is captured once before training so the same slices are shown
+    # across epochs and runs. No-op without a checkpoint_dir, a val_loader, or matplotlib.
+    recon_dump_every_epochs: int = 5
     grad_clip_norm: float = 1.0
     # Steps that make up one full pass over the manifest, = ceil(num_volumes *
     # patches_per_volume / batch_size). 0 means unknown (the loader is an IterableDataset
@@ -97,6 +115,23 @@ class Stage1VAEConfig:
     early_stopping_patience: int = 5  # checkpoints without improvement before stopping
     early_stopping_min_delta: float = 0.005  # relative improvement (0.5%) that counts
     early_stopping_ema_decay: float = 0.98  # EMA smoothing of the noisy per-step loss
+    # Learning-rate schedule. "constant" (default) keeps the current fixed-lr behavior
+    # exactly. "cosine" ramps lr linearly from 0 over `lr_warmup_steps`, then cosine-decays
+    # to `lr * lr_min_factor` by `lr_cosine_total_steps` (0 => start_step + steps, i.e. the
+    # length of this run — set it explicitly to the full-schedule length when resuming so
+    # the curve is invariant across resumes). Applied per-step, stateless (a pure function
+    # of the global step), so resume needs no scheduler state persisted.
+    lr_schedule: Literal["constant", "cosine"] = "constant"
+    lr_warmup_steps: int = 0
+    lr_min_factor: float = 0.0
+    lr_cosine_total_steps: int = 0
+    # Foreground-weighted reconstruction L1 (item 7 — OFF by default, measure before use).
+    # When True the plain L1 term is replaced by foreground_weighted_l1_loss so brain voxels
+    # (target > foreground_threshold) count `foreground_weight`x a background voxel. With the
+    # flag off the loss math is byte-for-byte unchanged.
+    foreground_loss_weighting: bool = False
+    foreground_weight: float = 5.0
+    foreground_threshold: float = 0.0
     warm_start_checkpoint: Path | None = None
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -138,8 +173,48 @@ class Stage1VAEConfig:
             history_filename=str(
                 training.get("history_filename", data.get("history_filename", defaults.history_filename))
             ),
+            val_every_epochs=int(
+                training.get("val_every_epochs", data.get("val_every_epochs", defaults.val_every_epochs))
+            ),
+            latent_active_kl_threshold=float(
+                training.get(
+                    "latent_active_kl_threshold",
+                    data.get("latent_active_kl_threshold", defaults.latent_active_kl_threshold),
+                )
+            ),
+            recon_dump_every_epochs=int(
+                training.get(
+                    "recon_dump_every_epochs", data.get("recon_dump_every_epochs", defaults.recon_dump_every_epochs)
+                )
+            ),
             grad_clip_norm=float(
                 training.get("grad_clip_norm", data.get("grad_clip_norm", defaults.grad_clip_norm))
+            ),
+            lr_schedule=str(training.get("lr_schedule", data.get("lr_schedule", defaults.lr_schedule))),
+            lr_warmup_steps=int(
+                training.get("lr_warmup_steps", data.get("lr_warmup_steps", defaults.lr_warmup_steps))
+            ),
+            lr_min_factor=float(
+                training.get("lr_min_factor", data.get("lr_min_factor", defaults.lr_min_factor))
+            ),
+            lr_cosine_total_steps=int(
+                training.get(
+                    "lr_cosine_total_steps", data.get("lr_cosine_total_steps", defaults.lr_cosine_total_steps)
+                )
+            ),
+            foreground_loss_weighting=bool(
+                training.get(
+                    "foreground_loss_weighting",
+                    data.get("foreground_loss_weighting", defaults.foreground_loss_weighting),
+                )
+            ),
+            foreground_weight=float(
+                training.get("foreground_weight", data.get("foreground_weight", defaults.foreground_weight))
+            ),
+            foreground_threshold=float(
+                training.get(
+                    "foreground_threshold", data.get("foreground_threshold", defaults.foreground_threshold)
+                )
             ),
             steps_per_epoch=int(
                 training.get("steps_per_epoch", data.get("steps_per_epoch", defaults.steps_per_epoch))
@@ -194,8 +269,18 @@ class Stage1VAEConfig:
             "data_range": self.data_range,
             "val_max_batches": self.val_max_batches,
             "history_filename": self.history_filename,
+            "val_every_epochs": self.val_every_epochs,
+            "latent_active_kl_threshold": self.latent_active_kl_threshold,
+            "recon_dump_every_epochs": self.recon_dump_every_epochs,
             "lpips_num_slices": self.lpips_num_slices,
             "grad_clip_norm": self.grad_clip_norm,
+            "lr_schedule": self.lr_schedule,
+            "lr_warmup_steps": self.lr_warmup_steps,
+            "lr_min_factor": self.lr_min_factor,
+            "lr_cosine_total_steps": self.lr_cosine_total_steps,
+            "foreground_loss_weighting": self.foreground_loss_weighting,
+            "foreground_weight": self.foreground_weight,
+            "foreground_threshold": self.foreground_threshold,
             "steps_per_epoch": self.steps_per_epoch,
             "early_stopping": self.early_stopping,
             "early_stopping_patience": self.early_stopping_patience,
@@ -322,6 +407,11 @@ def run_stage1_vae_train(
     if cfg.loss_weights.get("lpips", 0.0) > 0:
         lpips_net = build_lpips_net(device)
 
+    # Cosine schedule length: default to this run's span (start_step..start_step+steps).
+    # For a resumed run, set lr_cosine_total_steps to the full-schedule length so the curve
+    # is continuous instead of restarting each resume.
+    lr_total_steps = cfg.lr_cosine_total_steps if cfg.lr_cosine_total_steps > 0 else start_step + cfg.steps
+
     iterator = iter(loader)
     autocast_ctx = _autocast_context(device, cfg.precision)
     if cfg.log_every_steps > 0:
@@ -341,6 +431,16 @@ def run_stage1_vae_train(
     )
     best_val_total = float("inf")
 
+    # Fixed reconstruction-panel batch: captured once (on CPU) so the same slices are shown
+    # every dump across epochs and runs. Only when the hook is on and there's somewhere to
+    # write; failure to grab a batch (empty val loader) just disables the hook.
+    dump_recon = do_validation and cfg.recon_dump_every_epochs > 0 and cfg.checkpoint_dir is not None
+    fixed_recon_batch: RawBatch | None = None
+    if dump_recon:
+        assert val_loader is not None
+        fixed_recon_batch = _capture_fixed_batch(val_loader)
+        dump_recon = fixed_recon_batch is not None
+
     losses: list[float] = []
     epoch_sums: dict[str, float] = {}
     epoch_batches = 0
@@ -356,6 +456,10 @@ def run_stage1_vae_train(
             batch = next(iterator)
         batch = move_raw_batch(batch, device)
 
+        current_lr = _lr_at_step(step + 1, cfg, lr_total_steps)
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
             components = _compute_vae_loss_components(encoder, decoder, batch, cfg, lpips_net=lpips_net)
@@ -365,11 +469,14 @@ def run_stage1_vae_train(
             torch.nn.utils.clip_grad_norm_(trainable_params, cfg.grad_clip_norm)
         optimizer.step()
         _sync_if_cuda(device)
-        loss_value = float(total_loss.detach().cpu())
+        # One detach->cpu read per term, reused for both the epoch means and the per-step
+        # console line — no extra syncs beyond the accumulation the loop already did.
+        component_values = {name: float(value.detach().cpu()) for name, value in components.items()}
+        loss_value = component_values["total"]
         losses.append(loss_value)
         # Accumulate per-term train means for the current epoch's history line.
-        for name, value in components.items():
-            epoch_sums[name] = epoch_sums.get(name, 0.0) + float(value.detach().cpu())
+        for name, value in component_values.items():
+            epoch_sums[name] = epoch_sums.get(name, 0.0) + value
         epoch_batches += 1
         if tracker is not None:
             tracker.update_step(loss_value)
@@ -395,9 +502,16 @@ def run_stage1_vae_train(
             elapsed = time.perf_counter() - train_start
             step_elapsed = time.perf_counter() - step_start
             ema_str = f" ema={tracker.ema:.6f}" if tracker is not None and tracker.ema is not None else ""
+            # Per-term raw losses so posterior collapse vs. real convergence is legible from
+            # the per-step log, not just the opaque total (weighted breakdown is in history).
+            terms_str = " ".join(
+                f"{name}={component_values[name]:.4f}" for name in _LOSS_TERM_ORDER if name in component_values
+            )
+            lr_str = f" lr={current_lr:.2e}" if cfg.lr_schedule != "constant" else ""
             _log_training_progress(
                 f"stage1_vae {_epoch_label(current_step, cfg.steps_per_epoch)} "
                 f"step={current_step}/{start_step + cfg.steps} loss={loss_value:.6f}{ema_str} "
+                f"[{terms_str}]{lr_str} "
                 f"step_sec={step_elapsed:.3f} avg_sec_per_step={elapsed / len(losses):.3f}"
             )
 
@@ -405,32 +519,48 @@ def run_stage1_vae_train(
             assert val_loader is not None  # do_validation guarantees this
             epoch_index = current_step // cfg.steps_per_epoch
             train_means = {name: total / max(1, epoch_batches) for name, total in epoch_sums.items()}
-            val_means = _run_validation(encoder, decoder, val_loader, cfg, device, lpips_net, autocast_ctx)
             epoch_sums, epoch_batches = {}, 0
+            run_val = epoch_index % max(1, cfg.val_every_epochs) == 0
 
-            val_total = val_means.get("total", float("nan"))
-            is_best = val_total == val_total and val_total < best_val_total  # NaN-safe
-            if is_best:
-                best_val_total = val_total
-            if history_path is not None:
-                _append_history(
-                    history_path,
-                    {
-                        "epoch": epoch_index,
-                        "step": current_step,
-                        "train": train_means,
-                        "validation": val_means,
-                        "lr": cfg.lr,
-                        "best": is_best,
-                        "seconds": time.perf_counter() - train_start,
-                    },
+            if run_val:
+                val_means, latent_stats = _run_validation(
+                    encoder, decoder, val_loader, cfg, device, lpips_net, autocast_ctx
                 )
-            if is_best and cfg.checkpoint_dir is not None:
-                _save_best_checkpoint(cfg, encoder, decoder, optimizer, current_step)
-            _log_training_progress(
-                f"stage1_vae epoch={epoch_index} val_total={val_total:.6f} "
-                f"train_total={train_means.get('total', float('nan')):.6f}{' [best]' if is_best else ''}"
-            )
+                val_total = val_means.get("total", float("nan"))
+                is_best = val_total == val_total and val_total < best_val_total  # NaN-safe
+                if is_best:
+                    best_val_total = val_total
+                if history_path is not None:
+                    _append_history(
+                        history_path,
+                        {
+                            "epoch": epoch_index,
+                            "step": current_step,
+                            "train": train_means,
+                            "train_weighted": _weighted_terms(train_means, cfg.loss_weights),
+                            "validation": val_means,
+                            "validation_weighted": _weighted_terms(val_means, cfg.loss_weights),
+                            "latent": latent_stats,
+                            "lr": current_lr,
+                            "best": is_best,
+                            "seconds": time.perf_counter() - train_start,
+                        },
+                    )
+                if is_best and cfg.checkpoint_dir is not None:
+                    _save_best_checkpoint(cfg, encoder, decoder, optimizer, current_step)
+                latent_str = f" | latent: {summarize_latent_stats(latent_stats)}" if latent_stats else ""
+                _log_training_progress(
+                    f"stage1_vae epoch={epoch_index} val_total={val_total:.6f} "
+                    f"train_total={train_means.get('total', float('nan')):.6f}"
+                    f"{' [best]' if is_best else ''}{latent_str}"
+                )
+
+            if dump_recon and epoch_index % cfg.recon_dump_every_epochs == 0:
+                assert fixed_recon_batch is not None and cfg.checkpoint_dir is not None
+                _dump_reconstruction_panel(
+                    encoder, decoder, fixed_recon_batch, cfg, device, autocast_ctx, epoch_index
+                )
+
             encoder.train()
             decoder.train()
 
@@ -505,8 +635,9 @@ def _compute_vae_loss_components(
     components["nrmse"] = nrmse_loss(reconstructed, batch.image, data_range=cfg.data_range)
     if weights.get("l1", 0.0) > 0:
         # Plain image-space L1 (no mask): the flat per-voxel absolute-error term that
-        # anchors the DC level and drives the background to exactly 0.
-        components["l1"] = masked_l1_loss(reconstructed, batch.image)
+        # anchors the DC level and drives the background to exactly 0. With the (default-off)
+        # foreground-weighting flag, brain voxels are up-weighted instead — see _l1_term.
+        components["l1"] = _l1_term(reconstructed, batch.image, cfg)
     if weights.get("ssim", 0.0) > 0:
         # ssim_loss dispatches on rank: 5D volumes -> ssim3d (avg_pool3d), 4D -> 2D ssim.
         components["ssim"] = ssim_loss(
@@ -539,14 +670,19 @@ def _run_validation(
     device: torch.device,
     lpips_net: nn.Module | None,
     autocast_ctx: Any,
-) -> dict[str, float]:
-    """Mean per-term loss over the validation loader, deterministic (latent mean, no
-    sampling). `val_max_batches`>0 caps the pass. `ssim3d`/`nrmse`/`lpips` are logged as
-    the challenge metrics too (ssim3d = 1 - ssim loss)."""
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Mean per-term loss + latent posterior-collapse stats over the validation loader.
+
+    Deterministic (latent mean, no sampling). `val_max_batches`>0 caps the pass.
+    `ssim3d`/`nrmse`/`lpips` are logged as the challenge metrics too (ssim3d = 1 - ssim
+    loss). The latent stats reuse the very `mean`/`logvar` already encoded for the
+    reconstruction, so they cost one online accumulation and no extra forward pass.
+    Returns `(per_term_means, latent_stats)`."""
 
     encoder.eval()
     decoder.eval()
     sums: dict[str, float] = {}
+    latent_acc = LatentStatsAccumulator(encoder.latent_channels)
     count = 0
     for batch in val_loader:
         if cfg.val_max_batches > 0 and count >= cfg.val_max_batches:
@@ -558,6 +694,7 @@ def _run_validation(
             mean, logvar = encoder.encode_dist(batch.image, batch.source_domain)
             reconstructed = decoder.decode(mean, batch.source_domain)
             components = _reconstruction_components(reconstructed, batch.image, mean, logvar, cfg, lpips_net)
+        latent_acc.update(mean, logvar)
         for name, value in components.items():
             sums[name] = sums.get(name, 0.0) + float(value)
         count += 1
@@ -565,7 +702,8 @@ def _run_validation(
     if "ssim" in means:
         means["ssim3d"] = 1.0 - means["ssim"]  # challenge metric (higher better)
     means["num_batches"] = count
-    return means
+    latent_stats = latent_acc.compute(active_threshold=cfg.latent_active_kl_threshold) if count else {}
+    return means, latent_stats
 
 
 def _reconstruction_components(
@@ -582,7 +720,7 @@ def _reconstruction_components(
     weights = cfg.loss_weights
     components: dict[str, torch.Tensor] = {"nrmse": nrmse_loss(reconstructed, target, data_range=cfg.data_range)}
     if weights.get("l1", 0.0) > 0:
-        components["l1"] = masked_l1_loss(reconstructed, target)
+        components["l1"] = _l1_term(reconstructed, target, cfg)
     if weights.get("ssim", 0.0) > 0:
         components["ssim"] = ssim_loss(reconstructed, target, window_size=cfg.ssim_window_size, data_range=cfg.data_range)
     if weights.get("lpips", 0.0) > 0:
@@ -597,6 +735,114 @@ def _reconstruction_components(
         total = total + weights.get(name, 0.0) * value
     components["total"] = total
     return components
+
+
+def _l1_term(reconstructed: torch.Tensor, target: torch.Tensor, cfg: Stage1VAEConfig) -> torch.Tensor:
+    """L1 reconstruction term: plain mean L1 (default) or the foreground-weighted variant.
+
+    With `foreground_loss_weighting=False` (default) this is exactly `masked_l1_loss` with
+    no mask — the loss math is unchanged. The flag is an opt-in experiment (item 7), kept
+    off until its effect is measured."""
+
+    if cfg.foreground_loss_weighting:
+        return foreground_weighted_l1_loss(
+            reconstructed,
+            target,
+            threshold=cfg.foreground_threshold,
+            foreground_weight=cfg.foreground_weight,
+        )
+    return masked_l1_loss(reconstructed, target)
+
+
+def _lr_at_step(current_step: int, cfg: Stage1VAEConfig, total_steps: int) -> float:
+    """Learning rate for a 1-indexed global step. Stateless (pure function of the step) so a
+    resumed run lands on the same curve without persisting scheduler state.
+
+    "constant" returns cfg.lr unchanged. "cosine": linear warmup 0 -> lr over
+    `lr_warmup_steps`, then a cosine decay to `lr * lr_min_factor` at `total_steps`."""
+
+    base_lr = cfg.lr
+    if cfg.lr_schedule == "constant":
+        return base_lr
+    if cfg.lr_schedule != "cosine":
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {cfg.lr_schedule!r}.")
+    warmup = cfg.lr_warmup_steps
+    if warmup > 0 and current_step <= warmup:
+        return base_lr * current_step / warmup
+    min_lr = base_lr * cfg.lr_min_factor
+    denominator = max(1, total_steps - warmup)
+    progress = min(max((current_step - warmup) / denominator, 0.0), 1.0)
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+
+def _weighted_terms(means: Mapping[str, float], weights: Mapping[str, float]) -> dict[str, float]:
+    """Per-term means multiplied by their loss weight, so history shows both the raw term
+    and its actual contribution to the total. Non-term keys (num_batches, ssim3d, total,
+    latent) are skipped — only weighted terms belong here."""
+
+    return {
+        name: float(means[name]) * float(weights[name])
+        for name in _LOSS_TERM_ORDER
+        if name in means and name in weights
+    }
+
+
+def _capture_fixed_batch(loader: DataLoader[RawBatch]) -> RawBatch | None:
+    """Grab the first batch of a loader, kept on CPU, for the fixed reconstruction panel.
+
+    Returns None if the loader yields nothing (an empty validation set disables the hook)."""
+
+    for batch in loader:
+        return batch
+    return None
+
+
+@torch.no_grad()
+def _dump_reconstruction_panel(
+    encoder: KLVAEEncoder,
+    decoder: KLVAEDecoder,
+    batch: RawBatch,
+    cfg: Stage1VAEConfig,
+    device: torch.device,
+    autocast_ctx: Any,
+    epoch_index: int,
+) -> None:
+    """Render input/reconstruction/|error| for the fixed batch to checkpoint_dir/recon_epochN.png.
+
+    Deterministic mean reconstruction (no sampling), matching eval. Best-effort: a missing
+    matplotlib (the optional 'evaluation' extra) just skips the dump with a log line rather
+    than killing a training run."""
+
+    assert cfg.checkpoint_dir is not None
+    encoder.eval()
+    decoder.eval()
+    moved = move_raw_batch(batch, device)
+    with autocast_ctx:
+        mean, _ = encoder.encode_dist(moved.image, moved.source_domain)
+        reconstructed = decoder.decode(mean, moved.source_domain)
+    try:
+        from fieldbridge.evaluation.stage1_report import render_reconstruction_panel
+    except ImportError:  # pragma: no cover - matplotlib-optional path
+        _log_training_progress(
+            f"stage1_vae epoch={epoch_index}: recon dump skipped (matplotlib unavailable)."
+        )
+        return
+    path = cfg.checkpoint_dir / f"recon_epoch{epoch_index:04d}.png"
+    render_reconstruction_panel(
+        moved.image.float().cpu(),
+        reconstructed.float().cpu(),
+        labels=_domain_labels(moved.source_domain),
+        path=path,
+    )
+    _log_training_progress(f"stage1_vae epoch={epoch_index}: wrote reconstruction panel {path.name}")
+
+
+def _domain_labels(domain: Any) -> list[str]:
+    """Per-sample display labels from a (possibly batched) domain."""
+
+    if isinstance(domain, (list, tuple)):
+        return [getattr(d, "label", str(d)) for d in domain]
+    return [getattr(domain, "label", str(domain))]
 
 
 def _append_history(history_path: Path, entry: Mapping[str, Any]) -> None:

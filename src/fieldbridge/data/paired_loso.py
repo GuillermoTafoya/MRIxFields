@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import hashlib
+import json
+import os
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -26,6 +31,9 @@ from fieldbridge.evaluation.prospective_paired import (
     validate_preprocessed_geometry,
 )
 
+PREPROCESSED_CACHE_SCHEMA_VERSION = 1
+CacheProgress = Callable[[str, float, int, int, float], None]
+
 
 @dataclass(frozen=True, slots=True)
 class LosoFold:
@@ -47,6 +55,183 @@ class AffineCalibration:
 
     def apply(self, source_01: torch.Tensor) -> torch.Tensor:
         return (source_01 * self.scale + self.bias).clamp(0.0, 1.0)
+
+
+@dataclass(frozen=True, slots=True)
+class CachePreparationStats:
+    cache_hit: bool
+    tensors: int
+    elapsed_seconds: float
+    tensors_per_second: float
+
+
+class PreprocessedTensorCache:
+    """In-memory view of an exact, fingerprinted ephemeral preprocessing cache."""
+
+    def __init__(
+        self,
+        *,
+        fingerprint: str,
+        case_ids: Sequence[str],
+        slice_indices: Sequence[int],
+        images: Mapping[tuple[str, float], torch.Tensor],
+        geometries: Mapping[tuple[str, float], Sequence[SliceGeometry]],
+        stats: CachePreparationStats,
+    ) -> None:
+        self.fingerprint = fingerprint
+        self.case_ids = tuple(str(case_id) for case_id in case_ids)
+        self.slice_indices = tuple(int(index) for index in slice_indices)
+        self._offsets = {index: offset for offset, index in enumerate(self.slice_indices)}
+        self._images = dict(images)
+        self._geometries = {
+            key: tuple(values) for key, values in geometries.items()
+        }
+        self.stats = stats
+        expected = {
+            (case_id, field) for case_id in self.case_ids for field in ALL_FIELDS
+        }
+        if set(self._images) != expected or set(self._geometries) != expected:
+            raise ValueError("Preprocessed cache acquisition set changed.")
+
+    def get(
+        self,
+        case_id: str,
+        field: float,
+        slice_index: int,
+    ) -> tuple[torch.Tensor, SliceGeometry]:
+        key = (str(case_id), float(field))
+        if key not in self._images or int(slice_index) not in self._offsets:
+            raise KeyError("Requested tensor is outside the preprocessed cache contract.")
+        offset = self._offsets[int(slice_index)]
+        return self._images[key][offset], self._geometries[key][offset]
+
+
+def prepare_preprocessed_tensor_cache(
+    volumes: Mapping[str, Mapping[float, torch.Tensor]],
+    *,
+    cache_root: Path,
+    case_ids: Sequence[str],
+    preprocessing: SlicePreprocessingSpec,
+    slice_indices: Sequence[int],
+    manifest_fingerprint: str,
+    input_fingerprints: Mapping[str, Mapping[float, str]],
+    code_fingerprint: str,
+    config_fingerprint: str,
+    progress_callback: CacheProgress | None = None,
+) -> PreprocessedTensorCache:
+    """Build or validate a bit-exact scratch cache without silently rebuilding it."""
+
+    cases = tuple(str(case_id) for case_id in case_ids)
+    indices = tuple(int(index) for index in slice_indices)
+    _validate_volume_bank(volumes, cases)
+    if not indices:
+        raise ValueError("Preprocessed cache requires at least one slice.")
+    identity = _cache_identity(
+        cases=cases,
+        fields=ALL_FIELDS,
+        indices=indices,
+        preprocessing=preprocessing,
+        manifest_fingerprint=manifest_fingerprint,
+        input_fingerprints=input_fingerprints,
+        code_fingerprint=code_fingerprint,
+        config_fingerprint=config_fingerprint,
+    )
+    fingerprint = _canonical_fingerprint(identity)
+    root = Path(cache_root) / "paired_loso_preprocessed_v1"
+    destination = root / fingerprint
+    building = root / f"{fingerprint}.building"
+    if building.exists():
+        raise ValueError("An incomplete preprocessing cache build already exists.")
+    started = time.perf_counter()
+    if destination.exists():
+        images, geometries = _load_preprocessed_cache(
+            destination,
+            fingerprint=fingerprint,
+            identity=identity,
+            cases=cases,
+            indices=indices,
+            progress_callback=progress_callback,
+        )
+        elapsed = max(time.perf_counter() - started, 1e-12)
+        count = len(cases) * len(ALL_FIELDS) * len(indices)
+        return PreprocessedTensorCache(
+            fingerprint=fingerprint,
+            case_ids=cases,
+            slice_indices=indices,
+            images=images,
+            geometries=geometries,
+            stats=CachePreparationStats(True, count, elapsed, count / elapsed),
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    building.mkdir()
+    images: dict[tuple[str, float], torch.Tensor] = {}
+    geometries: dict[tuple[str, float], tuple[SliceGeometry, ...]] = {}
+    file_hashes: dict[str, str] = {}
+    total = len(cases) * len(ALL_FIELDS)
+    completed = 0
+    for case_offset, case_id in enumerate(cases, start=1):
+        case_slot = f"case_{case_offset:02d}"
+        for field in ALL_FIELDS:
+            entry_images: list[torch.Tensor] = []
+            entry_geometries: list[SliceGeometry] = []
+            for slice_index in indices:
+                image, geometry = preprocess_volume_slice(
+                    volumes[case_id][field],
+                    slice_index,
+                    preprocessing,
+                    apply_model_range=False,
+                )
+                entry_images.append(image)
+                entry_geometries.append(geometry)
+            stacked = torch.stack(entry_images, dim=0).contiguous()
+            geometry_tuple = tuple(entry_geometries)
+            images[(case_id, field)] = stacked
+            geometries[(case_id, field)] = geometry_tuple
+            filename = _cache_filename(case_slot, field)
+            torch.save(
+                {
+                    "schema_version": PREPROCESSED_CACHE_SCHEMA_VERSION,
+                    "cache_fingerprint": fingerprint,
+                    "case_slot": case_slot,
+                    "field_strength_t": float(field),
+                    "slice_indices": list(indices),
+                    "images_01": stacked,
+                    "geometries": [geometry.to_dict() for geometry in geometry_tuple],
+                },
+                building / filename,
+            )
+            file_hashes[filename] = _sha256_file(building / filename)
+            completed += 1
+            if progress_callback is not None:
+                elapsed = max(time.perf_counter() - started, 1e-12)
+                progress_callback(
+                    case_slot,
+                    field,
+                    completed,
+                    total,
+                    completed * len(indices) / elapsed,
+                )
+    metadata = {
+        "schema_version": PREPROCESSED_CACHE_SCHEMA_VERSION,
+        "cache_fingerprint": fingerprint,
+        "identity": identity,
+        "files": file_hashes,
+    }
+    (building / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(building, destination)
+    elapsed = max(time.perf_counter() - started, 1e-12)
+    count = len(cases) * len(ALL_FIELDS) * len(indices)
+    return PreprocessedTensorCache(
+        fingerprint=fingerprint,
+        case_ids=cases,
+        slice_indices=indices,
+        images=images,
+        geometries=geometries,
+        stats=CachePreparationStats(False, count, elapsed, count / elapsed),
+    )
 
 
 def build_loso_folds(case_ids: Sequence[str]) -> tuple[LosoFold, ...]:
@@ -94,11 +279,13 @@ class RealPairedSliceDataset(Dataset[PseudoPairSliceSample]):
         case_ids: Sequence[str],
         preprocessing: SlicePreprocessingSpec,
         slice_indices: Sequence[int],
+        preprocessed_cache: PreprocessedTensorCache | None = None,
     ) -> None:
         self.volumes = volumes
         self.case_ids = tuple(str(case) for case in case_ids)
         self.preprocessing = preprocessing
         self.slice_indices = tuple(int(index) for index in slice_indices)
+        self.preprocessed_cache = preprocessed_cache
         if not self.case_ids or not self.slice_indices:
             raise ValueError("Paired dataset requires cases and slice indices.")
         self.samples = tuple(
@@ -108,24 +295,37 @@ class RealPairedSliceDataset(Dataset[PseudoPairSliceSample]):
             for slice_index in self.slice_indices
         )
         _validate_volume_bank(volumes, self.case_ids)
+        if preprocessed_cache is not None:
+            if not set(self.case_ids).issubset(preprocessed_cache.case_ids):
+                raise ValueError("Paired dataset cases are outside the preprocessing cache.")
+            if self.slice_indices != preprocessed_cache.slice_indices:
+                raise ValueError("Paired dataset slices differ from the preprocessing cache.")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> PseudoPairSliceSample:
         case_id, target_field, slice_index = self.samples[int(index)]
-        source_01, source_geometry = preprocess_volume_slice(
-            self.volumes[case_id][SOURCE_FIELD],
-            slice_index,
-            self.preprocessing,
-            apply_model_range=False,
-        )
-        target_01, target_geometry = preprocess_volume_slice(
-            self.volumes[case_id][target_field],
-            slice_index,
-            self.preprocessing,
-            apply_model_range=False,
-        )
+        if self.preprocessed_cache is None:
+            source_01, source_geometry = preprocess_volume_slice(
+                self.volumes[case_id][SOURCE_FIELD],
+                slice_index,
+                self.preprocessing,
+                apply_model_range=False,
+            )
+            target_01, target_geometry = preprocess_volume_slice(
+                self.volumes[case_id][target_field],
+                slice_index,
+                self.preprocessing,
+                apply_model_range=False,
+            )
+        else:
+            source_01, source_geometry = self.preprocessed_cache.get(
+                case_id, SOURCE_FIELD, slice_index
+            )
+            target_01, target_geometry = self.preprocessed_cache.get(
+                case_id, target_field, slice_index
+            )
         validate_preprocessed_geometry(source_geometry, target_geometry)
         mask = valid_fit_pad_mask(target_01, target_geometry)
         return PseudoPairSliceSample(
@@ -160,6 +360,7 @@ def fit_train_only_affine_calibrations(
     train_case_ids: Sequence[str],
     preprocessing: SlicePreprocessingSpec,
     slice_indices: Sequence[int],
+    preprocessed_cache: PreprocessedTensorCache | None = None,
 ) -> dict[float, AffineCalibration]:
     """Fit target-specific least squares using only declared training cases."""
 
@@ -171,18 +372,26 @@ def fit_train_only_affine_calibrations(
         sum_x = sum_y = sum_xx = sum_xy = 0.0
         for case_id in train_cases:
             for slice_index in slice_indices:
-                source, source_geometry = preprocess_volume_slice(
-                    volumes[case_id][SOURCE_FIELD],
-                    int(slice_index),
-                    preprocessing,
-                    apply_model_range=False,
-                )
-                target, target_geometry = preprocess_volume_slice(
-                    volumes[case_id][field],
-                    int(slice_index),
-                    preprocessing,
-                    apply_model_range=False,
-                )
+                if preprocessed_cache is None:
+                    source, source_geometry = preprocess_volume_slice(
+                        volumes[case_id][SOURCE_FIELD],
+                        int(slice_index),
+                        preprocessing,
+                        apply_model_range=False,
+                    )
+                    target, target_geometry = preprocess_volume_slice(
+                        volumes[case_id][field],
+                        int(slice_index),
+                        preprocessing,
+                        apply_model_range=False,
+                    )
+                else:
+                    source, source_geometry = preprocessed_cache.get(
+                        case_id, SOURCE_FIELD, int(slice_index)
+                    )
+                    target, target_geometry = preprocessed_cache.get(
+                        case_id, field, int(slice_index)
+                    )
                 validate_preprocessed_geometry(source_geometry, target_geometry)
                 valid = valid_fit_pad_mask(target, target_geometry)
                 mask = (target > 0.0).to(target.dtype) * valid
@@ -207,6 +416,179 @@ def fit_train_only_affine_calibrations(
             fitted_pixels=count,
         )
     return calibrations
+
+
+def _cache_identity(
+    *,
+    cases: Sequence[str],
+    fields: Sequence[float],
+    indices: Sequence[int],
+    preprocessing: SlicePreprocessingSpec,
+    manifest_fingerprint: str,
+    input_fingerprints: Mapping[str, Mapping[float, str]],
+    code_fingerprint: str,
+    config_fingerprint: str,
+) -> dict[str, Any]:
+    if not _is_hex_digest(manifest_fingerprint, 64) or not _is_hex_digest(
+        config_fingerprint, 64
+    ):
+        raise ValueError("Cache manifest/config fingerprints must be full SHA-256 values.")
+    if not _is_hex_digest(code_fingerprint, 40):
+        raise ValueError("Cache code fingerprint must be a full Git commit SHA.")
+    anonymous_inputs = []
+    for case_offset, case_id in enumerate(cases, start=1):
+        if case_id not in input_fingerprints:
+            raise ValueError("Cache input fingerprint case set is incomplete.")
+        field_hashes = input_fingerprints[case_id]
+        if set(float(field) for field in field_hashes) != set(float(field) for field in fields):
+            raise ValueError("Cache input fingerprint field set is incomplete.")
+        normalized = {}
+        for field in fields:
+            digest = str(field_hashes[float(field)]).lower()
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("Cache input identity must contain full SHA-256 values.")
+            normalized[f"{float(field):g}T"] = digest
+        anonymous_inputs.append(
+            {"case_slot": f"case_{case_offset:02d}", "fields": normalized}
+        )
+    return {
+        "schema_version": PREPROCESSED_CACHE_SCHEMA_VERSION,
+        "manifest_sha256": manifest_fingerprint.lower(),
+        "input_sha256": anonymous_inputs,
+        "preprocessing": preprocessing.to_dict(),
+        "case_slots": [f"case_{offset:02d}" for offset in range(1, len(cases) + 1)],
+        "fields": [float(field) for field in fields],
+        "slice_indices": [int(index) for index in indices],
+        "code_commit": code_fingerprint.lower(),
+        "config_sha256": config_fingerprint.lower(),
+    }
+
+
+def _load_preprocessed_cache(
+    directory: Path,
+    *,
+    fingerprint: str,
+    identity: Mapping[str, Any],
+    cases: Sequence[str],
+    indices: Sequence[int],
+    progress_callback: CacheProgress | None,
+) -> tuple[
+    dict[tuple[str, float], torch.Tensor],
+    dict[tuple[str, float], tuple[SliceGeometry, ...]],
+]:
+    if not directory.is_dir():
+        raise ValueError("Preprocessed cache fingerprint path is not a directory.")
+    metadata_path = directory / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Preprocessed cache metadata is missing or invalid.") from exc
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("schema_version") != PREPROCESSED_CACHE_SCHEMA_VERSION
+        or metadata.get("cache_fingerprint") != fingerprint
+        or metadata.get("identity") != identity
+        or not isinstance(metadata.get("files"), Mapping)
+    ):
+        raise ValueError("Preprocessed cache metadata contract changed.")
+    file_hashes = dict(metadata["files"])
+    expected_files = {
+        _cache_filename(f"case_{case_offset:02d}", field)
+        for case_offset in range(1, len(cases) + 1)
+        for field in ALL_FIELDS
+    }
+    observed_files = {
+        path.name for path in directory.iterdir() if path.name != "metadata.json"
+    }
+    if set(file_hashes) != expected_files or observed_files != expected_files:
+        raise ValueError("Preprocessed cache file set changed.")
+    images: dict[tuple[str, float], torch.Tensor] = {}
+    geometries: dict[tuple[str, float], tuple[SliceGeometry, ...]] = {}
+    started = time.perf_counter()
+    total = len(cases) * len(ALL_FIELDS)
+    completed = 0
+    for case_offset, case_id in enumerate(cases, start=1):
+        case_slot = f"case_{case_offset:02d}"
+        for field in ALL_FIELDS:
+            filename = _cache_filename(case_slot, field)
+            path = directory / filename
+            if _sha256_file(path) != file_hashes[filename]:
+                raise ValueError("Preprocessed cache tensor checksum changed.")
+            payload = _torch_load_cache(path)
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("schema_version") != PREPROCESSED_CACHE_SCHEMA_VERSION
+                or payload.get("cache_fingerprint") != fingerprint
+                or payload.get("case_slot") != case_slot
+                or float(payload.get("field_strength_t", -1.0)) != float(field)
+                or tuple(payload.get("slice_indices", ())) != tuple(indices)
+            ):
+                raise ValueError("Preprocessed cache tensor contract changed.")
+            tensor = payload.get("images_01")
+            geometry_payload = payload.get("geometries")
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.dtype != torch.float32
+                or tensor.ndim != 4
+                or int(tensor.shape[0]) != len(indices)
+                or not torch.isfinite(tensor).all()
+                or not isinstance(geometry_payload, list)
+                or len(geometry_payload) != len(indices)
+            ):
+                raise ValueError("Preprocessed cache tensor payload is invalid.")
+            geometry_tuple = tuple(
+                SliceGeometry(**dict(value)) for value in geometry_payload
+            )
+            if tuple(geometry.slice_index for geometry in geometry_tuple) != tuple(indices):
+                raise ValueError("Preprocessed cache geometry order changed.")
+            images[(case_id, field)] = tensor
+            geometries[(case_id, field)] = geometry_tuple
+            completed += 1
+            if progress_callback is not None:
+                elapsed = max(time.perf_counter() - started, 1e-12)
+                progress_callback(
+                    case_slot,
+                    field,
+                    completed,
+                    total,
+                    completed * len(indices) / elapsed,
+                )
+    return images, geometries
+
+
+def _cache_filename(case_slot: str, field: float) -> str:
+    field_label = f"{float(field):g}".replace(".", "p")
+    return f"{case_slot}_field_{field_label}T.pt"
+
+
+def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_hex_digest(value: str, length: int) -> bool:
+    normalized = str(value).lower()
+    return len(normalized) == length and all(
+        character in "0123456789abcdef" for character in normalized
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _torch_load_cache(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
 
 def verify_full_slice_coverage(indices: Sequence[int], depth: int) -> None:

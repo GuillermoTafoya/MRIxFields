@@ -513,6 +513,69 @@ def validate_resume_checkpoint(
         raise ValueError("Resume checkpoint epoch/global-step alignment changed.")
 
 
+def validate_one_batch_training_compatibility(
+    config: PseudoPairEpochConfig | Mapping[str, Any],
+    *,
+    model: BaseTranslator,
+    batch: PseudoPairSliceBatch,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Exercise the real CUDA/AMP/AdamW train path without saving artifacts."""
+
+    cfg = (
+        config
+        if isinstance(config, PseudoPairEpochConfig)
+        else PseudoPairEpochConfig.from_mapping(config)
+    )
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Paired LOSO dry-run requires an available CUDA device.")
+    model = model.to(device).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+    scaler = _grad_scaler(enabled=cfg.amp)
+    moved = _move_batch(batch, device)
+    optimizer.zero_grad(set_to_none=True)
+    with _autocast(device, cfg.amp):
+        prediction = model(
+            moved.x_low,
+            moved.source_domain,
+            moved.target_domain,
+        )
+        components = combined_reconstruction_loss_components(
+            prediction,
+            moved.x_high,
+            moved.mask,
+            cfg.loss_weights,
+        )
+    if prediction.shape != moved.x_high.shape or not torch.isfinite(prediction).all():
+        raise RuntimeError("Dry-run prediction shape or finiteness validation failed.")
+    if not all(torch.isfinite(value).all() for value in components.values()):
+        raise RuntimeError("Dry-run loss finiteness validation failed.")
+    scaler.scale(components["total"]).backward()
+    gradients = [
+        parameter.grad for parameter in model.parameters() if parameter.grad is not None
+    ]
+    if not gradients or not all(torch.isfinite(gradient).all() for gradient in gradients):
+        raise RuntimeError("Dry-run backward compatibility validation failed.")
+    if cfg.grad_clip_norm > 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
+    scaler.step(optimizer)
+    scaler.update()
+    torch.cuda.synchronize(device)
+    return {
+        "cuda": True,
+        "amp_enabled": bool(cfg.amp),
+        "batch_size": int(moved.x_low.shape[0]),
+        "forward": True,
+        "loss": True,
+        "backward": True,
+        "optimizer": "AdamW",
+        "optimizer_step": True,
+    }
+
+
 def _train_epoch(
     model: BaseTranslator,
     loader: DataLoader[PseudoPairSliceBatch],
@@ -534,7 +597,18 @@ def _train_epoch(
     model.train()
     totals = {"total": 0.0, "masked_l1": 0.0, "gradient": 0.0, "background": 0.0}
     samples = 0
-    for step_in_epoch, raw_batch in enumerate(loader, start=1):
+    epoch_started = time.perf_counter()
+    preparation_seconds = 0.0
+    iterator_started = time.perf_counter()
+    iterator = iter(loader)
+    preparation_seconds += time.perf_counter() - iterator_started
+    for step_in_epoch in range(1, steps_per_epoch + 1):
+        preparation_started = time.perf_counter()
+        try:
+            raw_batch = next(iterator)
+        except StopIteration as exc:
+            raise RuntimeError("Training loader ended before the fixed epoch step count.") from exc
+        preparation_seconds += time.perf_counter() - preparation_started
         batch = _move_batch(raw_batch, device)
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device, cfg.amp):
@@ -579,10 +653,26 @@ def _train_epoch(
                 f"elapsed_seconds={elapsed:.1f} steps_per_second={completed_steps / elapsed:.3f}",
                 flush=True,
             )
-    return {
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    epoch_elapsed = max(time.perf_counter() - epoch_started, 1e-12)
+    preparation_elapsed = max(preparation_seconds, 1e-12)
+    summary = {
         **{key: value / max(1, samples) for key, value in totals.items()},
         "samples": float(samples),
-    }, global_step
+        "batch_preparation_samples_per_second": samples / preparation_elapsed,
+        "training_steps_per_second": steps_per_epoch / epoch_elapsed,
+    }
+    print(
+        f"paired_loso fold={fold_slot}"
+        f"{' case=' + case_slot if case_slot is not None else ''} arm={arm} "
+        f"epoch={epoch}/{cfg.epochs} phase=epoch_complete "
+        f"batch_preparation_samples_per_second="
+        f"{summary['batch_preparation_samples_per_second']:.3f} "
+        f"training_steps_per_second={summary['training_steps_per_second']:.3f}",
+        flush=True,
+    )
+    return summary, global_step
 
 
 def _save_paired_checkpoint(

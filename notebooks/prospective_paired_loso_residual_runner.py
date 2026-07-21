@@ -26,6 +26,7 @@ from fieldbridge.data.paired_loso import (
     RealPairedSliceDataset,
     build_loso_folds,
     fit_train_only_affine_calibrations,
+    prepare_preprocessed_tensor_cache,
 )
 from fieldbridge.data.preprocessing import (
     SlicePreprocessingSpec,
@@ -64,6 +65,7 @@ from fieldbridge.training.paired_loso import (
     resolve_arm_recovery,
     train_fixed_endpoint,
     validate_endpoint_checkpoint,
+    validate_one_batch_training_compatibility,
 )
 from fieldbridge.training.pseudo_pair_epochs import PseudoPairEpochConfig
 
@@ -113,6 +115,7 @@ def run_experiment(
     dry_run: bool = False,
     resume: bool = False,
 ) -> dict[str, Any]:
+    _log_phase("configuration", "start")
     config = load_yaml_config(config_path)
     preprocessing, folds = _validate_config(config)
     experiment_commit = _git_commit()
@@ -131,38 +134,74 @@ def run_experiment(
         _mapping(config, "synthetic_checkpoint_contract"),
         historical_training_config=historical,
     )
+    _log_phase("manifest_selection", "start")
     records = read_manifest_jsonl(manifest_path)
     selected = select_required_acquisitions(
         records,
         split_name=str(_mapping(config, "experiment")["manifest_split"]),
     )
+    manifest_fingerprint = _file_sha(manifest_path)
+    _log_phase("manifest_selection", "complete", acquisitions=len(CASE_IDS) * len(ALL_FIELDS))
     output_dir.mkdir(parents=True, exist_ok=True)
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    volumes = _cache_and_load_volumes(selected, scratch_dir=scratch_dir)
-    _write_alignment_preflight(
-        volumes,
-        preprocessing=preprocessing,
-        output_dir=output_dir / "alignment_preflight",
+    volumes, input_fingerprints = _cache_and_load_volumes(
+        selected, scratch_dir=scratch_dir
     )
+    input_identity_fingerprint = _input_identity_fingerprint(input_fingerprints)
     train_indices = selected_slice_indices(preprocessing)
+    alignment_fingerprint = _canonical_sha(
+        {
+            "manifest_sha256": manifest_fingerprint,
+            "input_identity_sha256": input_identity_fingerprint,
+            "preprocessing": preprocessing.to_dict(),
+            "selected_slice_indices": list(SELECTED_SLICE_INDICES),
+            "experiment_commit": experiment_commit,
+            "config_sha256": config_fingerprint,
+        }
+    )
     preflight = _preflight_payload(
         config=config,
         folds=folds,
         train_indices=train_indices,
         config_fingerprint=config_fingerprint,
         experiment_fingerprint=experiment_fingerprint,
-    )
-    (output_dir / "preflight_sanitized.json").write_text(
-        json.dumps(preflight, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+        manifest_fingerprint=manifest_fingerprint,
+        input_identity_fingerprint=input_identity_fingerprint,
+        alignment_fingerprint=alignment_fingerprint,
     )
     if preflight_only:
+        _write_alignment_preflight(
+            volumes,
+            preprocessing=preprocessing,
+            output_dir=output_dir / "alignment_preflight",
+            contract_fingerprint=alignment_fingerprint,
+        )
+        (output_dir / "preflight_sanitized.json").write_text(
+            json.dumps(preflight, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         return preflight
+    _validate_preflight_artifacts(
+        output_dir=output_dir,
+        expected_preflight=preflight,
+        alignment_fingerprint=alignment_fingerprint,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if _mapping(config, "runtime").get("require_cuda") and device.type != "cuda":
         raise RuntimeError("The preregistered LOSO run requires a CUDA runtime.")
     train_cfg = PseudoPairEpochConfig.from_mapping(config)
+    amp_enabled = bool(train_cfg.amp and device.type == "cuda")
+    cuda_device = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else "unavailable"
+    )
+    _log_phase(
+        "resolved_device",
+        "complete",
+        device=device.type,
+        cuda_device=cuda_device,
+        amp_enabled=str(amp_enabled).lower(),
+    )
     recovery_plans = {}
     progress: SanitizedRunProgress | None = None
     if not dry_run:
@@ -191,24 +230,88 @@ def run_experiment(
         )
         for (fold_slot, arm), plan in recovery_plans.items():
             progress.validate_recovery(fold_slot, arm, plan.action)
-    telemetry = NvidiaSmiTelemetry()
+    telemetry = NvidiaSmiTelemetry(device=device, amp_enabled=amp_enabled)
     telemetry.start()
+    _log_phase("cache_preparation", "start")
+    try:
+        preprocessed_cache = prepare_preprocessed_tensor_cache(
+            volumes,
+            cache_root=scratch_dir,
+            case_ids=CASE_IDS,
+            preprocessing=preprocessing,
+            slice_indices=train_indices,
+            manifest_fingerprint=manifest_fingerprint,
+            input_fingerprints=input_fingerprints,
+            code_fingerprint=experiment_commit,
+            config_fingerprint=config_fingerprint,
+            progress_callback=_print_cache_progress,
+        )
+    except Exception:
+        telemetry.stop()
+        raise
+    telemetry.set_cache_preparation(preprocessed_cache.stats)
+    _log_phase(
+        "cache_preparation",
+        "complete",
+        cache_hit=str(preprocessed_cache.stats.cache_hit).lower(),
+        tensors=preprocessed_cache.stats.tensors,
+        tensors_per_second=f"{preprocessed_cache.stats.tensors_per_second:.3f}",
+    )
+    if dry_run:
+        try:
+            dry_validation = _run_training_dry_run(
+                fold=folds[0],
+                case_slot="case_01",
+                volumes=volumes,
+                preprocessed_cache=preprocessed_cache,
+                preprocessing=preprocessing,
+                train_indices=train_indices,
+                train_cfg=train_cfg,
+                model_config=_mapping(config, "model"),
+                synthetic_state=synthetic_state,
+                num_workers=int(_mapping(config, "training")["num_workers"]),
+                device=device,
+            )
+            telemetry.add_batch_preparation_rate(
+                dry_validation["batch_preparation_samples_per_second"]
+            )
+        finally:
+            telemetry.stop()
+        return {
+            **preflight,
+            "dry_run": True,
+            "training_started": False,
+            "dry_run_validation": dry_validation,
+            "runtime_telemetry": telemetry.summary(),
+        }
     selected_rows: list[dict[str, Any]] = []
     complete_rows: list[dict[str, Any]] = []
     try:
         for fold_index, fold in enumerate(folds, start=1):
             case_slot = f"case_{fold_index:02d}"
+            _log_phase("fold", "start", fold=fold.fold_slot, case=case_slot)
+            affine_started = time.perf_counter()
+            _log_phase("affine_fit", "start", fold=fold.fold_slot, case=case_slot)
             calibrations = fit_train_only_affine_calibrations(
                 volumes,
                 train_case_ids=fold.train_case_ids,
                 preprocessing=preprocessing,
                 slice_indices=train_indices,
+                preprocessed_cache=preprocessed_cache,
+            )
+            _log_phase(
+                "affine_fit",
+                "complete",
+                fold=fold.fold_slot,
+                case=case_slot,
+                elapsed_seconds=f"{time.perf_counter() - affine_started:.3f}",
             )
             dataset = RealPairedSliceDataset(
                 volumes,
                 case_ids=fold.train_case_ids,
                 preprocessing=preprocessing,
                 slice_indices=train_indices,
+                preprocessed_cache=preprocessed_cache,
             )
             models: dict[str, torch.nn.Module] = {}
             for arm in NEURAL_ARMS:
@@ -221,9 +324,6 @@ def run_experiment(
                     else None,
                 )
                 _validate_initialization(model, arm, preprocessing, device)
-                if dry_run:
-                    models[arm] = model.to(device).eval()
-                    continue
                 assert progress is not None
                 loader = _build_train_loader(
                     dataset,
@@ -238,10 +338,12 @@ def run_experiment(
                     "resume": "resumed",
                     "endpoint": "loaded completed endpoint",
                 }[plan.action]
-                print(
-                    f"paired_loso fold={fold.fold_slot} case={case_slot} arm={arm} "
-                    f"orchestration={mode}",
-                    flush=True,
+                _log_phase(
+                    "arm",
+                    mode.replace(" ", "_"),
+                    fold=fold.fold_slot,
+                    case=case_slot,
+                    arm=arm,
                 )
                 if plan.action == "endpoint":
                     endpoint_state = plan.checkpoint_state
@@ -313,11 +415,9 @@ def run_experiment(
                         global_step=expected_global,
                         elapsed_seconds=progress.elapsed_seconds(fold.fold_slot, arm),
                     )
+                telemetry.add_training_history(arm_dir / "history.jsonl")
                 model.load_state_dict(endpoint_state["model"], strict=True)
                 models[arm] = model.to(device).eval()
-            if dry_run:
-                _dry_run_forward(models, dataset, device)
-                continue
 
             held_out = fold.held_out_case_id
             assert progress is not None
@@ -401,11 +501,10 @@ def run_experiment(
                 elapsed_by_arm=final_elapsed,
                 phase="fold_complete",
             )
+            _log_phase("fold", "complete", fold=fold.fold_slot, case=case_slot)
     finally:
         telemetry.stop()
 
-    if dry_run:
-        return {**preflight, "dry_run": True, "training_started": False}
     aggregate = aggregate_selected_rows(selected_rows)
     viability = evaluate_viability(aggregate, _mapping(config, "viability_rules"))
     complete = _aggregate_complete_rows(complete_rows)
@@ -419,7 +518,9 @@ def run_experiment(
         provenance={
             "config_sha256": config_fingerprint,
             "experiment_sha256": experiment_fingerprint,
-            "manifest_sha256": _file_sha(manifest_path),
+            "manifest_sha256": manifest_fingerprint,
+            "input_identity_sha256": input_identity_fingerprint,
+            "preprocessed_cache_sha256": preprocessed_cache.fingerprint,
             "seed": int(config["seed"]),
             "paired_loso_pipeline_version": int(
                 _mapping(config, "paired_checkpoint_contract")["pipeline_version"]
@@ -485,25 +586,78 @@ def _validate_config(config: Mapping[str, Any]):
 
 def _cache_and_load_volumes(selected, *, scratch_dir: Path):
     volumes: dict[str, dict[float, torch.Tensor]] = {}
+    input_fingerprints: dict[str, dict[float, str]] = {}
+    total = len(CASE_IDS) * len(ALL_FIELDS)
+    completed = 0
     for case_index, case_id in enumerate(CASE_IDS, start=1):
         loaded = {}
         volumes[case_id] = {}
+        input_fingerprints[case_id] = {}
         for field in ALL_FIELDS:
+            case_slot = f"case_{case_index:02d}"
+            field_label = f"{field:g}T"
+            _log_phase(
+                "staging",
+                "start",
+                case=case_slot,
+                field=field_label,
+                progress=f"{completed + 1}/{total}",
+            )
             source_path = Path(selected[case_id][field].raw_uri)
-            field_label = str(field).replace(".", "p")
+            filename_field = str(field).replace(".", "p")
             destination = (
-                scratch_dir / f"case_{case_index:02d}_field_{field_label}T.nii.gz"
+                scratch_dir / f"case_{case_index:02d}_field_{filename_field}T.nii.gz"
             )
             shutil.copy2(source_path, destination)
+            actual_sha = _file_sha(destination)
+            declared_sha = selected[case_id][field].sha256
+            if declared_sha is not None and actual_sha != str(declared_sha).lower():
+                raise ValueError("Staged acquisition checksum differs from the manifest.")
+            input_fingerprints[case_id][field] = actual_sha
+            _log_phase(
+                "staging",
+                "complete",
+                case=case_slot,
+                field=field_label,
+                progress=f"{completed + 1}/{total}",
+            )
+            _log_phase(
+                "loading",
+                "start",
+                case=case_slot,
+                field=field_label,
+                progress=f"{completed + 1}/{total}",
+            )
             acquisition = load_nifti_acquisition(destination)
             loaded[field] = acquisition
             volumes[case_id][field] = acquisition.volume
+            completed += 1
+            _log_phase(
+                "loading",
+                "complete",
+                case=case_slot,
+                field=field_label,
+                progress=f"{completed}/{total}",
+            )
         validate_paired_geometry(loaded)
-    return volumes
+    return volumes, input_fingerprints
 
 
-def _write_alignment_preflight(volumes, *, preprocessing, output_dir: Path) -> None:
+def _write_alignment_preflight(
+    volumes,
+    *,
+    preprocessing,
+    output_dir: Path,
+    contract_fingerprint: str,
+) -> None:
+    _log_phase(
+        "alignment",
+        "start",
+        panels=len(CASE_IDS) * len(TARGET_FIELDS) * len(SELECTED_SLICE_INDICES),
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
+    total = len(CASE_IDS) * len(TARGET_FIELDS) * len(SELECTED_SLICE_INDICES)
+    completed = 0
     for case_index, case_id in enumerate(CASE_IDS, start=1):
         for field in TARGET_FIELDS:
             for slice_index in SELECTED_SLICE_INDICES:
@@ -535,6 +689,60 @@ def _write_alignment_preflight(volumes, *, preprocessing, output_dir: Path) -> N
                 stem = f"case_{case_index:02d}_{str(field).replace('.', 'p')}T_{slice_index:03d}"
                 figure.savefig(output_dir / f"{stem}.png", dpi=100, bbox_inches="tight")
                 plt.close(figure)
+                completed += 1
+                if completed % len(SELECTED_SLICE_INDICES) == 0 or completed == total:
+                    _log_phase(
+                        "alignment",
+                        "running",
+                        case=f"case_{case_index:02d}",
+                        field=f"{field:g}T",
+                        progress=f"{completed}/{total}",
+                    )
+    (output_dir / "contract_sanitized.json").write_text(
+        json.dumps(
+            {"alignment_contract_sha256": contract_fingerprint},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _log_phase("alignment", "complete", panels=completed)
+
+
+def _validate_preflight_artifacts(
+    *,
+    output_dir: Path,
+    expected_preflight: Mapping[str, Any],
+    alignment_fingerprint: str,
+) -> None:
+    _log_phase("alignment", "validate_start")
+    preflight_path = output_dir / "preflight_sanitized.json"
+    contract_path = output_dir / "alignment_preflight" / "contract_sanitized.json"
+    try:
+        observed_preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        observed_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Preflight artifacts are missing or invalid; rerun --preflight first."
+        ) from exc
+    if observed_preflight != dict(expected_preflight):
+        raise ValueError("Preflight contract changed; rerun --preflight first.")
+    if observed_contract != {"alignment_contract_sha256": alignment_fingerprint}:
+        raise ValueError("Alignment contract changed; rerun --preflight first.")
+    expected_panels = {
+        f"case_{case_offset:02d}_{str(field).replace('.', 'p')}T_{slice_index:03d}.png"
+        for case_offset in range(1, len(CASE_IDS) + 1)
+        for field in TARGET_FIELDS
+        for slice_index in SELECTED_SLICE_INDICES
+    }
+    observed_panels = {
+        path.name
+        for path in (output_dir / "alignment_preflight").glob("*.png")
+    }
+    if observed_panels != expected_panels:
+        raise ValueError("Alignment panel coverage changed; rerun --preflight first.")
+    _log_phase("alignment", "validated", panels=len(observed_panels))
 
 
 def _validate_initialization(model, arm, preprocessing, device) -> None:
@@ -548,16 +756,6 @@ def _validate_initialization(model, arm, preprocessing, device) -> None:
         raise RuntimeError("Initialization model/preprocessing contract changed.")
 
 
-def _dry_run_forward(models, dataset, device) -> None:
-    sample = dataset[0]
-    source = sample.x_low.unsqueeze(0).to(device)
-    for arm, model in models.items():
-        with torch.inference_mode():
-            output = model(source, sample.source_domain, sample.target_domain)
-        if output.shape != source.shape or not torch.isfinite(output).all():
-            raise RuntimeError(f"Dry-run forward failed for {arm}.")
-
-
 def _build_train_loader(dataset, *, train_cfg, num_workers):
     generator = torch.Generator().manual_seed(train_cfg.seed)
     return DataLoader(
@@ -568,6 +766,126 @@ def _build_train_loader(dataset, *, train_cfg, num_workers):
         num_workers=int(num_workers),
         collate_fn=collate_pseudo_pair_slices,
     )
+
+
+def _run_training_dry_run(
+    *,
+    fold,
+    case_slot,
+    volumes,
+    preprocessed_cache,
+    preprocessing,
+    train_indices,
+    train_cfg,
+    model_config,
+    synthetic_state,
+    num_workers,
+    device,
+):
+    _log_phase("dry_run", "start", fold=fold.fold_slot, case=case_slot)
+    dataset = RealPairedSliceDataset(
+        volumes,
+        case_ids=fold.train_case_ids,
+        preprocessing=preprocessing,
+        slice_indices=train_indices,
+        preprocessed_cache=preprocessed_cache,
+    )
+    loader = _build_train_loader(
+        dataset,
+        train_cfg=train_cfg,
+        num_workers=num_workers,
+    )
+    batch_started = time.perf_counter()
+    batch = next(iter(loader))
+    batch_elapsed = max(time.perf_counter() - batch_started, 1e-12)
+    batch_throughput = int(batch.x_low.shape[0]) / batch_elapsed
+    _log_phase(
+        "dry_run_batch",
+        "complete",
+        fold=fold.fold_slot,
+        case=case_slot,
+        batch_size=int(batch.x_low.shape[0]),
+        samples_per_second=f"{batch_throughput:.3f}",
+    )
+    arm_results = {}
+    for arm in NEURAL_ARMS:
+        _log_phase(
+            "dry_run_arm",
+            "start",
+            fold=fold.fold_slot,
+            case=case_slot,
+            arm=arm,
+        )
+        torch.manual_seed(train_cfg.seed)
+        model = initialize_residual_arm(
+            model_config,
+            arm=arm,
+            synthetic_checkpoint=synthetic_state
+            if arm == "synthetic_initialization"
+            else None,
+        )
+        _validate_initialization(model, arm, preprocessing, device)
+        arm_results[arm] = validate_one_batch_training_compatibility(
+            train_cfg,
+            model=model,
+            batch=batch,
+            device=device,
+        )
+        _log_phase(
+            "dry_run_arm",
+            "complete",
+            fold=fold.fold_slot,
+            case=case_slot,
+            arm=arm,
+            cuda="true",
+            amp_enabled=str(bool(train_cfg.amp)).lower(),
+            forward="true",
+            loss="true",
+            backward="true",
+            optimizer_step="true",
+        )
+    _log_phase("dry_run", "complete", fold=fold.fold_slot, case=case_slot)
+    return {
+        "fold_slot": fold.fold_slot,
+        "case_slot": case_slot,
+        "affine_fit_executed": False,
+        "real_batch": True,
+        "batch_preparation_samples_per_second": batch_throughput,
+        "arms": arm_results,
+    }
+
+
+def _print_cache_progress(case_slot, field, completed, total, tensors_per_second):
+    _log_phase(
+        "cache_preparation",
+        "running",
+        case=case_slot,
+        field=f"{field:g}T",
+        progress=f"{completed}/{total}",
+        tensors_per_second=f"{tensors_per_second:.3f}",
+    )
+
+
+def _log_phase(phase: str, state: str, **values: Any) -> None:
+    details = " ".join(f"{key}={value}" for key, value in values.items())
+    suffix = f" {details}" if details else ""
+    print(f"paired_loso phase={phase} state={state}{suffix}", flush=True)
+
+
+def _input_identity_fingerprint(
+    input_fingerprints: Mapping[str, Mapping[float, str]],
+) -> str:
+    anonymous = [
+        {
+            "case_slot": f"case_{case_offset:02d}",
+            "fields": {
+                f"{field:g}T": input_fingerprints[case_id][field]
+                for field in ALL_FIELDS
+            },
+        }
+        for case_offset, case_id in enumerate(CASE_IDS, start=1)
+    ]
+    return _canonical_sha(anonymous)
 
 
 def _transition_evaluation_progress(
@@ -591,19 +909,25 @@ def _transition_evaluation_progress(
             global_step=global_step,
             elapsed_seconds=elapsed_by_arm[arm],
         )
-        print(
-            f"paired_loso fold={fold_slot} case={case_slot} arm={arm} "
-            f"evaluation_phase={phase} state={state}",
-            flush=True,
+        _log_phase(
+            "evaluation",
+            state,
+            fold=fold_slot,
+            case=case_slot,
+            arm=arm,
+            evaluation_phase=phase,
         )
 
 
 def _print_evaluation_progress(fold_slot, case_slot, phase, completed, total):
-    print(
-        f"paired_loso fold={fold_slot} case={case_slot} "
-        f"arms=identity_initialization,synthetic_initialization "
-        f"evaluation_phase={phase} progress={completed}/{total}",
-        flush=True,
+    _log_phase(
+        "evaluation",
+        "running",
+        fold=fold_slot,
+        case=case_slot,
+        arms="identity_initialization,synthetic_initialization",
+        evaluation_phase=phase,
+        progress=f"{completed}/{total}",
     )
 
 
@@ -708,7 +1032,17 @@ def _aggregate_complete_rows(rows):
     return output
 
 
-def _preflight_payload(*, config, folds, train_indices, config_fingerprint, experiment_fingerprint):
+def _preflight_payload(
+    *,
+    config,
+    folds,
+    train_indices,
+    config_fingerprint,
+    experiment_fingerprint,
+    manifest_fingerprint,
+    input_identity_fingerprint,
+    alignment_fingerprint,
+):
     return {
         "ok": True,
         "evidence_scope": "prospective_paired_loso_development",
@@ -731,19 +1065,37 @@ def _preflight_payload(*, config, folds, train_indices, config_fingerprint, expe
         },
         "config_sha256": config_fingerprint,
         "experiment_sha256": experiment_fingerprint,
+        "manifest_sha256": manifest_fingerprint,
+        "input_identity_sha256": input_identity_fingerprint,
+        "alignment_contract_sha256": alignment_fingerprint,
         "held_out_checkpoint_selection": False,
         "synthetic_examples_in_paired_training": False,
     }
 
 
 class NvidiaSmiTelemetry:
-    def __init__(self, period_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        amp_enabled: bool,
+        period_seconds: float = 5.0,
+    ) -> None:
+        self.device = device
+        self.amp_enabled = bool(amp_enabled)
         self.period_seconds = period_seconds
-        self.rows: list[tuple[float, float, float]] = []
+        self.rows: list[tuple[float, float, float, float]] = []
+        self.batch_preparation_rates: list[float] = []
+        self.training_step_rates: list[float] = []
+        self.cache_preparation: dict[str, Any] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._started_at = 0.0
 
     def start(self) -> None:
+        self._started_at = time.perf_counter()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         if shutil.which("nvidia-smi") is None:
             return
         self._thread = threading.Thread(target=self._sample, daemon=True)
@@ -767,20 +1119,103 @@ class NvidiaSmiTelemetry:
             )
             if process.returncode == 0 and process.stdout.strip():
                 values = process.stdout.splitlines()[0].split(",")
-                self.rows.append(tuple(float(value.strip()) for value in values))
+                utilization, memory, power = (
+                    float(value.strip()) for value in values
+                )
+                elapsed = time.perf_counter() - self._started_at
+                self.rows.append((elapsed, utilization, memory, power))
+                print(
+                    "paired_loso phase=gpu_telemetry state=sample "
+                    f"elapsed_seconds={elapsed:.1f} "
+                    f"utilization_percent={utilization:.1f} "
+                    f"memory_used_mib={memory:.1f}",
+                    flush=True,
+                )
             self._stop.wait(self.period_seconds)
 
-    def summary(self) -> dict[str, Any]:
-        if not self.rows:
-            return {"available": False, "samples": 0}
-        utilization, memory, power = zip(*self.rows, strict=True)
-        return {
-            "available": True,
-            "samples": len(self.rows),
-            "gpu_utilization_percent_mean": statistics.fmean(utilization),
-            "memory_used_mib_max": max(memory),
-            "power_draw_watts_mean": statistics.fmean(power),
+    def set_cache_preparation(self, stats) -> None:
+        self.cache_preparation = {
+            "cache_hit": bool(stats.cache_hit),
+            "tensors": int(stats.tensors),
+            "elapsed_seconds": float(stats.elapsed_seconds),
+            "tensors_per_second": float(stats.tensors_per_second),
         }
+
+    def add_batch_preparation_rate(self, value: float) -> None:
+        self.batch_preparation_rates.append(float(value))
+
+    def add_training_history(self, path: Path) -> None:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            train = record.get("train", {})
+            if "batch_preparation_samples_per_second" in train:
+                self.batch_preparation_rates.append(
+                    float(train["batch_preparation_samples_per_second"])
+                )
+            if "training_steps_per_second" in train:
+                self.training_step_rates.append(
+                    float(train["training_steps_per_second"])
+                )
+
+    def summary(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "available": bool(self.rows),
+            "cuda_device": (
+                torch.cuda.get_device_name(self.device)
+                if self.device.type == "cuda"
+                else "unavailable"
+            ),
+            "amp_enabled": self.amp_enabled,
+            "periodic_samples": [
+                {
+                    "elapsed_seconds": elapsed,
+                    "utilization_percent": utilization,
+                    "memory_used_mib": memory,
+                    "power_draw_watts": power,
+                }
+                for elapsed, utilization, memory, power in self.rows
+            ],
+            "cache_preparation": self.cache_preparation,
+            "batch_preparation_samples_per_second": _throughput_summary(
+                self.batch_preparation_rates
+            ),
+            "training_steps_per_second": _throughput_summary(
+                self.training_step_rates
+            ),
+        }
+        if self.device.type == "cuda":
+            payload["torch_gpu_memory_allocated_mib_max"] = (
+                torch.cuda.max_memory_allocated(self.device) / (1024 * 1024)
+            )
+            payload["torch_gpu_memory_reserved_mib_max"] = (
+                torch.cuda.max_memory_reserved(self.device) / (1024 * 1024)
+            )
+        if self.rows:
+            utilization = [row[1] for row in self.rows]
+            memory = [row[2] for row in self.rows]
+            power = [row[3] for row in self.rows]
+            payload.update(
+                {
+                    "samples": len(self.rows),
+                    "gpu_utilization_percent_mean": statistics.fmean(utilization),
+                    "memory_used_mib_max": max(memory),
+                    "power_draw_watts_mean": statistics.fmean(power),
+                }
+            )
+        else:
+            payload["samples"] = 0
+        return payload
+
+
+def _throughput_summary(values):
+    if not values:
+        return {"samples": 0}
+    return {
+        "samples": len(values),
+        "mean": statistics.fmean(values),
+        "minimum": min(values),
+        "maximum": max(values),
+    }
 
 
 def _load_historical_yaml():

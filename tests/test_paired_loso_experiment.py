@@ -250,6 +250,8 @@ def test_fixed_endpoint_checkpoint_and_resume_contract(tmp_path: Path) -> None:
     assert state["optimizer_name"] == "AdamW"
     assert state["global_step"] == 2
     assert "data_loader_generator_state" in state
+    assert result.history[0]["train"]["batch_preparation_samples_per_second"] > 0.0
+    assert result.history[0]["train"]["training_steps_per_second"] > 0.0
     assert set(state) == {
         "trainer",
         "paired_loso_pipeline_version",
@@ -432,6 +434,10 @@ def test_runner_and_notebook_preregister_preflight_dry_run_resume_scratch_and_te
     assert "shutil.copy2" in runner_source
     assert "scratch_dir" in runner_source
     assert "validation_loader" in runner_source
+    assert "prepare_preprocessed_tensor_cache" in runner_source
+    assert "validate_one_batch_training_compatibility" in runner_source
+    assert "batch_preparation_samples_per_second" in runner_source
+    assert "periodic_samples" in runner_source
 
     notebook = json.loads(NOTEBOOK_PATH.read_text(encoding="utf-8"))
     code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
@@ -447,6 +453,9 @@ def test_runner_and_notebook_preregister_preflight_dry_run_resume_scratch_and_te
     assert "EXPECTED_EXPERIMENT_COMMIT" in source
     assert "fieldbridge_loso_scratch" in source
     assert "--preflight" in source and "--dry-run" in source and "--resume" in source
+    assert "skips affine fitting" in source
+    assert "CUDA/AMP forward, loss, backward, and AdamW-step" in source
+    assert "fingerprinted deterministic tensor cache" in source
 
 
 def test_runner_config_preflight_contract_loads_without_private_inputs() -> None:

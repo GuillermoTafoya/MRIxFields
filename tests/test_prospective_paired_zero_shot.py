@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,12 +33,38 @@ from fieldbridge.evaluation.prospective_paired import (
     validate_preprocessed_geometry,
 )
 from fieldbridge.official.data_manifest import MRIxFieldsDataRecord
+from fieldbridge.training.pseudo_pair_epochs import (
+    PSEUDO_PAIR_PIPELINE_VERSION,
+    PseudoPairEpochConfig,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "experiment" / "prospective_paired_zero_shot_v1.yaml"
 NOTEBOOK_PATH = PROJECT_ROOT / "notebooks" / "prospective_paired_zero_shot_colab.ipynb"
 RUNNER_PATH = PROJECT_ROOT / "notebooks" / "prospective_paired_zero_shot_runner.py"
+HISTORICAL_CONFIG_PATH = (
+    PROJECT_ROOT
+    / "configs"
+    / "experiment"
+    / "pseudo_pair_t2flair_residual_probe_10epoch.yaml"
+)
 FROZEN_COMMIT = "e1e526ea5fa0a58f5682823f85a3957d5cc8647c"
+SERIALIZED_PSEUDO_PAIR_CONFIG_KEYS = {
+    "epochs",
+    "batch_size",
+    "seed",
+    "lr",
+    "weight_decay",
+    "device",
+    "amp",
+    "grad_clip_norm",
+    "loss_weights",
+    "scheduler",
+    "checkpoint_dir",
+    "checkpoint_max_bytes",
+    "history_filename",
+    "log_every_steps",
+}
 
 
 def _record(case_id: str, field: float, *, suffix: str = "") -> MRIxFieldsDataRecord:
@@ -150,19 +177,14 @@ def test_physical_and_fit_pad_geometry_fail_closed() -> None:
         validate_preprocessed_geometry(geometry, replace(geometry, pad_left=74))
 
 
-def test_checkpoint_contract_verifies_all_frozen_identity_fields() -> None:
-    training = {
-        "epochs": 10,
-        "batch_size": 4,
-        "checkpoint_dir": "historical",
-        "resume_from": None,
-    }
-    recorded = {
-        "epochs": 10,
-        "batch_size": 4,
-        "checkpoint_dir": "private",
-        "resume_from": None,
-    }
+def _historical_training_config() -> dict:
+    return load_yaml_config(HISTORICAL_CONFIG_PATH)
+
+
+def _checkpoint_state() -> tuple[dict, dict, dict]:
+    historical = _historical_training_config()
+    recorded = PseudoPairEpochConfig.from_mapping(historical).to_dict()
+    recorded["checkpoint_dir"] = "runtime-checkpoint-directory"
     contract = {
         "git_commit": FROZEN_COMMIT,
         "trainer": "pseudo_pair_epochs",
@@ -177,7 +199,121 @@ def test_checkpoint_contract_verifies_all_frozen_identity_fields() -> None:
         "model": {},
         "_meta": {"git_commit": FROZEN_COMMIT, "config": dict(recorded)},
     }
-    validate_checkpoint_contract(state, contract, historical_training_config={"training": training})
+    return state, contract, historical
+
+
+def test_historical_num_workers_absent_from_checkpoint_schema_passes() -> None:
+    state, contract, historical = _checkpoint_state()
+
+    assert historical["training"]["num_workers"] == 0
+    assert "num_workers" not in PseudoPairEpochConfig.__dataclass_fields__
+    assert "num_workers" not in state["pseudo_pair_config"]
+    validate_checkpoint_contract(
+        state,
+        contract,
+        historical_training_config=historical,
+    )
+
+
+def test_non_checkpointed_runtime_and_resume_declarations_stay_frozen() -> None:
+    state, contract, historical = _checkpoint_state()
+    historical["training"]["num_workers"] = 1
+    with pytest.raises(ValueError, match="num_workers=0"):
+        validate_checkpoint_contract(
+            state,
+            contract,
+            historical_training_config=historical,
+        )
+
+    state, contract, historical = _checkpoint_state()
+    historical["training"]["resume_from"] = "another-checkpoint"
+    with pytest.raises(ValueError, match="resume_from=null"):
+        validate_checkpoint_contract(
+            state,
+            contract,
+            historical_training_config=historical,
+        )
+
+
+def test_checkpoint_config_copies_must_agree_exactly() -> None:
+    state, contract, historical = _checkpoint_state()
+    state["_meta"]["config"] = {
+        **state["_meta"]["config"],
+        "num_workers": 0,
+    }
+
+    with pytest.raises(ValueError, match="copies disagree"):
+        validate_checkpoint_contract(
+            state,
+            contract,
+            historical_training_config=historical,
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    sorted(SERIALIZED_PSEUDO_PAIR_CONFIG_KEYS - {"checkpoint_dir"}),
+)
+def test_every_serialized_training_field_mismatch_fails(field_name: str) -> None:
+    state, contract, historical = _checkpoint_state()
+    changed = deepcopy(state)
+    value = changed["pseudo_pair_config"][field_name]
+    if isinstance(value, bool):
+        replacement = not value
+    elif isinstance(value, (int, float)):
+        replacement = value + 1
+    elif isinstance(value, dict):
+        replacement = {**value, "unexpected_change": 1}
+    else:
+        replacement = f"{value}-changed"
+    changed["pseudo_pair_config"][field_name] = replacement
+    changed["_meta"]["config"][field_name] = replacement
+
+    with pytest.raises(ValueError, match=field_name):
+        validate_checkpoint_contract(
+            changed,
+            contract,
+            historical_training_config=historical,
+        )
+
+
+def test_unknown_historical_training_fields_are_not_silently_ignored() -> None:
+    state, contract, historical = _checkpoint_state()
+    historical["training"]["untracked_runtime_knob"] = "not-serialized"
+
+    with pytest.raises(ValueError, match="unknown fields.*untracked_runtime_knob"):
+        validate_checkpoint_contract(
+            state,
+            contract,
+            historical_training_config=historical,
+        )
+
+
+def test_frozen_checkpoint_schema_remains_exactly_version_2() -> None:
+    state, contract, historical = _checkpoint_state()
+
+    assert PSEUDO_PAIR_PIPELINE_VERSION == 2
+    assert contract["pseudo_pair_pipeline_version"] == 2
+    assert state["pseudo_pair_pipeline_version"] == 2
+    assert set(state["pseudo_pair_config"]) == SERIALIZED_PSEUDO_PAIR_CONFIG_KEYS
+    assert set(state["_meta"]["config"]) == SERIALIZED_PSEUDO_PAIR_CONFIG_KEYS
+    assert {
+        "seed",
+        "lr",
+        "weight_decay",
+        "amp",
+        "loss_weights",
+        "scheduler",
+    } <= SERIALIZED_PSEUDO_PAIR_CONFIG_KEYS
+    validate_checkpoint_contract(
+        state,
+        contract,
+        historical_training_config=historical,
+    )
+
+
+def test_checkpoint_contract_verifies_all_frozen_identity_fields() -> None:
+    state, contract, historical = _checkpoint_state()
     for key, bad_value in {
         "model_class": "OtherModel",
         "pseudo_pair_pipeline_version": 1,
@@ -190,7 +326,7 @@ def test_checkpoint_contract_verifies_all_frozen_identity_fields() -> None:
             validate_checkpoint_contract(
                 changed,
                 contract,
-                historical_training_config={"training": training},
+                historical_training_config=historical,
             )
     changed = dict(state)
     changed["_meta"] = {**state["_meta"], "git_commit": "0" * 40}
@@ -198,7 +334,7 @@ def test_checkpoint_contract_verifies_all_frozen_identity_fields() -> None:
         validate_checkpoint_contract(
             changed,
             contract,
-            historical_training_config={"training": training},
+            historical_training_config=historical,
         )
 
 

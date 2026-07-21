@@ -233,7 +233,16 @@ on acquisition multiplicity, physical geometry, fit-pad geometry, and checkpoint
 identity; evaluates the real 0.1T source plus correct and every wrong target condition
 against each actual paired target; and emits anonymous tables, fixed alignment/error
 maps, hierarchical summaries, a conditioning sweep, and a sanitized JSON handoff.
-No execution result is recorded in this snapshot. Any future result from this audit is
+The first private Colab handoff attempt stopped before inference because the validator
+incorrectly required historical `training.num_workers` to appear in the checkpoint's
+normalized `PseudoPairEpochConfig` payload. `num_workers` is owned by DataLoader runtime
+construction, not `PseudoPairEpochConfig`, so legacy checkpoint metadata cannot
+independently attest it even though both the historical YAML and run launcher predeclare
+zero workers. The corrective validator normalizes the historical YAML through the
+trainer's actual serialization contract, allows only explicit runtime/path handling,
+and retains exact comparison of the two checkpoint config copies and every serialized
+training field. This was a handoff-validation blocker, not model or audit evidence; no
+private metric result was produced or recorded. Any future result from this audit is
 observed selected-slice development evidence (`complete_volume: false`), not held-out or
 confirmatory evidence, and cannot unblock the scaled pilot by itself. No subsequent
 training experiment is implemented.

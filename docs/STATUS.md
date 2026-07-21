@@ -226,6 +226,18 @@ Any residual-probe result remains development evidence and cannot satisfy promot
 final-volume gates because the split has been observed and evaluation still uses
 selected slices only.
 
+A diagnostic-only prospective paired Track-A audit is now implemented for a frozen
+residual checkpoint. It is limited to the predeclared T2-FLAIR cases, target fields, and
+eight selected slices in `prospective_paired_zero_shot_v1.yaml`. The runner fails closed
+on acquisition multiplicity, physical geometry, fit-pad geometry, and checkpoint
+identity; evaluates the real 0.1T source plus correct and every wrong target condition
+against each actual paired target; and emits anonymous tables, fixed alignment/error
+maps, hierarchical summaries, a conditioning sweep, and a sanitized JSON handoff.
+No execution result is recorded in this snapshot. Any future result from this audit is
+observed selected-slice development evidence (`complete_volume: false`), not held-out or
+confirmatory evidence, and cannot unblock the scaled pilot by itself. No subsequent
+training experiment is implemented.
+
 Track B remains at the volumetric reconstruction gate. No new VAE training, posterior
 experiment, or Stage-2 work is authorized by the diagnostic v1 result in this snapshot.
 

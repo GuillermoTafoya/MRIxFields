@@ -98,6 +98,35 @@ exploratory sampled-slice/per-volume diagnostic and must be labeled
 `complete_volume: false`. It is not full-volume nRMSE or SSIM and does not satisfy the
 final-volume gate.
 
+### Prospective Paired Selected-Slice Development Audit
+
+The Track-A prospective paired zero-shot audit is a descriptive development diagnostic,
+not a promotion or confirmation run. It uses real paired T2-FLAIR acquisitions for the
+predeclared cases and indices in
+`configs/experiment/prospective_paired_zero_shot_v1.yaml`, reports
+`evidence_scope: prospective_paired_selected_slice_development`, and always reports
+`complete_volume: false`.
+
+Each source/target pair must have exactly equal shape, affine, orientation codes, voxel
+sizes, and resulting `SliceGeometry`. Acquisitions stay in the released `[0, 1]` scale;
+they are never normalized independently. `preprocess_volume_slice` applies the exact
+historical `fit_pad` contract, so native aspect ratio is preserved rather than directly
+distorted to the model canvas.
+
+For every actual target, the audit compares the real 0.1T source, the correctly
+conditioned frozen prediction, and all wrong requested-target predictions against that
+same actual target. Foreground is the nonzero actual-target support inside the unpadded
+frame; outside-mask error is absolute prediction-to-target error on the remainder of
+that frame. Signed foreground bias is `mean(candidate - target)` on foreground, and
+residual magnitude is `mean(abs(prediction - source))` on foreground. Conditioning
+margins are oriented so positive means the correct condition is better; signed bias is
+compared by absolute magnitude. Error-improvement maps are exactly
+`abs(source-target) - abs(prediction-target)`, so positive values mean improvement.
+
+Slices are weighted equally within case, cases equally within target field, and target
+fields equally in the macro summary. No scientific pass/fail threshold may be created
+after observing these cases.
+
 ## Baselines And Metrics
 
 Every pseudo-pair report includes two comparisons against the unmodified high-field

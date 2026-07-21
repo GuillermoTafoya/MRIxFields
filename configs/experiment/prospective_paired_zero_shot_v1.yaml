@@ -1,0 +1,67 @@
+seed: 13
+
+audit:
+  name: prospective_paired_zero_shot_v1
+  evidence_scope: prospective_paired_selected_slice_development
+  complete_volume: false
+  evidence_role: observed_development_not_confirmatory
+  split_name: Training_prospective
+  cohort: prospective
+  paired_required: true
+  modality: T2FLAIR
+  internal_contrast: T2-FLAIR
+  case_ids: ["0006", "0007", "0009"]
+  source_field: 0.1
+  target_fields: [1.5, 3.0, 5.0, 7.0]
+  selected_slice_indices: [72, 103, 135, 166, 197, 228, 260, 291]
+  aggregation:
+    slice_to_case: equal_weight
+    case_to_field: equal_weight
+    field_to_macro: equal_weight
+
+preprocessing:
+  slice_start: 72
+  slice_end: 292
+  slices_per_volume: 8
+  normalization: official_01
+  model_range: minus_one_one
+  resize_mode: fit_pad
+  output_height: 128
+  output_width: 160
+  slice_axis: z
+
+model:
+  name: conditional_residual_unet_field_translator
+  in_channels: 1
+  out_channels: 1
+  hidden_channels: [16, 32]
+  latent_channels: 64
+  cond_dim: 64
+  spatial_dims: 2
+  upsample_mode: interpolate
+  skip_mode: gated
+  pad_to_multiple: true
+  model_range: minus_one_one
+
+checkpoint_contract:
+  git_commit: e1e526ea5fa0a58f5682823f85a3957d5cc8647c
+  trainer: pseudo_pair_epochs
+  model_class: ConditionalResidualUNetFieldTranslator
+  pseudo_pair_pipeline_version: 2
+  epoch: 10
+  global_step: 160
+
+reporting:
+  metrics:
+    - masked_mae
+    - nrmse
+    - ssim
+    - correlation
+    - gradient_mae
+    - outside_mask_error
+    - signed_foreground_bias
+    - prediction_minus_source_residual_magnitude
+  error_improvement_definition: abs(source-target) - abs(prediction-target)
+  positive_error_improvement_means: improvement
+  scientific_thresholds: null
+  training_experiment: not_implemented

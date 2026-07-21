@@ -1,9 +1,9 @@
 # Research Status
 
-Snapshot date: 2026-07-15
+Snapshot date: 2026-07-20
 
 Repository baseline: `origin/main` at
-`dea6735cbda1770381f107bd9817e44e24a30716`.
+`5c5ef8efc37fa2877719c8cff9a342b7aa13bf89`.
 
 The shared north star is one shared-parameter conditional model that emits complete 3D
 MRI volumes. The current tracks test different risks and are intentionally separate.
@@ -87,8 +87,8 @@ confirmatory claim, complete-volume claim, or real 0.1T translation claim.
 
 ## Track B: Volumetric Stage-1 Stack
 
-Status: infrastructure implemented; negative reconstruction engineering evidence recorded;
-diagnostic v1 pending; scientific and challenge evidence pending.
+Status: infrastructure implemented; diagnostic v1 completed with negative, non-held-out
+engineering evidence; Stage 2 blocked; scientific and challenge evidence pending.
 
 Track B contains the 3D patch-based KL-VAE, resumable patch bank, sliding-window
 full-volume reconstruction, and conditional latent diffuser. It addresses volumetric
@@ -129,12 +129,60 @@ held-out subject set and not a basis for Stage 2. It does not isolate whether th
 failure is checkpoint reconstruction, latent sampling, normalization/background handling,
 or sliding-window inference.
 
-The predeclared diagnostic v1 addresses that isolation without training: it audits the
-official manifest, uses official `sample_id` as unique volume identity, validates bank and
-config provenance, compares latent-mean and sampled patch reconstructions, verifies the
-identity tiler, and reports full-volume overlap/seam sensitivity at `0.25`, `0.5`, and
-`0.75`. It reports every supplied checkpoint step chronologically and does not select a
+The predeclared diagnostic v1 addressed that isolation without training: it audited the
+official manifest, used official `sample_id` as unique volume identity, validated bank and
+config provenance, compared latent-mean and sampled patch reconstructions, verified the
+identity tiler, and reported full-volume overlap/seam sensitivity at `0.25`, `0.5`, and
+`0.75`. It reported every supplied checkpoint step chronologically and did not select a
 best checkpoint post hoc.
+
+### Stage-1 Reconstruction Diagnostic v1 Result
+
+The following is user-supplied evidence from the completed private Colab diagnostic.
+Repository maintainers and coding agents do not have access to the checkpoint, patch bank,
+manifest, volumes, or full output and have not independently verified the artifacts or
+reported values.
+
+- Diagnostic code commit: `9b071cc17c545e126891ae77f7e0dd27c2815b1c`.
+- Training/checkpoint code commit: `c9ee9dd738f8d9fee7acf9340dc4325c47a639cd`.
+- Checkpoint: legacy/unversioned, step 54,000.
+- Evidence scope: development engineering diagnostic; `held_out: false`;
+  `confirmatory: false`; `complete_volume: true`.
+- Manifest fingerprint:
+  `a2c49959c14f5ab917425e6e42bad0381259d339e68f03619fba2429d1babe8a`.
+- Patch-bank fingerprint:
+  `95499028d3baab2a2aa5a53dc648454d25f4fdbce4a51b8c3f32a8a18b877a8e`.
+- Resolved-config fingerprint:
+  `5462b1890ab2cf55b9f89b76b3db472f8c67a337c2b4ff333094166ec53b1a65`.
+- Combined provenance fingerprint:
+  `b8a134fe850eca4a2de4173e9bac763384f197afb3c34bffff09850fd6259bfd`.
+
+The identity tiler passed at overlaps `0.25`, `0.50`, and `0.75`. The fixed-patch
+direct-versus-tiled check also passed, with mean absolute difference
+`1.0026588448397433e-09`. These checks make a tiler implementation failure an unlikely
+explanation for the large posterior-mean reconstruction error.
+
+| Step-54,000 fixed-patch path | nRMSE | SSIM3D | LPIPS | Foreground MAE | Outside reconstruction mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Posterior mean | 0.50438815 | -0.05506255 | 0.63492680 | 0.35528192 | 0.07830130 |
+| Sampled posterior, seed 13 | 0.05191850 | 0.53982496 | 0.04449676 | 0.09432714 | -0.97147036 |
+
+The target outside mean was `-0.99989337`. For complete-volume posterior-mean
+reconstruction, nRMSE ranged from `0.50107300` to `0.50455886` across the declared
+overlaps, and SSIM3D ranged approximately from `-0.04117` to `-0.02156`. The overlap
+nRMSE span was `0.00348586`; the seam-ratio span was `0.57896406`; and the
+posterior-mean reconstruction standard-deviation ratio was `0.49903357`.
+
+The chronological fixed-patch posterior-mean path worsened from nRMSE `0.1342` at step
+2,000 to `0.6437` at step 50,000, then partially rebounded to `0.5044` at step 54,000.
+No checkpoint is selected post hoc from that trajectory.
+
+This evidence supports an engineering interpretation of a posterior mean/sample contract
+mismatch and possible variance-channel information leakage. It does not establish that
+sampled decoding is stable or generalizable. Although the diagnostic reconstructed a
+complete volume, it used the training manifest and therefore is neither held out nor
+confirmatory and does not pass the final-volume scientific gate. Stage 2 was not started
+and remains blocked.
 
 ## Invalid Evidence
 
@@ -151,10 +199,11 @@ evidence. They must not be resumed or compared as if they were v2 results.
   retain the degraded baseline while learning useful restoration and conditioning.
 - The development split has been observed and cannot support a confirmatory claim.
 - Track A does not yet reconstruct and evaluate complete held-out NIfTI volumes.
-- Track B's supplied Stage-1 reconstruction evidence is negative, non-held-out, and
-  confounded by a failed generic manifest audit and overlap-protocol mismatch.
-- Track B diagnostic v1 must isolate patch reconstruction from tiled inference before any
-  new training experiment or Stage-2 decision.
+- Track B diagnostic v1 is complete. Its negative, non-held-out engineering evidence
+  supports a posterior mean/sample contract mismatch and possible variance-channel
+  information leakage, but not stable or generalizable sampled decoding.
+- Track B has no held-out or confirmatory reconstruction evidence. A posterior experiment
+  has not been implemented, and Stage 2 remains blocked.
 - A shared 3D paired/degradation provenance contract does not yet exist between tracks.
 - Eventual anatomical metrics require a validated toolchain and documented protocol.
 
@@ -177,7 +226,8 @@ Any residual-probe result remains development evidence and cannot satisfy promot
 final-volume gates because the split has been observed and evaluation still uses
 selected slices only.
 
-Track B proceeds independently through its volumetric reconstruction gate.
+Track B remains at the volumetric reconstruction gate. No new VAE training, posterior
+experiment, or Stage-2 work is authorized by the diagnostic v1 result in this snapshot.
 
 ## Artifact Location Policy
 

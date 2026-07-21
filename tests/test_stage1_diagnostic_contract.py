@@ -1,6 +1,11 @@
 import ast
+import importlib.util
 import json
+import subprocess
 from pathlib import Path
+
+import pytest
+import torch
 
 from fieldbridge.config import load_yaml_config
 
@@ -19,6 +24,15 @@ RUNNER_PATH = (
     PROJECT_ROOT / "notebooks" / "stage1_vae_reconstruction_diagnostic_runner.py"
 )
 STATUS_PATH = PROJECT_ROOT / "docs" / "STATUS.md"
+EVIDENCE_TRAINING_COMMIT = "c9ee9dd738f8d9fee7acf9340dc4325c47a639cd"
+
+
+def _load_runner():  # type: ignore[no-untyped-def]
+    spec = importlib.util.spec_from_file_location("stage1_diagnostic_runner_test", RUNNER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_stage1_diagnostic_config_is_inference_only_and_frozen() -> None:
@@ -64,7 +78,7 @@ def test_stage1_diagnostic_notebook_is_unexecuted_and_accepts_external_inputs() 
         "External Stage-1 checkpoint path",
         "External Stage-1 patch-bank directory",
         "External official JSONL manifest path",
-        "External resolved Stage-1 run config path",
+        "Historical training/checkpoint commit SHA",
         "New diagnostic output directory",
     ):
         assert prompt in source
@@ -73,18 +87,26 @@ def test_stage1_diagnostic_notebook_is_unexecuted_and_accepts_external_inputs() 
     assert "run_stage1_diagnostic" in source
     assert "CHECKPOINT_SWEEP_PATHS" in source
     assert "nvidia-smi" in source
+    assert notebook["metadata"]["accelerator"] == "GPU"
     assert "train-stage1-vae" not in source
     assert "train-stage2-diffuser" not in source
     assert "run_stage1_vae_train" not in source
     assert "build_patch_bank" not in source
 
+    preflight_index = source.index('subprocess.run(["nvidia-smi"]')
+    clone_index = source.index('"clone", "--no-checkout"')
     install_index = source.index('"pip", "install"')
     source_path_index = source.index("sys.path.insert(0, SOURCE_DIR)")
     invalidate_index = source.index("importlib.invalidate_caches()")
     package_import_index = source.index("import fieldbridge as installed_fieldbridge")
+    assert preflight_index < clone_index < install_index
     assert install_index < source_path_index < invalidate_index < package_import_index
+    assert 'if not REPO_DIR.exists():' in source
+    assert '["git", "fetch", "origin", EXPECTED_CODE_COMMIT]' in source
+    assert "Use a fresh Colab runtime" not in source
     assert 'module_name.startswith("fieldbridge.")' in source
     assert "REPO_DIR not in PACKAGE_FILE.parents" in source
+    assert "reconstruct_resolved_training_yaml" in source
 
 
 def test_stage1_diagnostic_runner_has_no_training_or_selection_path() -> None:
@@ -95,6 +117,7 @@ def test_stage1_diagnostic_runner_has_no_training_or_selection_path() -> None:
     }
 
     assert "run_stage1_diagnostic" in function_names
+    assert "reconstruct_resolved_training_yaml" in function_names
     assert "load_adapted_mrixfields_manifest" in source
     assert "strict_paths=True" in source
     assert "run_stage1_reconstruction_diagnostics" in source
@@ -106,6 +129,117 @@ def test_stage1_diagnostic_runner_has_no_training_or_selection_path() -> None:
     assert "build_patch_bank" not in source
     assert "best.pt" not in source
     assert "diagnostics.png" not in source
+
+
+def test_resolved_training_yaml_uses_historical_commit_checkpoint_and_bank(tmp_path) -> None:
+    runner = _load_runner()
+    repo_dir = tmp_path / "historical-repo"
+    config_path = repo_dir / "configs" / "experiment" / "stage1_vae.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """seed: 13
+data:
+  patch_size: [32, 32, 32]
+  patches_per_volume: 16
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  loss_weights:
+    ssim: 1.0
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "FieldBridge Tests"], cwd=repo_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fieldbridge-tests@example.invalid"],
+        cwd=repo_dir,
+        check=True,
+    )
+    subprocess.run(["git", "add", "configs/experiment/stage1_vae.yaml"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "historical config"], cwd=repo_dir, check=True)
+    training_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True
+    ).strip()
+    recorded_config = {
+        "steps": 54_000,
+        "batch_size": 8,
+        "seed": 13,
+        "lr": 0.0001,
+        "device": "cuda",
+        "precision": "bf16",
+        "loss_weights": {"ssim": 1.0, "nrmse": 1.0, "lpips": 1.0, "kl": 0.0001},
+        "ssim_window_size": 7,
+        "lpips_num_slices": 8,
+        "grad_clip_norm": 1.0,
+        "steps_per_epoch": 3968,
+        "early_stopping": True,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.005,
+        "early_stopping_ema_decay": 0.98,
+        "checkpoint_at_end": True,
+        "log_every_steps": 1,
+    }
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "_meta": {
+                "git_commit": training_commit,
+                "seed": 13,
+                "config": recorded_config,
+            }
+        },
+        checkpoint_path,
+    )
+    bank_dir = tmp_path / "bank"
+    bank_dir.mkdir()
+    (bank_dir / "bank_meta.json").write_text(
+        json.dumps({"patch_size": [64, 64, 64], "patches_per_volume": 32, "seed": 13}),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "resolved.yaml"
+
+    result = runner.reconstruct_resolved_training_yaml(
+        repo_dir=repo_dir,
+        checkpoint_path=checkpoint_path,
+        patch_bank_dir=bank_dir,
+        expected_training_commit=training_commit,
+        output_path=output_path,
+    )
+
+    assert result == output_path
+    resolved = load_yaml_config(output_path)
+    assert resolved["seed"] == 13
+    assert resolved["data"]["patch_size"] == [64, 64, 64]
+    assert resolved["data"]["patches_per_volume"] == 32
+    assert resolved["training"]["steps"] == 54_000
+    assert resolved["training"]["steps_per_epoch"] == 3968
+    assert resolved["training"]["loss_weights"] == recorded_config["loss_weights"]
+    assert "l1" not in resolved["training"]["loss_weights"]
+    assert "stratified_crop" not in resolved["data"]
+
+    with pytest.raises(ValueError, match="does not equal"):
+        runner.reconstruct_resolved_training_yaml(
+            repo_dir=repo_dir,
+            checkpoint_path=checkpoint_path,
+            patch_bank_dir=bank_dir,
+            expected_training_commit="a" * 40,
+            output_path=output_path,
+        )
 
 
 def test_status_records_supplied_negative_engineering_evidence_without_overclaim() -> None:
@@ -123,4 +257,14 @@ def test_status_records_supplied_negative_engineering_evidence_without_overclaim
     assert "MSE | 0.95595611" in status
     assert "not held out or confirmatory" in status
     assert "overlap `0.25`, despite notebook prose stating `0.5`" in status
-    assert "does not select a\nbest checkpoint post hoc" in status
+    assert "did not select a\nbest checkpoint post hoc" in status
+    assert "9b071cc17c545e126891ae77f7e0dd27c2815b1c" in status
+    assert EVIDENCE_TRAINING_COMMIT in status
+    assert "held_out: false" in status
+    assert "confirmatory: false" in status
+    assert "complete_volume: true" in status
+    assert "0.50438815" in status
+    assert "0.05191850" in status
+    assert "possible variance-channel information leakage" in status
+    assert "Stage 2 was not started\nand remains blocked" in status
+    assert "diagnostic v1 pending" not in status

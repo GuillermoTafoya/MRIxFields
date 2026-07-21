@@ -6,21 +6,147 @@ import json
 import re
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 
-from fieldbridge.config import load_yaml_config
+from fieldbridge.config import dump_yaml_config, load_yaml_config
 from fieldbridge.data.mrixfields_adapter import load_adapted_mrixfields_manifest
 from fieldbridge.evaluation.stage1_diagnostics import (
     Stage1DiagnosticSpec,
     run_stage1_reconstruction_diagnostics,
 )
+from fieldbridge.training.checkpoints import load_checkpoint
 
 DIAGNOSTIC_CONFIG_NAME = "stage1_vae_reconstruction_diagnostic_v1.yaml"
+HISTORICAL_TRAINING_CONFIG = "configs/experiment/stage1_vae.yaml"
+PATCH_BANK_META_NAME = "bank_meta.json"
 _SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+
+def reconstruct_resolved_training_yaml(
+    *,
+    repo_dir: Path,
+    checkpoint_path: Path,
+    patch_bank_dir: Path,
+    expected_training_commit: str,
+    output_path: Path,
+) -> Path:
+    """Rebuild the run YAML without consulting the current checkout's generic config."""
+
+    repo_dir = repo_dir.resolve()
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    patch_bank_dir = patch_bank_dir.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    if _SHA_PATTERN.fullmatch(expected_training_commit) is None:
+        raise ValueError("expected_training_commit must be an exact 40-character git SHA.")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError("External Stage-1 checkpoint does not exist.")
+    bank_meta_path = patch_bank_dir / PATCH_BANK_META_NAME
+    if not bank_meta_path.is_file():
+        raise FileNotFoundError("Stage-1 patch bank is missing bank_meta.json.")
+    if output_path == repo_dir or repo_dir in output_path.parents:
+        raise ValueError("Reconstructed run config must remain outside the Git checkout.")
+
+    checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
+    metadata = checkpoint.get("_meta")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("Stage-1 checkpoint is missing mapping-valued _meta metadata.")
+    recorded_commit = str(metadata.get("git_commit", ""))
+    if recorded_commit != expected_training_commit:
+        raise ValueError(
+            "Checkpoint-recorded git commit does not equal the expected historical "
+            "training commit."
+        )
+    recorded_config = metadata.get("config")
+    if not isinstance(recorded_config, Mapping):
+        raise ValueError("Stage-1 checkpoint does not record its resolved training config.")
+    recorded_config = deepcopy(dict(recorded_config))
+
+    resolved_commit = subprocess.check_output(
+        ["git", "rev-parse", f"{recorded_commit}^{{commit}}"],
+        cwd=repo_dir,
+        text=True,
+    ).strip()
+    if resolved_commit != recorded_commit:
+        raise RuntimeError(
+            f"Historical training commit resolved to {resolved_commit}, expected {recorded_commit}."
+        )
+    try:
+        historical_yaml = subprocess.check_output(
+            ["git", "show", f"{recorded_commit}:{HISTORICAL_TRAINING_CONFIG}"],
+            cwd=repo_dir,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Unable to read the generic Stage-1 YAML from the exact checkpoint-recorded "
+            "training commit; refusing to use the current checkout's YAML."
+        ) from exc
+    historical = yaml.safe_load(historical_yaml)
+    if not isinstance(historical, Mapping):
+        raise ValueError("Historical Stage-1 YAML must contain a top-level mapping.")
+    reconstructed = deepcopy(dict(historical))
+
+    bank_meta = json.loads(bank_meta_path.read_text(encoding="utf-8"))
+    if not isinstance(bank_meta, Mapping):
+        raise ValueError("Stage-1 bank_meta.json must contain a mapping.")
+    patch_size = bank_meta.get("patch_size")
+    if not isinstance(patch_size, list) or len(patch_size) != 3:
+        raise ValueError("Stage-1 bank_meta.json must record a three-dimensional patch_size.")
+    patches_per_volume = int(bank_meta["patches_per_volume"])
+    bank_seed = int(bank_meta["seed"])
+
+    data = reconstructed.get("data")
+    training = reconstructed.get("training")
+    if not isinstance(data, Mapping) or not isinstance(training, Mapping):
+        raise ValueError("Historical Stage-1 YAML must contain data and training mappings.")
+    reconstructed["data"] = {
+        **deepcopy(dict(data)),
+        "patch_size": [int(value) for value in patch_size],
+        "patches_per_volume": patches_per_volume,
+    }
+    reconstructed["seed"] = bank_seed
+    resolved_training = deepcopy(dict(training))
+    for key, value in recorded_config.items():
+        if key != "seed":
+            resolved_training[key] = deepcopy(value)
+    reconstructed["training"] = resolved_training
+
+    projected = {
+        key: (
+            reconstructed["seed"]
+            if key == "seed"
+            else reconstructed["training"].get(key)
+        )
+        for key in recorded_config
+    }
+    if projected != recorded_config:
+        mismatches = sorted(
+            key for key in recorded_config if projected.get(key) != recorded_config[key]
+        )
+        raise ValueError(
+            "Reconstructed training config does not exactly equal the checkpoint-recorded "
+            f"config for keys: {mismatches}."
+        )
+    metadata_seed = metadata.get("seed")
+    if metadata_seed is not None and int(metadata_seed) != bank_seed:
+        raise ValueError("Checkpoint seed and patch-bank seed do not match.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(dump_yaml_config(reconstructed), encoding="utf-8")
+    reloaded = load_yaml_config(output_path)
+    reloaded_projection = {
+        key: reloaded["seed"] if key == "seed" else reloaded["training"].get(key)
+        for key in recorded_config
+    }
+    if reloaded_projection != recorded_config:
+        raise RuntimeError("Serialized resolved training YAML changed the checkpoint contract.")
+    return output_path
 
 
 def run_stage1_diagnostic(

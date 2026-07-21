@@ -17,7 +17,6 @@ from fieldbridge.evaluation.stage1_diagnostics import (
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.official.data_manifest import parse_mrixfields_data_path
 from fieldbridge.training.checkpoints import save_checkpoint
-from fieldbridge.training.stage1_vae import Stage1VAEConfig
 
 
 def _official_records():
@@ -94,7 +93,30 @@ def _write_checkpoint(tmp_path, config: dict):
             "early_stop": {"ema": 1.2, "best": 1.1, "num_bad_checkpoints": 2},
         },
         seed=13,
-        config=Stage1VAEConfig.from_mapping(config).to_dict(),
+        config={
+            "steps": 1,
+            "batch_size": 1,
+            "seed": 13,
+            "lr": 0.0001,
+            "device": "cpu",
+            "precision": "fp32",
+            "loss_weights": {
+                "ssim": 1.0,
+                "nrmse": 1.0,
+                "lpips": 0.0,
+                "kl": 0.0001,
+            },
+            "ssim_window_size": 3,
+            "lpips_num_slices": 0,
+            "grad_clip_norm": 1.0,
+            "steps_per_epoch": 4,
+            "early_stopping": True,
+            "early_stopping_patience": 2,
+            "early_stopping_min_delta": 0.005,
+            "early_stopping_ema_decay": 0.98,
+            "checkpoint_at_end": True,
+            "log_every_steps": 0,
+        },
         git_commit="a" * 40,
     )
     return path
@@ -203,6 +225,12 @@ def test_stage1_diagnostic_runs_end_to_end_on_synthetic_cpu(tmp_path) -> None:
         lpips_num_slices=0,
     )
 
+    inference_mode_observations: list[bool] = []
+
+    def diagnostic_loader(path, record):  # type: ignore[no-untyped-def]
+        inference_mode_observations.append(torch.is_inference_mode_enabled())
+        return _raw_volume(path, record)
+
     report = run_stage1_reconstruction_diagnostics(
         checkpoint_path=checkpoint,
         patch_bank_dir=bank_dir,
@@ -210,7 +238,7 @@ def test_stage1_diagnostic_runs_end_to_end_on_synthetic_cpu(tmp_path) -> None:
         resolved_config=config,
         diagnostic_spec=spec,
         checkpoint_sweep_paths=(checkpoint,),
-        image_loader=_raw_volume,
+        image_loader=diagnostic_loader,
         device=torch.device("cpu"),
     )
 
@@ -267,6 +295,7 @@ def test_stage1_diagnostic_runs_end_to_end_on_synthetic_cpu(tmp_path) -> None:
     assert report["checkpoint_step_sweep"]["best_checkpoint_selected"] is False
     assert [item["step"] for item in report["checkpoint_step_sweep"]["results"]] == [4]
     assert report["recommendation"]["status"] == "NO_NEXT_TRAINING_EXPERIMENT"
+    assert inference_mode_observations and all(inference_mode_observations)
 
     serialized = json.dumps(report)
     for private_key in ('"case_id":', '"subject_id":', '"sample_id":', '"image_path":'):

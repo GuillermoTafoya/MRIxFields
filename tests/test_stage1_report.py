@@ -46,6 +46,22 @@ def test_sliding_window_blending_reconstructs_identity_exactly(overlap: float) -
     assert torch.allclose(recon, image, atol=1e-5)
 
 
+def test_sliding_window_can_preserve_legacy_signed_range_without_clamping() -> None:
+    image = torch.linspace(-1.0, 1.0, 20**3).reshape(1, 1, 20, 20, 20)
+
+    recon = sliding_window_reconstruct(
+        _IdentityEncoder(),
+        _IdentityDecoder(),
+        image,
+        patch_size=(8, 8, 8),
+        domain=None,
+        overlap=0.5,
+        clamp_output=False,
+    )
+
+    assert torch.allclose(recon, image, atol=1e-5)
+
+
 def test_sliding_window_rejects_out_of_range_overlap() -> None:
     image = torch.rand(1, 1, 32, 32, 32)
     with pytest.raises(ValueError):
@@ -145,7 +161,7 @@ class _FieldContrastDataset(Dataset[RawBatch]):
         return len(self.domains)
 
     def __getitem__(self, index: int) -> RawBatch:
-        image = torch.rand(1, 16, 16, 16) * 2.0 - 1.0
+        image = torch.rand(1, 16, 16, 16)
         domain = self.domains[index]
         return RawBatch(
             image=image,

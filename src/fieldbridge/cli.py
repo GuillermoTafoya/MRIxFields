@@ -64,6 +64,18 @@ from fieldbridge.official.submissions import (
     validate_submission_dir,
 )
 from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_pseudo_pairs
+from fieldbridge.evaluation.stage1_full_volume_audit import (
+    AuditRuntime,
+    audit_stage1_checkpoint,
+    checkpoint_public_metadata,
+    freeze_stage1_audit_selection,
+    load_and_validate_stage1_audit_selection,
+    prepare_audit_root,
+    resolve_audit_commit,
+    run_synthetic_stage1_audit_smoke,
+    sha256_file,
+    write_audit_comparison,
+)
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
 from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.pseudo_pair_epochs import (
@@ -313,6 +325,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional metrics_raw.json from training to also render the loss curve.",
     )
+
+    select_stage1_audit = subparsers.add_parser(
+        "select-stage1-vae-audit",
+        help="Freeze the deterministic 60-volume, 15-domain Stage-1 test selection.",
+    )
+    select_stage1_audit.add_argument("--split-json", type=Path, required=True)
+    select_stage1_audit.add_argument(
+        "--private-out",
+        type=Path,
+        required=True,
+        help="Private selection JSON with rerun identities/paths; keep outside Git.",
+    )
+    select_stage1_audit.add_argument(
+        "--sanitized-out",
+        type=Path,
+        required=True,
+        help="Sanitized selection report containing anonymous domain/case slots only.",
+    )
+    select_stage1_audit.add_argument("--seed", type=int, default=13)
+
+    audit_stage1 = subparsers.add_parser(
+        "audit-stage1-vae",
+        help="Audit one or more Stage-1 checkpoints on a frozen 60-volume selection.",
+        description="Full-volume posterior-mean audit. Do not run concurrently with Stage-1 "
+        "training on the same GPU.",
+    )
+    audit_stage1.add_argument("--split-json", type=Path, required=True)
+    audit_stage1.add_argument("--selection", type=Path, required=True)
+    audit_stage1.add_argument("--config", type=Path, default=Path("configs/experiment/stage1_vae.yaml"))
+    audit_stage1.add_argument(
+        "--checkpoint",
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+        help="Checkpoint label and private path; repeat to compare independently evaluated checkpoints.",
+    )
+    audit_stage1.add_argument("--out", type=Path, required=True)
+    audit_stage1.add_argument("--overlap", type=float, default=0.5)
+    audit_stage1.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    audit_stage1.add_argument(
+        "--precision", choices=("float32", "amp-bfloat16"), default="float32"
+    )
+    audit_stage1.add_argument("--resume", action="store_true")
+
+    smoke_stage1_audit = subparsers.add_parser(
+        "smoke-stage1-audit",
+        help="Run the complete 15-domain audit orchestration on synthetic CPU volumes.",
+    )
+    smoke_stage1_audit.add_argument("--out", type=Path, required=True)
 
     train_stage2_diffuser = subparsers.add_parser(
         "train-stage2-diffuser",
@@ -760,6 +821,112 @@ def main(argv: list[str] | None = None) -> int:
             f"build-patch-bank done: wrote={result.num_volumes_written} skipped={result.num_volumes_skipped} "
             f"failed={result.num_volumes_failed} total_patches={result.total_patches} out={result.out_dir}"
         )
+        return 0
+
+    if args.command == "select-stage1-vae-audit":
+        splits = load_vae_splits(args.split_json)
+        payload = freeze_stage1_audit_selection(
+            splits,
+            private_path=args.private_out,
+            sanitized_path=args.sanitized_out,
+            seed=args.seed,
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "total_volumes": payload["total_volumes"],
+                    "domain_count": len(payload["domains"]),
+                    "selection_fingerprint": payload["selection_fingerprint"],
+                    "split_fingerprint": payload["split_fingerprint"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "audit-stage1-vae":
+        import torch
+
+        config = _load_optional_config(args.config)
+        splits = load_vae_splits(args.split_json)
+        selection = load_and_validate_stage1_audit_selection(args.selection, splits=splits)
+        if args.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is unavailable.")
+        device = torch.device(
+            "cuda" if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available()) else "cpu"
+        )
+        data_config = _data_mapping(config)
+        training_config = config.get("training", {})
+        if not isinstance(training_config, Mapping):
+            training_config = {}
+        runtime = AuditRuntime(
+            patch_size=_eval_patch_size(config),
+            overlap=float(args.overlap),
+            foreground_threshold=float(data_config.get("foreground_threshold", 0.0)),
+            precision=args.precision,
+            seed=int(selection["seed"]),
+            latent_active_kl_threshold=float(training_config.get("latent_active_kl_threshold", 0.01)),
+        )
+        root_contract = prepare_audit_root(
+            args.out,
+            selection=selection,
+            audit_commit=resolve_audit_commit(),
+            config_sha256=sha256_file(args.config),
+            runtime=runtime,
+            device=device,
+        )
+        checkpoint_specs = [_parse_labeled_path(spec) for spec in args.checkpoint]
+        labels = [label for label, _ in checkpoint_specs]
+        if len(labels) != len(set(labels)):
+            raise ValueError("Checkpoint labels must be unique within one audit invocation.")
+        model_config = _model_config(config)
+        summaries: list[dict[str, Any]] = []
+        for index, (label, checkpoint_path) in enumerate(checkpoint_specs, start=1):
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+            decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+            state = load_checkpoint(checkpoint_path)
+            encoder.load_state_dict(state["encoder"])
+            decoder.load_state_dict(state["decoder"])
+            metadata = checkpoint_public_metadata(state, encoder=encoder, decoder=decoder)
+            checkpoint_slot = f"checkpoint-{index:02d}"
+            print(
+                f"stage1_audit checkpoint={checkpoint_slot} state=validated_loading device={device} "
+                f"precision={runtime.precision}",
+                flush=True,
+            )
+            summary = audit_stage1_checkpoint(
+                encoder=encoder,
+                decoder=decoder,
+                volume_loader=lambda record: nifti_image_loader(record.image_path, record),
+                selection=selection,
+                out_dir=args.out / "checkpoints" / checkpoint_slot,
+                checkpoint_slot=checkpoint_slot,
+                checkpoint_label=label,
+                checkpoint_sha256=sha256_file(checkpoint_path),
+                checkpoint_metadata=metadata,
+                root_contract=root_contract,
+                runtime=runtime,
+                device=device,
+                resume=bool(args.resume),
+                progress_path=args.out / "run_progress_sanitized.json",
+            )
+            summaries.append(summary)
+            del encoder, decoder, state
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        comparison = write_audit_comparison(
+            args.out, checkpoint_summaries=summaries, root_contract=root_contract
+        )
+        print(json.dumps(comparison, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "smoke-stage1-audit":
+        payload = run_synthetic_stage1_audit_smoke(args.out)
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     if args.command == "eval-stage1-vae":
@@ -1352,6 +1519,13 @@ def _load_loss_curve(path: Path | None) -> list[float] | None:
         return None
     losses = data.get("losses") if isinstance(data, Mapping) else None
     return [float(x) for x in losses] if isinstance(losses, list) else None
+
+
+def _parse_labeled_path(value: str) -> tuple[str, Path]:
+    label, separator, raw_path = value.partition("=")
+    if not separator or not label.strip() or not raw_path.strip():
+        raise ValueError("--checkpoint must use LABEL=PATH syntax.")
+    return label.strip(), Path(os.path.expandvars(raw_path.strip()))
 
 
 def _num_workers(config: Mapping[str, Any]) -> int:

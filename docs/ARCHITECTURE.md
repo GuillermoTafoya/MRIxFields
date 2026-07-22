@@ -347,6 +347,14 @@ on `validation` (writing `history.jsonl` — per-term train+val losses — and a
 (`--overlap`), `--per-domain` field sampling, optional `--metrics-raw` to overlay the
 training loss curve.
 
+`select-stage1-vae-audit` and `audit-stage1-vae` harden that same evaluator into the
+versioned Stage-1 full-volume audit contract. The first freezes four test records in each
+of all 15 canonical domains. The second reuses the posterior-mean overlap tiler, adds
+raw-range/foreground/tail/histogram/latent diagnostics, atomically recoverable per-volume
+results, equal-domain macro aggregation, anonymous panels, and compatible multi-checkpoint
+comparison. The exact contract and Windows handoff are documented in
+`docs/STAGE1_FULL_VOLUME_AUDIT.md`.
+
 `eval-pseudo-pairs` reports degraded `x_low` versus `x_high` and predicted `x_pred`
 versus `x_high`, with aggregate and per-target-field metrics plus improvement over the
 degraded baseline. It also runs a target-conditioning audit by evaluating correct target

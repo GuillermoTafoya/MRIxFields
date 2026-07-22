@@ -179,6 +179,22 @@ development subjects, not confirmatory claims.
 
 ## Baselines And Metrics
 
+### Stage-1 Domain-Balanced Full-Volume Audit v1
+
+The Track-B Stage-1 audit freezes four test-split volumes in each of all 15 canonical
+field/contrast domains before checkpoint evaluation. Selection is stable under record
+ordering, tied to the subject-held-out split fingerprint and an all-record fingerprint,
+and fails closed on leakage or incomplete domain coverage. Complete native tensors are
+reconstructed with the existing fixed posterior-mean sliding-window path under inference
+mode. Metrics use the raw decoder output only for range diagnostics and the `[0,1]`-clamped
+output for reconstruction scores.
+
+The primary result averages complete volumes equally within domain and all 15 domain
+means equally. Pooled micro metrics are secondary. Exact metric formulas, recovery rules,
+artifacts, and the two-step server workflow are frozen in
+`docs/STAGE1_FULL_VOLUME_AUDIT.md`. The audit reports evidence and checkpoint comparisons;
+it has no automatic scientific viability gate.
+
 Every pseudo-pair report includes two comparisons against the unmodified high-field
 target:
 

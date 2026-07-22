@@ -174,7 +174,7 @@ def _hann_window_3d(patch: tuple[int, int, int], device: "Any", dtype: "Any") ->
     return window.clamp_min(1e-3)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def sliding_window_reconstruct(
     encoder: KLVAEEncoder,
     decoder: KLVAEDecoder,
@@ -184,6 +184,7 @@ def sliding_window_reconstruct(
     domain: Any,
     overlap: float = 0.5,
     clamp_output: bool = True,
+    latent_accumulator: LatentStatsAccumulator | None = None,
 ) -> torch.Tensor:
     """Reconstruct a full (B, C, D, H, W) volume from latent means, tile by tile.
 
@@ -199,7 +200,12 @@ def sliding_window_reconstruct(
     if not 0.0 <= overlap < 1.0:
         raise ValueError(f"overlap must be in [0, 1), got {overlap}.")
     pd, ph, pw = (int(p) for p in patch_size)
+    if min(pd, ph, pw) <= 0:
+        raise ValueError(f"patch_size values must be positive, got {(pd, ph, pw)}.")
     _, _, depth, height, width = image.shape
+    # Volumes smaller than a configured patch are still valid complete volumes.  Use the
+    # actual extent on each axis so the Hann window and decoded tile shape stay aligned.
+    pd, ph, pw = min(pd, depth), min(ph, height), min(pw, width)
     strides = tuple(max(1, round(p * (1.0 - overlap))) for p in (pd, ph, pw))
     window = _hann_window_3d((pd, ph, pw), image.device, image.dtype)
 
@@ -209,7 +215,9 @@ def sliding_window_reconstruct(
         for y in _tiled_starts(height, ph, strides[1]):
             for x in _tiled_starts(width, pw, strides[2]):
                 tile = image[..., z : z + pd, y : y + ph, x : x + pw]
-                mean, _ = encoder.encode_dist(tile, domain)
+                mean, logvar = encoder.encode_dist(tile, domain)
+                if latent_accumulator is not None:
+                    latent_accumulator.update(mean, logvar)
                 rec = decoder.decode(mean, domain)
                 weighted_sum[..., z : z + pd, y : y + ph, x : x + pw] += rec * window
                 weight_sum[..., z : z + pd, y : y + ph, x : x + pw] += window

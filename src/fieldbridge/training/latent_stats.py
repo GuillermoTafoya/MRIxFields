@@ -90,6 +90,7 @@ class LatentStatsAccumulator:
             "per_dim_std": [float(v) for v in std_c],
             "per_dim_kl": [float(v) for v in kl_c],
             "global_std": global_std,
+            "global_mean": global_mean,
             "mean_per_dim_std": float(std_c.mean()),
             "min_per_dim_std": float(std_c.min()),
             "max_per_dim_std": float(std_c.max()),

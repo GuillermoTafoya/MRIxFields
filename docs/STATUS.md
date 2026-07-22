@@ -135,6 +135,15 @@ final-volume gates.
 Status: infrastructure implemented; diagnostic v1 completed with negative, non-held-out
 engineering evidence; Stage 2 blocked; scientific and challenge evidence pending.
 
+A deterministic domain-balanced full-volume Stage-1 audit v1 is implemented but has not
+been executed on private data or a real checkpoint. It freezes four held-out-test volumes
+per canonical field/contrast domain (60 total), evaluates complete native tensors through
+the existing posterior-mean overlap tiler, records raw-before-clamp diagnostics, aggregates
+all 15 domain means equally, and supports fail-closed per-volume recovery plus independent
+checkpoint comparison. This is evaluation infrastructure only and adds no scientific
+evidence. It must wait until the active 75-epoch Stage-1 training run releases the GPU;
+Stage 2 remains blocked.
+
 Track B contains the 3D patch-based KL-VAE, resumable patch bank, sliding-window
 full-volume reconstruction, and conditional latent diffuser. It addresses volumetric
 representation and reconstruction constraints, not the paired synthetic-restoration

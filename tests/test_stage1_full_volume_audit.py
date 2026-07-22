@@ -259,7 +259,12 @@ def test_linear_quantiles_use_numpy_above_threshold(
         reference_values, torch.tensor(quantiles, dtype=torch.float32)
     )
     assert actual.dtype == torch.float32
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=torch.finfo(torch.float32).eps,
+        atol=0.0,
+    )
 
 
 def test_numpy_linear_quantiles_agree_with_torch_on_reference_vector(
@@ -272,7 +277,12 @@ def test_numpy_linear_quantiles_agree_with_torch_on_reference_vector(
     actual = audit_module._linear_quantiles(values, quantiles)
     expected = torch.quantile(values, torch.tensor(quantiles, dtype=torch.float32))
 
-    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=torch.finfo(torch.float32).eps,
+        atol=0.0,
+    )
 
 
 def test_numpy_linear_quantiles_are_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:

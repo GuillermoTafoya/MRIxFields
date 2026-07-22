@@ -129,3 +129,41 @@ def test_lr_schedule_default_is_constant_and_preserves_behavior() -> None:
     assert cfg.lr_schedule == "constant"
     assert _lr_at_step(1, cfg, total_steps=100) == cfg.lr
     assert cfg.foreground_loss_weighting is False
+
+
+# --- val-based early stopping (item 5) -----------------------------------------------
+
+
+def test_val_early_stopping_config_parsed_from_training() -> None:
+    cfg = Stage1VAEConfig.from_mapping(
+        {"training": {"val_early_stopping": True, "val_early_stopping_patience": 7}}
+    )
+    assert cfg.val_early_stopping is True
+    assert cfg.val_early_stopping_patience == 7
+    # Default preserved when unset.
+    assert Stage1VAEConfig().val_early_stopping is False
+
+
+def test_val_early_stopping_does_not_stop_when_patience_exceeds_validations(tmp_path) -> None:
+    # Wiring guard: with patience larger than the number of validations the run can never trip,
+    # so it completes the full schedule (no spurious early stop).
+    encoder = KLVAEEncoder(base_channels=4, latent_channels=3, spatial_dims=3, num_res_blocks=1)
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=3, num_res_blocks=1)
+    config = Stage1VAEConfig(
+        steps=6,
+        batch_size=2,
+        steps_per_epoch=2,  # => 3 epochs / 3 validations
+        loss_weights={"l1": 1.0, "nrmse": 1.0, "ssim": 0.0, "lpips": 0.0, "kl": 1e-4},
+        checkpoint_dir=tmp_path,
+        checkpoint_max_bytes=200_000_000,
+        recon_dump_every_epochs=0,
+        val_every_epochs=1,
+        val_early_stopping=True,
+        val_early_stopping_patience=100,
+    )
+
+    result = run_stage1_vae_train(
+        config, encoder=encoder, decoder=decoder, loader=_loader(), val_loader=_loader()
+    )
+    assert result.steps == 6
+    assert result.stopped_early is False

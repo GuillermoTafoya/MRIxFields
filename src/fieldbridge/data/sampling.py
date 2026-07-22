@@ -2,9 +2,37 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 
 from fieldbridge.data.contracts import VolumeRecord
+
+
+def field_balanced_weights(records: Sequence[VolumeRecord], *, default_weight: float = 1.0) -> list[float]:
+    """Inverse-frequency per-record weights that equalize field strengths in expectation.
+
+    Each record gets weight proportional to `1 / count(its field)` within `records`, scaled so
+    the weights average to `default_weight`. Sampling with these weights makes every field
+    strength appear ~equally often per pass regardless of how many volumes each field has — the
+    under-represented fields (here 5T at 220 and 0.1T at 240 vs 1.5T at 441) get up-sampled with
+    NO hand-tuned multipliers (the ratios come from the data). Feeds
+    `StreamingPatchDataset(sampling_weights=...)`; the multiplier map variant is
+    `domain_oversampling_weights`.
+
+    Because each field's total weight mass is equalized here, striding the weight vector by
+    worker (records[worker.id::num_workers]) keeps the per-worker field balance too: a field's
+    mass in a shard is ~1/num_workers of its global mass, equal across fields.
+    """
+
+    counts: Counter = Counter(record.domain.field_strength_t for record in records)
+    num_fields = len(counts)
+    if num_fields == 0:
+        return []
+    total = len(records)
+    return [
+        default_weight * (total / num_fields) / counts[record.domain.field_strength_t]
+        for record in records
+    ]
 
 
 def domain_oversampling_weights(

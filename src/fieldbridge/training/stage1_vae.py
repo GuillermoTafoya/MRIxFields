@@ -34,7 +34,7 @@ from fieldbridge.training.latent_stats import LatentStatsAccumulator, summarize_
 from fieldbridge.training.losses import (
     build_lpips_net,
     foreground_weighted_l1_loss,
-    kl_divergence,
+    kl_divergence_free_bits,
     lpips_loss,
     lpips_loss_3d,
     masked_l1_loss,
@@ -115,6 +115,14 @@ class Stage1VAEConfig:
     early_stopping_patience: int = 5  # checkpoints without improvement before stopping
     early_stopping_min_delta: float = 0.005  # relative improvement (0.5%) that counts
     early_stopping_ema_decay: float = 0.98  # EMA smoothing of the noisy per-step loss
+    # Validation-based early stopping (item 5). Stops once the best-by-val total has not improved
+    # for `val_early_stopping_patience` consecutive validations. Unlike the train-EMA stop above
+    # (which watches training loss and so cannot see val overfitting — run B's train fell while
+    # val diverged 27 epochs), this targets exactly that waste. Off by default; model selection
+    # stays the best-by-val checkpoint — this only caps GPU spent after val plateaus. Counts in
+    # units of validations (every `val_every_epochs`), and resets on any best-val improvement.
+    val_early_stopping: bool = False
+    val_early_stopping_patience: int = 7
     # Learning-rate schedule. "constant" (default) keeps the current fixed-lr behavior
     # exactly. "cosine" ramps lr linearly from 0 over `lr_warmup_steps`, then cosine-decays
     # to `lr * lr_min_factor` by `lr_cosine_total_steps` (0 => start_step + steps, i.e. the
@@ -132,6 +140,12 @@ class Stage1VAEConfig:
     foreground_loss_weighting: bool = False
     foreground_weight: float = 5.0
     foreground_threshold: float = 0.0
+    # Per-channel free-bits floor on the KL term (item 4), in the per-element units the latent
+    # collapse diagnostics report (per_dim_kl). 0.0 => the KL term is exactly kl_divergence
+    # (default-preserving). >0 reserves that many nats/element per channel from KL pressure so
+    # low-information latent channels stop collapsing to the prior. See
+    # losses.kl_divergence_free_bits for the scale reconciliation.
+    kl_free_bits: float = 0.0
     warm_start_checkpoint: Path | None = None
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -216,6 +230,9 @@ class Stage1VAEConfig:
                     "foreground_threshold", data.get("foreground_threshold", defaults.foreground_threshold)
                 )
             ),
+            kl_free_bits=float(
+                training.get("kl_free_bits", data.get("kl_free_bits", defaults.kl_free_bits))
+            ),
             steps_per_epoch=int(
                 training.get("steps_per_epoch", data.get("steps_per_epoch", defaults.steps_per_epoch))
             ),
@@ -237,6 +254,15 @@ class Stage1VAEConfig:
                 training.get(
                     "early_stopping_ema_decay",
                     data.get("early_stopping_ema_decay", defaults.early_stopping_ema_decay),
+                )
+            ),
+            val_early_stopping=bool(
+                training.get("val_early_stopping", data.get("val_early_stopping", defaults.val_early_stopping))
+            ),
+            val_early_stopping_patience=int(
+                training.get(
+                    "val_early_stopping_patience",
+                    data.get("val_early_stopping_patience", defaults.val_early_stopping_patience),
                 )
             ),
             warm_start_checkpoint=Path(warm_start_checkpoint) if warm_start_checkpoint else None,
@@ -281,11 +307,14 @@ class Stage1VAEConfig:
             "foreground_loss_weighting": self.foreground_loss_weighting,
             "foreground_weight": self.foreground_weight,
             "foreground_threshold": self.foreground_threshold,
+            "kl_free_bits": self.kl_free_bits,
             "steps_per_epoch": self.steps_per_epoch,
             "early_stopping": self.early_stopping,
             "early_stopping_patience": self.early_stopping_patience,
             "early_stopping_min_delta": self.early_stopping_min_delta,
             "early_stopping_ema_decay": self.early_stopping_ema_decay,
+            "val_early_stopping": self.val_early_stopping,
+            "val_early_stopping_patience": self.val_early_stopping_patience,
             "checkpoint_at_end": self.checkpoint_at_end,
             "log_every_steps": self.log_every_steps,
         }
@@ -446,6 +475,9 @@ def run_stage1_vae_train(
     epoch_batches = 0
     last_checkpoint_step: int | None = None
     stopped_early = False
+    # Val-early-stop bookkeeping (item 5): consecutive validations without a best-val improvement.
+    # Local (not persisted), so a resume restarts the count — acceptable; C is a fresh run.
+    val_epochs_no_improve = 0
     train_start = time.perf_counter()
     for step in range(start_step, start_step + cfg.steps):
         step_start = time.perf_counter()
@@ -548,6 +580,8 @@ def run_stage1_vae_train(
                     )
                 if is_best and cfg.checkpoint_dir is not None:
                     _save_best_checkpoint(cfg, encoder, decoder, optimizer, current_step)
+                # Val-early-stop: reset on any best-val improvement, else count this validation.
+                val_epochs_no_improve = 0 if is_best else val_epochs_no_improve + 1
                 latent_str = f" | latent: {summarize_latent_stats(latent_stats)}" if latent_stats else ""
                 _log_training_progress(
                     f"stage1_vae epoch={epoch_index} val_total={val_total:.6f} "
@@ -563,6 +597,18 @@ def run_stage1_vae_train(
 
             encoder.train()
             decoder.train()
+
+            if (
+                cfg.val_early_stopping
+                and run_val
+                and val_epochs_no_improve >= cfg.val_early_stopping_patience
+            ):
+                _log_training_progress(
+                    f"stage1_vae val-early-stop at epoch={epoch_index}: val_total did not improve for "
+                    f"{cfg.val_early_stopping_patience} validations (best={best_val_total:.6f})."
+                )
+                stopped_early = True
+                break
 
         if should_stop:
             _log_training_progress(
@@ -652,7 +698,7 @@ def _compute_vae_loss_components(
             )
         else:
             components["lpips"] = lpips_loss(reconstructed, batch.image, net=lpips_net)
-    components["kl"] = kl_divergence(mean, logvar)
+    components["kl"] = kl_divergence_free_bits(mean, logvar, cfg.kl_free_bits)
 
     total = reconstructed.sum() * 0.0
     for name, value in components.items():
@@ -729,7 +775,7 @@ def _reconstruction_components(
             if reconstructed.ndim == 5
             else lpips_loss(reconstructed, target, net=lpips_net)
         )
-    components["kl"] = kl_divergence(mean, logvar)
+    components["kl"] = kl_divergence_free_bits(mean, logvar, cfg.kl_free_bits)
     total = reconstructed.sum() * 0.0
     for name, value in components.items():
         total = total + weights.get(name, 0.0) * value

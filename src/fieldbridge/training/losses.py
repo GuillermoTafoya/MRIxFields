@@ -175,6 +175,43 @@ def kl_divergence(mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return per_sample.mean()
 
 
+def kl_divergence_free_bits(mean: torch.Tensor, logvar: torch.Tensor, free_bits: float = 0.0) -> torch.Tensor:
+    """KL to N(0, I) with a per-channel free-bits floor, on the same scale as `kl_divergence`.
+
+    Motivation (item 4): the Etapa-1 latent collapses to 1 active channel of 4 — the KL term,
+    tiny as its weight is, still pushes low-information channels to the prior and euthanizes
+    them. Free-bits reserves a per-channel KL budget the optimizer is not penalized for: below
+    `free_bits` the channel's contribution is clamped, so its gradient through the KL term
+    vanishes and the term stops pulling it toward the prior. It PERMITS (does not force) the
+    reconstruction loss to keep all 4 channels alive.
+
+    Scale reconciliation — the subtle part. `free_bits` is expressed on the *per-element mean*
+    scale, i.e. directly comparable to `LatentStatsAccumulator.per_dim_kl` (the number the
+    collapse diagnostics report: ~0.24 on the live channel, <0.008 on the dead ones). But the
+    training KL term lives on the *summed* scale (`kl_divergence` ~1e3). So we clamp on the
+    per-element-mean per channel, then multiply back by the per-channel spatial element count
+    to land on `kl_divergence`'s scale. Two consequences, both intended:
+
+    * `free_bits == 0.0` reduces to `kl_divergence` exactly (kl_elem is >= 0 elementwise, so
+      the clamp is a no-op), up to float summation order — the equivalence test uses allclose.
+    * `free_bits` is read in the same units as the per-dim-KL you see in the logs, so 0.5 means
+      "reserve ~0.5 nats/element per channel" — roughly the KL of a unit-variance informative
+      posterior, i.e. the standardized-latent target Etapa-2 assumes.
+
+    Reduction matches `LatentStatsAccumulator` (reduce over every dim but channel=1).
+    """
+
+    if mean.ndim < 2:
+        raise ValueError(f"kl_divergence_free_bits expects (batch, channels, ...); got {tuple(mean.shape)}.")
+    kl_elem = -0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp())  # >= 0 elementwise
+    reduce_dims = tuple(d for d in range(mean.ndim) if d != 1)
+    per_channel_mean = kl_elem.mean(dim=reduce_dims)  # [C]; == LatentStatsAccumulator per_dim_kl
+    # Spatial elements per channel per sample (S): rescales the per-element-mean back onto the
+    # summed kl_divergence scale so free_bits=0 is byte-for-byte the same term (float order aside).
+    spatial_numel = mean.numel() / (mean.shape[0] * mean.shape[1])
+    return spatial_numel * per_channel_mean.clamp_min(float(free_bits)).sum()
+
+
 def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
     """1 - ssim(...) — ssim is "higher is better", losses in this module are "minimize".
 

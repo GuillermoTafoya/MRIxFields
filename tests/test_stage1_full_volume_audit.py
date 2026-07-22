@@ -220,6 +220,72 @@ def test_quantile_q99_tail_histogram_and_raw_range_contracts() -> None:
     assert ranged["raw_fraction_above_one"] > 0
 
 
+@pytest.mark.parametrize("size", [3, 4])
+def test_linear_quantiles_use_torch_at_or_below_threshold(
+    size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(audit_module, "TORCH_QUANTILE_MAX_ELEMENTS", 4)
+    monkeypatch.setattr(
+        audit_module.np,
+        "quantile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("NumPy fallback used")),
+    )
+    values = torch.linspace(0.1, 0.9, size, dtype=torch.float32)
+    quantiles = (0.05, 0.5, 0.95)
+
+    actual = audit_module._linear_quantiles(values, quantiles)
+
+    expected = torch.quantile(values, torch.tensor(quantiles, dtype=torch.float32))
+    assert torch.equal(actual, expected)
+
+
+def test_linear_quantiles_use_numpy_above_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit_module, "TORCH_QUANTILE_MAX_ELEMENTS", 4)
+    original_torch_quantile = torch.quantile
+    monkeypatch.setattr(
+        audit_module.torch,
+        "quantile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("torch path used")),
+    )
+    values = torch.tensor([0.7, 0.1, 0.9, 0.3, 0.5], dtype=torch.float64)
+    quantiles = (0.05, 0.5, 0.95)
+
+    actual = audit_module._linear_quantiles(values, quantiles)
+
+    reference_values = values.float()
+    expected = original_torch_quantile(
+        reference_values, torch.tensor(quantiles, dtype=torch.float32)
+    )
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+
+
+def test_numpy_linear_quantiles_agree_with_torch_on_reference_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit_module, "TORCH_QUANTILE_MAX_ELEMENTS", 1)
+    values = torch.tensor([0.1, 0.7, 0.3, 0.9, 0.2, 0.4, 0.8], dtype=torch.float32)
+    quantiles = (0.01, 0.05, 0.50, 0.95, 0.99)
+
+    actual = audit_module._linear_quantiles(values, quantiles)
+    expected = torch.quantile(values, torch.tensor(quantiles, dtype=torch.float32))
+
+    assert torch.equal(actual, expected)
+
+
+def test_numpy_linear_quantiles_are_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(audit_module, "TORCH_QUANTILE_MAX_ELEMENTS", 1)
+    values = torch.linspace(0.0, 1.0, 257, dtype=torch.float32).flip(0)
+    quantiles = (0.01, 0.05, 0.50, 0.95, 0.99)
+
+    first = audit_module._linear_quantiles(values, quantiles)
+    second = audit_module._linear_quantiles(values, quantiles)
+
+    assert torch.equal(first, second)
+
+
 def test_empty_foreground_fails_closed() -> None:
     target = torch.zeros(1, 1, 4, 4, 4)
     with pytest.raises(ValueError, match="foreground mask is empty"):
@@ -301,6 +367,78 @@ def test_recovery_is_deterministic_and_rejects_incompatible_results(
     state_path.write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(ValueError, match="incompatible fingerprint"):
         audit_stage1_checkpoint(**kwargs, resume=True)
+
+
+def test_interrupted_recovery_reuses_18_volumes_and_resumes_at_domain_05_case_03(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selection = _freeze(tmp_path)
+    runtime = AuditRuntime(patch_size=(5, 6, 7), overlap=0.5)
+    root = prepare_audit_root(
+        tmp_path / "audit",
+        selection=selection,
+        audit_commit="audit-commit",
+        config_sha256="c" * 64,
+        runtime=runtime,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        audit_module,
+        "render_audit_panel",
+        lambda *args, path, **kwargs: path.write_bytes(b"panel"),
+    )
+    checkpoint_dir = tmp_path / "audit" / "checkpoints" / "checkpoint-01"
+    loaded_case_slots: list[str] = []
+    record_to_slot = {
+        str(item["record_id"]): str(item["case_slot"]) for item in selection["selected"]
+    }
+
+    def interrupted_loader(record: VolumeRecord) -> torch.Tensor:
+        case_slot = record_to_slot[str(record.case_id)]
+        loaded_case_slots.append(case_slot)
+        if case_slot == "domain-05-case-03":
+            raise RuntimeError("synthetic interruption")
+        return _supported_target()[0]
+
+    kwargs = dict(
+        encoder=_IdentityEncoder(),
+        decoder=_IdentityDecoder(),
+        volume_loader=interrupted_loader,
+        selection=selection,
+        out_dir=checkpoint_dir,
+        checkpoint_slot="checkpoint-01",
+        checkpoint_label="identity",
+        checkpoint_sha256="a" * 64,
+        checkpoint_metadata={"training_commit": "training"},
+        root_contract=root,
+        runtime=runtime,
+        device=torch.device("cpu"),
+        progress_path=tmp_path / "audit" / "run_progress_sanitized.json",
+    )
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        audit_stage1_checkpoint(**kwargs)
+
+    completed = sorted((checkpoint_dir / ".audit_state").glob("*.json"))
+    assert len(completed) == 18
+    assert loaded_case_slots[-1] == "domain-05-case-03"
+
+    resumed_case_slots: list[str] = []
+
+    def resumed_loader(record: VolumeRecord) -> torch.Tensor:
+        resumed_case_slots.append(record_to_slot[str(record.case_id)])
+        return _supported_target()[0]
+
+    kwargs["volume_loader"] = resumed_loader
+    result = audit_stage1_checkpoint(**kwargs, resume=True)
+
+    assert resumed_case_slots[0] == "domain-05-case-03"
+    assert len(resumed_case_slots) == 42
+    assert result["volume_count"] == 60
+    for path in (tmp_path / "audit").rglob("*.json*"):
+        text = path.read_text(encoding="utf-8")
+        assert "C:/private" not in text
+        assert "private-record" not in text
+        assert "private-subject" not in text
 
 
 def test_non_resume_refuses_existing_audit_and_outputs_are_sanitized(

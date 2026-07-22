@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 from fieldbridge.data.contracts import VolumeRecord
@@ -36,6 +37,7 @@ SELECTION_SCHEMA_VERSION = 1
 AUDIT_CONTRACT_VERSION = "stage1-full-volume-audit-v1"
 METRIC_CONTRACT_VERSION = "stage1-full-volume-metrics-v1"
 HISTOGRAM_BINS = 256
+TORCH_QUANTILE_MAX_ELEMENTS = 2**24
 DEFAULT_SELECTION_SEED = 13
 VOLUMES_PER_DOMAIN = 4
 EXPECTED_DOMAIN_COUNT = 15
@@ -387,8 +389,8 @@ def compute_full_volume_metrics(
         background_status = "not_available_no_background"
 
     quantiles = (0.01, 0.05, 0.50, 0.95, 0.99)
-    target_q = torch.quantile(foreground_target.float(), torch.tensor(quantiles, device=target.device))
-    recon_q = torch.quantile(foreground_recon.float(), torch.tensor(quantiles, device=target.device))
+    target_q = _linear_quantiles(foreground_target, quantiles)
+    recon_q = _linear_quantiles(foreground_recon, quantiles)
     q_metrics: dict[str, float] = {}
     for name, target_value, recon_value in zip(("q01", "q05", "q50", "q95", "q99"), target_q, recon_q):
         signed = float(recon_value - target_value)
@@ -441,6 +443,23 @@ def compute_full_volume_metrics(
         )
     _validate_metric_finiteness(metrics)
     return metrics
+
+
+def _linear_quantiles(values: torch.Tensor, quantiles: Sequence[float]) -> torch.Tensor:
+    """Match float32 ``torch.quantile`` without its 2^24-element hard limit."""
+
+    flattened = values.detach().float().reshape(-1)
+    q = torch.tensor(tuple(quantiles), dtype=torch.float32, device=flattened.device)
+    if flattened.numel() <= TORCH_QUANTILE_MAX_ELEMENTS:
+        return torch.quantile(flattened, q)
+
+    # NumPy's linear method uses q * (n - 1), matching torch.quantile's default
+    # interpolation. Cast the result back to float32 before returning it on the input
+    # device so downstream tail selection retains the frozen float32 contract.
+    cpu_values = flattened.cpu().numpy()
+    numpy_q = np.asarray(tuple(quantiles), dtype=np.float32)
+    result = np.asarray(np.quantile(cpu_values, numpy_q, method="linear"), dtype=np.float32)
+    return torch.from_numpy(result).to(device=flattened.device)
 
 
 def _validate_metric_finiteness(metrics: Mapping[str, Any]) -> None:

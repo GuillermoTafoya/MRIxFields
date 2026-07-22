@@ -1,0 +1,101 @@
+# Etapa-1 KL-VAE · run v2 — sibling of stage1_vae_75ep_cosine.yaml for direct comparison.
+#
+# Combined bundle (NOT an ablation — results are attributable to the bundle) that attacks the
+# three defects the 75ep cosine run (run B, best ep9) exposed:
+#   * Overfitting from ep9  -> val-based early stopping (patience 7). Model selection is still
+#     the best-by-val checkpoint; this only caps GPU after val plateaus, and unlike the
+#     train-EMA stop it actually sees the val overfitting (run B's train fell while val diverged).
+#   * Dynamic-range collapse on T1w 5T/7T -> foreground-weighted L1 (weight 4.0) rebalances the
+#     gradient toward the (rare, bright) brain voxels, plus field-balanced sampling that
+#     up-samples the under-represented fields (5T=220, 0.1T=240 vs 1.5T=441 volumes).
+#   * Latent posterior collapse (1/4 active) -> per-channel free-bits (0.5 nats/element) removes
+#     the KL pressure that euthanizes low-information channels. latent_channels stays at 4.
+#
+# Model / data / LR schedule are IDENTICAL to stage1_vae_75ep_cosine.yaml. Only the three fixes
+# + val-early-stop + the isolated checkpoint_dir differ.
+#
+# Launch (75-epoch horizon; val-early-stop will usually cut it well before then):
+#   python -m fieldbridge.cli train-stage1-vae \
+#     --config configs/experiment/stage1_vae_v2_fgw_freebits.yaml \
+#     --split-json <SPLIT.json> --epochs 75
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+  patch_size: [64, 64, 64]
+  patches_per_volume: 16
+  foreground_threshold: 0.0
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
+  # Item 3: field-strength-balanced streaming order (TRAIN loader only; val stays on the natural
+  # distribution). inverse_frequency derives the per-field multipliers from the split's own
+  # counts — no magic numbers — so every field is sampled ~equally per pass. Sampling is WITH
+  # REPLACEMENT (relaxes "each volume once per pass"); reads-per-pass and steps_per_epoch are
+  # unchanged. Seeded => reproducible.
+  field_balance:
+    enabled: true
+    mode: inverse_frequency
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  loss_weights:
+    l1: 1.0
+    ssim: 1.0
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+  ssim_window_size: 7
+  data_range: 1.0
+  lpips_num_slices: 8
+  grad_clip_norm: 1.0
+  # Train-EMA early stopping OFF: it watches training loss and cannot detect val overfitting.
+  early_stopping: false
+  # Item 5: val-based early stopping — stop when best-by-val has not improved for 7 validations.
+  # This is the guard against run B's 27-epoch overfitting tail.
+  val_early_stopping: true
+  val_early_stopping_patience: 7
+  val_every_epochs: 1
+  latent_active_kl_threshold: 0.01
+  recon_dump_every_epochs: 5
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_factor: 0.05
+  lr_cosine_total_steps: 0
+  # Item 2: foreground-weighted reconstruction L1 ON. Brain voxels (target > threshold) count
+  # 4x a background voxel, so background-dominated patches stop deflating the loss and the rare
+  # bright high-field peaks get penalized when clipped.
+  foreground_loss_weighting: true
+  foreground_weight: 4.0
+  foreground_threshold: 0.0
+  # Item 4: per-channel free-bits floor on KL (per-element units, comparable to per_dim_kl in
+  # the collapse diagnostics). 0.5 ~ the KL of a unit-variance informative posterior — the
+  # standardized-latent target Etapa-2 assumes. 0.0 would reproduce the old kl_divergence.
+  kl_free_bits: 0.5
+  warm_start_checkpoint: null
+  # ISOLATED from run B's outputs/stage1_vae_75ep_cosine/checkpoints — never collide with its
+  # same-date step-stamped checkpoints (save_checkpoint refuses silent overwrite) and keep both
+  # runs' artifacts for comparison. run_stage1_vae.bat reads CKPT from env to point its eval here.
+  checkpoint_dir: outputs/stage1_vae_v2_fgw_freebits/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 50
+  resume_from: null

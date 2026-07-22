@@ -135,12 +135,28 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
         seed: int = 0,
         crop_config: StratifiedCropConfig | None = None,
         foreground_threshold: float = 0.0,
+        sampling_weights: Sequence[float] | None = None,
     ) -> None:
         if patches_per_volume < 1:
             raise ValueError("patches_per_volume must be >= 1.")
         self.records = tuple(records)
         if not self.records:
             raise ValueError("StreamingPatchDataset requires at least one record.")
+        # Optional per-record sampling weights (aligned to `records`). None => uniform
+        # `randperm` volume order, each volume read exactly once per pass (the default). When
+        # given, the volume order is a weighted draw WITH REPLACEMENT (see __iter__) — used for
+        # field-strength balancing (see data.sampling.field_balanced_weights).
+        if sampling_weights is not None:
+            if len(sampling_weights) != len(self.records):
+                raise ValueError(
+                    f"sampling_weights has {len(sampling_weights)} entries but there are "
+                    f"{len(self.records)} records."
+                )
+            self.sampling_weights = torch.as_tensor(sampling_weights, dtype=torch.float64)
+            if self.sampling_weights.numel() and float(self.sampling_weights.min()) < 0:
+                raise ValueError("sampling_weights must be non-negative.")
+        else:
+            self.sampling_weights = None
         self.image_loader = image_loader
         # None => no cropping (yield the whole volume); real configs always set a patch.
         self.patch_size = tuple(int(p) for p in patch_size) if patch_size is not None else None
@@ -157,14 +173,31 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
 
     def __iter__(self) -> "Iterator[RawBatch]":
         records = self.records
+        weights = self.sampling_weights
         worker = get_worker_info()
         if worker is not None:
             records = records[worker.id :: worker.num_workers]
+            # Shard the weights with the SAME stride so weight[i] stays aligned to its record.
+            # field_balanced_weights equalizes each field's mass, so a strided shard keeps the
+            # per-worker field balance (a field's mass in the shard is ~1/num_workers of global).
+            if weights is not None:
+                weights = weights[worker.id :: worker.num_workers]
         # Reshuffle each pass so re-iterating (the training loop restarts the iterator on
         # StopIteration) does not replay the same volume order.
         generator = torch.Generator().manual_seed(self.seed + self._pass)
         self._pass += 1
-        order = torch.randperm(len(records), generator=generator).tolist()
+        if weights is not None:
+            # Field-balanced order: a weighted draw WITH REPLACEMENT of `len(records)` volumes.
+            # Same number of reads (and steps) per pass as the uniform path, so steps_per_epoch
+            # is unchanged — only the field composition shifts. TRADEOFF: with replacement, a
+            # volume may be drawn 0..k times per pass, so the "every volume read exactly once per
+            # pass" guarantee is relaxed in exchange for up-sampling under-represented fields.
+            # Seeded generator keeps it reproducible.
+            order = torch.multinomial(
+                weights, num_samples=len(records), replacement=True, generator=generator
+            ).tolist()
+        else:
+            order = torch.randperm(len(records), generator=generator).tolist()
         for record_index in order:
             record = records[record_index]
             volume = self.image_loader(record.image_path, record)

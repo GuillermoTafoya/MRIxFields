@@ -39,6 +39,7 @@ from fieldbridge.data.patch_bank import (
 )
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.preprocessing import SlicePreprocessingSpec, from_model_range, selected_slice_indices
+from fieldbridge.data.sampling import domain_oversampling_weights, field_balanced_weights
 from fieldbridge.data.sources import nifti_image_loader
 from fieldbridge.data.transforms import StratifiedCropConfig, assert_official_unit_range
 from fieldbridge.data.volume_splits import (
@@ -763,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
                     config=config,
                     num_workers=_num_workers(config),
                     seed_offset=10_000,
+                    apply_field_balance=False,
                 )
         else:
             loader = _build_streaming_patch_loader(
@@ -1148,11 +1150,15 @@ def _build_streaming_patch_loader_from_records(
     config: Mapping[str, Any],
     num_workers: int = 0,
     seed_offset: int = 0,
+    apply_field_balance: bool = True,
 ) -> "DataLoader[RawBatch]":
     """Same streaming loader, from an explicit record list (a split) instead of a manifest.
 
     `seed_offset` shifts the dataset's shuffle/crop seed so a validation loader draws
-    different patches than the train loader from the same base seed.
+    different patches than the train loader from the same base seed. `apply_field_balance`
+    is False for the validation loader so val metrics stay on the natural field distribution
+    (honest + comparable across runs); field balancing (data.field_balance) is a TRAIN-only
+    resampling.
     """
 
     base_seed = int(config.get("seed", 0)) if isinstance(config.get("seed", 0), int) else 0
@@ -1165,6 +1171,7 @@ def _build_streaming_patch_loader_from_records(
         seed=base_seed + seed_offset,
         crop_config=_crop_config(config),
         foreground_threshold=_foreground_threshold(config),
+        sampling_weights=_field_sampling_weights(config, records) if apply_field_balance else None,
     )
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
@@ -1489,6 +1496,40 @@ def _foreground_threshold(config: Mapping[str, Any]) -> float:
         return 0.0
     value = data_config.get("foreground_threshold")
     return float(value) if value is not None else 0.0
+
+
+def _field_sampling_weights(
+    config: Mapping[str, Any], records: "Sequence[VolumeRecord]"
+) -> list[float] | None:
+    """`data.field_balance` -> per-record streaming sampling weights, or None for uniform order.
+
+    Config shape (default absent => uniform `randperm`, unchanged):
+
+        data:
+          field_balance:
+            enabled: true
+            mode: inverse_frequency          # equalize the 5 fields per pass (default)
+            # boost_by_field: {5.0: 2.0}     # used only when mode: boost (explicit multipliers)
+
+    `inverse_frequency` derives the ratios from the split's own field counts (no magic numbers);
+    `boost` takes an explicit multiplier map via `domain_oversampling_weights`.
+    """
+
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        return None
+    spec = data_config.get("field_balance")
+    if not isinstance(spec, Mapping) or not spec.get("enabled", False):
+        return None
+    mode = str(spec.get("mode", "inverse_frequency"))
+    if mode == "inverse_frequency":
+        return field_balanced_weights(records)
+    if mode == "boost":
+        boost = {float(k): float(v) for k, v in dict(spec.get("boost_by_field", {})).items()}
+        return domain_oversampling_weights(records, boost_by_field=boost)
+    raise ValueError(
+        f"data.field_balance.mode must be 'inverse_frequency' or 'boost', got {mode!r}."
+    )
 
 
 def _steps_per_epoch(config: Mapping[str, Any], manifest_path: Path) -> int:

@@ -13,6 +13,7 @@ from fieldbridge.training.losses import (
     gradient_loss,
     identity_loss,
     kl_divergence,
+    kl_divergence_free_bits,
     lpips_loss,
     lpips_loss_3d,
     masked_l1_loss,
@@ -280,3 +281,64 @@ def test_build_lpips_net_freezes_params_but_keeps_input_gradient_path() -> None:
     assert loss.requires_grad
     _assert_finite_and_backprop(loss, prediction)
     assert prediction.grad.abs().sum() > 0
+
+
+# --- free-bits KL (item 4) -----------------------------------------------------------
+
+
+def test_free_bits_zero_equals_kl_divergence_5d() -> None:
+    # free_bits=0 must reproduce the plain kl_divergence term exactly (float order aside),
+    # since the per-element KL is >= 0 so the per-channel clamp is a no-op.
+    torch.manual_seed(0)
+    mean = torch.randn(3, 4, 5, 6, 7, requires_grad=True)
+    logvar = torch.randn(3, 4, 5, 6, 7, requires_grad=True)
+
+    fb = kl_divergence_free_bits(mean, logvar, 0.0)
+    plain = kl_divergence(mean, logvar)
+
+    assert torch.allclose(fb, plain, atol=1e-5, rtol=1e-5)
+    _assert_finite_and_backprop(fb, mean, logvar)
+
+
+def test_free_bits_zero_equals_kl_divergence_4d() -> None:
+    torch.manual_seed(1)
+    mean = torch.randn(2, 4, 9, 9, requires_grad=True)
+    logvar = torch.randn(2, 4, 9, 9, requires_grad=True)
+
+    assert torch.allclose(kl_divergence_free_bits(mean, logvar, 0.0), kl_divergence(mean, logvar), atol=1e-5, rtol=1e-5)
+
+
+def test_free_bits_floor_raises_the_term_and_stays_finite() -> None:
+    # A large free_bits floors every channel's per-element-mean KL at free_bits, so the term
+    # equals free_bits * (spatial elements/channel) * num_channels and exceeds the unclamped KL.
+    torch.manual_seed(2)
+    mean = 0.05 * torch.randn(2, 4, 8, 8, 8, requires_grad=True)  # near-prior => tiny raw KL
+    logvar = torch.zeros(2, 4, 8, 8, 8, requires_grad=True)
+
+    free_bits = 0.5
+    fb = kl_divergence_free_bits(mean, logvar, free_bits)
+    spatial = 8 * 8 * 8
+    channels = 4
+    assert torch.isfinite(fb)
+    # every channel below the floor => term == free_bits * spatial * channels
+    assert torch.isclose(fb, torch.tensor(free_bits * spatial * channels), rtol=1e-4)
+    assert fb > kl_divergence(mean, logvar)
+
+
+def test_free_bits_matches_latent_stats_per_dim_kl_scale() -> None:
+    # The clamped quantity is per-channel per-element-mean KL == LatentStatsAccumulator.per_dim_kl,
+    # so free_bits is read in the same units as the collapse diagnostics. Check the per-channel
+    # mean the function clamps equals the accumulator's per_dim_kl.
+    from fieldbridge.training.latent_stats import LatentStatsAccumulator
+
+    torch.manual_seed(3)
+    mean = torch.randn(4, 4, 6, 6, 6)
+    logvar = torch.randn(4, 4, 6, 6, 6)
+    acc = LatentStatsAccumulator(latent_channels=4)
+    acc.update(mean, logvar)
+    per_dim_kl = acc.compute()["per_dim_kl"]
+
+    kl_elem = -0.5 * (1.0 + logvar - mean.pow(2) - logvar.exp())
+    per_channel_mean = kl_elem.mean(dim=(0, 2, 3, 4))
+    for a, b in zip(per_channel_mean.tolist(), per_dim_kl):
+        assert abs(a - b) < 1e-6

@@ -724,6 +724,13 @@ def main(argv: list[str] | None = None) -> int:
         # A split provides its own train/validation record lists; --manifest / --patch-bank
         # keep the original no-validation behavior.
         split = load_vae_splits(args.split_json) if args.split_json is not None else None
+        if split is not None:
+            _override(
+                config,
+                "training",
+                "split_fingerprint",
+                vae_splits_fingerprint(split),
+            )
         # Compute steps_per_epoch so the loop can log epoch/step-in-epoch (loaders are
         # length-less to the config). --epochs, if given, sets steps from it.
         if args.patch_bank is not None:
@@ -735,8 +742,28 @@ def main(argv: list[str] | None = None) -> int:
         else:
             steps_per_epoch = _steps_per_epoch(config, args.manifest)
         _override(config, "training", "steps_per_epoch", steps_per_epoch)
+        training_config = config.get("training", {})
+        if isinstance(training_config, Mapping) and "kl_warmup_epochs" in training_config:
+            _override(
+                config,
+                "training",
+                "kl_warmup_steps",
+                int(training_config["kl_warmup_epochs"]) * steps_per_epoch,
+            )
         if args.epochs is not None:
             _override(config, "training", "steps", args.epochs * steps_per_epoch)
+        training_config = config.get("training", {})
+        if (
+            isinstance(training_config, Mapping)
+            and str(training_config.get("lr_schedule", "constant")) == "cosine"
+            and int(training_config.get("lr_cosine_total_steps", 0)) == 0
+        ):
+            _override(
+                config,
+                "training",
+                "lr_cosine_total_steps",
+                int(training_config.get("steps", 0)),
+            )
         if args.seed is not None:
             config["seed"] = args.seed
         model_config = _model_config(config)
@@ -1172,6 +1199,9 @@ def _build_streaming_patch_loader_from_records(
         crop_config=_crop_config(config),
         foreground_threshold=_foreground_threshold(config),
         sampling_weights=_field_sampling_weights(config, records) if apply_field_balance else None,
+        joint_domain_balance=(
+            _joint_domain_balance_enabled(config) if apply_field_balance else False
+        ),
     )
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
@@ -1532,6 +1562,28 @@ def _field_sampling_weights(
     )
 
 
+def _joint_domain_balance_enabled(config: Mapping[str, Any]) -> bool:
+    """Whether the additive 15-way domain/subject-balanced schedule is enabled."""
+
+    data_config = config.get("data", {})
+    if not isinstance(data_config, Mapping):
+        return False
+    spec = data_config.get("joint_domain_balance")
+    if spec is None:
+        return False
+    if isinstance(spec, bool):
+        return spec
+    if not isinstance(spec, Mapping):
+        raise ValueError("data.joint_domain_balance must be a boolean or mapping.")
+    mode = str(spec.get("mode", "field_contrast_subject"))
+    if mode != "field_contrast_subject":
+        raise ValueError(
+            "data.joint_domain_balance.mode must be 'field_contrast_subject', "
+            f"got {mode!r}."
+        )
+    return bool(spec.get("enabled", False))
+
+
 def _steps_per_epoch(config: Mapping[str, Any], manifest_path: Path) -> int:
     """ceil(num_volumes * patches_per_volume / batch_size). Reads only manifest metadata
     (no image arrays), so it's cheap even though the loader re-reads it."""
@@ -1633,7 +1685,14 @@ def _top_level_component_kwargs(
     return top_level
 
 
-_KL_VAE_SHARED_KEYS = {"base_channels", "latent_channels", "spatial_dims", "activation", "use_norm", "num_res_blocks"}
+_KL_VAE_SHARED_KEYS = {
+    "base_channels",
+    "latent_channels",
+    "spatial_dims",
+    "activation",
+    "use_norm",
+    "num_res_blocks",
+}
 
 
 def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str, Any]:
@@ -1645,6 +1704,8 @@ def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str,
     # Decoder-only: the encoder has no output head.
     if component == "decoder" and "output_activation" in model_config:
         kwargs["output_activation"] = model_config["output_activation"]
+    if component == "decoder" and "domain_conditioning_dim" in model_config:
+        kwargs["domain_conditioning_dim"] = model_config["domain_conditioning_dim"]
     return kwargs
 
 

@@ -120,6 +120,25 @@ def test_validation_history_has_weighted_latent_and_best_checkpoint(tmp_path) ->
     assert "active_units" in entry["latent"]
 
     assert (tmp_path / "vae_kl_vae_best.pt").exists()
+    latest = torch.load(
+        tmp_path / "vae_stage1_latest_recoverable.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert latest["checkpoint_version"] == "stage1_v3_recoverable"
+    assert latest["sampler_state"]["recoverable"] is True
+    assert latest["sampler_state"]["batch_offset"] == 0
+    assert {
+        "optimizer",
+        "scheduler",
+        "amp_scaler",
+        "rng_state",
+        "candidate_state",
+        "latent_health",
+        "val_epochs_no_improve",
+        "epoch",
+        "global_step",
+    } <= set(latest)
     assert (tmp_path / "recon_epoch0001.png").exists()  # recon hook fired
 
 

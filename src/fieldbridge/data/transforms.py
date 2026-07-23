@@ -92,7 +92,12 @@ def normalize_percentile_clip_to_unit_range(
     return 2.0 * (clamped - lo) / (hi - lo) - 1.0
 
 
-def random_crop(image: torch.Tensor, *, patch_size: Iterable[int]) -> torch.Tensor:
+def random_crop(
+    image: torch.Tensor,
+    *,
+    patch_size: Iterable[int],
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     """Random crop of `patch_size` over the trailing spatial dims.
 
     Needed for full-resolution 3D volumes (e.g. 364x436x364): decoding back toward full
@@ -109,7 +114,11 @@ def random_crop(image: torch.Tensor, *, patch_size: Iterable[int]) -> torch.Tens
     for size, size_patch in zip(spatial_shape, patch):
         if size_patch > size:
             raise ValueError(f"patch_size {patch} exceeds image spatial shape {spatial_shape}.")
-        starts.append(0 if size_patch == size else int(torch.randint(0, size - size_patch + 1, (1,)).item()))
+        starts.append(
+            0
+            if size_patch == size
+            else int(torch.randint(0, size - size_patch + 1, (1,), generator=generator).item())
+        )
     slices = tuple(slice(start, start + size_patch) for start, size_patch in zip(starts, patch))
     return image[(..., *slices)]
 

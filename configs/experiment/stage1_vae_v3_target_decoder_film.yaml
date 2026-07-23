@@ -1,0 +1,71 @@
+# Experimental arm only: v3 KL-VAE plus one shared low-capacity target-domain FiLM decoder.
+# This is not a replacement for the unconditioned v3 arm and uses an isolated output path.
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+  patch_size: [64, 64, 64]
+  patches_per_volume: 16
+  foreground_threshold: 0.0
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
+  joint_domain_balance:
+    enabled: true
+    mode: field_contrast_subject
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+  output_activation: none
+  domain_conditioning_dim: 16
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  latent_mode: stochastic
+  decoder_domain: target
+  loss_weights:
+    masked_l1: 1.0
+    background: 0.1
+    ssim: 0.25
+    nrmse: 0.0
+    lpips: 0.0
+    kl: 0.0001
+  foreground_mask_threshold: 0.0
+  ssim_window_size: 7
+  data_range: 1.0
+  grad_clip_norm: 1.0
+  kl_free_bits: 0.01
+  kl_warmup_epochs: 10
+  latent_activity_rule: std_and_kl
+  latent_active_std_threshold: 0.05
+  latent_active_kl_threshold: 0.01
+  promotion_min_active_channels: 3
+  require_all_validation_domains: true
+  val_every_epochs: 1
+  val_early_stopping: true
+  val_early_stopping_patience: 10
+  recon_dump_every_epochs: 5
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_factor: 0.05
+  lr_cosine_total_steps: 0
+  checkpoint_dir: outputs/stage1_vae_v3_target_decoder_film/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 50
+  resume_from: null

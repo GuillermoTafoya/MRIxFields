@@ -228,7 +228,15 @@ def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) 
     from fieldbridge.evaluation.metrics import ssim, ssim3d
 
     metric = ssim3d if prediction.ndim == 5 else ssim
-    return 1.0 - metric(prediction, target, **kwargs)
+    similarity = metric(prediction, target, **kwargs)
+    if not bool(torch.isfinite(similarity)):
+        raise ValueError("SSIM similarity must be finite.")
+    if not bool(((similarity >= -1.0) & (similarity <= 1.0)).detach().cpu().item()):
+        raise ValueError(f"SSIM similarity escaped [-1, 1]: {float(similarity)}.")
+    loss = 1.0 - similarity
+    if not bool(torch.isfinite(loss)) or bool((loss < 0).detach().cpu().item()):
+        raise ValueError(f"SSIM loss must be finite and nonnegative, got {float(loss)}.")
+    return loss
 
 
 def nrmse_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:

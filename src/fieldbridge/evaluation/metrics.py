@@ -135,29 +135,14 @@ def ssim(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """2D structural similarity (official MRIxFields Task 3 metric), uniform-window."""
+    """Stable 2D structural similarity in the documented mathematical range [-1, 1]."""
 
     if prediction.ndim != 4:
         raise ValueError("ssim expects (B, C, H, W) tensors — this project is 2D-only.")
 
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
-    pad = window_size // 2
-
-    def local_mean(x: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool2d(x, kernel_size=window_size, stride=1, padding=pad)
-
-    mu_p = local_mean(prediction)
-    mu_t = local_mean(target)
-    mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
-
-    sigma_p_sq = local_mean(prediction**2) - mu_p_sq
-    sigma_t_sq = local_mean(target**2) - mu_t_sq
-    sigma_pt = local_mean(prediction * target) - mu_pt
-
-    numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
-    denominator = (mu_p_sq + mu_t_sq + c1) * (sigma_p_sq + sigma_t_sq + c2)
-    return (numerator / denominator).mean()
+    return _stable_ssim(
+        prediction, target, data_range=data_range, window_size=window_size, spatial_dims=2
+    )
 
 
 def ssim3d(
@@ -167,7 +152,7 @@ def ssim3d(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """Volumetric structural similarity (avg_pool3d), the 3D analogue of `ssim`.
+    """Stable volumetric SSIM in [-1, 1], the 3D analogue of :func:`ssim`.
 
     Not the official 2D Task 3 metric — used as a training-time loss term for
     spatial_dims=3 volumes, where the 2D `ssim` (avg_pool2d, 4D-only) can't apply.
@@ -176,24 +161,73 @@ def ssim3d(
     if prediction.ndim != 5:
         raise ValueError("ssim3d expects (B, C, D, H, W) tensors.")
 
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
+    return _stable_ssim(
+        prediction, target, data_range=data_range, window_size=window_size, spatial_dims=3
+    )
+
+
+def _stable_ssim(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float,
+    window_size: int,
+    spatial_dims: int,
+) -> torch.Tensor:
+    """Uniform-window SSIM with autocast-safe moments and covariance projection.
+
+    The former ``E[x²] - E[x]²`` implementation ran in bf16 autocast. Cancellation
+    could make variances negative, break the covariance bound, and produce SSIM > 1
+    (therefore a negative training loss). Moments now run in float32, variances are
+    projected to nonnegative values, and covariance is projected onto the
+    Cauchy-Schwarz bound before forming the two bounded SSIM factors.
+    """
+
+    _validate_same_shape(prediction, target)
+    if not bool(torch.isfinite(prediction).all()) or not bool(torch.isfinite(target).all()):
+        raise ValueError("SSIM inputs must contain only finite values.")
+    if not data_range > 0:
+        raise ValueError("SSIM data_range must be positive.")
+    if window_size < 1 or window_size % 2 == 0:
+        raise ValueError("SSIM window_size must be a positive odd integer.")
+    pool = F.avg_pool3d if spatial_dims == 3 else F.avg_pool2d
+    pad_fn = F.pad
     pad = window_size // 2
+    padding = tuple(value for _ in range(spatial_dims) for value in (pad, pad))
+    device_type = prediction.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        p = prediction.float()
+        t = target.float()
 
-    def local_mean(x: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool3d(x, kernel_size=window_size, stride=1, padding=pad)
+        def local_mean(x: torch.Tensor) -> torch.Tensor:
+            return pool(
+                pad_fn(x, padding, mode="replicate"),
+                kernel_size=window_size,
+                stride=1,
+            )
 
-    mu_p = local_mean(prediction)
-    mu_t = local_mean(target)
-    mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
-
-    sigma_p_sq = local_mean(prediction**2) - mu_p_sq
-    sigma_t_sq = local_mean(target**2) - mu_t_sq
-    sigma_pt = local_mean(prediction * target) - mu_pt
-
-    numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
-    denominator = (mu_p_sq + mu_t_sq + c1) * (sigma_p_sq + sigma_t_sq + c2)
-    return (numerator / denominator).mean()
+        mu_p = local_mean(p)
+        mu_t = local_mean(t)
+        var_p = (local_mean(p.square()) - mu_p.square()).clamp_min(0.0)
+        var_t = (local_mean(t.square()) - mu_t.square()).clamp_min(0.0)
+        covariance = local_mean(p * t) - mu_p * mu_t
+        covariance_limit = (var_p * var_t).sqrt()
+        covariance = torch.maximum(
+            torch.minimum(covariance, covariance_limit), -covariance_limit
+        )
+        c1 = float(0.01 * data_range) ** 2
+        c2 = float(0.03 * data_range) ** 2
+        luminance = (2.0 * mu_p * mu_t + c1) / (
+            mu_p.square() + mu_t.square() + c1
+        )
+        structure = (2.0 * covariance + c2) / (var_p + var_t + c2)
+        similarity = (luminance * structure).mean()
+        # Only projects final floating-point roundoff; the moment corrections above fix
+        # the invalid covariance/denominator that caused the observed out-of-range value.
+        similarity = similarity.clamp(-1.0, 1.0)
+    if not bool(torch.isfinite(similarity)):
+        raise ValueError("SSIM produced a non-finite value.")
+    return similarity
 
 
 def lpips_metric(

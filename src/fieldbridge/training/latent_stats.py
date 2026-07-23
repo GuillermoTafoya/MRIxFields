@@ -71,13 +71,31 @@ class LatentStatsAccumulator:
         self._sumsq += m.pow(2).sum(dim=reduce_dims).cpu()
         self._kl_sum += kl_elem.sum(dim=reduce_dims).cpu()
 
-    def compute(self, *, active_threshold: float = DEFAULT_ACTIVE_KL_THRESHOLD) -> dict[str, Any]:
+    def compute(
+        self,
+        *,
+        active_threshold: float = DEFAULT_ACTIVE_KL_THRESHOLD,
+        active_std_threshold: float = 0.0,
+        activity_rule: str = "kl",
+    ) -> dict[str, Any]:
         count = max(self._count, 1)
         mean_c = self._sum / count
         var_c = (self._sumsq / count - mean_c.pow(2)).clamp_min(0.0)
         std_c = var_c.sqrt()
         kl_c = self._kl_sum / count
-        active_mask = kl_c > active_threshold
+        kl_active = kl_c > active_threshold
+        std_active = std_c > active_std_threshold
+        if activity_rule == "kl":
+            active_mask = kl_active
+        elif activity_rule == "std":
+            active_mask = std_active
+        elif activity_rule == "std_and_kl":
+            active_mask = std_active & kl_active
+        else:
+            raise ValueError(
+                "activity_rule must be 'kl', 'std', or 'std_and_kl', "
+                f"got {activity_rule!r}."
+            )
         total_count = count * self.latent_channels
         global_mean = float(self._sum.sum() / total_count)
         global_var = float((self._sumsq.sum() / total_count - global_mean**2))
@@ -86,6 +104,8 @@ class LatentStatsAccumulator:
             "num_dims": self.latent_channels,
             "active_units": int(active_mask.sum()),
             "active_threshold": float(active_threshold),
+            "active_std_threshold": float(active_std_threshold),
+            "activity_rule": activity_rule,
             "dead_units": int((~active_mask).sum()),
             "per_dim_std": [float(v) for v in std_c],
             "per_dim_kl": [float(v) for v in kl_c],

@@ -16,8 +16,10 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -557,6 +559,7 @@ class _CandidateTracker:
 
     best: dict[str, dict[str, Any]] = field(default_factory=dict)
     frontier: list[dict[str, Any]] = field(default_factory=list)
+    aliases: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def update(
         self,
@@ -605,6 +608,12 @@ class _CandidateTracker:
                     "epoch": int(epoch),
                     "step": int(step),
                 }
+                self.aliases[f"metric:{name}"] = {
+                    "candidate_id": candidate_id,
+                    "checkpoint_path": str(checkpoint_path),
+                    "role": f"promotable_metric_best:{name}",
+                    "filename": _metric_candidate_filename(name),
+                }
                 improved.append(name)
         comparable = [
             existing for existing in self.frontier
@@ -624,12 +633,19 @@ class _CandidateTracker:
                 or not _dominates(metric_vector, existing["metrics"])
             ]
             self.frontier.append(point)
+            self.aliases["pareto"] = {
+                "candidate_id": candidate_id,
+                "checkpoint_path": str(checkpoint_path),
+                "role": "promoted_pareto_alias",
+                "filename": "vae_kl_vae_best.pt",
+            }
         return improved, added, candidate_id
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "best": _jsonable_copy(self.best),
             "frontier": _jsonable_copy(self.frontier),
+            "aliases": _jsonable_copy(self.aliases),
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -646,6 +662,31 @@ class _CandidateTracker:
             for item in state.get("frontier", [])
             if isinstance(item, Mapping) and isinstance(item.get("metrics"), Mapping)
         ]
+        self.aliases = {
+            str(name): dict(value)
+            for name, value in dict(state.get("aliases", {})).items()
+            if isinstance(value, Mapping)
+        }
+        if not self.aliases:
+            for metric_name, item in self.best.items():
+                if "candidate_id" in item and "checkpoint_path" in item:
+                    self.aliases[f"metric:{metric_name}"] = {
+                        "candidate_id": item["candidate_id"],
+                        "checkpoint_path": item["checkpoint_path"],
+                        "role": f"promotable_metric_best:{metric_name}",
+                        "filename": _metric_candidate_filename(metric_name),
+                    }
+            if self.frontier:
+                latest = max(
+                    self.frontier,
+                    key=lambda item: (int(item.get("step", -1)), str(item.get("candidate_id", ""))),
+                )
+                self.aliases["pareto"] = {
+                    "candidate_id": latest.get("candidate_id"),
+                    "checkpoint_path": latest.get("checkpoint_path"),
+                    "role": "promoted_pareto_alias",
+                    "filename": "vae_kl_vae_best.pt",
+                }
 
     def validate_checkpoint_mapping(self) -> None:
         for item in self.frontier:
@@ -691,6 +732,21 @@ class _CandidateTracker:
             if not Path(str(item["checkpoint_path"])).is_file():
                 raise ValueError(
                     f"Metric best {metric_name!r} points to a missing immutable "
+                    f"checkpoint: {item['checkpoint_path']}."
+                )
+        for alias_name, item in self.aliases.items():
+            missing = {
+                name
+                for name in ("candidate_id", "checkpoint_path", "role", "filename")
+                if not item.get(name)
+            }
+            if missing:
+                raise ValueError(
+                    f"Candidate alias {alias_name!r} is incomplete; missing={sorted(missing)}."
+                )
+            if not Path(str(item["checkpoint_path"])).is_file():
+                raise ValueError(
+                    f"Candidate alias {alias_name!r} points to a missing immutable "
                     f"checkpoint: {item['checkpoint_path']}."
                 )
 
@@ -760,6 +816,12 @@ def run_stage1_vae_train(
     val_epochs_no_improve = 0
     last_latent_stats: dict[str, Any] = {}
     validation_pass = 0
+    do_validation = val_loader is not None and cfg.steps_per_epoch > 0
+    history_path = (
+        cfg.checkpoint_dir / cfg.history_filename
+        if cfg.checkpoint_dir is not None and do_validation
+        else None
+    )
 
     start_step = 0
     if cfg.resume_from is not None:
@@ -776,7 +838,6 @@ def run_stage1_vae_train(
         val_epochs_no_improve = int(state.get("val_epochs_no_improve", 0))
         if isinstance(state.get("latent_health"), Mapping):
             last_latent_stats = dict(state["latent_health"])
-        _restore_rng_state(state.get("rng_state"))
         _restore_loader_state(
             loader, state.get("train_sampler_state", state.get("sampler_state"))
         )
@@ -786,6 +847,17 @@ def run_stage1_vae_train(
         if isinstance(validation_state, Mapping):
             validation_pass = int(validation_state.get("pass", 0))
         candidate_tracker.validate_checkpoint_mapping()
+        if history_path is not None:
+            _reconcile_history_to_checkpoint(
+                history_path,
+                state.get("committed_history"),
+                checkpoint_step=start_step,
+            )
+        if cfg.checkpoint_dir is not None:
+            _reconcile_candidate_aliases(cfg, candidate_tracker.state_dict())
+        # Reconciliation performs file I/O only. Restore RNG last so replay starts from
+        # the exact committed stochastic state regardless of recovery housekeeping.
+        _restore_rng_state(state.get("rng_state"))
 
     lpips_net: nn.Module | None = None
     if cfg.loss_weights.get("lpips", 0.0) > 0:
@@ -819,11 +891,6 @@ def run_stage1_vae_train(
             f"batch_size={cfg.batch_size} "
             f"device={device.type} {epochs_label} early_stopping={cfg.early_stopping}"
         )
-
-    do_validation = val_loader is not None and cfg.steps_per_epoch > 0
-    history_path = (
-        cfg.checkpoint_dir / cfg.history_filename if cfg.checkpoint_dir is not None and do_validation else None
-    )
 
     # Fixed reconstruction-panel batch: captured once (on CPU) so the same slices are shown
     # every dump across epochs and runs. Only when the hook is on and there's somewhere to
@@ -1003,49 +1070,55 @@ def run_stage1_vae_train(
                 next_val_epochs_no_improve = (
                     0 if improved_metrics or pareto_added else val_epochs_no_improve + 1
                 )
+                committed_history: Mapping[str, Any] | None = None
                 if history_path is not None:
-                    _append_history(
-                        history_path,
-                        {
-                            "epoch": epoch_index,
-                            "step": current_step,
-                            "train": train_means,
-                            "train_weighted": _weighted_terms(
-                                train_means,
-                                cfg.loss_weights,
-                                kl_factor=_kl_warmup_factor(current_step, cfg),
+                    history_entry = {
+                        "epoch": epoch_index,
+                        "step": current_step,
+                        "train": train_means,
+                        "train_weighted": _weighted_terms(
+                            train_means,
+                            cfg.loss_weights,
+                            kl_factor=_kl_warmup_factor(current_step, cfg),
+                        ),
+                        "validation": val_means,
+                        "validation_weighted": _weighted_terms(
+                            val_means,
+                            cfg.loss_weights,
+                            kl_factor=_kl_warmup_factor(current_step, cfg),
+                        ),
+                        "latent": latent_stats,
+                        "exposure": {
+                            "expected": _expected_loader_exposure(
+                                loader, pass_index=max(0, epoch_index - 1)
                             ),
-                            "validation": val_means,
-                            "validation_weighted": _weighted_terms(
-                                val_means,
-                                cfg.loss_weights,
-                                kl_factor=_kl_warmup_factor(current_step, cfg),
-                            ),
-                            "latent": latent_stats,
-                            "exposure": {
-                                "expected": _expected_loader_exposure(
-                                    loader, pass_index=max(0, epoch_index - 1)
-                                ),
-                                "observed": observed_exposure,
-                            },
-                            "selection": {
-                                "policy": "metric_specific_plus_pareto_no_scalar_weights",
-                                "metrics": selection_metrics,
-                                "improved_metrics": improved_metrics,
-                                "pareto_added": pareto_added,
-                                "promotion_eligible": promotion_eligible,
-                                "candidate_class": (
-                                    "promotable"
-                                    if promotion_eligible
-                                    else "diagnostic_ineligible"
-                                ),
-                                "candidate_id": candidate_id,
-                                "required_active_channels": cfg.promotion_min_active_channels,
-                            },
-                            "lr": current_lr,
-                            "best": pareto_added,
-                            "seconds": time.perf_counter() - train_start,
+                            "observed": observed_exposure,
                         },
+                        "selection": {
+                            "policy": "metric_specific_plus_pareto_no_scalar_weights",
+                            "metrics": selection_metrics,
+                            "improved_metrics": improved_metrics,
+                            "pareto_added": pareto_added,
+                            "promotion_eligible": promotion_eligible,
+                            "candidate_class": (
+                                "promotable"
+                                if promotion_eligible
+                                else "diagnostic_ineligible"
+                            ),
+                            "candidate_id": candidate_id,
+                            "required_active_channels": cfg.promotion_min_active_channels,
+                        },
+                        "lr": current_lr,
+                        "best": pareto_added,
+                        "seconds": time.perf_counter() - train_start,
+                    }
+                    committed_history = _prepare_history_entry(
+                        history_path, history_entry
+                    )
+                    _recovery_crash_injection_point(
+                        "after_history_prepared",
+                        epoch=epoch_index,
+                        step=current_step,
                     )
                 if cfg.checkpoint_dir is not None:
                     if promotion_eligible and pareto_added:
@@ -1067,39 +1140,16 @@ def run_stage1_vae_train(
                                 validation_pass
                             ),
                         )
-                    if promotion_eligible:
-                        for metric_name in improved_metrics:
-                            _save_candidate_checkpoint(
-                                cfg,
-                                encoder,
-                                decoder,
-                                optimizer,
-                                current_step,
-                                label=metric_name,
-                                candidate_state=candidate_tracker.state_dict(),
-                                latent_health=latent_stats,
-                                val_epochs_no_improve=next_val_epochs_no_improve,
-                                candidate_id=candidate_id,
-                                validation_sampler_state=_validation_sampler_state(
-                                    validation_pass
-                                ),
-                            )
-                    if promotion_eligible and pareto_added:
-                        assert candidate_id is not None
-                        _save_best_checkpoint(
-                            cfg,
-                            encoder,
-                            decoder,
-                            optimizer,
-                            current_step,
-                            candidate_state=candidate_tracker.state_dict(),
-                            latent_health=latent_stats,
-                            val_epochs_no_improve=next_val_epochs_no_improve,
-                            candidate_id=candidate_id,
-                            validation_sampler_state=_validation_sampler_state(
-                                validation_pass
-                            ),
+                        _recovery_crash_injection_point(
+                            "after_immutable_pareto",
+                            epoch=epoch_index,
+                            step=current_step,
                         )
+                    _recovery_crash_injection_point(
+                        "before_latest_recoverable_replace",
+                        epoch=epoch_index,
+                        step=current_step,
+                    )
                     _save_latest_recoverable_checkpoint(
                         cfg,
                         encoder,
@@ -1115,6 +1165,13 @@ def run_stage1_vae_train(
                         validation_sampler_state=_validation_sampler_state(
                             validation_pass
                         ),
+                        committed_history=committed_history,
+                    )
+                    # Aliases are derived only after the recovery commit. A crash leaves
+                    # either the prior committed aliases or a reconstructable committed
+                    # candidate mapping, never an alias to an uncommitted artifact.
+                    _reconcile_candidate_aliases(
+                        cfg, candidate_tracker.state_dict()
                     )
                 val_epochs_no_improve = next_val_epochs_no_improve
                 latent_str = f" | latent: {summarize_latent_stats(latent_stats)}" if latent_stats else ""
@@ -1702,50 +1759,183 @@ def _domain_labels(domain: Any) -> list[str]:
     return [getattr(domain, "label", str(domain))]
 
 
-def _append_history(history_path: Path, entry: Mapping[str, Any]) -> None:
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    with history_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True) + "\n")
-
-
-def _save_best_checkpoint(
-    cfg: Stage1VAEConfig,
-    encoder: KLVAEEncoder,
-    decoder: KLVAEDecoder,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    *,
-    candidate_state: Mapping[str, Any],
-    latent_health: Mapping[str, Any],
-    val_epochs_no_improve: int,
-    candidate_id: str,
-    validation_sampler_state: Mapping[str, Any] | None,
-) -> None:
-    """Compatibility path for the latest non-dominated multi-metric candidate."""
-
-    assert cfg.checkpoint_dir is not None
-    save_checkpoint(
-        cfg.checkpoint_dir / "vae_kl_vae_best.pt",
-        _checkpoint_payload(
-            cfg,
-            encoder,
-            decoder,
-            optimizer,
-            step,
-            candidate_state=candidate_state,
-            latent_health=latent_health,
-            val_epochs_no_improve=val_epochs_no_improve,
-            sampler_state=_sampler_state(step, cfg),
-            validation_sampler_state=validation_sampler_state,
-            checkpoint_role="promoted_pareto_alias",
-            candidate_id=candidate_id,
-        ),
-        max_bytes=cfg.checkpoint_max_bytes,
-        overwrite=True,
-        seed=cfg.seed,
-        config=_checkpoint_config(cfg),
-        git_commit=_experiment_git_commit(cfg),
+def _metric_candidate_filename(metric_name: str) -> str:
+    safe_label = "".join(
+        char if char.isalnum() or char == "_" else "_" for char in metric_name
     )
+    return f"vae_stage1_candidate_{safe_label}.pt"
+
+
+def _history_entry_key(entry: Mapping[str, Any]) -> tuple[int, int]:
+    try:
+        return int(entry["epoch"]), int(entry["step"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Stage-1 history entries require integer epoch and step identities."
+        ) from exc
+
+
+def _history_fingerprint(entries: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        entries,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _history_state(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    last_epoch, last_step = _history_entry_key(entries[-1]) if entries else (0, 0)
+    return {
+        "schema": "stage1-v3-committed-history-v1",
+        "entries": _jsonable_copy(entries),
+        "count": len(entries),
+        "last_epoch": last_epoch,
+        "last_step": last_step,
+        "fingerprint": _history_fingerprint(entries),
+    }
+
+
+def _validate_history_state(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if state.get("schema") != "stage1-v3-committed-history-v1":
+        raise ValueError("Unsupported or missing committed Stage-1 history schema.")
+    raw_entries = state.get("entries")
+    if not isinstance(raw_entries, list) or not all(
+        isinstance(entry, Mapping) for entry in raw_entries
+    ):
+        raise ValueError("Committed Stage-1 history entries are malformed.")
+    entries = [dict(entry) for entry in raw_entries]
+    keys = [_history_entry_key(entry) for entry in entries]
+    epochs = [key[0] for key in keys]
+    steps = [key[1] for key in keys]
+    if (
+        keys != sorted(keys, key=lambda key: (key[1], key[0]))
+        or len(set(epochs)) != len(epochs)
+        or len(set(steps)) != len(steps)
+    ):
+        raise ValueError(
+            "Committed Stage-1 history must contain one unique, ordered entry per "
+            "epoch and step."
+        )
+    expected = _history_state(entries)
+    for name in ("count", "last_epoch", "last_step", "fingerprint"):
+        if state.get(name) != expected[name]:
+            raise ValueError(
+                f"Committed Stage-1 history metadata mismatch for {name}: "
+                f"{state.get(name)!r} != {expected[name]!r}."
+            )
+    return entries
+
+
+def _read_history_entries(
+    history_path: Path, *, tolerate_malformed: bool = False
+) -> list[dict[str, Any]]:
+    if not history_path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line_number, line in enumerate(
+        history_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError("entry is not a JSON object")
+            _history_entry_key(value)
+        except (json.JSONDecodeError, ValueError) as exc:
+            if tolerate_malformed:
+                continue
+            raise ValueError(
+                f"Malformed Stage-1 history at {history_path}:{line_number}: {exc}"
+            ) from exc
+        entries.append(value)
+    return entries
+
+
+def _write_history_entries_atomic(
+    history_path: Path, entries: list[dict[str, Any]]
+) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{history_path.name}.",
+        suffix=".tmp",
+        dir=history_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with temporary_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for entry in entries:
+                handle.write(
+                    json.dumps(entry, sort_keys=True, allow_nan=False) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, history_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _prepare_history_entry(
+    history_path: Path, entry: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Atomically prepare exactly one history entry for an uncommitted epoch."""
+
+    current_key = _history_entry_key(entry)
+    retained: dict[tuple[int, int], dict[str, Any]] = {}
+    for existing in _read_history_entries(history_path):
+        key = _history_entry_key(existing)
+        if key[0] < current_key[0] and key[1] < current_key[1]:
+            retained[key] = existing
+    retained[current_key] = _jsonable_copy(dict(entry))
+    entries = [
+        retained[key]
+        for key in sorted(retained, key=lambda key: (key[1], key[0]))
+    ]
+    _write_history_entries_atomic(history_path, entries)
+    return _history_state(entries)
+
+
+def _reconcile_history_to_checkpoint(
+    history_path: Path,
+    committed_state: Any,
+    *,
+    checkpoint_step: int,
+) -> None:
+    """Make history exactly match the last atomically committed recovery state."""
+
+    if isinstance(committed_state, Mapping):
+        entries = _validate_history_state(committed_state)
+        if entries and _history_entry_key(entries[-1])[1] != int(checkpoint_step):
+            raise ValueError(
+                "Committed history step does not match recovery checkpoint step: "
+                f"{_history_entry_key(entries[-1])[1]} != {checkpoint_step}."
+            )
+    else:
+        # Read compatibility for checkpoints written before the transaction contract:
+        # trim malformed, duplicate, or future lines to the checkpoint boundary.
+        deduplicated: dict[tuple[int, int], dict[str, Any]] = {}
+        for entry in _read_history_entries(
+            history_path, tolerate_malformed=True
+        ):
+            key = _history_entry_key(entry)
+            if key[1] <= int(checkpoint_step):
+                deduplicated[key] = entry
+        entries = [
+            deduplicated[key]
+            for key in sorted(deduplicated, key=lambda key: (key[1], key[0]))
+        ]
+    _write_history_entries_atomic(history_path, entries)
+
+
+def _recovery_crash_injection_point(
+    point: str, *, epoch: int, step: int
+) -> None:
+    """No-op production hook monkeypatched by deterministic crash-recovery tests."""
+
+    del point, epoch, step
 
 
 def _save_step_checkpoint(
@@ -1792,46 +1982,6 @@ def _save_step_checkpoint(
     )
 
 
-def _save_candidate_checkpoint(
-    cfg: Stage1VAEConfig,
-    encoder: KLVAEEncoder,
-    decoder: KLVAEDecoder,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    *,
-    label: str,
-    candidate_state: Mapping[str, Any],
-    latent_health: Mapping[str, Any],
-    val_epochs_no_improve: int,
-    candidate_id: str | None,
-    validation_sampler_state: Mapping[str, Any] | None,
-) -> None:
-    assert cfg.checkpoint_dir is not None
-    safe_label = "".join(char if char.isalnum() or char == "_" else "_" for char in label)
-    save_checkpoint(
-        cfg.checkpoint_dir / f"vae_stage1_candidate_{safe_label}.pt",
-        _checkpoint_payload(
-            cfg,
-            encoder,
-            decoder,
-            optimizer,
-            step,
-            candidate_state=candidate_state,
-            latent_health=latent_health,
-            val_epochs_no_improve=val_epochs_no_improve,
-            sampler_state=_sampler_state(step, cfg),
-            validation_sampler_state=validation_sampler_state,
-            checkpoint_role=f"promotable_metric_best:{label}",
-            candidate_id=candidate_id,
-        ),
-        max_bytes=cfg.checkpoint_max_bytes,
-        overwrite=True,
-        seed=cfg.seed,
-        config=_checkpoint_config(cfg),
-        git_commit=_experiment_git_commit(cfg),
-    )
-
-
 def _save_pareto_checkpoint(
     cfg: Stage1VAEConfig,
     encoder: KLVAEEncoder,
@@ -1846,8 +1996,20 @@ def _save_pareto_checkpoint(
     val_epochs_no_improve: int,
     validation_sampler_state: Mapping[str, Any] | None,
 ) -> None:
-    """Write one immutable model artifact for a newly non-dominated point."""
+    """Write or idempotently reuse one immutable non-dominated model artifact."""
 
+    candidate_metadata = _candidate_metadata(
+        candidate_state, candidate_id=candidate_id
+    )
+    if candidate_path.exists():
+        _validate_immutable_candidate_checkpoint(
+            cfg,
+            candidate_path,
+            candidate_id=candidate_id,
+            step=step,
+            expected_metadata=candidate_metadata,
+        )
+        return
     save_checkpoint(
         candidate_path,
         _checkpoint_payload(
@@ -1863,6 +2025,7 @@ def _save_pareto_checkpoint(
             validation_sampler_state=validation_sampler_state,
             checkpoint_role="immutable_promotable_pareto",
             candidate_id=candidate_id,
+            candidate_metadata=candidate_metadata,
         ),
         max_bytes=cfg.checkpoint_max_bytes,
         overwrite=False,
@@ -1870,6 +2033,204 @@ def _save_pareto_checkpoint(
         config=_checkpoint_config(cfg),
         git_commit=_experiment_git_commit(cfg),
     )
+    _validate_immutable_candidate_checkpoint(
+        cfg,
+        candidate_path,
+        candidate_id=candidate_id,
+        step=step,
+        expected_metadata=candidate_metadata,
+    )
+
+
+def _candidate_metadata(
+    candidate_state: Mapping[str, Any], *, candidate_id: str
+) -> dict[str, Any]:
+    matches = [
+        dict(item)
+        for item in candidate_state.get("frontier", [])
+        if isinstance(item, Mapping) and item.get("candidate_id") == candidate_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Candidate state must contain exactly one matching frontier point for "
+            f"{candidate_id!r}; found {len(matches)}."
+        )
+    return _jsonable_copy(matches[0])
+
+
+def _validate_immutable_candidate_checkpoint(
+    cfg: Stage1VAEConfig,
+    path: Path,
+    *,
+    candidate_id: str,
+    step: int | None,
+    expected_metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    try:
+        state = load_checkpoint(path, map_location="cpu")
+    except Exception as exc:
+        raise ValueError(
+            f"Immutable Pareto checkpoint is unreadable or corrupt: {path}."
+        ) from exc
+    required = {
+        "encoder",
+        "decoder",
+        "optimizer",
+        "scheduler",
+        "rng_state",
+        "candidate_state",
+        "experiment_identity",
+    }
+    missing = sorted(required - set(state))
+    if missing:
+        raise ValueError(
+            f"Immutable Pareto checkpoint {path} is incomplete; missing={missing}."
+        )
+    if state.get("checkpoint_role") != "immutable_promotable_pareto":
+        raise ValueError(
+            f"Immutable Pareto checkpoint {path} has incompatible role "
+            f"{state.get('checkpoint_role')!r}."
+        )
+    if state.get("candidate_id") != candidate_id:
+        raise ValueError(
+            f"Immutable Pareto checkpoint candidate mismatch at {path}: "
+            f"{state.get('candidate_id')!r} != {candidate_id!r}."
+        )
+    if step is not None and int(state.get("step", -1)) != int(step):
+        raise ValueError(
+            f"Immutable Pareto checkpoint step mismatch at {path}: "
+            f"{state.get('step')!r} != {step!r}."
+        )
+    if state.get("split_fingerprint") != cfg.split_fingerprint:
+        raise ValueError(
+            f"Immutable Pareto checkpoint split mismatch at {path}."
+        )
+    saved_identity = state.get("experiment_identity")
+    current_identity = _experiment_identity(cfg)
+    if not isinstance(saved_identity, Mapping):
+        raise ValueError(
+            f"Immutable Pareto checkpoint {path} has no experiment identity."
+        )
+    if (
+        saved_identity.get("resume_compatibility_fingerprint")
+        != current_identity.get("resume_compatibility_fingerprint")
+    ):
+        raise ValueError(
+            f"Immutable Pareto checkpoint config identity mismatch at {path}."
+        )
+    if not isinstance(state["candidate_state"], Mapping):
+        raise ValueError(
+            f"Immutable Pareto checkpoint {path} has malformed candidate state."
+        )
+    state_metadata = _candidate_metadata(
+        state["candidate_state"], candidate_id=candidate_id
+    )
+    stored_metadata = state.get("candidate_metadata")
+    if stored_metadata is None:
+        stored_metadata = state_metadata
+    elif _jsonable_copy(stored_metadata) != _jsonable_copy(state_metadata):
+        raise ValueError(
+            f"Immutable Pareto checkpoint candidate metadata disagrees with its "
+            f"frontier state at {path}."
+        )
+    if expected_metadata is not None and _jsonable_copy(stored_metadata) != _jsonable_copy(
+        expected_metadata
+    ):
+        raise ValueError(
+            f"Immutable Pareto checkpoint candidate metadata mismatch at {path}."
+        )
+    return state
+
+
+def _validate_candidate_artifacts(
+    cfg: Stage1VAEConfig, candidate_state: Mapping[str, Any]
+) -> None:
+    checked: set[tuple[str, str]] = set()
+    for item in candidate_state.get("frontier", []):
+        if not isinstance(item, Mapping):
+            raise ValueError("Candidate frontier contains malformed metadata.")
+        candidate_id = str(item.get("candidate_id", ""))
+        path = Path(str(item.get("checkpoint_path", "")))
+        _validate_immutable_candidate_checkpoint(
+            cfg,
+            path,
+            candidate_id=candidate_id,
+            step=int(item.get("step", -1)),
+            expected_metadata=item,
+        )
+        checked.add((candidate_id, str(path)))
+    for item in candidate_state.get("best", {}).values():
+        if not isinstance(item, Mapping):
+            raise ValueError("Candidate metric best contains malformed metadata.")
+        candidate_id = str(item.get("candidate_id", ""))
+        path = Path(str(item.get("checkpoint_path", "")))
+        identity = (candidate_id, str(path))
+        if identity in checked:
+            continue
+        _validate_immutable_candidate_checkpoint(
+            cfg,
+            path,
+            candidate_id=candidate_id,
+            step=int(item.get("step", -1)),
+            expected_metadata=None,
+        )
+        checked.add(identity)
+
+
+def _reconcile_candidate_aliases(
+    cfg: Stage1VAEConfig, candidate_state: Mapping[str, Any]
+) -> None:
+    """Derive overwriteable aliases only from committed immutable candidates."""
+
+    if cfg.checkpoint_dir is None:
+        return
+    _validate_candidate_artifacts(cfg, candidate_state)
+    aliases = candidate_state.get("aliases", {})
+    if not isinstance(aliases, Mapping):
+        raise ValueError("Committed candidate alias mapping is malformed.")
+    for alias_name, metadata in sorted(aliases.items()):
+        if not isinstance(metadata, Mapping):
+            raise ValueError(f"Candidate alias {alias_name!r} is malformed.")
+        source = Path(str(metadata.get("checkpoint_path", "")))
+        candidate_id = str(metadata.get("candidate_id", ""))
+        state = _validate_immutable_candidate_checkpoint(
+            cfg,
+            source,
+            candidate_id=candidate_id,
+            step=None,
+            expected_metadata=None,
+        )
+        alias_payload = dict(state)
+        source_meta = alias_payload.pop("_meta", {})
+        alias_payload["checkpoint_role"] = str(metadata.get("role", ""))
+        alias_payload["candidate_id"] = candidate_id
+        filename = str(metadata.get("filename", ""))
+        if not filename or Path(filename).name != filename:
+            raise ValueError(
+                f"Candidate alias {alias_name!r} has no valid destination filename."
+            )
+        destination = cfg.checkpoint_dir / filename
+        save_checkpoint(
+            destination,
+            alias_payload,
+            max_bytes=cfg.checkpoint_max_bytes,
+            overwrite=True,
+            seed=(
+                source_meta.get("seed")
+                if isinstance(source_meta, Mapping)
+                else cfg.seed
+            ),
+            config=(
+                source_meta.get("config")
+                if isinstance(source_meta, Mapping)
+                else _checkpoint_config(cfg)
+            ),
+            git_commit=(
+                source_meta.get("git_commit")
+                if isinstance(source_meta, Mapping)
+                else _experiment_git_commit(cfg)
+            ),
+        )
 
 
 def _save_latest_recoverable_checkpoint(
@@ -1884,6 +2245,7 @@ def _save_latest_recoverable_checkpoint(
     val_epochs_no_improve: int,
     latent_health: Mapping[str, Any],
     validation_sampler_state: Mapping[str, Any] | None,
+    committed_history: Mapping[str, Any] | None,
 ) -> None:
     """Persist the stable epoch-boundary checkpoint with complete recovery state."""
 
@@ -1891,6 +2253,16 @@ def _save_latest_recoverable_checkpoint(
     sampler_state = _sampler_state(step, cfg)
     if sampler_state is not None and not sampler_state["recoverable"]:
         raise RuntimeError("latest recoverable checkpoint may only be saved at an epoch boundary.")
+    _validate_candidate_artifacts(cfg, candidate_state)
+    if committed_history is not None:
+        committed_entries = _validate_history_state(committed_history)
+        if (
+            not committed_entries
+            or _history_entry_key(committed_entries[-1])[1] != int(step)
+        ):
+            raise ValueError(
+                "Latest recovery checkpoint requires history committed at the same step."
+            )
     save_checkpoint(
         cfg.checkpoint_dir / "vae_stage1_latest_recoverable.pt",
         _checkpoint_payload(
@@ -1906,6 +2278,7 @@ def _save_latest_recoverable_checkpoint(
             sampler_state=sampler_state,
             validation_sampler_state=validation_sampler_state,
             checkpoint_role="latest_recoverable_epoch_boundary",
+            committed_history=committed_history,
         ),
         max_bytes=cfg.checkpoint_max_bytes,
         overwrite=True,
@@ -1930,6 +2303,8 @@ def _checkpoint_payload(
     validation_sampler_state: Mapping[str, Any] | None = None,
     checkpoint_role: str = "recovery",
     candidate_id: str | None = None,
+    candidate_metadata: Mapping[str, Any] | None = None,
+    committed_history: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "checkpoint_version": "stage1_v3_recoverable",
@@ -1966,6 +2341,16 @@ def _checkpoint_payload(
         ),
         "checkpoint_role": checkpoint_role,
         "candidate_id": candidate_id,
+        "candidate_metadata": (
+            _jsonable_copy(candidate_metadata)
+            if candidate_metadata is not None
+            else None
+        ),
+        "committed_history": (
+            _jsonable_copy(committed_history)
+            if committed_history is not None
+            else None
+        ),
         "split_fingerprint": cfg.split_fingerprint,
         "experiment_identity": _experiment_identity(cfg),
     }

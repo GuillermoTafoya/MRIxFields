@@ -127,6 +127,17 @@ does not advance validation state. Metric-specific aliases, immutable Pareto wei
 and latest recovery state are stored separately. Mid-epoch step checkpoints are marked
 nonrecoverable for exact sampler replay.
 
+Epoch persistence is a recovery transaction. History is prepared atomically and the
+complete committed history snapshot and fingerprint are embedded in the latest
+recoverable checkpoint. Resume reconciles the JSONL history to that committed snapshot,
+removing duplicate or future entries and restoring a missing committed entry. Checkpoint
+overwrites are serialized to a validated temporary file in the destination directory
+and published with an atomic replace, so a failed overwrite preserves the prior recovery
+point. An existing immutable Pareto path is reused on deterministic replay only after its
+candidate ID, step, role, split/config identity, and frontier metadata all match; any
+mismatch fails closed. Candidate aliases are rebuilt from validated immutable artifacts
+only after the latest recovery checkpoint commits.
+
 The strict complete-record recovery hash is versioned separately as
 `recovery_fingerprint_v3`. The older case-membership `vae_splits_fingerprint` remains
 unchanged because the frozen audit-v1 selection contract depends on its exact arithmetic.

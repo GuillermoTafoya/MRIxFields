@@ -8,6 +8,8 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+import fieldbridge.training.checkpoints as checkpoint_module
+import fieldbridge.training.stage1_vae as stage1_module
 from fieldbridge.cli import (
     _preflight_stage1_v3_records,
     _resolve_stage1_epoch_dependent_schedules,
@@ -674,6 +676,9 @@ def _normalized_candidate_state(state: dict[str, object]) -> dict[str, object]:
     for item in normalized.get("best", {}).values():
         if "checkpoint_path" in item:
             item["checkpoint_path"] = Path(item["checkpoint_path"]).name
+    for item in normalized.get("aliases", {}).values():
+        if "checkpoint_path" in item:
+            item["checkpoint_path"] = Path(item["checkpoint_path"]).name
     return normalized
 
 
@@ -754,3 +759,169 @@ def test_interrupted_resume_matches_uninterrupted_validation_and_selection(
     assert _normalized_candidate_state(full_state["candidate_state"]) == (
         _normalized_candidate_state(resumed_state["candidate_state"])
     )
+
+
+def _assert_nested_state_equal(left, right) -> None:
+    if torch.is_tensor(left):
+        torch.testing.assert_close(left, right, rtol=0.0, atol=0.0)
+        return
+    if isinstance(left, dict):
+        assert set(left) == set(right)
+        for key in left:
+            _assert_nested_state_equal(left[key], right[key])
+        return
+    if isinstance(left, (list, tuple)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right, strict=True):
+            _assert_nested_state_equal(left_item, right_item)
+        return
+    assert left == right
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    [
+        "after_history_prepared",
+        "after_immutable_pareto",
+        "before_latest_recoverable_replace",
+        "during_latest_recoverable_replace",
+    ],
+)
+def test_epoch_recovery_transaction_is_crash_idempotent(
+    tmp_path, monkeypatch, crash_point
+) -> None:
+    train_records = _resume_records("train")
+    val_records = _resume_records("val")
+
+    full_dir = tmp_path / crash_point / "full"
+    full_crops: list[str] = []
+    full_encoder, full_decoder = _resume_models()
+    run_stage1_vae_train(
+        _resume_config(full_dir),
+        encoder=full_encoder,
+        decoder=full_decoder,
+        loader=_resume_loader(records=train_records, seed=77),
+        val_loader=_resume_loader(
+            records=val_records, seed=10_077, crop_log=full_crops
+        ),
+    )
+
+    resumed_dir = tmp_path / crash_point / "resumed"
+    failed_crops: list[str] = []
+    triggered = {"value": False}
+    if crash_point == "during_latest_recoverable_replace":
+        original_replace = checkpoint_module.os.replace
+        latest_replacements = {"count": 0}
+
+        def _replace_with_crash(source, destination):
+            if Path(destination).name == "vae_stage1_latest_recoverable.pt":
+                latest_replacements["count"] += 1
+                if latest_replacements["count"] == 2:
+                    triggered["value"] = True
+                    raise OSError("injected crash during latest replacement")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(
+            checkpoint_module.os, "replace", _replace_with_crash
+        )
+        expected_error = "injected crash during latest replacement"
+    else:
+
+        def _hook(point, *, epoch, step):
+            if point == crash_point and step == 4 and not triggered["value"]:
+                triggered["value"] = True
+                raise RuntimeError(f"injected crash at {point}")
+
+        monkeypatch.setattr(
+            stage1_module, "_recovery_crash_injection_point", _hook
+        )
+        expected_error = f"injected crash at {crash_point}"
+
+    failed_encoder, failed_decoder = _resume_models()
+    with pytest.raises((RuntimeError, OSError), match=expected_error):
+        run_stage1_vae_train(
+            _resume_config(resumed_dir),
+            encoder=failed_encoder,
+            decoder=failed_decoder,
+            loader=_resume_loader(records=train_records, seed=77),
+            val_loader=_resume_loader(
+                records=val_records,
+                seed=10_077,
+                crop_log=failed_crops,
+            ),
+        )
+    assert triggered["value"] is True
+
+    recovery_path = resumed_dir / "vae_stage1_latest_recoverable.pt"
+    before_resume = load_checkpoint(recovery_path)
+    assert before_resume["step"] == 2
+    assert before_resume["committed_history"]["last_step"] == 2
+    committed_aliases = before_resume["candidate_state"]["aliases"]
+    for alias in committed_aliases.values():
+        alias_state = load_checkpoint(resumed_dir / alias["filename"])
+        assert alias_state["candidate_id"] == alias["candidate_id"]
+    assert list(resumed_dir.glob(".vae_stage1_latest_recoverable.pt.*.tmp")) == []
+
+    replay_crops: list[str] = []
+    replay_encoder, replay_decoder = _resume_models()
+    run_stage1_vae_train(
+        _resume_config(resumed_dir, resume_from=recovery_path),
+        encoder=replay_encoder,
+        decoder=replay_decoder,
+        loader=_resume_loader(records=train_records, seed=77),
+        val_loader=_resume_loader(
+            records=val_records, seed=10_077, crop_log=replay_crops
+        ),
+    )
+
+    # The failed attempt and replay both see the same second validation pass; the
+    # committed loader advances only once.
+    assert failed_crops[:2] == full_crops[:2]
+    assert failed_crops[-2:] == full_crops[-2:]
+    assert replay_crops == full_crops[-2:]
+
+    full_state = load_checkpoint(full_dir / "vae_stage1_latest_recoverable.pt")
+    replay_state = load_checkpoint(
+        resumed_dir / "vae_stage1_latest_recoverable.pt"
+    )
+    for key in ("encoder", "decoder", "optimizer", "scheduler", "rng_state"):
+        _assert_nested_state_equal(full_state[key], replay_state[key])
+    assert full_state["validation_sampler_state"] == replay_state[
+        "validation_sampler_state"
+    ]
+    assert _normalized_candidate_state(full_state["candidate_state"]) == (
+        _normalized_candidate_state(replay_state["candidate_state"])
+    )
+
+    full_history = _history_without_runtime(full_dir / "history.jsonl")
+    replay_history = _history_without_runtime(resumed_dir / "history.jsonl")
+    assert replay_history == full_history
+    identities = [
+        (int(entry["epoch"]), int(entry["step"])) for entry in replay_history
+    ]
+    assert identities == [(1, 2), (2, 4)]
+    assert len(identities) == len(set(identities))
+    committed_entries = replay_state["committed_history"]["entries"]
+    assert [
+        (int(entry["epoch"]), int(entry["step"])) for entry in committed_entries
+    ] == identities
+
+    full_immutable = sorted(
+        path.name for path in full_dir.glob("vae_stage1_pareto_*.pt")
+    )
+    replay_immutable = sorted(
+        path.name for path in resumed_dir.glob("vae_stage1_pareto_*.pt")
+    )
+    assert replay_immutable == full_immutable
+    for filename in replay_immutable:
+        full_candidate = load_checkpoint(full_dir / filename)
+        replay_candidate = load_checkpoint(resumed_dir / filename)
+        assert replay_candidate["candidate_id"] == full_candidate["candidate_id"]
+        assert replay_candidate["step"] == full_candidate["step"]
+        assert (
+            replay_candidate["checkpoint_role"]
+            == full_candidate["checkpoint_role"]
+            == "immutable_promotable_pareto"
+        )
+    assert list(resumed_dir.glob(".*.tmp")) == []

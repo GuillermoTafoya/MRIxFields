@@ -121,6 +121,10 @@ def _metadata() -> str:
         'Requires-Dist: lpips>=0.1.4; extra == "perceptual"',
         "Provides-Extra: nifti",
         'Requires-Dist: nibabel>=5.0; extra == "nifti"',
+        "Provides-Extra: official-evaluation",
+        'Requires-Dist: nibabel>=5.0; extra == "official-evaluation"',
+        'Requires-Dist: scikit-image>=0.20; extra == "official-evaluation"',
+        'Requires-Dist: lpips>=0.1.4; extra == "official-evaluation"',
         "",
     ]
     return "\n".join(lines)

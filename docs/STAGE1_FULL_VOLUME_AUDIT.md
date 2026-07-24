@@ -37,8 +37,8 @@ normalizes a separable 3D Hann-weighted sum. There are no crops, selected slices
 augmentations, or posterior samples. Encoder and decoder are in eval mode and execution
 uses `torch.inference_mode()` with deterministic PyTorch algorithms.
 
-The input must be finite and in the official `[0,1]` range. Raw decoder output is retained
-for range diagnostics, then clamped to `[0,1]` for official reconstruction metrics.
+The input must be finite and in the project `[0,1]` range. Raw decoder output is retained
+for range diagnostics, then clamped to `[0,1]` for the frozen audit metrics.
 `float32` is the primary default. `--precision amp-bfloat16` is explicit, CUDA-only, and
 part of the recovery fingerprint.
 
@@ -55,10 +55,11 @@ Let `t` be the target, `r_raw` the raw reconstruction, `r=clamp(r_raw,0,1)`, and
 config (currently zero). Empty foreground is fatal.
 
 - Foreground MAE: `mean_F |r-t|`.
-- Foreground nRMSE: `sqrt(mean_F (r-t)^2) / 1`; the denominator is the official data
-  range, exactly one.
-- SSIM3D: the repository uniform-window volumetric SSIM on complete clamped tensors with
-  `data_range=1`.
+- Foreground range-normalized RMSE: `sqrt(mean_F (r-t)^2) / 1`; this historical audit
+  diagnostic is not the published Task-3 L2-ratio nRMSE.
+- SSIM3D: `stage1_full_volume_ssim3d_v1`, the exact repository zero-padded
+  uniform-window volumetric calculation used at audit commit `be60d75`, on complete
+  clamped tensors with `data_range=1`. It is not the published slice-wise Task-3 SSIM.
 - Correlation: Pearson correlation over foreground voxels. Equal constant vectors report
   one; other constant cases report zero with an explicit status.
 - Gradient MAE: finite forward differences of `r` and `t`, masked only where both adjacent

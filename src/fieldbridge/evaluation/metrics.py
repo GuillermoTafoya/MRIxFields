@@ -1,4 +1,10 @@
-"""Tensor metrics, including the three official MRIxFields Task 3 metrics: nRMSE, SSIM, LPIPS."""
+"""Project tensor metrics.
+
+These helpers predate the published MRIxFields2026 evaluator and are retained for
+backward compatibility with repository diagnostics. They are not the official Task-3
+metric implementations. Use :mod:`fieldbridge.evaluation.mrixfields2026_official` for
+source-pinned challenge parity.
+"""
 
 from __future__ import annotations
 
@@ -123,7 +129,12 @@ def gradient_mae(
 
 
 def nrmse(prediction: torch.Tensor, target: torch.Tensor, *, data_range: float = 1.0) -> torch.Tensor:
-    """RMSE normalized by the intensity range (official MRIxFields Task 3 metric)."""
+    """Project range-normalized RMSE.
+
+    This is ``sqrt(mean((prediction-target)^2)) / data_range``. The published
+    MRIxFields2026 evaluator instead divides the full-volume L2 error by the target L2
+    norm; see :func:`mrixfields2026_official.official_task3_nrmse`.
+    """
 
     return torch.sqrt(mse(prediction, target)) / data_range
 
@@ -135,13 +146,22 @@ def ssim(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """Stable 2D structural similarity in the documented mathematical range [-1, 1]."""
+    """Historical project 2D uniform-window SSIM.
+
+    This is not the published Task-3 slice-wise scikit-image SSIM. It intentionally
+    preserves the repository's pre-v3 tensor-metric behavior. Training uses the
+    autocast-safe bounded implementation in :mod:`fieldbridge.training.ssim`.
+    """
 
     if prediction.ndim != 4:
         raise ValueError("ssim expects (B, C, H, W) tensors — this project is 2D-only.")
 
-    return _stable_ssim(
-        prediction, target, data_range=data_range, window_size=window_size, spatial_dims=2
+    return _historical_uniform_ssim(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
+        spatial_dims=2,
     )
 
 
@@ -152,21 +172,53 @@ def ssim3d(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """Stable volumetric SSIM in [-1, 1], the 3D analogue of :func:`ssim`.
+    """Historical project volumetric uniform-window SSIM.
 
-    Not the official 2D Task 3 metric — used as a training-time loss term for
-    spatial_dims=3 volumes, where the 2D `ssim` (avg_pool2d, 4D-only) can't apply.
+    This is neither the published Task-3 metric nor the bounded v3 training proxy. It is
+    retained for backward compatibility. The frozen Stage-1 audit imports
+    :func:`stage1_full_volume_ssim3d_v1` directly instead of this generic alias.
     """
 
     if prediction.ndim != 5:
         raise ValueError("ssim3d expects (B, C, D, H, W) tensors.")
 
-    return _stable_ssim(
-        prediction, target, data_range=data_range, window_size=window_size, spatial_dims=3
+    return stage1_full_volume_ssim3d_v1(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
     )
 
 
-def _stable_ssim(
+def stage1_full_volume_ssim3d_v1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float = 1.0,
+    window_size: int = 7,
+) -> torch.Tensor:
+    """Frozen SSIM3D used by ``stage1-full-volume-metrics-v1``.
+
+    The arithmetic intentionally matches the implementation at audit commit
+    ``be60d75``: zero-padded ``avg_pool3d`` moments in the caller's dtype, without
+    variance projection or output clamping. Do not use this as a differentiable
+    training loss. Its purpose is reproducibility of the completed frozen audit.
+    """
+
+    if prediction.ndim != 5:
+        raise ValueError(
+            "stage1_full_volume_ssim3d_v1 expects (B, C, D, H, W) tensors."
+        )
+    return _historical_uniform_ssim(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
+        spatial_dims=3,
+    )
+
+
+def _historical_uniform_ssim(
     prediction: torch.Tensor,
     target: torch.Tensor,
     *,
@@ -174,66 +226,38 @@ def _stable_ssim(
     window_size: int,
     spatial_dims: int,
 ) -> torch.Tensor:
-    """Uniform-window SSIM with autocast-safe moments and covariance projection.
+    """Preserve the pre-v3 project SSIM arithmetic exactly."""
 
-    The former ``E[x²] - E[x]²`` implementation ran in bf16 autocast. Cancellation
-    could make variances negative, break the covariance bound, and produce SSIM > 1
-    (therefore a negative training loss). Moments now run in float32, variances are
-    projected to nonnegative values, and covariance is projected onto the
-    Cauchy-Schwarz bound before forming the two bounded SSIM factors.
-    """
-
-    _validate_same_shape(prediction, target)
-    if not bool(torch.isfinite(prediction).all()) or not bool(torch.isfinite(target).all()):
-        raise ValueError("SSIM inputs must contain only finite values.")
-    if not data_range > 0:
-        raise ValueError("SSIM data_range must be positive.")
-    if window_size < 1 or window_size % 2 == 0:
-        raise ValueError("SSIM window_size must be a positive odd integer.")
     pool = F.avg_pool3d if spatial_dims == 3 else F.avg_pool2d
-    pad_fn = F.pad
     pad = window_size // 2
-    padding = tuple(value for _ in range(spatial_dims) for value in (pad, pad))
-    device_type = prediction.device.type
-    with torch.autocast(device_type=device_type, enabled=False):
-        p = prediction.float()
-        t = target.float()
 
-        def local_mean(x: torch.Tensor) -> torch.Tensor:
-            return pool(
-                pad_fn(x, padding, mode="replicate"),
-                kernel_size=window_size,
-                stride=1,
-            )
+    def local_mean(x: torch.Tensor) -> torch.Tensor:
+        return pool(x, kernel_size=window_size, stride=1, padding=pad)
 
-        mu_p = local_mean(p)
-        mu_t = local_mean(t)
-        var_p = (local_mean(p.square()) - mu_p.square()).clamp_min(0.0)
-        var_t = (local_mean(t.square()) - mu_t.square()).clamp_min(0.0)
-        covariance = local_mean(p * t) - mu_p * mu_t
-        covariance_limit = (var_p * var_t).sqrt()
-        covariance = torch.maximum(
-            torch.minimum(covariance, covariance_limit), -covariance_limit
-        )
-        c1 = float(0.01 * data_range) ** 2
-        c2 = float(0.03 * data_range) ** 2
-        luminance = (2.0 * mu_p * mu_t + c1) / (
-            mu_p.square() + mu_t.square() + c1
-        )
-        structure = (2.0 * covariance + c2) / (var_p + var_t + c2)
-        similarity = (luminance * structure).mean()
-        # Only projects final floating-point roundoff; the moment corrections above fix
-        # the invalid covariance/denominator that caused the observed out-of-range value.
-        similarity = similarity.clamp(-1.0, 1.0)
-    if not bool(torch.isfinite(similarity)):
-        raise ValueError("SSIM produced a non-finite value.")
-    return similarity
+    mu_p = local_mean(prediction)
+    mu_t = local_mean(target)
+    mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
+    sigma_p_sq = local_mean(prediction**2) - mu_p_sq
+    sigma_t_sq = local_mean(target**2) - mu_t_sq
+    sigma_pt = local_mean(prediction * target) - mu_pt
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
+    denominator = (mu_p_sq + mu_t_sq + c1) * (
+        sigma_p_sq + sigma_t_sq + c2
+    )
+    return (numerator / denominator).mean()
 
 
 def lpips_metric(
     prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.Module | None = None
 ) -> torch.Tensor:
-    """Perceptual distance (official MRIxFields Task 3 metric). Requires the optional `lpips` package."""
+    """Project VGG LPIPS helper for 2D ``[0,1]`` tensors.
+
+    This is not the published Task-3 adapter, which constructs LPIPS with the AlexNet
+    trunk and applies its own slice-selection rules. Requires the optional ``lpips``
+    package.
+    """
 
     from fieldbridge.training.losses import lpips_loss
 

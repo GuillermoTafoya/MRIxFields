@@ -42,10 +42,17 @@ one subject or volume.
 
 ## Loss and numerical contract
 
-SSIM moments are evaluated in float32 outside autocast. Variances are projected
+The differentiable training SSIM now has a deliberately separate name and module.
+Its moments are evaluated in float32 outside autocast. Variances are projected
 nonnegative and covariance is projected onto its Cauchy-Schwarz bound before the
 luminance and structure terms are formed. Similarity is documented and checked in
-`[-1, 1]`; loss is finite and nonnegative.
+`[-1, 1]`; loss is finite and nonnegative. It is a training proxy, not the frozen
+Stage-1 audit SSIM3D and not the published Task-3 scikit-image metric.
+
+The completed audit remains on `stage1-full-volume-metrics-v1`, whose SSIM3D arithmetic
+is frozen explicitly as `stage1_full_volume_ssim3d_v1` at the `be60d75` behavior. The
+source-pinned official Task-3 adapter is documented separately in
+`MRIXFIELDS2026_TASK3_METRICS.md`.
 
 New arms use target-derived foreground (`target > 0`) for masked L1 and a separate mean
 absolute prediction penalty on exact-zero background. All raw and weighted loss

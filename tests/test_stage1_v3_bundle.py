@@ -13,9 +13,9 @@ from fieldbridge.data.sampling import (
     exposure_report,
     joint_domain_subject_balanced_indices,
 )
-from fieldbridge.evaluation.metrics import ssim3d
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.losses import ssim_loss
+from fieldbridge.training.ssim import stable_training_ssim3d
 from fieldbridge.training.stage1_vae import (
     Stage1VAEConfig,
     _compute_vae_loss_components,
@@ -94,7 +94,9 @@ def test_ssim_range_and_nonnegative_loss_for_edge_cases(prediction_factory) -> N
     target[..., 2:6, 2:6, 2:6] = 0.7
     prediction = prediction_factory(target).requires_grad_(True)
 
-    similarity = ssim3d(prediction, target, window_size=3)
+    similarity = stable_training_ssim3d(
+        prediction, target, window_size=3
+    )
     loss = ssim_loss(prediction, target, window_size=3)
 
     assert torch.isfinite(similarity)

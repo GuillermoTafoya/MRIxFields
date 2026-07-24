@@ -213,21 +213,23 @@ def kl_divergence_free_bits(mean: torch.Tensor, logvar: torch.Tensor, free_bits:
 
 
 def ssim_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object) -> torch.Tensor:
-    """1 - ssim(...) — ssim is "higher is better", losses in this module are "minimize".
+    """One minus the bounded, autocast-safe training SSIM similarity.
 
-    Dispatches by rank: 4D (B,C,H,W) -> 2D `ssim`, 5D (B,C,D,H,W) -> `ssim3d`. Lets the
-    same loss term drive both the 2D-slice and full-3D-volume training paths.
-
-    Deferred import: evaluation/metrics.py imports training.losses.lpips_loss (also
-    deferred, inside lpips_metric) — importing evaluation.metrics at module level here
-    would work today (no actual cycle, since that import is function-local on the other
-    side too) but keeping both sides deferred avoids ever depending on which one loads
-    first.
+    Dispatches by rank: 4D uses the 2D proxy and 5D uses the volumetric proxy. These
+    differentiable training similarities are intentionally separate from both the frozen
+    Stage-1 audit SSIM3D and the published Task-3 slice-wise scikit-image metric.
     """
 
-    from fieldbridge.evaluation.metrics import ssim, ssim3d
+    from fieldbridge.training.ssim import (
+        stable_training_ssim,
+        stable_training_ssim3d,
+    )
 
-    metric = ssim3d if prediction.ndim == 5 else ssim
+    metric = (
+        stable_training_ssim3d
+        if prediction.ndim == 5
+        else stable_training_ssim
+    )
     similarity = metric(prediction, target, **kwargs)
     if not bool(torch.isfinite(similarity)):
         raise ValueError("SSIM similarity must be finite.")
@@ -279,14 +281,13 @@ def adversarial_hinge_loss_discriminator(real_logits: torch.Tensor, fake_logits:
 
 
 def lpips_loss(prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.Module | None = None) -> torch.Tensor:
-    """Perceptual loss via LPIPS. Requires the optional `lpips` package.
+    """Differentiable project LPIPS training proxy. Requires optional ``lpips``.
 
-    Inputs are the project's official [0, 1] volumes; `lpips.LPIPS` with its default
-    `normalize=False` expects [-1, 1], so they are affine-mapped here. This is a
-    metric-space conversion inside the perceptual net, NOT a rescaling of the data (which
-    the official format forbids) — the tensors the losses and metrics see stay in [0, 1].
-    Skipping it would silently halve the effective input contrast and report an LPIPS
-    that is not the challenge's LPIPS.
+    Inputs follow the project's ``[0,1]`` tensor contract. ``lpips.LPIPS`` with its
+    default ``normalize=False`` expects ``[-1,1]``, so they are affine-mapped here.
+    Stage-1 constructs a VGG trunk once and samples a fixed number of slices; the
+    published Task-3 evaluator instead constructs an AlexNet trunk and averages its own
+    target-filtered slice set. This loss is therefore not an official evaluation metric.
 
     Constructing the default net loads pretrained VGG weights, which is expensive —
     build it once (e.g. in the training loop) and pass it in via `net` on every call

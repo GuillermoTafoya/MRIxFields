@@ -38,6 +38,11 @@ perceptual = [
 nifti = [
   "nibabel>=5.0",
 ]
+official-evaluation = [
+  "nibabel>=5.0",
+  "scikit-image>=0.20",
+  "lpips>=0.1.4",
+]
 
 [project.scripts]
 fieldbridge = "fieldbridge.cli:main"

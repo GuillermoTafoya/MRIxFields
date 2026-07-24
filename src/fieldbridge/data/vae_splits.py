@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -209,9 +210,40 @@ def summarize_vae_splits(splits: VaeSplits) -> dict[str, Any]:
 
 
 def vae_splits_fingerprint(splits: VaeSplits) -> str:
-    """Stable hash of the sorted case_ids per split — a content fingerprint for logging."""
+    """Frozen case-membership hash used by the completed audit-v1 contract."""
 
-    payload = {name: sorted(r.case_id for r in splits.records_for(name)) for name in _SPLIT_NAMES}
+    payload = {
+        name: sorted(record.case_id for record in splits.records_for(name))
+        for name in _SPLIT_NAMES
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def vae_splits_recovery_fingerprint_v3(splits: VaeSplits) -> str:
+    """Strict v3 recovery hash over complete record and split identity.
+
+    This is intentionally separate from ``vae_splits_fingerprint``: the latter is used
+    by the frozen be60d75 audit-v1 selection contract and must retain its case-only
+    arithmetic. The v3 recovery hash detects changed paths, domains, subjects, seed,
+    fractions, or split metadata under unchanged case IDs.
+    """
+
+    payload = {
+        "seed": int(splits.seed),
+        "fractions": [float(value) for value in splits.fractions],
+        "metadata": dict(splits.metadata),
+        "splits": {
+            name: [
+                record.to_dict()
+                for record in sorted(
+                    splits.records_for(name),
+                    key=lambda record: (record.case_id, str(record.image_path)),
+                )
+            ]
+            for name in _SPLIT_NAMES
+        },
+    }
     encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -221,26 +253,118 @@ def save_vae_splits(splits: VaeSplits, path: str | Path) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = splits.to_dict()
     payload["fingerprint"] = vae_splits_fingerprint(splits)
+    payload["recovery_fingerprint_v3"] = vae_splits_recovery_fingerprint_v3(splits)
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return out
 
 
 def load_vae_splits(path: str | Path) -> VaeSplits:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    splits_payload = payload.get("splits", {})
+    split_path = Path(path)
+    try:
+        payload = json.loads(split_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VolumeSplitError(f"Could not read VAE split file {split_path}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise VolumeSplitError(f"VAE split file {split_path} must contain a JSON object.")
+    splits_payload = payload.get("splits")
+    if not isinstance(splits_payload, Mapping):
+        raise VolumeSplitError(f"VAE split file {split_path} is missing a 'splits' object.")
+    missing_names = [name for name in _SPLIT_NAMES if name not in splits_payload]
+    if missing_names:
+        raise VolumeSplitError(
+            f"VAE split file {split_path} is missing split(s): {missing_names}."
+        )
 
     def _records(name: str) -> tuple[VolumeRecord, ...]:
-        return tuple(record_from_mapping(r) for r in splits_payload.get(name, []))
+        values = splits_payload.get(name)
+        if not isinstance(values, list):
+            raise VolumeSplitError(
+                f"VAE split file {split_path} entry {name!r} must be a list."
+            )
+        try:
+            return tuple(record_from_mapping(record) for record in values)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VolumeSplitError(
+                f"VAE split file {split_path} contains a malformed {name!r} record: {exc}"
+            ) from exc
 
-    fractions = payload.get("fractions", [0.8, 0.1, 0.1])
-    return VaeSplits(
+    fractions = payload.get("fractions")
+    if not isinstance(fractions, list) or len(fractions) != 3:
+        raise VolumeSplitError(
+            f"VAE split file {split_path} must contain three split fractions."
+        )
+    try:
+        fraction_values = tuple(float(value) for value in fractions)
+        seed = int(payload["seed"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VolumeSplitError(
+            f"VAE split file {split_path} has invalid seed or fractions."
+        ) from exc
+    if (
+        any(not math.isfinite(value) or value < 0.0 for value in fraction_values)
+        or abs(sum(fraction_values) - 1.0) > 1e-6
+    ):
+        raise VolumeSplitError(
+            f"VAE split file {split_path} fractions must be finite, non-negative, "
+            f"and sum to 1.0; got {fraction_values}."
+        )
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise VolumeSplitError(
+            f"VAE split file {split_path} metadata must be a JSON object."
+        )
+    splits = VaeSplits(
         train=_records("train"),
         validation=_records("validation"),
         test=_records("test"),
-        seed=int(payload.get("seed", 13)),
-        fractions=(float(fractions[0]), float(fractions[1]), float(fractions[2])),
-        metadata=dict(payload.get("metadata", {})),
+        seed=seed,
+        fractions=(
+            fraction_values[0],
+            fraction_values[1],
+            fraction_values[2],
+        ),
+        metadata=dict(metadata),
     )
+    expected_membership_fingerprint = payload.get("fingerprint")
+    if (
+        not isinstance(expected_membership_fingerprint, str)
+        or not expected_membership_fingerprint
+    ):
+        raise VolumeSplitError(
+            f"VAE split file {split_path} has no persisted fingerprint; rebuild it."
+        )
+    actual_membership_fingerprint = vae_splits_fingerprint(splits)
+    if actual_membership_fingerprint != expected_membership_fingerprint:
+        raise VolumeSplitError(
+            "VAE split fingerprint mismatch; the file is stale or was altered: "
+            f"{expected_membership_fingerprint} != {actual_membership_fingerprint}."
+        )
+    expected_recovery_fingerprint = payload.get("recovery_fingerprint_v3")
+    if (
+        not isinstance(expected_recovery_fingerprint, str)
+        or not expected_recovery_fingerprint
+    ):
+        raise VolumeSplitError(
+            f"VAE split file {split_path} has no v3 recovery fingerprint; rebuild it."
+        )
+    actual_recovery_fingerprint = vae_splits_recovery_fingerprint_v3(splits)
+    if actual_recovery_fingerprint != expected_recovery_fingerprint:
+        raise VolumeSplitError(
+            "VAE split v3 recovery fingerprint mismatch; the file is stale or was "
+            f"altered: {expected_recovery_fingerprint} != "
+            f"{actual_recovery_fingerprint}."
+        )
+    for name in _SPLIT_NAMES:
+        records = splits.records_for(name)
+        case_ids = [record.case_id for record in records]
+        paths = [str(record.image_path) for record in records]
+        if len(case_ids) != len(set(case_ids)) or len(paths) != len(set(paths)):
+            raise VolumeSplitError(
+                f"VAE split file {split_path} contains duplicate case/path identity "
+                f"inside the {name!r} split."
+            )
+    audit_vae_splits(splits).raise_for_leakage()
+    return splits
 
 
 def _sorted_records(records: Iterable[VolumeRecord]) -> list[VolumeRecord]:

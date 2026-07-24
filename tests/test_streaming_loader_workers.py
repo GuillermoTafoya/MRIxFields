@@ -13,9 +13,11 @@ after GPU time is already committed on the training box):
 
 from __future__ import annotations
 
+import hashlib
 import pickle
 
 import torch
+from torch.utils.data import DataLoader
 
 from fieldbridge.cli import _build_streaming_patch_loader_from_records
 from fieldbridge.data.contracts import VolumeRecord
@@ -23,12 +25,18 @@ from fieldbridge.data.datasets import (
     ManifestVolumeDataset,
     StreamingPatchDataset,
     _identity_target_domain,
+    collate_raw_batches,
 )
-from fieldbridge.data.domains import Domain
+from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 
 
 def _dummy_loader(path, record) -> torch.Tensor:  # module-level => picklable
     return torch.zeros(1, 8, 8, 8)
+
+
+def _coordinate_loader(path, record) -> torch.Tensor:  # module-level => picklable
+    del path, record
+    return torch.arange(16**3, dtype=torch.float32).reshape(1, 16, 16, 16)
 
 
 def _record() -> VolumeRecord:
@@ -83,3 +91,57 @@ def test_loader_leaves_persistent_off_when_single_process() -> None:
     )
     assert loader.num_workers == 0
     assert loader.persistent_workers is False
+
+
+def _worker_invariance_records() -> list[VolumeRecord]:
+    return [
+        VolumeRecord(
+            case_id=f"case-{index}",
+            image_path=f"case-{index}.nii.gz",
+            domain=Domain(field, contrast),
+            subject_id=f"subject-{index}",
+            metadata={"prefix": "P"},
+        )
+        for index, (field, contrast) in enumerate(
+            (field, contrast)
+            for field in FIELD_STRENGTHS_T
+            for contrast in CONTRASTS
+        )
+    ]
+
+
+def _crop_signatures(num_workers: int) -> list[tuple[str, str]]:
+    dataset = StreamingPatchDataset(
+        _worker_invariance_records(),
+        image_loader=_coordinate_loader,
+        patch_size=(8, 8, 8),
+        patches_per_volume=2,
+        seed=29,
+        joint_domain_balance=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=2,
+        num_workers=num_workers,
+        persistent_workers=False,
+        collate_fn=collate_raw_batches,
+    )
+    signatures: list[tuple[str, str]] = []
+    for batch in loader:
+        assert isinstance(batch.metadata, list)
+        for index, metadata in enumerate(batch.metadata):
+            digest = hashlib.sha256(
+                batch.image[index].numpy().tobytes()
+            ).hexdigest()
+            signatures.append((str(metadata["case_id"]), digest))
+    return sorted(signatures)
+
+
+def test_crop_sequence_is_worker_assignment_invariant_and_item_decorrelated() -> None:
+    single_process = _crop_signatures(0)
+    repeated = _crop_signatures(0)
+    two_workers = _crop_signatures(2)
+
+    assert single_process == repeated == two_workers
+    # Scheduled items do not all inherit one correlated initial RNG stream.
+    assert len({digest for _, digest in single_process}) > 1

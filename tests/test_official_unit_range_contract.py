@@ -256,6 +256,9 @@ def test_per_epoch_validation_writes_history_and_best_checkpoint(tmp_path) -> No
         loss_weights={"l1": 1.0, "ssim": 1.0, "nrmse": 1.0, "lpips": 0.0, "kl": 1e-4},
         checkpoint_dir=tmp_path,
         checkpoint_max_bytes=50_000_000,
+        # This legacy instrumentation assertion exercises promoted persistence;
+        # the scientific v3 configurations retain the stricter 3/4 gate.
+        promotion_min_active_channels=1,
     )
 
     run_stage1_vae_train(cfg, encoder=encoder, decoder=decoder, loader=train, val_loader=val)
@@ -267,7 +270,7 @@ def test_per_epoch_validation_writes_history_and_best_checkpoint(tmp_path) -> No
     for entry in lines:
         assert {"epoch", "step", "train", "validation", "best"} <= set(entry)
         assert "total" in entry["train"] and "total" in entry["validation"]
-        assert "ssim3d" in entry["validation"]  # challenge metric derived from the ssim term
+        assert "ssim3d_proxy" in entry["validation"]
     assert (tmp_path / "vae_kl_vae_best.pt").exists()
 
 

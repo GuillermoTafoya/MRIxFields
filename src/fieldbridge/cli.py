@@ -20,8 +20,10 @@ from fieldbridge.data.vae_splits import (
     save_vae_splits,
     summarize_vae_splits,
     vae_splits_fingerprint,
+    vae_splits_recovery_fingerprint_v3,
 )
 from fieldbridge.data.datasets import (
+    ALL_DOMAINS,
     ImageTransform,
     ManifestVolumeDataset,
     StreamingPatchDataset,
@@ -88,7 +90,11 @@ from fieldbridge.training.pseudo_pair_epochs import (
     train_pseudo_pair_epochs,
 )
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
-from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
+from fieldbridge.training.stage1_vae import (
+    Stage1VAEConfig,
+    preflight_stage1_resume,
+    run_stage1_vae_train,
+)
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
 
@@ -195,8 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--epochs",
         type=int,
         default=None,
-        help="Number of full passes over the manifest. Overrides --steps (steps = "
-        "epochs * ceil(num_volumes * patches_per_volume / batch_size)).",
+        help="Number of full passes over the manifest. Endpoint precedence is "
+        "--epochs > config training.epochs > explicit --steps/config steps.",
     )
     train_stage1_vae.add_argument("--batch-size", type=int, default=None)
     train_stage1_vae.add_argument(
@@ -746,7 +752,6 @@ def main(argv: list[str] | None = None) -> int:
                 "train-stage1-vae requires one of --manifest, --split-json, or --patch-bank."
             )
         config = _load_optional_config(args.config)
-        _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "data", "patches_per_volume", args.patches_per_volume)
         # A split provides its own train/validation record lists; --manifest / --patch-bank
@@ -757,10 +762,10 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 "training",
                 "split_fingerprint",
-                vae_splits_fingerprint(split),
+                vae_splits_recovery_fingerprint_v3(split),
             )
-        # Compute steps_per_epoch so the loop can log epoch/step-in-epoch (loaders are
-        # length-less to the config). --epochs, if given, sets steps from it.
+        # Resolve the endpoint only after the split determines an exact pass length.
+        # Precedence is CLI --epochs > config training.epochs > explicit steps.
         if args.patch_bank is not None:
             num_volumes, ppv = patch_bank_size(args.patch_bank)
             batch_size = int(config.get("training", {}).get("batch_size", 2))
@@ -770,34 +775,23 @@ def main(argv: list[str] | None = None) -> int:
         else:
             steps_per_epoch = _steps_per_epoch(config, args.manifest)
         _override(config, "training", "steps_per_epoch", steps_per_epoch)
-        training_config = config.get("training", {})
-        if isinstance(training_config, Mapping) and "kl_warmup_epochs" in training_config:
-            _override(
-                config,
-                "training",
-                "kl_warmup_steps",
-                int(training_config["kl_warmup_epochs"]) * steps_per_epoch,
-            )
-        if args.epochs is not None:
-            _override(config, "training", "steps", args.epochs * steps_per_epoch)
-        training_config = config.get("training", {})
-        if (
-            isinstance(training_config, Mapping)
-            and str(training_config.get("lr_schedule", "constant")) == "cosine"
-            and int(training_config.get("lr_cosine_total_steps", 0)) == 0
-        ):
-            _override(
-                config,
-                "training",
-                "lr_cosine_total_steps",
-                int(training_config.get("steps", 0)),
-            )
+        _resolve_stage1_endpoint(
+            config,
+            steps_per_epoch=steps_per_epoch,
+            cli_epochs=args.epochs,
+            cli_steps=args.steps,
+        )
+        _resolve_stage1_epoch_dependent_schedules(
+            config, steps_per_epoch=steps_per_epoch
+        )
         if args.seed is not None:
             config["seed"] = args.seed
+        _preflight_stage1_v3_records(config, split)
+        stage_config = Stage1VAEConfig.from_mapping(config)
+        preflight_stage1_resume(stage_config)
         model_config = _model_config(config)
         encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
         decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
-        stage_config = Stage1VAEConfig.from_mapping(config)
         val_loader: "DataLoader[RawBatch] | None" = None
         if args.patch_bank is not None:
             loader = DataLoader(
@@ -849,6 +843,9 @@ def main(argv: list[str] | None = None) -> int:
         save_vae_splits(splits, args.out)
         summary = summarize_vae_splits(splits)
         summary["fingerprint"] = vae_splits_fingerprint(splits)
+        summary["recovery_fingerprint_v3"] = (
+            vae_splits_recovery_fingerprint_v3(splits)
+        )
         summary["out"] = str(args.out)
         if args.json:
             print(json.dumps(summary, indent=2, sort_keys=True))
@@ -1637,8 +1634,153 @@ def _steps_per_epoch(config: Mapping[str, Any], manifest_path: Path) -> int:
 def _steps_per_epoch_for_volumes(config: Mapping[str, Any], num_volumes: int) -> int:
     training = config.get("training", {})
     batch_size = int(training.get("batch_size", 2)) if isinstance(training, Mapping) else 2
-    patches = num_volumes * _patches_per_volume(config)
-    return max(1, -(-patches // max(1, batch_size)))
+    patches_per_volume = _patches_per_volume(config)
+    batch_size = max(1, batch_size)
+    workers = max(0, _num_workers(config))
+    if workers <= 1:
+        return max(1, -(-(num_volumes * patches_per_volume) // batch_size))
+
+    # IterableDataset automatic batching is performed independently in each worker.
+    # Account for each worker's possible final partial batch; using one global ceil can
+    # declare an epoch early and then skip prefetched exposures on iterator restart.
+    base, remainder = divmod(int(num_volumes), workers)
+    batches = 0
+    for worker_index in range(workers):
+        worker_volumes = base + (1 if worker_index < remainder else 0)
+        if worker_volumes:
+            batches += -(-(worker_volumes * patches_per_volume) // batch_size)
+    return max(1, batches)
+
+
+def _resolve_stage1_endpoint(
+    config: dict[str, Any],
+    *,
+    steps_per_epoch: int,
+    cli_epochs: int | None,
+    cli_steps: int | None,
+) -> None:
+    """Resolve one absolute Stage-1 endpoint after the pass length is known.
+
+    Precedence is intentionally strict: ``--epochs`` wins, then
+    ``training.epochs``, then an explicit CLI/config step endpoint.  Epoch endpoints
+    always resolve to complete passes.  Step endpoints are accepted only when they also
+    end on a pass boundary for validation-enabled v3 runs.
+    """
+
+    if steps_per_epoch <= 0:
+        raise ValueError("Stage-1 steps_per_epoch must be positive before endpoint resolution.")
+    training = config.setdefault("training", {})
+    if not isinstance(training, dict):
+        raise ValueError("training config must be a mapping.")
+
+    source: str
+    epochs_value: int | None
+    if cli_epochs is not None:
+        epochs_value = int(cli_epochs)
+        source = "cli_epochs"
+    elif training.get("epochs") is not None:
+        epochs_value = int(training["epochs"])
+        source = "config_epochs"
+    else:
+        epochs_value = None
+        source = "cli_steps" if cli_steps is not None else "config_steps"
+
+    if epochs_value is not None:
+        if epochs_value <= 0:
+            raise ValueError("Stage-1 epochs must be positive.")
+        endpoint_steps = epochs_value * int(steps_per_epoch)
+        training["epochs"] = epochs_value
+    else:
+        raw_steps = cli_steps if cli_steps is not None else training.get("steps")
+        if raw_steps is None:
+            raise ValueError(
+                "Stage-1 requires training.epochs, --epochs, training.steps, or --steps."
+            )
+        endpoint_steps = int(raw_steps)
+        if endpoint_steps <= 0:
+            raise ValueError("Stage-1 steps must be positive.")
+
+    validation_enabled = bool(
+        training.get("require_all_validation_domains", False)
+        or _joint_domain_balance_enabled(config)
+    )
+    if validation_enabled and endpoint_steps % int(steps_per_epoch) != 0:
+        raise ValueError(
+            "Validation-enabled Stage-1 endpoints must contain complete epochs: "
+            f"steps={endpoint_steps}, steps_per_epoch={steps_per_epoch}."
+        )
+    if validation_enabled and endpoint_steps < int(steps_per_epoch):
+        raise ValueError(
+            "Validation-enabled Stage-1 endpoint cannot reach the first epoch boundary: "
+            f"steps={endpoint_steps}, steps_per_epoch={steps_per_epoch}."
+        )
+
+    training["steps"] = endpoint_steps
+    training["endpoint_total_steps"] = endpoint_steps
+    training["endpoint_source"] = source
+    training["resolved_epochs"] = endpoint_steps // int(steps_per_epoch)
+
+
+def _preflight_stage1_v3_records(
+    config: Mapping[str, Any], splits: Any | None
+) -> None:
+    """Fail closed on absent or incomplete 15-domain train/validation splits."""
+
+    training = config.get("training", {})
+    require_validation = bool(
+        isinstance(training, Mapping)
+        and training.get("require_all_validation_domains", False)
+    )
+    joint_balance = _joint_domain_balance_enabled(config)
+    if not (require_validation or joint_balance):
+        return
+    if splits is None:
+        raise ValueError(
+            "Stage-1 v3 requires a verified --split-json with train and validation records."
+        )
+
+    expected = {domain.label for domain in ALL_DOMAINS}
+    for split_name in ("train", "validation"):
+        records = tuple(getattr(splits, split_name, ()))
+        if not records:
+            raise ValueError(f"Stage-1 v3 {split_name} split is empty.")
+        observed = {record.domain.label for record in records}
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        if missing or unexpected:
+            raise ValueError(
+                f"Stage-1 v3 {split_name} split must contain all 15 domains; "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+
+
+def _resolve_stage1_epoch_dependent_schedules(
+    config: dict[str, Any], *, steps_per_epoch: int
+) -> None:
+    """Resolve warm-up and scheduler lengths after the final epoch endpoint."""
+
+    training = config.get("training", {})
+    if not isinstance(training, Mapping):
+        raise ValueError("training config must be a mapping.")
+    if "kl_warmup_epochs" in training:
+        _override(
+            config,
+            "training",
+            "kl_warmup_steps",
+            int(training["kl_warmup_epochs"]) * int(steps_per_epoch),
+        )
+    training = config.get("training", {})
+    if (
+        isinstance(training, Mapping)
+        and str(training.get("lr_schedule", "constant")) == "cosine"
+        and int(training.get("lr_cosine_total_steps", 0)) == 0
+    ):
+        _override(
+            config,
+            "training",
+            "lr_cosine_total_steps",
+            int(training.get("endpoint_total_steps", training.get("steps", 0))),
+        )
 
 
 def _load_loss_curve(path: Path | None) -> list[float] | None:

@@ -12,6 +12,8 @@ latent, VAE frozen by default — staged, not end-to-end.
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import random
@@ -30,8 +32,17 @@ from torch.utils.data import DataLoader
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
 from fieldbridge.training.batch import move_raw_batch
-from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
-from fieldbridge.training.latent_stats import LatentStatsAccumulator, summarize_latent_stats
+from fieldbridge.training.checkpoints import (
+    checkpoint_filename,
+    load_checkpoint,
+    resolve_git_commit,
+    save_checkpoint,
+)
+from fieldbridge.training.latent_stats import (
+    DEFAULT_INPUT_DEPENDENCE_THRESHOLD,
+    DomainBalancedLatentStatsAccumulator,
+    summarize_latent_stats,
+)
 from fieldbridge.training.losses import (
     background_penalty,
     build_lpips_net,
@@ -85,6 +96,9 @@ DEFAULT_VAE_LOSS_WEIGHTS: dict[str, float] = {
 @dataclass(frozen=True, slots=True)
 class Stage1VAEConfig:
     steps: int = 2
+    endpoint_total_steps: int | None = None
+    endpoint_source: str = "steps"
+    resolved_epochs: int | None = None
     batch_size: int = 2
     seed: int = 13
     lr: float = 1e-4
@@ -168,6 +182,7 @@ class Stage1VAEConfig:
     # Decoder domain argument. "target" is an explicit experimental arm; legacy uses source.
     decoder_domain: Literal["source", "target"] = "source"
     latent_active_std_threshold: float = 0.0
+    latent_input_dependence_threshold: float = DEFAULT_INPUT_DEPENDENCE_THRESHOLD
     latent_activity_rule: Literal["kl", "std", "std_and_kl"] = "kl"
     promotion_min_active_channels: int = 3
     split_fingerprint: str | None = None
@@ -179,6 +194,8 @@ class Stage1VAEConfig:
     checkpoint_max_bytes: int = 10_000_000
     log_every_steps: int = 0
     resume_from: Path | None = None
+    resolved_experiment: dict[str, Any] = field(default_factory=dict)
+    config_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if self.latent_mode not in ("stochastic", "deterministic"):
@@ -193,6 +210,10 @@ class Stage1VAEConfig:
             raise ValueError("kl_warmup_steps must be non-negative.")
         if self.promotion_min_active_channels < 1:
             raise ValueError("promotion_min_active_channels must be positive.")
+        if self.endpoint_total_steps is not None and self.endpoint_total_steps <= 0:
+            raise ValueError("endpoint_total_steps must be positive when set.")
+        if self.latent_input_dependence_threshold < 0:
+            raise ValueError("latent_input_dependence_threshold must be non-negative.")
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "Stage1VAEConfig":
@@ -206,8 +227,20 @@ class Stage1VAEConfig:
         checkpoint_dir = training.get("checkpoint_dir", data.get("checkpoint_dir"))
         warm_start_checkpoint = training.get("warm_start_checkpoint", data.get("warm_start_checkpoint"))
         resume_from = training.get("resume_from", data.get("resume_from"))
+        resolved_experiment = _jsonable_copy(data)
         return cls(
             steps=int(training.get("steps", data.get("steps", defaults.steps))),
+            endpoint_total_steps=(
+                int(training["endpoint_total_steps"])
+                if training.get("endpoint_total_steps") is not None
+                else None
+            ),
+            endpoint_source=str(training.get("endpoint_source", "steps")),
+            resolved_epochs=(
+                int(training["resolved_epochs"])
+                if training.get("resolved_epochs") is not None
+                else None
+            ),
             batch_size=int(training.get("batch_size", data.get("batch_size", defaults.batch_size))),
             seed=int(data.get("seed", training.get("seed", defaults.seed))),
             lr=float(training.get("lr", data.get("lr", defaults.lr))),
@@ -298,6 +331,15 @@ class Stage1VAEConfig:
                     ),
                 )
             ),
+            latent_input_dependence_threshold=float(
+                training.get(
+                    "latent_input_dependence_threshold",
+                    data.get(
+                        "latent_input_dependence_threshold",
+                        defaults.latent_input_dependence_threshold,
+                    ),
+                )
+            ),
             latent_activity_rule=str(
                 training.get(
                     "latent_activity_rule",
@@ -374,11 +416,16 @@ class Stage1VAEConfig:
             ),
             log_every_steps=int(training.get("log_every_steps", data.get("log_every_steps", defaults.log_every_steps))),
             resume_from=Path(resume_from) if resume_from else None,
+            resolved_experiment=resolved_experiment,
+            config_fingerprint=_config_fingerprint(resolved_experiment),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "steps": self.steps,
+            "endpoint_total_steps": self.endpoint_total_steps,
+            "endpoint_source": self.endpoint_source,
+            "resolved_epochs": self.resolved_epochs,
             "batch_size": self.batch_size,
             "seed": self.seed,
             "lr": self.lr,
@@ -407,6 +454,7 @@ class Stage1VAEConfig:
             "foreground_mask_threshold": self.foreground_mask_threshold,
             "decoder_domain": self.decoder_domain,
             "latent_active_std_threshold": self.latent_active_std_threshold,
+            "latent_input_dependence_threshold": self.latent_input_dependence_threshold,
             "latent_activity_rule": self.latent_activity_rule,
             "promotion_min_active_channels": self.promotion_min_active_channels,
             "split_fingerprint": self.split_fingerprint,
@@ -420,6 +468,7 @@ class Stage1VAEConfig:
             "val_early_stopping_patience": self.val_early_stopping_patience,
             "checkpoint_at_end": self.checkpoint_at_end,
             "log_every_steps": self.log_every_steps,
+            "config_fingerprint": self.config_fingerprint,
         }
 
 
@@ -504,15 +553,22 @@ _CANDIDATE_DIRECTIONS: dict[str, Literal["min", "max"]] = {
 
 @dataclass
 class _CandidateTracker:
-    """Metric-specific bests plus a non-dominated frontier; no guessed scalar weights."""
+    """Promotable metric bests plus recoverable non-dominated model identities."""
 
-    best: dict[str, float] = field(default_factory=dict)
-    frontier: list[dict[str, float]] = field(default_factory=list)
+    best: dict[str, dict[str, Any]] = field(default_factory=dict)
+    frontier: list[dict[str, Any]] = field(default_factory=list)
 
     def update(
-        self, metrics: Mapping[str, float], *, active_channels: int
-    ) -> tuple[list[str], bool]:
-        point = {
+        self,
+        metrics: Mapping[str, float],
+        *,
+        active_channels: int,
+        epoch: int,
+        step: int,
+        checkpoint_path: Path,
+        latent_evidence: Mapping[str, Any],
+    ) -> tuple[list[str], bool, str]:
+        metric_vector = {
             name: (
                 float(active_channels)
                 if name == "latent_active_channels"
@@ -521,38 +577,134 @@ class _CandidateTracker:
             for name in _CANDIDATE_DIRECTIONS
             if name == "latent_active_channels" or name in metrics
         }
+        candidate_id = _candidate_id(epoch, step, metric_vector)
+        point: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "checkpoint_path": str(checkpoint_path),
+            "epoch": int(epoch),
+            "step": int(step),
+            "metrics": metric_vector,
+            "latent_evidence": _jsonable_copy(latent_evidence),
+        }
         improved: list[str] = []
-        for name, value in point.items():
+        for name, value in metric_vector.items():
             current = self.best.get(name)
             direction = _CANDIDATE_DIRECTIONS[name]
-            if current is None or (value < current if direction == "min" else value > current):
-                self.best[name] = value
+            current_value = (
+                float(current["value"]) if isinstance(current, Mapping) else None
+            )
+            if current_value is None or (
+                value < current_value
+                if direction == "min"
+                else value > current_value
+            ):
+                self.best[name] = {
+                    "value": float(value),
+                    "candidate_id": candidate_id,
+                    "checkpoint_path": str(checkpoint_path),
+                    "epoch": int(epoch),
+                    "step": int(step),
+                }
                 improved.append(name)
         comparable = [
-            existing
-            for existing in self.frontier
-            if set(existing) == set(point)
+            existing for existing in self.frontier
+            if set(existing.get("metrics", {})) == set(metric_vector)
         ]
-        dominated = any(_dominates(existing, point) for existing in comparable)
+        dominated = any(
+            _dominates(existing["metrics"], metric_vector)
+            or existing["metrics"] == metric_vector
+            for existing in comparable
+        )
         added = not dominated
         if added:
             self.frontier = [
                 existing
                 for existing in self.frontier
-                if set(existing) != set(point) or not _dominates(point, existing)
+                if set(existing.get("metrics", {})) != set(metric_vector)
+                or not _dominates(metric_vector, existing["metrics"])
             ]
             self.frontier.append(point)
-        return improved, added
+        return improved, added, candidate_id
 
     def state_dict(self) -> dict[str, Any]:
-        return {"best": dict(self.best), "frontier": [dict(item) for item in self.frontier]}
+        return {
+            "best": _jsonable_copy(self.best),
+            "frontier": _jsonable_copy(self.frontier),
+        }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        self.best = {str(k): float(v) for k, v in dict(state.get("best", {})).items()}
+        raw_best = dict(state.get("best", {}))
+        self.best = {}
+        for name, value in raw_best.items():
+            if isinstance(value, Mapping):
+                self.best[str(name)] = dict(value)
+            else:
+                # Read compatibility for pre-correction draft checkpoints.
+                self.best[str(name)] = {"value": float(value)}
         self.frontier = [
-            {str(k): float(v) for k, v in dict(item).items()}
+            dict(item)
             for item in state.get("frontier", [])
+            if isinstance(item, Mapping) and isinstance(item.get("metrics"), Mapping)
         ]
+
+    def validate_checkpoint_mapping(self) -> None:
+        for item in self.frontier:
+            missing = {
+                name
+                for name in (
+                    "candidate_id",
+                    "checkpoint_path",
+                    "epoch",
+                    "step",
+                    "metrics",
+                    "latent_evidence",
+                )
+                if name not in item
+            }
+            if missing:
+                raise ValueError(
+                    f"Promotable frontier entry is incomplete; missing={sorted(missing)}."
+                )
+            expected_id = _candidate_id(
+                int(item["epoch"]),
+                int(item["step"]),
+                item["metrics"],
+            )
+            if item["candidate_id"] != expected_id:
+                raise ValueError(
+                    "Promotable frontier candidate ID does not match its epoch/step/"
+                    f"metric fingerprint: {item['candidate_id']!r} != {expected_id!r}."
+                )
+            path = Path(str(item.get("checkpoint_path", "")))
+            if not path.is_file():
+                raise ValueError(
+                    "Promotable frontier checkpoint is missing: "
+                    f"{item.get('candidate_id')!r} -> {path}."
+                )
+        for metric_name, item in self.best.items():
+            if "checkpoint_path" not in item or "candidate_id" not in item:
+                # Read-only compatibility for pre-correction draft state is not
+                # sufficient for exact v3 recovery.
+                raise ValueError(
+                    f"Metric best {metric_name!r} has no recoverable candidate mapping."
+                )
+            if not Path(str(item["checkpoint_path"])).is_file():
+                raise ValueError(
+                    f"Metric best {metric_name!r} points to a missing immutable "
+                    f"checkpoint: {item['checkpoint_path']}."
+                )
+
+
+def _candidate_id(
+    epoch: int, step: int, metrics: Mapping[str, float]
+) -> str:
+    encoded = json.dumps(
+        {name: float(value) for name, value in sorted(metrics.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"epoch{int(epoch):04d}_step{int(step):09d}_{fingerprint}"
 
 
 def _dominates(left: Mapping[str, float], right: Mapping[str, float]) -> bool:
@@ -607,10 +759,12 @@ def run_stage1_vae_train(
     candidate_tracker = _CandidateTracker()
     val_epochs_no_improve = 0
     last_latent_stats: dict[str, Any] = {}
+    validation_pass = 0
 
     start_step = 0
     if cfg.resume_from is not None:
         state = load_checkpoint(cfg.resume_from, map_location=device)
+        _validate_resume_identity(state, cfg)
         encoder.load_state_dict(state["encoder"])
         decoder.load_state_dict(state["decoder"])
         optimizer.load_state_dict(state["optimizer"])
@@ -623,27 +777,46 @@ def run_stage1_vae_train(
         if isinstance(state.get("latent_health"), Mapping):
             last_latent_stats = dict(state["latent_health"])
         _restore_rng_state(state.get("rng_state"))
-        _restore_loader_state(loader, state.get("sampler_state"))
+        _restore_loader_state(
+            loader, state.get("train_sampler_state", state.get("sampler_state"))
+        )
+        validation_state = state.get("validation_sampler_state")
+        if val_loader is not None:
+            _restore_loader_state(val_loader, validation_state)
+        if isinstance(validation_state, Mapping):
+            validation_pass = int(validation_state.get("pass", 0))
+        candidate_tracker.validate_checkpoint_mapping()
 
     lpips_net: nn.Module | None = None
     if cfg.loss_weights.get("lpips", 0.0) > 0:
         lpips_net = build_lpips_net(device)
 
-    # Cosine schedule length: default to this run's span (start_step..start_step+steps).
-    # For a resumed run, set lr_cosine_total_steps to the full-schedule length so the curve
-    # is continuous instead of restarting each resume.
-    lr_total_steps = cfg.lr_cosine_total_steps if cfg.lr_cosine_total_steps > 0 else start_step + cfg.steps
+    stop_step = (
+        int(cfg.endpoint_total_steps)
+        if cfg.endpoint_total_steps is not None
+        else start_step + cfg.steps
+    )
+    if stop_step < start_step:
+        raise ValueError(
+            f"Checkpoint step {start_step} is beyond configured endpoint {stop_step}."
+        )
+    lr_total_steps = (
+        cfg.lr_cosine_total_steps
+        if cfg.lr_cosine_total_steps > 0
+        else stop_step
+    )
 
     iterator = iter(loader)
     autocast_ctx = _autocast_context(device, cfg.precision)
     if cfg.log_every_steps > 0:
         epochs_label = (
-            f"~{(start_step + cfg.steps) / cfg.steps_per_epoch:.2f} epochs (steps_per_epoch={cfg.steps_per_epoch})"
+            f"~{stop_step / cfg.steps_per_epoch:.2f} epochs (steps_per_epoch={cfg.steps_per_epoch})"
             if cfg.steps_per_epoch > 0
             else "epoch size unknown"
         )
         _log_training_progress(
-            f"stage1_vae train start: steps={cfg.steps} batch_size={cfg.batch_size} "
+            f"stage1_vae train start: endpoint={stop_step} start_step={start_step} "
+            f"batch_size={cfg.batch_size} "
             f"device={device.type} {epochs_label} early_stopping={cfg.early_stopping}"
         )
 
@@ -673,7 +846,7 @@ def run_stage1_vae_train(
     last_checkpoint_step: int | None = None
     stopped_early = False
     train_start = time.perf_counter()
-    for step in range(start_step, start_step + cfg.steps):
+    for step in range(start_step, stop_step):
         step_start = time.perf_counter()
         try:
             batch = next(iterator)
@@ -737,11 +910,14 @@ def run_stage1_vae_train(
                 val_epochs_no_improve=val_epochs_no_improve,
                 latent_health=last_latent_stats,
                 sampler_state=_sampler_state(current_step, cfg),
+                validation_sampler_state=_validation_sampler_state(validation_pass),
             )
             last_checkpoint_step = current_step
 
         if cfg.log_every_steps > 0 and (
-            len(losses) == 1 or current_step % cfg.log_every_steps == 0 or len(losses) == cfg.steps
+            len(losses) == 1
+            or current_step % cfg.log_every_steps == 0
+            or current_step == stop_step
         ):
             elapsed = time.perf_counter() - train_start
             step_elapsed = time.perf_counter() - step_start
@@ -762,7 +938,7 @@ def run_stage1_vae_train(
             lr_str = f" lr={current_lr:.2e}" if cfg.lr_schedule != "constant" else ""
             _log_training_progress(
                 f"stage1_vae {_epoch_label(current_step, cfg.steps_per_epoch)} "
-                f"step={current_step}/{start_step + cfg.steps} loss={loss_value:.6f}{ema_str} "
+                f"step={current_step}/{stop_step} loss={loss_value:.6f}{ema_str} "
                 f"[{terms_str}]{lr_str} "
                 f"step_sec={step_elapsed:.3f} avg_sec_per_step={elapsed / len(losses):.3f}"
             )
@@ -784,6 +960,7 @@ def run_stage1_vae_train(
                 val_means, latent_stats = _run_validation(
                     encoder, decoder, val_loader, cfg, device, lpips_net, autocast_ctx
                 )
+                validation_pass += 1
                 last_latent_stats = latent_stats
                 val_total = val_means.get("total", float("nan"))
                 selection_metrics = {
@@ -792,12 +969,37 @@ def run_stage1_vae_train(
                     if name in _CANDIDATE_DIRECTIONS and isinstance(value, (int, float))
                 }
                 active_channels = int(latent_stats.get("active_units", 0))
-                improved_metrics, pareto_added = candidate_tracker.update(
-                    selection_metrics, active_channels=active_channels
-                )
                 promotion_eligible = (
                     active_channels >= cfg.promotion_min_active_channels
                 )
+                candidate_vector = {
+                    **selection_metrics,
+                    "latent_active_channels": float(active_channels),
+                }
+                proposed_id = _candidate_id(
+                    epoch_index, current_step, candidate_vector
+                )
+                candidate_path = (
+                    cfg.checkpoint_dir
+                    / f"vae_stage1_pareto_{proposed_id}.pt"
+                    if cfg.checkpoint_dir is not None
+                    else Path(f"unpersisted_{proposed_id}.pt")
+                )
+                if promotion_eligible:
+                    (
+                        improved_metrics,
+                        pareto_added,
+                        candidate_id,
+                    ) = candidate_tracker.update(
+                        selection_metrics,
+                        active_channels=active_channels,
+                        epoch=epoch_index,
+                        step=current_step,
+                        checkpoint_path=candidate_path,
+                        latent_evidence=latent_stats,
+                    )
+                else:
+                    improved_metrics, pareto_added, candidate_id = [], False, None
                 next_val_epochs_no_improve = (
                     0 if improved_metrics or pareto_added else val_epochs_no_improve + 1
                 )
@@ -832,6 +1034,12 @@ def run_stage1_vae_train(
                                 "improved_metrics": improved_metrics,
                                 "pareto_added": pareto_added,
                                 "promotion_eligible": promotion_eligible,
+                                "candidate_class": (
+                                    "promotable"
+                                    if promotion_eligible
+                                    else "diagnostic_ineligible"
+                                ),
+                                "candidate_id": candidate_id,
                                 "required_active_channels": cfg.promotion_min_active_channels,
                             },
                             "lr": current_lr,
@@ -840,19 +1048,44 @@ def run_stage1_vae_train(
                         },
                     )
                 if cfg.checkpoint_dir is not None:
-                    for metric_name in improved_metrics:
-                        _save_candidate_checkpoint(
+                    if promotion_eligible and pareto_added:
+                        assert candidate_id is not None
+                        # Persist the immutable frontier weights before writing any
+                        # overwriteable metric aliases whose state points at this path.
+                        _save_pareto_checkpoint(
                             cfg,
                             encoder,
                             decoder,
                             optimizer,
                             current_step,
-                            label=metric_name,
+                            candidate_id=candidate_id,
+                            candidate_path=candidate_path,
                             candidate_state=candidate_tracker.state_dict(),
                             latent_health=latent_stats,
                             val_epochs_no_improve=next_val_epochs_no_improve,
+                            validation_sampler_state=_validation_sampler_state(
+                                validation_pass
+                            ),
                         )
-                    if pareto_added:
+                    if promotion_eligible:
+                        for metric_name in improved_metrics:
+                            _save_candidate_checkpoint(
+                                cfg,
+                                encoder,
+                                decoder,
+                                optimizer,
+                                current_step,
+                                label=metric_name,
+                                candidate_state=candidate_tracker.state_dict(),
+                                latent_health=latent_stats,
+                                val_epochs_no_improve=next_val_epochs_no_improve,
+                                candidate_id=candidate_id,
+                                validation_sampler_state=_validation_sampler_state(
+                                    validation_pass
+                                ),
+                            )
+                    if promotion_eligible and pareto_added:
+                        assert candidate_id is not None
                         _save_best_checkpoint(
                             cfg,
                             encoder,
@@ -862,6 +1095,10 @@ def run_stage1_vae_train(
                             candidate_state=candidate_tracker.state_dict(),
                             latent_health=latent_stats,
                             val_epochs_no_improve=next_val_epochs_no_improve,
+                            candidate_id=candidate_id,
+                            validation_sampler_state=_validation_sampler_state(
+                                validation_pass
+                            ),
                         )
                     _save_latest_recoverable_checkpoint(
                         cfg,
@@ -875,6 +1112,9 @@ def run_stage1_vae_train(
                         candidate_state=candidate_tracker.state_dict(),
                         val_epochs_no_improve=next_val_epochs_no_improve,
                         latent_health=latent_stats,
+                        validation_sampler_state=_validation_sampler_state(
+                            validation_pass
+                        ),
                     )
                 val_epochs_no_improve = next_val_epochs_no_improve
                 latent_str = f" | latent: {summarize_latent_stats(latent_stats)}" if latent_stats else ""
@@ -928,6 +1168,7 @@ def run_stage1_vae_train(
             val_epochs_no_improve=val_epochs_no_improve,
             latent_health=last_latent_stats,
             sampler_state=_sampler_state(final_step, cfg),
+            validation_sampler_state=_validation_sampler_state(validation_pass),
         )
 
     elapsed_seconds = time.perf_counter() - train_start
@@ -1044,16 +1285,17 @@ def _run_validation(
     """Mean per-term loss + latent posterior-collapse stats over the validation loader.
 
     Deterministic (latent mean, no sampling). `val_max_batches`>0 caps the pass.
-    `ssim3d`/`nrmse`/`lpips` are logged as the challenge metrics too (ssim3d = 1 - ssim
-    loss). The latent stats reuse the very `mean`/`logvar` already encoded for the
-    reconstruction, so they cost one online accumulation and no extra forward pass.
+    Patch reconstruction diagnostics are training proxies and are never labeled as the
+    published challenge metrics or the frozen audit-v1 metrics. The latent stats reuse
+    the very `mean`/`logvar` already encoded for the reconstruction, so they cost one
+    online accumulation and no extra forward pass.
     Returns `(per_term_means, latent_stats)`."""
 
     encoder.eval()
     decoder.eval()
     # domain -> volume -> metric -> [sum over patches, patch count]
     volume_metrics: dict[str, dict[str, dict[str, list[float]]]] = {}
-    latent_acc = LatentStatsAccumulator(encoder.latent_channels)
+    latent_acc = DomainBalancedLatentStatsAccumulator(encoder.latent_channels)
     count = 0
     for batch in val_loader:
         if cfg.val_max_batches > 0 and count >= cfg.val_max_batches:
@@ -1068,7 +1310,6 @@ def _run_validation(
             )
             reconstructed = decoder.decode(mean, decode_domain)
             _require_finite_tensor(reconstructed, "validation reconstruction")
-        latent_acc.update(mean, logvar)
         for sample_index in range(int(batch.image.shape[0])):
             sample_components = _reconstruction_components(
                 reconstructed[sample_index : sample_index + 1],
@@ -1091,6 +1332,12 @@ def _run_validation(
             )
             domain = _batch_domain_label(batch.source_domain, sample_index)
             case_id = _batch_case_id(batch.metadata, sample_index)
+            latent_acc.update(
+                domain=domain,
+                volume_id=case_id,
+                mean=mean[sample_index : sample_index + 1],
+                logvar=logvar[sample_index : sample_index + 1],
+            )
             target = volume_metrics.setdefault(domain, {}).setdefault(case_id, {})
             for name, value in sample_values.items():
                 accumulator = target.setdefault(name, [0.0, 0.0])
@@ -1136,9 +1383,10 @@ def _run_validation(
     means["per_domain"] = per_domain  # type: ignore[assignment]
     latent_stats = (
         latent_acc.compute(
-            active_threshold=cfg.latent_active_kl_threshold,
+            active_kl_threshold=cfg.latent_active_kl_threshold,
             active_std_threshold=cfg.latent_active_std_threshold,
-            activity_rule=cfg.latent_activity_rule,
+            input_dependence_threshold=cfg.latent_input_dependence_threshold,
+            require_raw_kl=cfg.latent_mode == "stochastic",
         )
         if count
         else {}
@@ -1215,7 +1463,12 @@ def _update_exposure(report: dict[str, Any], batch: RawBatch) -> None:
         )
         subject = None
         if isinstance(metadata, Mapping):
-            subject = metadata.get("subject_id") or metadata.get("case_id")
+            subject_id = metadata.get("subject_id")
+            prefix = metadata.get("prefix")
+            if prefix and subject_id:
+                subject = f"{prefix}:{subject_id}"
+            else:
+                subject = subject_id or metadata.get("case_id")
         subject = str(subject or f"sample-{index}")
         by_domain[domain] = int(by_domain.get(domain, 0)) + 1
         domain_subjects = by_subject.setdefault(domain, {})
@@ -1374,11 +1627,26 @@ def _weighted_terms(
 
 
 def _capture_fixed_batch(loader: DataLoader[RawBatch]) -> RawBatch | None:
-    """Grab the first batch of a loader, kept on CPU, for the fixed reconstruction panel.
+    """Grab a deterministic batch without advancing the validation loader state.
 
-    Returns None if the loader yields nothing (an empty validation set disables the hook)."""
+    A shallow dataset copy owns an independent pass counter and runs synchronously, so
+    persistent validation workers and their crop sequence remain untouched.
+    """
 
-    for batch in loader:
+    dataset = copy.copy(loader.dataset)
+    load_state = getattr(dataset, "load_state_dict", None)
+    if callable(load_state):
+        load_state({"pass": 0})
+    independent = DataLoader(
+        dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=loader.collate_fn,
+        drop_last=False,
+        generator=torch.Generator().manual_seed(0),
+    )
+    for batch in independent:
         return batch
     return None
 
@@ -1450,6 +1718,8 @@ def _save_best_checkpoint(
     candidate_state: Mapping[str, Any],
     latent_health: Mapping[str, Any],
     val_epochs_no_improve: int,
+    candidate_id: str,
+    validation_sampler_state: Mapping[str, Any] | None,
 ) -> None:
     """Compatibility path for the latest non-dominated multi-metric candidate."""
 
@@ -1466,11 +1736,15 @@ def _save_best_checkpoint(
             latent_health=latent_health,
             val_epochs_no_improve=val_epochs_no_improve,
             sampler_state=_sampler_state(step, cfg),
+            validation_sampler_state=validation_sampler_state,
+            checkpoint_role="promoted_pareto_alias",
+            candidate_id=candidate_id,
         ),
         max_bytes=cfg.checkpoint_max_bytes,
         overwrite=True,
         seed=cfg.seed,
-        config=cfg.to_dict(),
+        config=_checkpoint_config(cfg),
+        git_commit=_experiment_git_commit(cfg),
     )
 
 
@@ -1486,6 +1760,7 @@ def _save_step_checkpoint(
     val_epochs_no_improve: int = 0,
     latent_health: Mapping[str, Any] | None = None,
     sampler_state: Mapping[str, Any] | None = None,
+    validation_sampler_state: Mapping[str, Any] | None = None,
 ) -> None:
     assert cfg.checkpoint_dir is not None
     filename = checkpoint_filename("vae", "kl_vae", step)
@@ -1500,13 +1775,20 @@ def _save_step_checkpoint(
         val_epochs_no_improve=val_epochs_no_improve,
         latent_health=latent_health,
         sampler_state=sampler_state,
+        validation_sampler_state=validation_sampler_state,
+        checkpoint_role=(
+            "recoverable_epoch_boundary"
+            if sampler_state is not None and sampler_state.get("recoverable")
+            else "diagnostic_nonrecoverable_step"
+        ),
     )
     save_checkpoint(
         cfg.checkpoint_dir / filename,
         payload,
         max_bytes=cfg.checkpoint_max_bytes,
         seed=cfg.seed,
-        config=cfg.to_dict(),
+        config=_checkpoint_config(cfg),
+        git_commit=_experiment_git_commit(cfg),
     )
 
 
@@ -1521,6 +1803,8 @@ def _save_candidate_checkpoint(
     candidate_state: Mapping[str, Any],
     latent_health: Mapping[str, Any],
     val_epochs_no_improve: int,
+    candidate_id: str | None,
+    validation_sampler_state: Mapping[str, Any] | None,
 ) -> None:
     assert cfg.checkpoint_dir is not None
     safe_label = "".join(char if char.isalnum() or char == "_" else "_" for char in label)
@@ -1536,11 +1820,55 @@ def _save_candidate_checkpoint(
             latent_health=latent_health,
             val_epochs_no_improve=val_epochs_no_improve,
             sampler_state=_sampler_state(step, cfg),
+            validation_sampler_state=validation_sampler_state,
+            checkpoint_role=f"promotable_metric_best:{label}",
+            candidate_id=candidate_id,
         ),
         max_bytes=cfg.checkpoint_max_bytes,
         overwrite=True,
         seed=cfg.seed,
-        config=cfg.to_dict(),
+        config=_checkpoint_config(cfg),
+        git_commit=_experiment_git_commit(cfg),
+    )
+
+
+def _save_pareto_checkpoint(
+    cfg: Stage1VAEConfig,
+    encoder: KLVAEEncoder,
+    decoder: KLVAEDecoder,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    *,
+    candidate_id: str,
+    candidate_path: Path,
+    candidate_state: Mapping[str, Any],
+    latent_health: Mapping[str, Any],
+    val_epochs_no_improve: int,
+    validation_sampler_state: Mapping[str, Any] | None,
+) -> None:
+    """Write one immutable model artifact for a newly non-dominated point."""
+
+    save_checkpoint(
+        candidate_path,
+        _checkpoint_payload(
+            cfg,
+            encoder,
+            decoder,
+            optimizer,
+            step,
+            candidate_state=candidate_state,
+            latent_health=latent_health,
+            val_epochs_no_improve=val_epochs_no_improve,
+            sampler_state=_sampler_state(step, cfg),
+            validation_sampler_state=validation_sampler_state,
+            checkpoint_role="immutable_promotable_pareto",
+            candidate_id=candidate_id,
+        ),
+        max_bytes=cfg.checkpoint_max_bytes,
+        overwrite=False,
+        seed=cfg.seed,
+        config=_checkpoint_config(cfg),
+        git_commit=_experiment_git_commit(cfg),
     )
 
 
@@ -1555,6 +1883,7 @@ def _save_latest_recoverable_checkpoint(
     candidate_state: Mapping[str, Any],
     val_epochs_no_improve: int,
     latent_health: Mapping[str, Any],
+    validation_sampler_state: Mapping[str, Any] | None,
 ) -> None:
     """Persist the stable epoch-boundary checkpoint with complete recovery state."""
 
@@ -1575,11 +1904,14 @@ def _save_latest_recoverable_checkpoint(
             val_epochs_no_improve=val_epochs_no_improve,
             latent_health=latent_health,
             sampler_state=sampler_state,
+            validation_sampler_state=validation_sampler_state,
+            checkpoint_role="latest_recoverable_epoch_boundary",
         ),
         max_bytes=cfg.checkpoint_max_bytes,
         overwrite=True,
         seed=cfg.seed,
-        config=cfg.to_dict(),
+        config=_checkpoint_config(cfg),
+        git_commit=_experiment_git_commit(cfg),
     )
 
 
@@ -1595,6 +1927,9 @@ def _checkpoint_payload(
     val_epochs_no_improve: int = 0,
     latent_health: Mapping[str, Any] | None = None,
     sampler_state: Mapping[str, Any] | None = None,
+    validation_sampler_state: Mapping[str, Any] | None = None,
+    checkpoint_role: str = "recovery",
+    candidate_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "checkpoint_version": "stage1_v3_recoverable",
@@ -1603,12 +1938,12 @@ def _checkpoint_payload(
         "optimizer": optimizer.state_dict(),
         "scheduler": {
             "kind": cfg.lr_schedule,
-            "global_step": int(step),
-            "total_steps": int(
-                cfg.lr_cosine_total_steps
-                if cfg.lr_cosine_total_steps > 0
-                else max(step, cfg.steps)
-            ),
+            "position": int(step),
+            "total_steps": int(_scheduler_total_steps(cfg, step)),
+            "lr_warmup_steps": int(cfg.lr_warmup_steps),
+            "lr_min_factor": float(cfg.lr_min_factor),
+            "base_lr": float(cfg.lr),
+            "kl_warmup_steps": int(cfg.kl_warmup_steps),
         },
         # bf16 autocast intentionally has no GradScaler, but the state is explicit.
         "amp_scaler": None,
@@ -1621,6 +1956,18 @@ def _checkpoint_payload(
         "latent_health": dict(latent_health or {}),
         "rng_state": _capture_rng_state(),
         "sampler_state": dict(sampler_state) if sampler_state is not None else None,
+        "train_sampler_state": (
+            dict(sampler_state) if sampler_state is not None else None
+        ),
+        "validation_sampler_state": (
+            dict(validation_sampler_state)
+            if validation_sampler_state is not None
+            else None
+        ),
+        "checkpoint_role": checkpoint_role,
+        "candidate_id": candidate_id,
+        "split_fingerprint": cfg.split_fingerprint,
+        "experiment_identity": _experiment_identity(cfg),
     }
     return payload
 
@@ -1641,6 +1988,145 @@ def _sampler_state(step: int, cfg: Stage1VAEConfig) -> dict[str, Any] | None:
         "batch_offset": offset,
         "recoverable": offset == 0,
     }
+
+
+def _validation_sampler_state(pass_index: int) -> dict[str, Any]:
+    return {
+        "pass": int(pass_index),
+        "batch_offset": 0,
+        "recoverable": True,
+    }
+
+
+def _scheduler_total_steps(cfg: Stage1VAEConfig, step: int) -> int:
+    if cfg.lr_cosine_total_steps > 0:
+        return int(cfg.lr_cosine_total_steps)
+    if cfg.endpoint_total_steps is not None:
+        return int(cfg.endpoint_total_steps)
+    return max(int(step), int(cfg.steps))
+
+
+def _validate_resume_identity(
+    state: Mapping[str, Any], cfg: Stage1VAEConfig
+) -> None:
+    saved_split = state.get("split_fingerprint")
+    if cfg.split_fingerprint is not None:
+        if saved_split != cfg.split_fingerprint:
+            raise ValueError(
+                "Resume split fingerprint mismatch: "
+                f"{saved_split!r} != {cfg.split_fingerprint!r}."
+            )
+
+    scheduler = state.get("scheduler")
+    if not isinstance(scheduler, Mapping):
+        raise ValueError("Resume checkpoint is missing scheduler recovery state.")
+    position = int(state.get("step", state.get("global_step", 0)))
+    expected_scheduler = {
+        "kind": cfg.lr_schedule,
+        "position": position,
+        "total_steps": _scheduler_total_steps(cfg, position),
+        "lr_warmup_steps": int(cfg.lr_warmup_steps),
+        "lr_min_factor": float(cfg.lr_min_factor),
+        "base_lr": float(cfg.lr),
+        "kl_warmup_steps": int(cfg.kl_warmup_steps),
+    }
+    for name, expected in expected_scheduler.items():
+        observed = scheduler.get(name)
+        if name == "position" and observed is None:
+            observed = scheduler.get("global_step")
+        if cfg.lr_schedule == "constant" and name in {
+            "total_steps",
+            "lr_warmup_steps",
+            "lr_min_factor",
+        }:
+            continue
+        if observed != expected:
+            raise ValueError(
+                "Resume scheduler configuration mismatch for "
+                f"{name}: {observed!r} != {expected!r}."
+            )
+
+    saved_identity = state.get("experiment_identity")
+    current_identity = _experiment_identity(cfg)
+    if isinstance(saved_identity, Mapping):
+        saved_compatibility = saved_identity.get(
+            "resume_compatibility_fingerprint"
+        )
+        current_compatibility = current_identity.get(
+            "resume_compatibility_fingerprint"
+        )
+        if (
+            bool(saved_identity.get("complete_resolved_config", False))
+            and bool(current_identity.get("complete_resolved_config", False))
+            and saved_compatibility is not None
+            and current_compatibility is not None
+            and saved_compatibility != current_compatibility
+        ):
+            raise ValueError(
+                "Resume experiment configuration is incompatible with the checkpoint: "
+                f"{saved_compatibility} != {current_compatibility}."
+            )
+
+
+def preflight_stage1_resume(cfg: Stage1VAEConfig) -> None:
+    """Validate resume identity on CPU before model construction or CUDA resolution."""
+
+    if cfg.resume_from is None:
+        return
+    state = load_checkpoint(cfg.resume_from, map_location="cpu")
+    _validate_resume_identity(state, cfg)
+
+
+def _checkpoint_config(cfg: Stage1VAEConfig) -> dict[str, Any]:
+    if cfg.resolved_experiment:
+        return _jsonable_copy(cfg.resolved_experiment)
+    return {"training": cfg.to_dict()}
+
+
+def _experiment_identity(cfg: Stage1VAEConfig) -> dict[str, Any]:
+    resolved = _checkpoint_config(cfg)
+    compatibility = copy.deepcopy(resolved)
+    training = compatibility.get("training")
+    if isinstance(training, dict):
+        training.pop("resume_from", None)
+    return {
+        "resolved_config": resolved,
+        "config_fingerprint": _config_fingerprint(resolved),
+        "resume_compatibility_fingerprint": _config_fingerprint(compatibility),
+        "complete_resolved_config": bool(cfg.resolved_experiment),
+        "split_fingerprint": cfg.split_fingerprint,
+        "git_commit": _experiment_git_commit(cfg),
+    }
+
+
+def _experiment_git_commit(cfg: Stage1VAEConfig) -> str:
+    del cfg
+    return resolve_git_commit()
+
+
+def _jsonable_copy(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _jsonable_copy(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_copy(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _config_fingerprint(config: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        _jsonable_copy(config),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _capture_rng_state() -> dict[str, Any]:

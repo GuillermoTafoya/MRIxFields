@@ -205,7 +205,7 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
         # Reshuffle each pass so re-iterating (the training loop restarts the iterator on
         # StopIteration) does not replay the same volume order.
         pass_index = self._pass
-        generator = torch.Generator().manual_seed(self.seed + pass_index)
+        schedule_generator = torch.Generator().manual_seed(self.seed + pass_index)
         self._pass += 1
         if self.joint_domain_balance:
             order = joint_domain_subject_balanced_indices(
@@ -219,25 +219,42 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
             # pass" guarantee is relaxed in exchange for up-sampling under-represented fields.
             # Seeded generator keeps it reproducible.
             order = torch.multinomial(
-                weights, num_samples=len(records), replacement=True, generator=generator
+                weights,
+                num_samples=len(records),
+                replacement=True,
+                generator=schedule_generator,
             ).tolist()
         else:
-            order = torch.randperm(len(records), generator=generator).tolist()
+            order = torch.randperm(
+                len(records), generator=schedule_generator
+            ).tolist()
         self.last_exposure_report = exposure_report(records, order)
+        scheduled = list(enumerate(order))
         if worker is not None:
             # Build one global deterministic schedule first, then shard schedule positions.
             # Sharding records first can remove domains from a worker and destroys exact balance.
-            order = order[worker.id :: worker.num_workers]
-        for record_index in order:
+            scheduled = scheduled[worker.id :: worker.num_workers]
+        for schedule_position, record_index in scheduled:
             record = records[record_index]
+            item_generator = torch.Generator().manual_seed(
+                _scheduled_item_seed(
+                    seed=self.seed,
+                    pass_index=pass_index,
+                    schedule_position=schedule_position,
+                    record=record,
+                )
+            )
             volume = self.image_loader(record.image_path, record)
             if self.volume_transform is not None:
                 volume = self.volume_transform(volume)
             target_domain = self.target_domain_selector(record)
             metadata = {
+                **dict(record.metadata),
+                # These canonical record fields must not be shadowed by stale manifest
+                # metadata. Exposure reporting then uses the same prefix:subject_id key
+                # as the hierarchical sampler.
                 "case_id": record.case_id,
                 "subject_id": record.subject_id,
-                **dict(record.metadata),
             }
             # Computed once per volume, not per patch: thresholding a full 364^3 volume is
             # far from free and the mask is patch-invariant.
@@ -255,10 +272,14 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
                         patch_size=self.patch_size,
                         mask=mask,
                         config=self.crop_config,
-                        generator=generator,
+                        generator=item_generator,
                     )
                 else:
-                    patch = random_crop(volume, patch_size=self.patch_size, generator=generator)
+                    patch = random_crop(
+                        volume,
+                        patch_size=self.patch_size,
+                        generator=item_generator,
+                    )
                 yield RawBatch(
                     image=patch,
                     source_domain=record.domain,
@@ -266,6 +287,27 @@ class StreamingPatchDataset(IterableDataset[RawBatch]):
                     metadata=dict(metadata),
                 )
             del volume  # drop before reading the next: only one volume resident at a time.
+
+
+def _scheduled_item_seed(
+    *,
+    seed: int,
+    pass_index: int,
+    schedule_position: int,
+    record: VolumeRecord,
+) -> int:
+    """Worker-invariant crop seed for one scheduled volume exposure."""
+
+    identity = (
+        f"{record.case_id}|{record.domain.label}|{record.subject_id}|"
+        f"{record.image_path}"
+    )
+    digest = hashlib.sha256(
+        f"{int(seed)}|{int(pass_index)}|{int(schedule_position)}|{identity}".encode(
+            "utf-8"
+        )
+    ).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
 
 class SyntheticVolumeDataset(Dataset[RawBatch]):

@@ -28,7 +28,9 @@ model:
   output_activation: none
   domain_conditioning_dim: 16
 training:
-  steps: 1000
+  # Keep the isolated FiLM comparison on the same maximum schedule as the base VAE arm.
+  # CLI --epochs overrides this, otherwise it overrides explicit steps.
+  epochs: 40
   batch_size: 8
   lr: 0.0001
   device: cuda
@@ -52,6 +54,7 @@ training:
   kl_warmup_epochs: 10
   latent_activity_rule: std_and_kl
   latent_active_std_threshold: 0.05
+  latent_input_dependence_threshold: 0.01
   latent_active_kl_threshold: 0.01
   promotion_min_active_channels: 3
   require_all_validation_domains: true

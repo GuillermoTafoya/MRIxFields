@@ -104,6 +104,9 @@ def test_validation_history_has_weighted_latent_and_best_checkpoint(tmp_path) ->
         checkpoint_max_bytes=200_000_000,
         recon_dump_every_epochs=1,
         val_every_epochs=1,
+        # This instrumentation test exercises promotable checkpoint persistence;
+        # the scientific v3 default remains the stricter 3/4-channel gate.
+        promotion_min_active_channels=1,
     )
 
     run_stage1_vae_train(

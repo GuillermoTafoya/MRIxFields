@@ -40,6 +40,13 @@ and observed exposure by domain and by subject within domain. Small domains stil
 records by necessity, but the repetition is explicit and cannot silently concentrate on
 one subject or volume.
 
+Each v3 arm declares `training.epochs: 40`; the CLI resolves that endpoint only after
+the exact iterable-loader `steps_per_epoch` is known. Endpoint precedence is
+`--epochs`, then `training.epochs`, then explicit CLI/config steps. For multi-worker
+iterable loading, pass length includes each worker's possible final partial batch.
+Validation-enabled v3 runs fail before model or CUDA initialization if the endpoint
+cannot reach and end on an epoch boundary.
+
 ## Loss and numerical contract
 
 The differentiable training SSIM now has a deliberately separate name and module.
@@ -63,10 +70,11 @@ loss is introduced.
 ## Controlled arms
 
 - `stage1_ae_v3_joint_domain.yaml`: deterministic latent mean, no sampling or KL.
-  Activity is monitored by per-channel latent standard deviation.
+  Activity requires both per-channel latent standard deviation and deterministic input
+  dependence.
 - `stage1_vae_v3_joint_domain_freebits.yaml`: stochastic KL-VAE, raw and effective
   per-channel free-bits KL, and a ten-epoch linear KL warm-up resolved from the split's
-  `steps_per_epoch`.
+  `steps_per_epoch`. Activity requires channel variation, input dependence, and raw KL.
 - `stage1_vae_v3_target_decoder_film.yaml`: separate experimental arm with one shared
   16-dimensional target-domain conditioner and FiLM in the decoder. It has no routers
   or domain-specific subnetworks and writes to an isolated checkpoint directory.
@@ -89,11 +97,39 @@ high-intensity-tail error, background leakage, and latent utilization. It does n
 collapse those quantities into guessed scalar weights. Promotion requires at least
 three of four active channels.
 
+Latent evidence follows the same weighting hierarchy as reconstruction validation:
+patches are reduced into volumes, volumes are averaged within a domain, and the 15
+domains receive equal macro weight. Per-channel input dependence is the population
+standard deviation of distinct volumes' channel-wise mean posterior values, measured in
+posterior-mean latent units; the configured threshold is `0.01`. A fixed spatial latent
+template therefore fails even if it has high spatial variation or raw KL. Macro and
+per-domain standard deviation, raw KL, input-dependence, and activity masks are stored.
+
+Candidate classes are deliberately distinct:
+
+- a **diagnostic candidate** failed the latent promotion gate and is recorded in history
+  only; it cannot update metric bests, the promotion frontier, or promoted aliases;
+- a **promotable candidate** passed the latent gate and may update metric-specific bests;
+- every newly non-dominated promotable point receives a stable epoch/step/metric
+  fingerprint ID and an **immutable Pareto checkpoint**; and
+- the frozen equal-domain **offline 60-volume promotion audit** remains the final
+  expensive evaluation and is never replaced by patch candidates.
+
 Epoch-boundary `vae_stage1_latest_recoverable.pt` stores model, optimizer, explicit
 scheduler position, explicit absent bf16 scaler state, Python/CPU/CUDA RNG, sampler
-pass, epoch/global step, training and validation early-stop state, candidate frontier,
-and latent health. Metric-specific and latest-Pareto checkpoints are stored separately.
-Mid-epoch step checkpoints are marked nonrecoverable for exact sampler replay.
+pass, independent validation pass, epoch/global step, training and validation early-stop
+state, candidate frontier-to-checkpoint mapping, and latent health. It also records the
+complete resolved data/crop, model, and training config, its fingerprint, the split
+fingerprint, and Git commit. Every split load recomputes its persisted fingerprint and
+reruns the subject/case/path leakage audit; resume rejects split, scheduler, warm-up, or
+resolved-config mismatches. Fixed reconstruction capture uses an independent loader and
+does not advance validation state. Metric-specific aliases, immutable Pareto weights,
+and latest recovery state are stored separately. Mid-epoch step checkpoints are marked
+nonrecoverable for exact sampler replay.
+
+The strict complete-record recovery hash is versioned separately as
+`recovery_fingerprint_v3`. The older case-membership `vae_splits_fingerprint` remains
+unchanged because the frozen audit-v1 selection contract depends on its exact arithmetic.
 
 The expensive frozen 60-volume audit remains an offline promotion gate. Patch proxies
 can nominate candidates; they cannot replace equal-domain complete-volume evaluation

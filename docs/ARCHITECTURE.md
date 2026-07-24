@@ -261,7 +261,10 @@ completed audit's pre-v3 SSIM arithmetic.
 `evaluation/mrixfields2026_official.py` is the official-evaluation adapter pinned to
 upstream commit `5d55309` and evaluator blob `4e21a48`. It implements canonical float32
 NIfTI loading, full-volume target-L2 nRMSE, slice-wise scikit-image SSIM, and slice-wise
-AlexNet LPIPS. Its optional dependencies are installed with `.[official-evaluation]`.
+AlexNet LPIPS. `mrixfields2026-evaluate-task3` matches NIfTI directories by published
+subject ID, rejects broadcasting/non-finite values, aggregates per-case mean and
+population standard deviation, and records source/runtime provenance. Its optional
+dependencies are installed with `.[official-evaluation]`.
 
 The bounded autocast-safe differentiable SSIM used by Stage-1 training lives in
 `training/ssim.py`; it is intentionally not exported as an evaluation metric.

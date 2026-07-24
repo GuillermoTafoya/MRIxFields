@@ -31,8 +31,33 @@ conversions and reductions:
 - LPIPS maps `[0,1]` to `[-1,1]`, repeats each axial slice to three channels, evaluates
   `lpips.LPIPS(net="alex")`, applies the published target-slice filter, and averages.
 
-Use `evaluate_official_task3_pair(prediction_path, target_path)` for file-based parity.
-This requires the optional dependencies:
+Use `evaluate_official_task3_pair(prediction_path, target_path)` for one file pair.
+Use `evaluate_official_task3_directory(prediction_dir, target_dir)` or the CLI for
+published-style subject matching and per-case aggregation:
+
+```powershell
+fieldbridge mrixfields2026-evaluate-task3 `
+  --pred-dir <PREDICTION_DIRECTORY> `
+  --target-dir <TARGET_DIRECTORY> `
+  --device cuda `
+  --out <RESULTS_JSON>
+```
+
+The directory evaluator is intended for one target field/contrast unit at a time. It
+rejects duplicate subject IDs, mismatched prediction/target shapes, non-finite inputs,
+non-finite metric results, and an empty matched set. Summary fields are the NumPy mean
+and population standard deviation (`np.std`, `ddof=0`) across per-case values, matching
+the published evaluator.
+
+The JSON records:
+
+- `OFFICIAL_TASK3_METRIC_CONTRACT`;
+- pinned upstream repository commit and evaluator/README blob SHAs;
+- Python, NumPy, nibabel, scikit-image, Torch, torchvision, and LPIPS versions;
+- the actual LPIPS device after the published CUDA-to-CPU fallback;
+- relative prediction/target names, per-case metrics, case count, and summary values.
+
+The official path requires the optional dependencies:
 
 ```powershell
 python -m pip install -e ".[official-evaluation]"

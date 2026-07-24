@@ -65,6 +65,9 @@ from fieldbridge.official.submissions import (
     validate_submission_dir,
 )
 from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_pseudo_pairs
+from fieldbridge.evaluation.mrixfields2026_official import (
+    evaluate_official_task3_directory,
+)
 from fieldbridge.evaluation.stage1_full_volume_audit import (
     AuditRuntime,
     audit_stage1_checkpoint,
@@ -470,6 +473,31 @@ def build_parser() -> argparse.ArgumentParser:
     audit_source.add_argument("--data-root", type=Path)
     audit_data.add_argument("--inspect-payload", action="store_true")
     audit_data.add_argument("--json", action="store_true", help="Emit JSON output.")
+
+    official_task3_eval = subparsers.add_parser(
+        "mrixfields2026-evaluate-task3",
+        help="Run the source-pinned official Task-3 metrics over matched NIfTI directories.",
+    )
+    official_task3_eval.add_argument("--pred-dir", type=Path, required=True)
+    official_task3_eval.add_argument("--target-dir", type=Path, required=True)
+    official_task3_eval.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=("nrmse", "ssim", "lpips"),
+        default=("nrmse", "ssim", "lpips"),
+    )
+    official_task3_eval.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+        help="LPIPS device; published fallback uses CPU when CUDA is unavailable.",
+    )
+    official_task3_eval.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional JSON output path; the same payload is always printed.",
+    )
 
     return parser
 
@@ -1106,6 +1134,22 @@ def main(argv: list[str] | None = None) -> int:
         report = audit_mrixfields_manifest(records)
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
         return 0 if report.ok else 1
+
+    if args.command == "mrixfields2026-evaluate-task3":
+        payload = evaluate_official_task3_directory(
+            args.pred_dir,
+            args.target_dir,
+            metrics=args.metrics,
+            device=args.device,
+        )
+        serialized = json.dumps(
+            payload, indent=2, sort_keys=True, allow_nan=False
+        )
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(serialized + "\n", encoding="utf-8")
+        print(serialized)
+        return 0
 
     raise ValueError(f"Unknown command: {args.command}")
 

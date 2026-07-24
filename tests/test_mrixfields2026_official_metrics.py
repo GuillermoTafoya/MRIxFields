@@ -44,6 +44,24 @@ def test_official_nrmse_matches_published_l2_ratio_and_zero_norm_rule() -> None:
     )
 
 
+def test_official_metrics_reject_shape_mismatch_before_broadcasting() -> None:
+    prediction = np.zeros((8, 8, 2), dtype=np.float32)
+    target = np.zeros((8, 8, 1), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="shape mismatch.*broadcasting"):
+        official.official_task3_nrmse(prediction, target)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_official_metrics_reject_nonfinite_input(invalid: float) -> None:
+    prediction = np.zeros((8, 8, 2), dtype=np.float32)
+    prediction[0, 0, 0] = invalid
+    target = np.zeros_like(prediction)
+
+    with pytest.raises(ValueError, match="prediction contains non-finite"):
+        official.official_task3_nrmse(prediction, target)
+
+
 def test_official_ssim_uses_global_target_range_and_skips_constant_slices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,6 +111,36 @@ def test_official_ssim_constant_target_returns_one_without_dependency(
     prediction = np.ones_like(target)
 
     assert official.official_task3_ssim(prediction, target) == 1.0
+
+
+def test_official_ssim_matches_real_scikit_image_on_deterministic_volume() -> None:
+    skimage_metrics = pytest.importorskip("skimage.metrics")
+    target = np.zeros((8, 8, 3), dtype=np.float32)
+    target[..., 1] = np.linspace(0.0, 0.75, 64).reshape(8, 8)
+    target[..., 2] = np.linspace(0.25, 1.0, 64).reshape(8, 8)
+    prediction = np.clip(target * 0.85 + 0.05, 0.0, 1.0)
+
+    pred64 = prediction.astype(np.float64)
+    target64 = target.astype(np.float64)
+    data_range = target64.max() - target64.min()
+    expected_slices = []
+    for index in range(pred64.shape[2]):
+        pred_slice = pred64[..., index]
+        target_slice = target64[..., index]
+        if target_slice.max() - target_slice.min() < 1e-10:
+            continue
+        expected_slices.append(
+            skimage_metrics.structural_similarity(
+                pred_slice,
+                target_slice,
+                data_range=data_range,
+            )
+        )
+    expected = float(np.mean(expected_slices))
+
+    assert official.official_task3_ssim(
+        prediction, target
+    ) == pytest.approx(expected, rel=0.0, abs=1e-12)
 
 
 def test_official_nifti_loader_canonicalizes_before_float32_read(
@@ -184,3 +232,139 @@ def test_official_lpips_uses_alexnet_signed_slices_and_cpu_fallback(
     assert torch.all(pred_tensor == 0.5)
     assert torch.all(target_tensor == -0.5)
     assert score == pytest.approx(1.0)
+
+
+def test_official_pair_rejects_nonfinite_metric_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arrays = iter(
+        [
+            (np.zeros((8, 8, 2), dtype=np.float32), np.eye(4)),
+            (np.ones((8, 8, 2), dtype=np.float32), np.eye(4)),
+        ]
+    )
+    monkeypatch.setattr(official, "load_official_nifti", lambda path: next(arrays))
+    monkeypatch.setattr(
+        official, "official_task3_nrmse", lambda prediction, target: float("nan")
+    )
+
+    with pytest.raises(ValueError, match="non-finite result"):
+        official.evaluate_official_task3_pair(
+            "prediction.nii.gz",
+            "target.nii.gz",
+            metrics=("nrmse",),
+        )
+
+
+def test_official_directory_aggregates_published_mean_and_population_std(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prediction_dir = tmp_path / "pred"
+    target_dir = tmp_path / "target"
+    for subject in ("0001", "0002"):
+        _touch_nifti(prediction_dir / f"P_T1W_7T_{subject}.nii.gz")
+        _touch_nifti(target_dir / f"P_T1W_7T_{subject}.nii.gz")
+
+    values = {
+        "0001": {"nrmse": 1.0, "ssim": 0.5, "lpips": 0.1},
+        "0002": {"nrmse": 3.0, "ssim": 0.7, "lpips": 0.3},
+    }
+
+    def fake_pair(prediction_path, target_path, *, metrics, device):
+        del target_path, metrics, device
+        subject = official._extract_subject_id(prediction_path.name)
+        return dict(values[subject])
+
+    monkeypatch.setattr(
+        official, "evaluate_official_task3_pair", fake_pair
+    )
+    monkeypatch.setattr(
+        official,
+        "official_task3_runtime_provenance",
+        lambda **kwargs: {"lpips_device": "cpu"},
+    )
+
+    payload = official.evaluate_official_task3_directory(
+        prediction_dir, target_dir
+    )
+
+    assert payload["case_count"] == 2
+    assert payload["summary"] == pytest.approx(
+        {
+            "nrmse_mean": 2.0,
+            "nrmse_std": 1.0,
+            "ssim_mean": 0.6,
+            "ssim_std": 0.1,
+            "lpips_mean": 0.2,
+            "lpips_std": 0.1,
+        }
+    )
+    assert [case["subject"] for case in payload["cases"]] == [
+        "0001",
+        "0002",
+    ]
+
+
+def test_official_directory_output_records_contract_and_runtime_provenance(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prediction_dir = tmp_path / "pred"
+    target_dir = tmp_path / "target"
+    _touch_nifti(prediction_dir / "P_T2W_5T_0001.nii.gz")
+    _touch_nifti(target_dir / "P_T2W_5T_0001.nii.gz")
+    monkeypatch.setattr(
+        official,
+        "evaluate_official_task3_pair",
+        lambda *args, **kwargs: {
+            "nrmse": 0.1,
+            "ssim": 0.9,
+            "lpips": 0.2,
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    payload = official.evaluate_official_task3_directory(
+        prediction_dir, target_dir, device="cuda"
+    )
+
+    assert (
+        payload["OFFICIAL_TASK3_METRIC_CONTRACT"]
+        == official.OFFICIAL_TASK3_METRIC_CONTRACT
+    )
+    assert payload["metric_contract"] == official.OFFICIAL_TASK3_METRIC_CONTRACT
+    assert payload["upstream"] == {
+        "repository": official.UPSTREAM_REPOSITORY,
+        "commit": official.UPSTREAM_COMMIT,
+        "evaluate_blob": official.UPSTREAM_EVALUATE_BLOB,
+        "readme_blob": official.UPSTREAM_README_BLOB,
+    }
+    assert set(payload["runtime"]) == {
+        "python",
+        "numpy",
+        "nibabel",
+        "scikit-image",
+        "torch",
+        "torchvision",
+        "lpips",
+        "lpips_device",
+    }
+    assert all(
+        isinstance(payload["runtime"][name], str)
+        for name in (
+            "python",
+            "numpy",
+            "nibabel",
+            "scikit-image",
+            "torch",
+            "torchvision",
+            "lpips",
+        )
+    )
+    assert payload["runtime"]["lpips_device"] == "cpu"
+
+
+def _touch_nifti(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()

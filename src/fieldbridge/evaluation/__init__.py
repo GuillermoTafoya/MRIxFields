@@ -29,6 +29,18 @@ from fieldbridge.evaluation.mrixfields2026_official import (
     official_task3_nrmse,
     official_task3_ssim,
 )
+from fieldbridge.evaluation.board_score import (
+    BoardAggregate,
+    BoardUnit,
+    SubmissionRanking,
+    aggregate_task3_board,
+    board_units_from_payload,
+    evaluate_task3_board_directory,
+    format_board_table,
+    format_rank_sum_table,
+    rank_submissions,
+    submissions_from_payload,
+)
 
 __all__ = [
     "Stage1DiagnosticSpec",
@@ -54,5 +66,15 @@ __all__ = [
     "minus_one_one_foreground_mask",
     "run_stage1_reconstruction_diagnostics",
     "seam_gradient_metric",
+    "BoardAggregate",
+    "BoardUnit",
+    "SubmissionRanking",
+    "aggregate_task3_board",
+    "board_units_from_payload",
+    "evaluate_task3_board_directory",
+    "format_board_table",
+    "format_rank_sum_table",
+    "rank_submissions",
+    "submissions_from_payload",
 ]
 

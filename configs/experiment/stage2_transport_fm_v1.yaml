@@ -1,0 +1,42 @@
+seed: 13
+# Etapa-2 latent transport, ablation rung 2: OT-CFM (deterministic flow matching with an
+# exact minibatch optimal-transport coupling). Single shared v_theta(z_t, t, c_s, c_t)
+# conditioned on (source, target) via FiLM/AdaGN — no per-field/contrast router. The VAE is
+# frozen and not loaded here; training runs on the precomputed latent bank.
+model:
+  name: flow_matching_latent
+  # Must match the VAE latent_channels (stage1_vae_v2_fgw_freebits.yaml -> 4).
+  latent_channels: 4
+  hidden_channels: [64, 128]
+  bottleneck_channels: 256
+  cond_dim: 128
+  time_embed_dim: 128
+  time_scale: 1000.0
+  spatial_dims: 3
+  activation: silu
+  skip_mode: concat
+training:
+  steps: 20000
+  batch_size: 8
+  lr: 0.0002
+  device: auto
+  precision: bf16
+  coupling: ot          # minibatch optimal-transport assignment (unpaired)
+  bridge: ot_cfm        # deterministic linear interpolation, target velocity z1 - z0
+  sigma: 0.1            # unused for ot_cfm; used by the schrodinger bridge
+  time_eps: 0.001
+  # Loss ladder: add each non-flow term by raising its weight (training-conventions).
+  loss_weights:
+    flow: 1.0
+    transport_cost: 0.0
+    identity: 0.0
+    cycle: 0.0          # needs the ODE sampler; not yet implemented (raises if > 0)
+  checkpoint_dir: outputs/stage2_transport_fm_v1/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 500000000
+  val_every_steps: 1000
+  val_batches: 8
+  log_every_steps: 50
+  resume_from: null
+  variant: fm_ot_cfm

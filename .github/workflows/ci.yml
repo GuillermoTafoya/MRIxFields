@@ -21,3 +21,19 @@ jobs:
       - name: Run smoke CLI
         run: fieldbridge smoke-train --steps 1
 
+  official-task3-evaluator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install official evaluation dependencies
+        run: python -m pip install -e ".[dev,official-evaluation]"
+      - name: Verify real scikit-image parity dependency
+        run: python -c "import skimage; from skimage.metrics import structural_similarity; print(skimage.__version__)"
+      - name: Run official Task-3 evaluator tests
+        run: |
+          pytest -q tests/test_mrixfields2026_official_metrics.py \
+            tests/test_mrixfields2026_official_evaluation_cli.py
+

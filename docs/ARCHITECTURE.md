@@ -32,7 +32,7 @@ src/fieldbridge/
 │   ├── translators/  # identity, conditional_cnn, conditional_unet, ot_cfm/sb stubs
 │   └── diffusion/     # Etapa 1's conditional latent diffuser (timestep + field conditioning, schedule, UNet)
 ├── training/         # batch helpers, losses, checkpoints, warm-start, smoke/stage1/stage2/Etapa-2 train loops
-├── evaluation/       # tensor metrics (3 official Task 3 metrics) + stage-1 VAE recon report
+├── evaluation/       # project metrics + pinned Task-3 adapter + Stage-1 reports
 ├── official/         # MRIxFields2026 challenge spec, submission build/validate
 ├── config/           # YAML load/merge helpers
 └── cli.py            # `fieldbridge` entry point
@@ -181,12 +181,12 @@ Trained by `training/stage2_diffuser.py` (§7) with a standard noise-prediction 
 | File | Purpose |
 |---|---|
 | `batch.py` | `move_raw_batch` / `move_latent_batch` — device transfer helpers. |
-| `losses.py` | `reconstruction_mse`, `latent_l1`, `kl_divergence`, `transport_cost_loss`, `cycle_consistency_loss`, `identity_loss`, `adversarial_hinge_loss_generator/_discriminator`, `nrmse_loss`, `ssim_loss` (dispatches by rank: 4D→2D `ssim`, 5D→`ssim3d`), `lpips_loss` + `lpips_loss_3d` (slice-averaged 2D LPIPS for volumes), `build_lpips_net` (constructs LPIPS(vgg) with its stdout chatter redirected to stderr so `--json` output stays valid JSON), `synthseg_inloss_stub` (explicit `NotImplementedError`). `lpips_loss` needs the optional `lpips` dependency (fails explicitly if missing). |
+| `losses.py`, `ssim.py` | Reconstruction and latent losses. `ssim_loss` dispatches by rank to the bounded float32 training-only SSIM proxies in `ssim.py`; these are separate from frozen audit and official evaluation metrics. `lpips_loss`/`lpips_loss_3d` are VGG training proxies. `build_lpips_net` keeps constructor chatter off stdout. |
 | `checkpoints.py` | `save_checkpoint`/`load_checkpoint` with a size guardrail, **explicit overwrite protection** (`FileExistsError` unless `overwrite=True`), and run metadata (`seed`, `config`, `git_commit`) stored under `state["_meta"]`. `checkpoint_filename(stage, variant, step)` builds `{stage}_{variant}_{YYYYMMDD}_step{N}.pt` names. |
 | `smoke_train.py` | Fixed CPU smoke test: identity encoder/decoder/translator, 2 steps, synthetic data. **Do not extend this — it's a stability tripwire, not a real trainer.** |
 | `train_loop.py` | The real, reusable Etapa 2 training loop. Config-driven precision (`fp32`/`bf16` via `torch.autocast`), optional gradient checkpointing on the translator's forward, configurable loss weights (`reconstruction`, `transport_cost`, `cycle`, `identity` — default only `reconstruction=1.0`, rest `0.0`), resume-from-checkpoint (model + optimizer state, not dataloader position — see note in the module), and `assert_frozen(module)` to verify the Etapa 1 VAE is frozen before Etapa 2 training. |
 | `pseudo_pair_epochs.py` | Real epoch-based pseudo-pair trainer for the deterministic conditional U-Net baseline: finite DataLoader epochs, AdamW, optional CUDA AMP, gradient clipping, scheduler, validation after every epoch, JSONL history, best/last checkpoints, and resume with optimizer/scheduler/global-step state. |
-| `stage1_vae.py` | Etapa 1 VAE-only training (`KLVAEEncoder`/`KLVAEDecoder`, no diffuser, no translator). Loss composition is **all terms active by default** (unlike Etapa 2's "0 except reconstruction" ladder convention) — `l1`+`ssim`+`nrmse`+`lpips`+`kl` (default weights `1.0/1.0/1.0/1.0/1e-4`), relative weights swept experimentally rather than turned on term-by-term. `l1` is the flat absolute-intensity anchor added 2026-07-20 (nRMSE's global sqrt gives near-uniform per-voxel gradient, SSIM is blind to a DC offset, LPIPS is contrast-invariant — nothing else forced the background to the exact 0 the `[0, 1]` contract needs). The full recipe runs on **3D volumes**: `ssim_loss` dispatches to `ssim3d` (avg_pool3d) and `lpips` uses `lpips_loss_3d` (slice-averaged, `lpips_num_slices` config). The LPIPS net is built once via `build_lpips_net`. `data_range` is config-driven and must equal eval's (`1.0` on the official `[0, 1]` contract). When a `val_loader` is passed (via `--split-json`, §10), runs **per-epoch validation** (deterministic mean recon on the validation split), appends a per-term train+val breakdown to `history.jsonl`, and saves the `vae_kl_vae_best.pt` selected by validation total — this is the model-selection signal, distinct from the train-EMA early-stop (a GPU-saver only). `_compute_vae_loss` delegates to `_compute_vae_loss_components` so logging can show where the loss lives. Supports warm-start (`training/warm_start.py`) and resume-from-checkpoint. |
+| `stage1_vae.py` | Stage-1 autoencoder/VAE training on the shared 3D backbone. The v3 arms use foreground-masked intensity terms, an exact-zero background penalty, the bounded SSIM training proxy, optional VGG LPIPS training proxy, deterministic or free-bits latent behavior, equal-domain validation, latent-health gates, Pareto candidates, and recoverable state. Training terms are not labeled as official challenge metrics. |
 | `stage2_diffuser.py` | Etapa 1's conditional-diffuser training (`DenoisingUNet` on top of a trained `KLVAEEncoder`, §6). VAE frozen by default (`train_vae_jointly=False`, reuses `assert_frozen` from `train_loop.py`); standard DDPM noise-prediction MSE loss, `num_timesteps`/`beta_start`/`beta_end` config-driven. |
 | `warm_start.py` | `load_state_dict_tolerant(module, state_dict)` — tolerant checkpoint loading for external (e.g. MAISI/Pinaya) warm-start weights: filters out shape-mismatched keys before calling `load_state_dict(strict=False)` (which alone still raises on shape mismatch) and logs skipped/missing/unexpected keys separately. |
 
@@ -253,16 +253,21 @@ is **not** used for Etapa 1 (no translator, different loss set) — `stage1_vae.
 
 ## 8. Evaluation (`evaluation/metrics.py`, `evaluation/stage1_report.py`)
 
-The three official MRIxFields Task 3 metrics are implemented:
+`evaluation/metrics.py` contains historical project tensor diagnostics: range-normalized
+RMSE, uniform-window Torch SSIM/SSIM3D, VGG LPIPS, MSE, MAE, and PSNR. None is the
+published Task-3 numerical implementation. `stage1_full_volume_ssim3d_v1` freezes the
+completed audit's pre-v3 SSIM arithmetic.
 
-- `nrmse(prediction, target, data_range=1.0)` — RMSE normalized by intensity range.
-- `ssim(prediction, target, data_range=1.0, window_size=7)` — 2D uniform-window SSIM
-  (the *official* metric; raises `ValueError` on non-4D input). `ssim3d` (avg_pool3d) is
-  the volumetric analogue used as a training-time loss term for `spatial_dims=3`.
-- `lpips_metric(prediction, target, net=None)` — thin wrapper around
-  `training.losses.lpips_loss` (2D; optional `lpips` dependency).
+`evaluation/mrixfields2026_official.py` is the official-evaluation adapter pinned to
+upstream commit `5d55309` and evaluator blob `4e21a48`. It implements canonical float32
+NIfTI loading, full-volume target-L2 nRMSE, slice-wise scikit-image SSIM, and slice-wise
+AlexNet LPIPS. `mrixfields2026-evaluate-task3` matches NIfTI directories by published
+subject ID, rejects broadcasting/non-finite values, aggregates per-case mean and
+population standard deviation, and records source/runtime provenance. Its optional
+dependencies are installed with `.[official-evaluation]`.
 
-`mse`, `mae`, `psnr` remain available for quick debugging but are not official metrics.
+The bounded autocast-safe differentiable SSIM used by Stage-1 training lives in
+`training/ssim.py`; it is intentionally not exported as an evaluation metric.
 
 ### Stage-1 VAE reconstruction report (`evaluation/stage1_report.py`)
 
@@ -474,7 +479,7 @@ touches package, CLI, data, model, or training code.
 | Stage | Status |
 |---|---|
 | Fase A — cross-cutting infra | **Done.** Field encoding, per-pair conditioner, FiLM, losses, metrics, checkpoint versioning, any-to-any sampler, real train loop, model factory, CLI `train`. |
-| Etapa 1 — VAE (`KLVAEEncoder`/`Decoder`) + conditional latent diffuser (`DenoisingUNet`) | **Core implemented, not GPU-validated.** VAE reworked 2026-07-05: `latent_channels=4` (16× compression) + residual blocks, `eval-stage1-vae` with deterministic recon + sliding-window blending. **Recipe overhaul 2026-07-20** after an eval showed anatomy reconstructed but background floating (SSIM3D~0, a calibration fault): (1) migrated to the official `[0, 1]` no-rescale contract — `assert_official_unit_range` passthrough, `lpips` maps `[0,1]→[-1,1]` internally, `data_range` aligned train/eval; (2) decoder head linear (was `Tanh`) so background can reach exactly 0; (3) added the L1 intensity anchor to the loss (`l1`+`ssim`+`nrmse`+`lpips`+`kl`); (4) stratified foreground/border/air patch sampling (uniform crops wasted ~2/3 of compute on air). **Deferred / out of scope** (were in the original plan, dropped for now): patchGAN discriminator, MAISI/Pinaya warm-start, 0.1T oversampling in Stage-1. **Open before the real run:** an earlier validation run measured ~37 s/step — an 8k-step run would be ~82 GPU-h (over budget), so per-step cost (full-volume NIfTI load per step, batch size, GPU placement) must be profiled first, and reconstruction quality on real data (0.1T especially) is not yet confirmed. Supersedes the original Fase B KL-VAE-GAN plan (`docs/plans/fase-b-vae.md`, superseded). |
+| Etapa 1 — shared 3D autoencoder/VAE + conditional latent transport | **v3 development bundle implemented, not private-data trained.** Uses the project `[0,1]` data contract, joint-domain/subject balancing, explicit background calibration, isolated deterministic/free-bits/decoder-FiLM arms, equal-domain validation, and recoverable multi-metric candidates. Training proxies, frozen audit-v1 diagnostics, and the published Task-3 evaluator are separate contracts; see `MRIXFIELDS2026_TASK3_METRICS.md`. |
 | Fase C — StarGAN-v2 latente (Etapa 2 ladder #1) | Not started. |
 | Fase D — OT-CFM (Etapa 2 ladder #2) | Not started (`translators/ot_cfm_stub.py` is a placeholder). |
 | Fase E — Entropic-OT bridge / SB (Etapa 2 ladder #3, primary) | Not started (`translators/sb_stub.py` is a placeholder). |

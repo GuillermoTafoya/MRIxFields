@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
 import pytest
 
 from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.vae_splits import (
+    VaeSplits,
     build_vae_splits,
     audit_vae_splits,
     load_vae_splits,
@@ -108,6 +112,40 @@ def test_roundtrip_save_load_preserves_split() -> None:
     assert vae_splits_fingerprint(reloaded) == vae_splits_fingerprint(splits)
     assert reloaded.seed == splits.seed
     assert reloaded.fractions == splits.fractions
+
+
+def test_load_rejects_tampered_split_record(tmp_path) -> None:
+    splits = build_vae_splits(_pool(), seed=7)
+    path = tmp_path / "split.json"
+    save_vae_splits(splits, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["splits"]["train"][0]["subject_id"] = "tampered-subject"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(VolumeSplitError, match="fingerprint mismatch"):
+        load_vae_splits(path)
+
+
+def test_load_rejects_leakage_even_with_matching_fingerprint(tmp_path) -> None:
+    splits = build_vae_splits(_pool(), seed=7)
+    leaked_subject = replace(
+        splits.train[0],
+        case_id=f"{splits.train[0].case_id}-leak-copy",
+        image_path=f"{splits.train[0].image_path}-leak-copy",
+    )
+    leaking = VaeSplits(
+        train=splits.train,
+        validation=(leaked_subject, *splits.validation),
+        test=splits.test,
+        seed=splits.seed,
+        fractions=splits.fractions,
+        metadata=splits.metadata,
+    )
+    path = tmp_path / "leaking.json"
+    save_vae_splits(leaking, path)
+
+    with pytest.raises(VolumeSplitError, match="leak"):
+        load_vae_splits(path)
 
 
 def test_empty_records_rejected() -> None:

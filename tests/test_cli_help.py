@@ -20,3 +20,11 @@ def test_stage1_full_volume_audit_commands_are_exposed(command: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
         build_parser().parse_args([command, "--help"])
     assert exc_info.value.code == 0
+
+
+def test_official_task3_directory_evaluator_is_exposed() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(
+            ["mrixfields2026-evaluate-task3", "--help"]
+        )
+    assert exc_info.value.code == 0

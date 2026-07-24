@@ -1,4 +1,10 @@
-"""Tensor metrics, including the three official MRIxFields Task 3 metrics: nRMSE, SSIM, LPIPS."""
+"""Project tensor metrics.
+
+These helpers predate the published MRIxFields2026 evaluator and are retained for
+backward compatibility with repository diagnostics. They are not the official Task-3
+metric implementations. Use :mod:`fieldbridge.evaluation.mrixfields2026_official` for
+source-pinned challenge parity.
+"""
 
 from __future__ import annotations
 
@@ -123,7 +129,12 @@ def gradient_mae(
 
 
 def nrmse(prediction: torch.Tensor, target: torch.Tensor, *, data_range: float = 1.0) -> torch.Tensor:
-    """RMSE normalized by the intensity range (official MRIxFields Task 3 metric)."""
+    """Project range-normalized RMSE.
+
+    This is ``sqrt(mean((prediction-target)^2)) / data_range``. The published
+    MRIxFields2026 evaluator instead divides the full-volume L2 error by the target L2
+    norm; see :func:`mrixfields2026_official.official_task3_nrmse`.
+    """
 
     return torch.sqrt(mse(prediction, target)) / data_range
 
@@ -135,29 +146,23 @@ def ssim(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """2D structural similarity (official MRIxFields Task 3 metric), uniform-window."""
+    """Historical project 2D uniform-window SSIM.
+
+    This is not the published Task-3 slice-wise scikit-image SSIM. It intentionally
+    preserves the repository's pre-v3 tensor-metric behavior. Training uses the
+    autocast-safe bounded implementation in :mod:`fieldbridge.training.ssim`.
+    """
 
     if prediction.ndim != 4:
         raise ValueError("ssim expects (B, C, H, W) tensors — this project is 2D-only.")
 
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
-    pad = window_size // 2
-
-    def local_mean(x: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool2d(x, kernel_size=window_size, stride=1, padding=pad)
-
-    mu_p = local_mean(prediction)
-    mu_t = local_mean(target)
-    mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
-
-    sigma_p_sq = local_mean(prediction**2) - mu_p_sq
-    sigma_t_sq = local_mean(target**2) - mu_t_sq
-    sigma_pt = local_mean(prediction * target) - mu_pt
-
-    numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
-    denominator = (mu_p_sq + mu_t_sq + c1) * (sigma_p_sq + sigma_t_sq + c2)
-    return (numerator / denominator).mean()
+    return _historical_uniform_ssim(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
+        spatial_dims=2,
+    )
 
 
 def ssim3d(
@@ -167,39 +172,92 @@ def ssim3d(
     data_range: float = 1.0,
     window_size: int = 7,
 ) -> torch.Tensor:
-    """Volumetric structural similarity (avg_pool3d), the 3D analogue of `ssim`.
+    """Historical project volumetric uniform-window SSIM.
 
-    Not the official 2D Task 3 metric — used as a training-time loss term for
-    spatial_dims=3 volumes, where the 2D `ssim` (avg_pool2d, 4D-only) can't apply.
+    This is neither the published Task-3 metric nor the bounded v3 training proxy. It is
+    retained for backward compatibility. The frozen Stage-1 audit imports
+    :func:`stage1_full_volume_ssim3d_v1` directly instead of this generic alias.
     """
 
     if prediction.ndim != 5:
         raise ValueError("ssim3d expects (B, C, D, H, W) tensors.")
 
-    c1 = (0.01 * data_range) ** 2
-    c2 = (0.03 * data_range) ** 2
+    return stage1_full_volume_ssim3d_v1(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
+    )
+
+
+def stage1_full_volume_ssim3d_v1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float = 1.0,
+    window_size: int = 7,
+) -> torch.Tensor:
+    """Frozen SSIM3D used by ``stage1-full-volume-metrics-v1``.
+
+    The arithmetic intentionally matches the implementation at audit commit
+    ``be60d75``: zero-padded ``avg_pool3d`` moments in the caller's dtype, without
+    variance projection or output clamping. Do not use this as a differentiable
+    training loss. Its purpose is reproducibility of the completed frozen audit.
+    """
+
+    if prediction.ndim != 5:
+        raise ValueError(
+            "stage1_full_volume_ssim3d_v1 expects (B, C, D, H, W) tensors."
+        )
+    return _historical_uniform_ssim(
+        prediction,
+        target,
+        data_range=data_range,
+        window_size=window_size,
+        spatial_dims=3,
+    )
+
+
+def _historical_uniform_ssim(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_range: float,
+    window_size: int,
+    spatial_dims: int,
+) -> torch.Tensor:
+    """Preserve the pre-v3 project SSIM arithmetic exactly."""
+
+    pool = F.avg_pool3d if spatial_dims == 3 else F.avg_pool2d
     pad = window_size // 2
 
     def local_mean(x: torch.Tensor) -> torch.Tensor:
-        return F.avg_pool3d(x, kernel_size=window_size, stride=1, padding=pad)
+        return pool(x, kernel_size=window_size, stride=1, padding=pad)
 
     mu_p = local_mean(prediction)
     mu_t = local_mean(target)
     mu_p_sq, mu_t_sq, mu_pt = mu_p**2, mu_t**2, mu_p * mu_t
-
     sigma_p_sq = local_mean(prediction**2) - mu_p_sq
     sigma_t_sq = local_mean(target**2) - mu_t_sq
     sigma_pt = local_mean(prediction * target) - mu_pt
-
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
     numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
-    denominator = (mu_p_sq + mu_t_sq + c1) * (sigma_p_sq + sigma_t_sq + c2)
+    denominator = (mu_p_sq + mu_t_sq + c1) * (
+        sigma_p_sq + sigma_t_sq + c2
+    )
     return (numerator / denominator).mean()
 
 
 def lpips_metric(
     prediction: torch.Tensor, target: torch.Tensor, *, net: torch.nn.Module | None = None
 ) -> torch.Tensor:
-    """Perceptual distance (official MRIxFields Task 3 metric). Requires the optional `lpips` package."""
+    """Project VGG LPIPS helper for 2D ``[0,1]`` tensors.
+
+    This is not the published Task-3 adapter, which constructs LPIPS with the AlexNet
+    trunk and applies its own slice-selection rules. Requires the optional ``lpips``
+    package.
+    """
 
     from fieldbridge.training.losses import lpips_loss
 

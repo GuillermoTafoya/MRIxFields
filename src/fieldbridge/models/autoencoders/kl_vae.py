@@ -23,6 +23,8 @@ from torch import nn
 
 from fieldbridge.data.domains import Domain
 from fieldbridge.models.autoencoders.base import BaseDecoder, BaseEncoder
+from fieldbridge.models.diffusion.field_conditioner import FieldStrengthConditioner
+from fieldbridge.models.film import FiLMLayer
 
 DomainBatch = Domain | Sequence[Domain]
 SpatialDims = Literal[2, 3]
@@ -134,6 +136,7 @@ class KLVAEDecoder(BaseDecoder):
         use_norm: bool = True,
         num_res_blocks: int = 2,
         output_activation: str = "none",
+        domain_conditioning_dim: int = 0,
     ) -> None:
         super().__init__()
         self.output_activation = _validate_output_activation(output_activation)
@@ -141,6 +144,9 @@ class KLVAEDecoder(BaseDecoder):
         self.latent_channels = _positive_int(latent_channels, "latent_channels")
         self.spatial_dims = _validate_spatial_dims(spatial_dims)
         self.num_res_blocks = _positive_int(num_res_blocks, "num_res_blocks")
+        self.domain_conditioning_dim = int(domain_conditioning_dim)
+        if self.domain_conditioning_dim < 0:
+            raise ValueError("domain_conditioning_dim must be non-negative.")
         base = _positive_int(base_channels, "base_channels")
 
         conv = _conv_nd(self.spatial_dims)
@@ -157,20 +163,52 @@ class KLVAEDecoder(BaseDecoder):
             base, base, self.num_res_blocks, spatial_dims=self.spatial_dims, activation=activation, use_norm=use_norm
         )
         self.to_image = conv(base, out, kernel_size=1)
+        if self.domain_conditioning_dim > 0:
+            self.domain_conditioner: nn.Module | None = FieldStrengthConditioner(
+                conditioning_dim=self.domain_conditioning_dim,
+                hidden_dim=self.domain_conditioning_dim,
+            )
+            self.domain_film1: nn.Module | None = FiLMLayer(
+                self.domain_conditioning_dim, base * 4
+            )
+            self.domain_film2: nn.Module | None = FiLMLayer(
+                self.domain_conditioning_dim, base * 2
+            )
+            self.domain_film3: nn.Module | None = FiLMLayer(
+                self.domain_conditioning_dim, base
+            )
+        else:
+            self.domain_conditioner = None
+            self.domain_film1 = None
+            self.domain_film2 = None
+            self.domain_film3 = None
 
     def decode(self, z: torch.Tensor, domain: DomainBatch) -> torch.Tensor:
-        del domain
         expected_dims = self.spatial_dims + 2
         if z.ndim != expected_dims:
             raise ValueError(f"Expected a {expected_dims}D latent tensor, got shape {tuple(z.shape)}.")
         if int(z.shape[1]) != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {int(z.shape[1])}.")
+        conditioning = (
+            self.domain_conditioner(domain, batch_size=z.shape[0], device=z.device)
+            if self.domain_conditioner is not None
+            else None
+        )
         h = self.from_latent(z)
         h = self.res1(h)
+        if conditioning is not None:
+            assert self.domain_film1 is not None
+            h = self.domain_film1(h, conditioning.to(dtype=h.dtype))
         h = self.up1(h)
         h = self.res2(h)
+        if conditioning is not None:
+            assert self.domain_film2 is not None
+            h = self.domain_film2(h, conditioning.to(dtype=h.dtype))
         h = self.up2(h)
         h = self.res3(h)
+        if conditioning is not None:
+            assert self.domain_film3 is not None
+            h = self.domain_film3(h, conditioning.to(dtype=h.dtype))
         out = self.to_image(h)
         if self.output_activation == "sigmoid":
             return torch.sigmoid(out)

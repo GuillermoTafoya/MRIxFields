@@ -11,6 +11,7 @@ from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.datasets import ALL_DOMAINS
 from fieldbridge.data.vae_splits import VaeSplits
 from fieldbridge.evaluation import stage1_full_volume_audit as audit_module
+from fieldbridge.evaluation.metrics import stage1_full_volume_ssim3d_v1
 from fieldbridge.evaluation.stage1_full_volume_audit import (
     AuditRuntime,
     aggregate_domain_balanced,
@@ -32,6 +33,22 @@ class _IdentityEncoder(torch.nn.Module):
 class _IdentityDecoder(torch.nn.Module):
     def decode(self, value: torch.Tensor, domain: object):
         return value
+
+
+def test_frozen_audit_ssim3d_v1_has_pre_v3_regression_value() -> None:
+    target = torch.linspace(
+        0.0, 1.0, 8 * 8 * 8, dtype=torch.float32
+    ).reshape(1, 1, 8, 8, 8)
+    reconstruction = target * 0.8 + 0.1
+
+    value = stage1_full_volume_ssim3d_v1(reconstruction, target)
+
+    assert audit_module.stage1_full_volume_ssim3d_v1 is (
+        stage1_full_volume_ssim3d_v1
+    )
+    assert float(value) == pytest.approx(
+        0.9868708848953247, rel=0.0, abs=1e-7
+    )
 
 
 def _records(per_domain: int = 4) -> list[VolumeRecord]:

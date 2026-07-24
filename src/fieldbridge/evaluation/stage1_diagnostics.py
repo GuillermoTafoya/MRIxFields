@@ -503,7 +503,7 @@ def run_stage1_reconstruction_diagnostics(
             "same manifest was used for training and diagnostic evaluation",
             "fixed development samples are not held out",
             "diagnostic overlap sweep is not checkpoint or hyperparameter selection",
-            "masked diagnostics supplement but do not replace official full-volume metrics",
+            "legacy unmasked project proxies are not published Task-3 metric parity",
         ],
     }
     report["recommendation"] = _result_dependent_recommendation(report, spec)
@@ -625,6 +625,14 @@ def _official_metrics(
     lpips_status: str,
     lpips_num_slices: int,
 ) -> dict[str, Any]:
+    """Legacy diagnostic-v1 project proxies.
+
+    The function and serialized ``official_*`` keys predate publication of the
+    MRIxFields2026 evaluator and remain for diagnostic-v1 schema compatibility. These
+    range-normalized RMSE, Torch SSIM3D, and VGG slice-LPIPS values are not official
+    Task-3 metric implementations.
+    """
+
     lpips_payload: dict[str, Any]
     if lpips_net is None or lpips_num_slices <= 0:
         lpips_payload = {"status": lpips_status, "value": None}
@@ -641,6 +649,7 @@ def _official_metrics(
             ),
         }
     return {
+        "metric_contract": "stage1-diagnostic-v1-project-proxies",
         "data_range": _DATA_RANGE,
         "nrmse": float(nrmse(reconstruction, target, data_range=_DATA_RANGE)),
         "ssim3d": float(ssim3d(reconstruction, target, data_range=_DATA_RANGE)),

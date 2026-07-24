@@ -26,7 +26,10 @@ import torch
 from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.datasets import ALL_DOMAINS
 from fieldbridge.data.vae_splits import VaeSplits, audit_vae_splits, vae_splits_fingerprint
-from fieldbridge.evaluation.metrics import gradient_mae, ssim3d
+from fieldbridge.evaluation.metrics import (
+    gradient_mae,
+    stage1_full_volume_ssim3d_v1,
+)
 from fieldbridge.evaluation.stage1_report import _central_first_spatial_axis_slice, _matplotlib_pyplot
 from fieldbridge.evaluation.stage1_report import sliding_window_reconstruct
 from fieldbridge.training.checkpoints import resolve_git_commit
@@ -407,7 +410,11 @@ def compute_full_volume_metrics(
     metrics: dict[str, Any] = {
         "foreground_mae": foreground_mae,
         "foreground_nrmse": foreground_nrmse,
-        "ssim3d": float(ssim3d(reconstruction, target, data_range=1.0)),
+        "ssim3d": float(
+            stage1_full_volume_ssim3d_v1(
+                reconstruction, target, data_range=1.0
+            )
+        ),
         "correlation": correlation,
         "correlation_status": correlation_status,
         "gradient_mae": float(gradient_mae(reconstruction, target, mask.to(target.dtype))),

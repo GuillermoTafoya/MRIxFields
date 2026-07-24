@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,7 +24,12 @@ def save_checkpoint(
     config: dict[str, Any] | None = None,
     git_commit: str | None = None,
 ) -> Path:
-    """Save a checkpoint with run metadata; reject silent overwrites and oversized outputs."""
+    """Atomically save a validated checkpoint in the destination directory.
+
+    The temporary artifact is written, size-checked, loaded back, and fsynced before
+    ``os.replace`` publishes it. An interrupted overwrite therefore leaves the previous
+    checkpoint intact. Temporary artifacts are removed on every handled failure path.
+    """
 
     checkpoint_path = Path(path)
     if checkpoint_path.exists() and not overwrite:
@@ -37,13 +44,42 @@ def save_checkpoint(
         "config": config,
         "git_commit": git_commit if git_commit is not None else resolve_git_commit(),
     }
-
-    torch.save(payload, checkpoint_path)
-    size = checkpoint_path.stat().st_size
-    if size > max_bytes:
-        checkpoint_path.unlink(missing_ok=True)
-        raise ValueError(f"Checkpoint exceeded size guardrail: {size} bytes > {max_bytes} bytes.")
-    return checkpoint_path
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{checkpoint_path.name}.",
+        suffix=".tmp",
+        dir=checkpoint_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(payload, temporary_path)
+        size = temporary_path.stat().st_size
+        if size <= 0:
+            raise ValueError("Checkpoint serialization produced an empty artifact.")
+        if size > max_bytes:
+            raise ValueError(
+                f"Checkpoint exceeded size guardrail: {size} bytes > {max_bytes} bytes."
+            )
+        validated = load_checkpoint(temporary_path, map_location="cpu")
+        missing_keys = sorted(set(payload) - set(validated))
+        if missing_keys or not isinstance(validated.get("_meta"), dict):
+            raise ValueError(
+                "Checkpoint validation failed before publication; "
+                f"missing_keys={missing_keys}, metadata_valid="
+                f"{isinstance(validated.get('_meta'), dict)}."
+            )
+        # Windows requires a writable descriptor for fsync.
+        with temporary_path.open("ab") as handle:
+            os.fsync(handle.fileno())
+        if checkpoint_path.exists() and not overwrite:
+            raise FileExistsError(
+                f"Checkpoint {checkpoint_path} already exists. Pass overwrite=True "
+                "to replace it explicitly."
+            )
+        os.replace(temporary_path, checkpoint_path)
+        return checkpoint_path
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def load_checkpoint(path: str | Path, *, map_location: str | torch.device = "cpu") -> dict[str, Any]:

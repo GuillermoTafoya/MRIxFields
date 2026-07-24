@@ -107,6 +107,8 @@ from fieldbridge.training.stage1_vae import (
     run_stage1_vae_train,
 )
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
+from fieldbridge.training.stage2_transport import Stage2TransportConfig, run_stage2_transport_train
+from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
 
 
@@ -419,6 +421,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_stage2_diffuser.add_argument("--seed", type=int, default=None)
     train_stage2_diffuser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train_transport = subparsers.add_parser(
+        "train-stage2-transport",
+        help="Train the latent transport v_theta (OT-CFM / Schrodinger bridge) on the latent bank.",
+    )
+    train_transport.add_argument(
+        "--config", type=Path, default=Path("configs/experiment/stage2_transport_fm_v1.yaml")
+    )
+    train_transport.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory.")
+    train_transport.add_argument(
+        "--latent-stats", type=Path, default=None, help="Defaults to <bank-dir>/latent_stats.json."
+    )
+    train_transport.add_argument("--checkpoint-dir", type=Path, default=None)
+    train_transport.add_argument("--steps", type=int, default=None)
+    train_transport.add_argument("--batch-size", type=int, default=None)
+    train_transport.add_argument("--seed", type=int, default=None)
+    train_transport.add_argument("--coupling", choices=("independent", "ot"), default=None)
+    train_transport.add_argument("--bridge", choices=("ot_cfm", "schrodinger"), default=None)
+    train_transport.add_argument("--resume-from", type=Path, default=None)
+    train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
+    train_transport.add_argument("--val", action="store_true", help="Enable validation-split flow loss + best checkpoint.")
+    train_transport.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
     build_latent_bank_parser = subparsers.add_parser(
         "build-latent-bank",
@@ -1214,6 +1238,49 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"train-stage2-diffuser completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "train-stage2-transport":
+        config = _load_optional_config(args.config)
+        _override(config, "training", "steps", args.steps)
+        _override(config, "training", "batch_size", args.batch_size)
+        _override(config, "training", "coupling", args.coupling)
+        _override(config, "training", "bridge", args.bridge)
+        _override(config, "training", "device", args.device)
+        if args.seed is not None:
+            config["seed"] = args.seed
+            _override(config, "training", "seed", args.seed)
+        if args.checkpoint_dir is not None:
+            _override(config, "training", "checkpoint_dir", str(args.checkpoint_dir))
+        if args.resume_from is not None:
+            _override(config, "training", "resume_from", str(args.resume_from))
+
+        model_config = _model_config(config)
+        translator_name = str(model_config.get("name", "flow_matching_latent"))
+        translator_kwargs = {key: value for key, value in model_config.items() if key != "name"}
+        translator = build_translator(translator_name, **translator_kwargs)
+
+        stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
+        stats = LatentStats.from_json(stats_path)
+        train_index = LatentBankIndex(args.bank_dir, "train")
+        val_index = LatentBankIndex(args.bank_dir, "validation") if args.val else None
+
+        stage_config = Stage2TransportConfig.from_mapping(config)
+        result = run_stage2_transport_train(
+            stage_config,
+            translator=translator,
+            train_index=train_index,
+            stats=stats,
+            val_index=val_index,
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(
+                f"train-stage2-transport completed: steps={result.steps} "
+                f"final_loss={result.final_loss:.6f} sec_per_step={result.seconds_per_step:.3f} "
+                f"best_val={result.best_val}"
+            )
         return 0
 
     if args.command == "print-config":

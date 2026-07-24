@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,15 @@ from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_p
 from fieldbridge.evaluation.mrixfields2026_official import (
     evaluate_official_task3_directory,
 )
+from fieldbridge.evaluation.board_score import (
+    aggregate_task3_board,
+    board_units_from_payload,
+    evaluate_task3_board_directory,
+    format_board_table,
+    format_rank_sum_table,
+    rank_submissions,
+    submissions_from_payload,
+)
 from fieldbridge.evaluation.stage1_full_volume_audit import (
     AuditRuntime,
     audit_stage1_checkpoint,
@@ -83,7 +93,8 @@ from fieldbridge.evaluation.stage1_full_volume_audit import (
     write_audit_comparison,
 )
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
-from fieldbridge.training.checkpoints import load_checkpoint
+from fieldbridge.data.latent_bank import LatentBankConfig, build_latent_bank
+from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 from fieldbridge.training.pseudo_pair_epochs import (
     PSEUDO_PAIR_PIPELINE_VERSION,
     PseudoPairEpochConfig,
@@ -409,6 +420,38 @@ def build_parser() -> argparse.ArgumentParser:
     train_stage2_diffuser.add_argument("--seed", type=int, default=None)
     train_stage2_diffuser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
 
+    build_latent_bank_parser = subparsers.add_parser(
+        "build-latent-bank",
+        help="Encode the split volumes to a frozen-VAE latent bank for Stage-2 transport.",
+    )
+    build_latent_bank_parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage1_vae_v2_fgw_freebits.yaml"),
+        help="VAE config providing the kl_vae model kwargs (and an optional latent_bank section).",
+    )
+    build_latent_bank_parser.add_argument("--split-json", type=Path, required=True)
+    build_latent_bank_parser.add_argument("--checkpoint", type=Path, required=True, help="Frozen VAE checkpoint (.pt).")
+    build_latent_bank_parser.add_argument("--out", type=Path, required=True, help="Latent bank output dir (gitignored WORK_DIR).")
+    build_latent_bank_parser.add_argument("--strategy", choices=("tiled", "full", "auto"), default=None)
+    build_latent_bank_parser.add_argument("--store-dtype", choices=("float16", "float32"), default=None)
+    build_latent_bank_parser.add_argument("--precision", choices=("float32", "bfloat16"), default=None)
+    build_latent_bank_parser.add_argument(
+        "--block-size", type=int, nargs=3, default=None, metavar=("D", "H", "W"),
+        help="Core tile size (voxels, multiples of the VAE downsample factor).",
+    )
+    build_latent_bank_parser.add_argument(
+        "--halo", type=int, nargs=3, default=None, metavar=("D", "H", "W"),
+        help="Halo of real neighbours around each tile (voxels, multiples of the factor).",
+    )
+    build_latent_bank_parser.add_argument("--roundtrip-samples", type=int, default=None)
+    build_latent_bank_parser.add_argument("--seed", type=int, default=None)
+    build_latent_bank_parser.add_argument("--overwrite", action="store_true")
+    build_latent_bank_parser.add_argument(
+        "--splits", nargs="+", default=None, help="Splits to encode (default train validation test)."
+    )
+    build_latent_bank_parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
     print_config = subparsers.add_parser("print-config", help="Print a YAML config.")
     print_config.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
 
@@ -504,6 +547,60 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional JSON output path; the same payload is always printed.",
     )
+
+    board = subparsers.add_parser(
+        "mrixfields2026-task3-board",
+        help=(
+            "Aggregate official Task-3 metrics into the leaderboard-shaped per-contrast "
+            "table + rank-sum. One of --pred-dir/--board-json/--summaries-json."
+        ),
+    )
+    board_source = board.add_mutually_exclusive_group(required=True)
+    board_source.add_argument(
+        "--pred-dir",
+        type=Path,
+        help="Prediction tree <contrast>/<subtask>/*.nii.gz; requires --target-dir.",
+    )
+    board_source.add_argument(
+        "--board-json",
+        type=Path,
+        help="Precomputed per-unit case metrics ({'units': [...]}) to aggregate.",
+    )
+    board_source.add_argument(
+        "--summaries-json",
+        type=Path,
+        help="Submission means ({'submissions': {name: {nrmse,ssim,lpips}}}) to rank.",
+    )
+    board.add_argument(
+        "--target-dir",
+        type=Path,
+        default=None,
+        help="Target tree matching --pred-dir layout (required with --pred-dir).",
+    )
+    board.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=("nrmse", "ssim", "lpips"),
+        default=("nrmse", "ssim", "lpips"),
+    )
+    board.add_argument(
+        "--contrast-weighting",
+        choices=("balanced", "pooled"),
+        default="balanced",
+        help="Overall mean weights contrasts equally (balanced) or cases equally (pooled).",
+    )
+    board.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+        help="LPIPS device for --pred-dir evaluation.",
+    )
+    board.add_argument(
+        "--rank-as",
+        default=None,
+        help="With --pred-dir/--board-json, add our aggregate under this name to the ranking.",
+    )
+    board.add_argument("--out", type=Path, default=None, help="Optional JSON output path.")
 
     return parser
 
@@ -1038,6 +1135,60 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
+    if args.command == "build-latent-bank":
+        import torch
+
+        config = _load_optional_config(args.config)
+        model_config = _model_config(config)
+        encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+        decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+        state = load_checkpoint(args.checkpoint)
+        encoder.load_state_dict(state["encoder"])
+        decoder.load_state_dict(state["decoder"])
+        encoder.requires_grad_(False)
+        decoder.requires_grad_(False)
+
+        splits = load_vae_splits(args.split_json)
+        bank_config = LatentBankConfig.from_mapping(config, out_dir=args.out)
+        overrides = {
+            "strategy": args.strategy,
+            "store_dtype": args.store_dtype,
+            "precision": args.precision,
+            "block_size": tuple(args.block_size) if args.block_size is not None else None,
+            "halo": tuple(args.halo) if args.halo is not None else None,
+            "roundtrip_samples": args.roundtrip_samples,
+            "seed": args.seed,
+            "splits": tuple(args.splits) if args.splits is not None else None,
+        }
+        applied = {key: value for key, value in overrides.items() if value is not None}
+        if args.overwrite:
+            applied["overwrite"] = True
+        bank_config = replace(bank_config, **applied)
+
+        records_by_split = {
+            name: splits.records_for(name) for name in bank_config.splits
+        }
+        device = _resolve_device(args.device)
+        manifest = build_latent_bank(
+            encoder=encoder,
+            decoder=decoder,
+            records_by_split=records_by_split,
+            config=bank_config,
+            device=device,
+            checkpoint_sha256=sha256_file(args.checkpoint),
+            git_commit=resolve_git_commit(),
+            vae_config_path=str(args.config),
+        )
+        summary = {
+            "counts": manifest["counts"],
+            "strategy_used": manifest["strategy_used"],
+            "latent_std": manifest["latent_stats"]["global_std"],
+            "roundtrip_mean_ssim3d": manifest["roundtrip"]["mean_ssim3d"],
+            "out_dir": str(args.out),
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
     if args.command == "train-stage2-diffuser":
         config = _load_optional_config(args.config)
         _override(config, "training", "steps", args.steps)
@@ -1148,7 +1299,57 @@ def main(argv: list[str] | None = None) -> int:
         print(serialized)
         return 0
 
+    if args.command == "mrixfields2026-task3-board":
+        return _run_task3_board(args)
+
     raise ValueError(f"Unknown command: {args.command}")
+
+
+def _run_task3_board(args: argparse.Namespace) -> int:
+    if args.summaries_json is not None:
+        payload_in = json.loads(Path(args.summaries_json).read_text(encoding="utf-8"))
+        submissions = submissions_from_payload(payload_in)
+        ranking = rank_submissions(submissions, metrics=args.metrics)
+        payload: dict[str, Any] = {
+            "ranking": ranking.to_dict(),
+            "submissions": submissions,
+        }
+        table = format_rank_sum_table(ranking)
+    else:
+        if args.pred_dir is not None:
+            if args.target_dir is None:
+                raise ValueError("--pred-dir requires --target-dir.")
+            aggregate, provenance = evaluate_task3_board_directory(
+                args.pred_dir,
+                args.target_dir,
+                metrics=args.metrics,
+                contrast_weighting=args.contrast_weighting,
+                device=args.device,
+            )
+        else:
+            payload_in = json.loads(Path(args.board_json).read_text(encoding="utf-8"))
+            units = board_units_from_payload(payload_in)
+            aggregate = aggregate_task3_board(
+                units,
+                metrics=args.metrics,
+                contrast_weighting=args.contrast_weighting,
+            )
+            provenance = None
+        payload = {"board": aggregate.to_dict()}
+        if provenance is not None:
+            payload["metric_contract"] = provenance["OFFICIAL_TASK3_METRIC_CONTRACT"]
+            payload["provenance"] = provenance
+        if args.rank_as is not None:
+            payload["submission"] = {args.rank_as: dict(aggregate.overall.means)}
+        table = format_board_table(aggregate)
+
+    serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(serialized + "\n", encoding="utf-8")
+    print(table)
+    print(serialized)
+    return 0
 
 
 def _build_manifest_loader(
@@ -1879,6 +2080,15 @@ _KL_VAE_SHARED_KEYS = {
     "use_norm",
     "num_res_blocks",
 }
+
+
+def _resolve_device(choice: str) -> "Any":
+    import torch
+
+    if choice == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but CUDA is not available.")
+    use_cuda = choice == "cuda" or (choice == "auto" and torch.cuda.is_available())
+    return torch.device("cuda" if use_cuda else "cpu")
 
 
 def _kl_vae_kwargs(model_config: Mapping[str, Any], component: str) -> dict[str, Any]:

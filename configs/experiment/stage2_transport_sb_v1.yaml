@@ -23,6 +23,10 @@ training:
   precision: bf16
   coupling: ot          # OT-coupled endpoints (entropic Sinkhorn coupling is a follow-up)
   bridge: schrodinger   # Brownian bridge, target drift (z1 - z_t)/(1 - t)
+  # Task 3 is field-to-field: constrain each batch to one contrast, field_s -> field_t.
+  same_contrast: true   # source and target share contrast; only field strength changes
+  field_pairing: cross  # cross: field_s != field_t (real translation); any: allow identity
+  ot_pool_size: 4       # avg-pool latents to 4^3 before the OT cost (0 = full latent, degenerate)
   sigma: 0.1            # bridge volatility
   time_eps: 0.001
   loss_weights:

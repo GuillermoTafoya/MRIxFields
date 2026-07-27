@@ -10,34 +10,40 @@ from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
 from fieldbridge.models.translators.flow_transport import FlowMatchingLatentTranslator
 from fieldbridge.training.stage2_transport import (
     Stage2TransportConfig,
+    _FieldPools,
     _bridge_sample,
     _ot_assignment,
+    _sample_constrained_pair,
     run_stage2_transport_train,
 )
 
 C, X = 4, 8
 
 
-def _make_bank(tmp_path, per_split=6):
-    domains = [Domain(0.1, Contrast.T1W), Domain(3.0, Contrast.T2W), Domain(7.0, Contrast.T2_FLAIR)]
+def _make_bank(tmp_path, subjects_per_cell=3):
+    # A (contrast x field) grid so same-contrast, cross-field pairs exist (field-to-field task).
+    contrasts = [Contrast.T1W, Contrast.T2W, Contrast.T2_FLAIR]
+    fields = [0.1, 3.0, 7.0]
     records = []
     for split in ("train", "validation"):
         split_dir = tmp_path / split
         split_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(per_split):
-            domain = domains[i % len(domains)]
-            latent = torch.randn(C, X, X, X, dtype=torch.float16)
-            case_id = f"{split}_{i}"
-            path = split_dir / f"{case_id}.pt"
-            torch.save(
-                {"case_id": case_id, "subject_id": f"s{i}", "split": split,
-                 "domain": domain.to_dict(), "latent": latent}, path
-            )
-            records.append(
-                {"case_id": case_id, "subject_id": f"s{i}", "split": split,
-                 "domain": domain.to_dict(), "latent_shape": [C, X, X, X],
-                 "source_shape": [1, X * 4, X * 4, X * 4], "path": f"{split}/{case_id}.pt"}
-            )
+        for contrast in contrasts:
+            for field in fields:
+                for s in range(subjects_per_cell):
+                    domain = Domain(field, contrast)
+                    latent = torch.randn(C, X, X, X, dtype=torch.float16)
+                    case_id = f"{split}_{contrast.name}_{field}_{s}"
+                    path = split_dir / f"{case_id}.pt"
+                    torch.save(
+                        {"case_id": case_id, "subject_id": f"{contrast.name}_{s}", "split": split,
+                         "domain": domain.to_dict(), "latent": latent}, path
+                    )
+                    records.append(
+                        {"case_id": case_id, "subject_id": f"{contrast.name}_{s}", "split": split,
+                         "domain": domain.to_dict(), "latent_shape": [C, X, X, X],
+                         "source_shape": [1, X * 4, X * 4, X * 4], "path": f"{split}/{case_id}.pt"}
+                    )
     (tmp_path / "latent_bank_manifest.json").write_text(json.dumps({"records": records}), encoding="utf-8")
     (tmp_path / "latent_stats.json").write_text(
         json.dumps({"per_channel_mean": [0.0] * C, "per_channel_std": [1.0] * C, "computed_over": "train"}),
@@ -61,6 +67,37 @@ def test_ot_assignment_recovers_optimal_permutation() -> None:
     recovered = _ot_assignment(z0, z1)
     # applying the recovered column order to z1 should reproduce z0.
     assert torch.allclose(z1[recovered], z0, atol=1e-5)
+
+
+def test_ot_assignment_pooled_returns_valid_permutation() -> None:
+    z0 = torch.randn(5, C, X, X, X)
+    z1 = torch.randn(5, C, X, X, X)
+    perm = _ot_assignment(z0, z1, pool_size=2)
+    assert sorted(perm.tolist()) == list(range(5))  # a valid full permutation of the batch
+
+
+def test_same_contrast_coupling_shares_contrast_and_crosses_field(tmp_path) -> None:
+    bank = _make_bank(tmp_path)
+    index = LatentBankIndex(bank, "train")
+    stats = LatentStats.from_json(bank / "latent_stats.json")
+    pools = _FieldPools.from_index(index)
+    cfg = Stage2TransportConfig(batch_size=4, same_contrast=True, field_pairing="cross")
+    gen = torch.Generator().manual_seed(0)
+    for _ in range(25):
+        _, dom_s, _, dom_t = _sample_constrained_pair(index, pools, stats, cfg, torch.device("cpu"), gen)
+        s_contrast = {Contrast.parse(d.contrast) for d in dom_s}
+        t_contrast = {Contrast.parse(d.contrast) for d in dom_t}
+        assert s_contrast == t_contrast and len(s_contrast) == 1  # one shared contrast per batch
+        s_field = {d.field_strength_t for d in dom_s}
+        t_field = {d.field_strength_t for d in dom_t}
+        assert len(s_field) == 1 and len(t_field) == 1 and s_field != t_field  # cross-field
+
+
+def test_require_pairable_guards_single_field_contrast() -> None:
+    pools = _FieldPools(by_contrast_field={Contrast.T1W: {3.0: (0,)}}, pairable_contrasts=())
+    with pytest.raises(ValueError, match="field_pairing='cross'"):
+        pools.require_pairable("cross")
+    pools.require_pairable("any")  # 'any' allows identity, so a single field is fine
 
 
 def test_bridge_ot_cfm_endpoints_and_target() -> None:

@@ -109,6 +109,13 @@ from fieldbridge.training.stage1_vae import (
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
 from fieldbridge.training.stage2_transport import Stage2TransportConfig, run_stage2_transport_train
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
+from fieldbridge.data.resplit import resplit_file
+from fieldbridge.evaluation.stage2_transport_eval import (
+    DecodeSpec,
+    TransportSamplerConfig,
+    evaluate_transport_travellers,
+    write_transport_eval,
+)
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
 
 
@@ -443,6 +450,44 @@ def build_parser() -> argparse.ArgumentParser:
     train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
     train_transport.add_argument("--val", action="store_true", help="Enable validation-split flow loss + best checkpoint.")
     train_transport.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    eval_transport = subparsers.add_parser(
+        "eval-stage2-transport",
+        help="Decode transported latents and score them vs the real target on the traveller pairs.",
+    )
+    eval_transport.add_argument(
+        "--config", type=Path, default=Path("configs/experiment/stage2_transport_fm_v1.yaml"),
+        help="Transport config providing the translator model kwargs.",
+    )
+    eval_transport.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory.")
+    eval_transport.add_argument("--split-json", type=Path, required=True, help="VAE split JSON (real target volumes).")
+    eval_transport.add_argument("--transport-checkpoint", type=Path, required=True, help="Trained v_theta checkpoint.")
+    eval_transport.add_argument(
+        "--vae-config", type=Path, default=Path("configs/experiment/stage1_vae_v2_fgw_freebits.yaml"),
+        help="VAE config providing the kl_vae decoder kwargs.",
+    )
+    eval_transport.add_argument("--vae-checkpoint", type=Path, required=True, help="Frozen VAE checkpoint (.pt).")
+    eval_transport.add_argument("--latent-stats", type=Path, default=None, help="Defaults to <bank-dir>/latent_stats.json.")
+    eval_transport.add_argument("--out", type=Path, default=None, help="Write the full per-pair JSON here.")
+    eval_transport.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    eval_transport.add_argument("--n-steps", type=int, default=20, help="ODE integration steps.")
+    eval_transport.add_argument(
+        "--metrics", nargs="+", default=["ssim", "nrmse", "lpips"], choices=("ssim", "nrmse", "lpips"),
+    )
+    eval_transport.add_argument(
+        "--subjects", nargs="+", default=None,
+        help="Restrict to these subject_ids (default: all prospective travellers in the split).",
+    )
+    eval_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    resplit_parser = subparsers.add_parser(
+        "resplit-travellers",
+        help="Move whole subjects between train/validation/test arrays of a split JSON (no re-encode).",
+    )
+    resplit_parser.add_argument("--split-json", type=Path, required=True, help="Input split JSON.")
+    resplit_parser.add_argument("--out", type=Path, required=True, help="Output split JSON (must differ from input).")
+    resplit_parser.add_argument("--subjects", nargs="+", required=True, help="Subject ids to move, e.g. 0006 0007.")
+    resplit_parser.add_argument("--to", dest="to_split", choices=("train", "validation", "test"), required=True)
 
     build_latent_bank_parser = subparsers.add_parser(
         "build-latent-bank",
@@ -1281,6 +1326,53 @@ def main(argv: list[str] | None = None) -> int:
                 f"final_loss={result.final_loss:.6f} sec_per_step={result.seconds_per_step:.3f} "
                 f"best_val={result.best_val}"
             )
+        return 0
+
+    if args.command == "eval-stage2-transport":
+        import torch
+
+        config = _load_optional_config(args.config)
+        model_config = _model_config(config)
+        translator_name = str(model_config.get("name", "flow_matching_latent"))
+        translator_kwargs = {key: value for key, value in model_config.items() if key != "name"}
+        translator = build_translator(translator_name, **translator_kwargs)
+        translator.load_state_dict(load_checkpoint(args.transport_checkpoint)["translator"])
+
+        vae_config = _load_optional_config(args.vae_config)
+        vae_model_config = _model_config(vae_config)
+        decoder = build_decoder("kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder"))
+        vae_state = load_checkpoint(args.vae_checkpoint)
+        decoder.load_state_dict(vae_state["decoder"])
+        decoder.requires_grad_(False)
+
+        stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
+        stats = LatentStats.from_json(stats_path)
+        bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        device = _resolve_device(args.device)
+        result = evaluate_transport_travellers(
+            translator=translator,
+            decoder=decoder,
+            records=records,
+            bank_manifest=bank_manifest,
+            bank_dir=args.bank_dir,
+            stats=stats,
+            sampler=TransportSamplerConfig(solver=args.solver, n_steps=args.n_steps),
+            decode=DecodeSpec.from_bank_manifest(bank_manifest),
+            device=device,
+            metrics=tuple(args.metrics),
+            subjects=args.subjects,
+        )
+        if args.out is not None:
+            write_transport_eval(result, args.out)
+        print(json.dumps({k: result[k] for k in ("num_pairs", "subjects", "metrics", "sampler", "overall", "by_contrast")},
+                         indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "resplit-travellers":
+        summary = resplit_file(args.split_json, args.out, args.subjects, args.to_split)
+        print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
     if args.command == "print-config":

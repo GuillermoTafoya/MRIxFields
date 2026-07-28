@@ -31,7 +31,7 @@ from typing import Any, Literal
 import torch
 from torch.nn import functional as F
 
-from fieldbridge.data.domains import Domain
+from fieldbridge.data.domains import Contrast, Domain
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
@@ -41,6 +41,7 @@ Precision = Literal["fp32", "bf16"]
 Device = Literal["auto", "cpu", "cuda"]
 Coupling = Literal["independent", "ot"]
 Bridge = Literal["ot_cfm", "schrodinger"]
+FieldPairing = Literal["cross", "any"]
 
 DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "flow": 1.0,
@@ -60,6 +61,16 @@ class Stage2TransportConfig:
     precision: Precision = "bf16"
     coupling: Coupling = "ot"
     bridge: Bridge = "ot_cfm"
+    # Task 3 is field-to-field: source and target share a contrast and differ (only) in field
+    # strength. same_contrast constrains the coupling to a single contrast per batch; the old
+    # unconstrained any-domain draw is same_contrast=False. field_pairing="cross" forces
+    # field_s != field_t (a real translation); "any" allows field_s == field_t (identity coverage).
+    same_contrast: bool = True
+    field_pairing: FieldPairing = "cross"
+    # Spatial pool applied to latents before the OT cost. Full-latent L2 is degenerate at high
+    # dim (all pairwise distances concentrate), so the minibatch-OT plan is ~random; pooling to a
+    # small grid makes the cost meaningful and cheap. 0 = full latent (legacy behaviour).
+    ot_pool_size: int = 4
     sigma: float = 0.1  # Schrodinger-bridge volatility (bridge="schrodinger" only)
     time_eps: float = 1e-3  # clamp on t and (1 - t)
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LOSS_WEIGHTS))
@@ -95,6 +106,9 @@ class Stage2TransportConfig:
             precision=pick("precision", defaults.precision),
             coupling=pick("coupling", defaults.coupling),
             bridge=pick("bridge", defaults.bridge),
+            same_contrast=bool(pick("same_contrast", defaults.same_contrast)),
+            field_pairing=pick("field_pairing", defaults.field_pairing),
+            ot_pool_size=int(pick("ot_pool_size", defaults.ot_pool_size)),
             sigma=float(pick("sigma", defaults.sigma)),
             time_eps=float(pick("time_eps", defaults.time_eps)),
             loss_weights=weights,
@@ -119,6 +133,9 @@ class Stage2TransportConfig:
             "precision": self.precision,
             "coupling": self.coupling,
             "bridge": self.bridge,
+            "same_contrast": self.same_contrast,
+            "field_pairing": self.field_pairing,
+            "ot_pool_size": self.ot_pool_size,
             "sigma": self.sigma,
             "time_eps": self.time_eps,
             "loss_weights": dict(self.loss_weights),
@@ -169,6 +186,10 @@ def run_stage2_transport_train(
     translator = translator.to(device)
     optimizer = torch.optim.Adam(translator.parameters(), lr=cfg.lr)
     sampler = torch.Generator().manual_seed(cfg.seed)
+    train_pools = _FieldPools.from_index(train_index)
+    val_pools = _FieldPools.from_index(val_index) if val_index is not None else None
+    if cfg.same_contrast:
+        train_pools.require_pairable(cfg.field_pairing)
 
     start_step = 0
     best_val: float | None = None
@@ -183,8 +204,9 @@ def run_stage2_transport_train(
     if cfg.log_every_steps > 0:
         _log(
             f"stage2_transport start steps={cfg.steps} batch={cfg.batch_size} device={device.type} "
-            f"coupling={cfg.coupling} bridge={cfg.bridge} train_records={len(train_index)} "
-            f"val_records={len(val_index) if val_index else 0}"
+            f"coupling={cfg.coupling} bridge={cfg.bridge} same_contrast={cfg.same_contrast} "
+            f"field_pairing={cfg.field_pairing} ot_pool={cfg.ot_pool_size} "
+            f"train_records={len(train_index)} val_records={len(val_index) if val_index else 0}"
         )
 
     losses: list[float] = []
@@ -196,7 +218,7 @@ def run_stage2_transport_train(
         translator.train()
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
-            total, terms = _transport_loss(translator, train_index, stats, cfg, device, sampler)
+            total, terms = _transport_loss(translator, train_index, train_pools, stats, cfg, device, sampler)
         total.backward()
         optimizer.step()
         _sync_if_cuda(device)
@@ -208,7 +230,7 @@ def run_stage2_transport_train(
             last_ckpt_step = current_step
 
         if val_index is not None and cfg.val_every_steps and current_step % cfg.val_every_steps == 0:
-            val = _validate(translator, val_index, stats, cfg, device)
+            val = _validate(translator, val_index, val_pools, stats, cfg, device)
             val_losses.append((current_step, val))
             if best_val is None or val < best_val:
                 best_val = val
@@ -243,15 +265,19 @@ def run_stage2_transport_train(
 def _transport_loss(
     translator: BaseTranslator,
     index: LatentBankIndex,
+    pools: "_FieldPools",
     stats: LatentStats,
     cfg: Stage2TransportConfig,
     device: torch.device,
     sampler: torch.Generator,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
-    z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
+    if cfg.same_contrast:
+        z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, sampler)
+    else:
+        z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
+        z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
     if cfg.coupling == "ot":
-        perm = _ot_assignment(z0, z1)
+        perm = _ot_assignment(z0, z1, pool_size=cfg.ot_pool_size)
         z1 = z1[perm]
         dom_t = [dom_t[i] for i in perm.tolist()]
 
@@ -307,21 +333,51 @@ def _bridge_sample(
     raise ValueError(f"Unknown bridge {cfg.bridge!r}.")
 
 
-def _ot_assignment(z0: torch.Tensor, z1: torch.Tensor) -> torch.Tensor:
-    """Exact minibatch OT coupling: squared-L2 Hungarian assignment (column perm for z1)."""
+def _ot_assignment(z0: torch.Tensor, z1: torch.Tensor, *, pool_size: int = 0) -> torch.Tensor:
+    """Minibatch OT coupling: squared-L2 Hungarian assignment (column perm for z1).
+
+    The cost is computed on spatially avg-pooled latents when ``pool_size > 0``. Full-latent L2
+    concentrates at high dim (batch-8 vectors of ~1e6 dims are ~equidistant), so the plan
+    degenerates to ~random; pooling to a small grid restores a meaningful, cheap cost. The
+    returned permutation still indexes the full-resolution ``z1``.
+    """
 
     from scipy.optimize import linear_sum_assignment
 
-    flat0 = z0.reshape(z0.shape[0], -1).float()
-    flat1 = z1.reshape(z1.shape[0], -1).float()
+    a = _spatial_pool(z0, pool_size) if pool_size and pool_size > 0 else z0
+    b = _spatial_pool(z1, pool_size) if pool_size and pool_size > 0 else z1
+    flat0 = a.reshape(a.shape[0], -1).float()
+    flat1 = b.reshape(b.shape[0], -1).float()
     cost = torch.cdist(flat0, flat1).square().detach().cpu().numpy()
     _, col = linear_sum_assignment(cost)
     return torch.as_tensor(col, dtype=torch.long, device=z0.device)
 
 
+def _spatial_pool(z: torch.Tensor, size: int) -> torch.Tensor:
+    """Adaptive avg-pool the spatial dims of a (B, C, ...) latent to a (size,)*spatial grid."""
+
+    tensor = z.float()
+    if tensor.ndim == 5:
+        return F.adaptive_avg_pool3d(tensor, size)
+    if tensor.ndim == 4:
+        return F.adaptive_avg_pool2d(tensor, size)
+    return tensor
+
+
 def _sample_time(batch_size: int, device: torch.device, sampler: torch.Generator, eps: float) -> torch.Tensor:
     t = torch.rand(batch_size, generator=sampler, device="cpu")
     return t.clamp(eps, 1.0 - eps).to(device)
+
+
+def _load_normalized(
+    index: LatentBankIndex,
+    stats: LatentStats,
+    indices: Sequence[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, list[Domain]]:
+    latents, domains = index.load_batch(list(indices))
+    latents = stats.normalize(latents).to(device)
+    return latents, domains
 
 
 def _sample_normalized_batch(
@@ -332,15 +388,86 @@ def _sample_normalized_batch(
     sampler: torch.Generator,
 ) -> tuple[torch.Tensor, list[Domain]]:
     indices = torch.randint(0, len(index), (batch_size,), generator=sampler).tolist()
-    latents, domains = index.load_batch(indices)
-    latents = stats.normalize(latents).to(device)
-    return latents, domains
+    return _load_normalized(index, stats, indices, device)
+
+
+@dataclass(frozen=True, slots=True)
+class _FieldPools:
+    """Record indices grouped by (contrast, field strength), for contrast-constrained sampling.
+
+    Built once per split. ``pairable_contrasts`` are the contrasts present at >= 2 field
+    strengths — the only ones from which a cross-field (field_s != field_t) pair can be drawn.
+    """
+
+    by_contrast_field: dict[Contrast, dict[float, tuple[int, ...]]]
+    pairable_contrasts: tuple[Contrast, ...]
+
+    @classmethod
+    def from_index(cls, index: LatentBankIndex) -> "_FieldPools":
+        table: dict[Contrast, dict[float, list[int]]] = {}
+        for position, record in enumerate(index.records):
+            contrast = Contrast.parse(record.domain.contrast)
+            field = float(record.domain.field_strength_t)
+            table.setdefault(contrast, {}).setdefault(field, []).append(position)
+        frozen = {c: {f: tuple(idx) for f, idx in fields.items()} for c, fields in table.items()}
+        pairable = tuple(c for c, fields in frozen.items() if len(fields) >= 2)
+        return cls(by_contrast_field=frozen, pairable_contrasts=pairable)
+
+    def require_pairable(self, field_pairing: FieldPairing) -> None:
+        if field_pairing == "cross" and not self.pairable_contrasts:
+            raise ValueError(
+                "same_contrast with field_pairing='cross' needs a bank where at least one "
+                "contrast is present at >= 2 field strengths; found none. Check the split, or "
+                "set field_pairing='any' / same_contrast=false."
+            )
+        if not self.by_contrast_field:
+            raise ValueError("Latent bank has no records to sample contrast-constrained pairs from.")
+
+
+def _draw_with_replacement(pool: tuple[int, ...], count: int, sampler: torch.Generator) -> list[int]:
+    picks = torch.randint(0, len(pool), (count,), generator=sampler).tolist()
+    return [pool[p] for p in picks]
+
+
+def _sample_constrained_pair(
+    index: LatentBankIndex,
+    pools: _FieldPools,
+    stats: LatentStats,
+    cfg: Stage2TransportConfig,
+    device: torch.device,
+    sampler: torch.Generator,
+) -> tuple[torch.Tensor, list[Domain], torch.Tensor, list[Domain]]:
+    """Draw a same-contrast (field_s -> field_t) batch: source and target share the contrast.
+
+    One (contrast, field_s, field_t) transition is chosen per batch so the minibatch-OT coupling
+    pairs anatomies for a single, well-defined field translation. Over steps this covers all
+    (contrast, field_s, field_t) combinations, training the one shared any-to-any field v_theta.
+    """
+
+    contrasts = pools.pairable_contrasts if cfg.field_pairing == "cross" else tuple(pools.by_contrast_field)
+    contrast = contrasts[int(torch.randint(0, len(contrasts), (1,), generator=sampler))]
+    fields = sorted(pools.by_contrast_field[contrast])
+    if cfg.field_pairing == "cross":
+        i = int(torch.randint(0, len(fields), (1,), generator=sampler))
+        j = int(torch.randint(0, len(fields) - 1, (1,), generator=sampler))
+        if j >= i:
+            j += 1
+        field_s, field_t = fields[i], fields[j]
+    else:
+        field_s = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
+        field_t = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
+    src_idx = _draw_with_replacement(pools.by_contrast_field[contrast][field_s], cfg.batch_size, sampler)
+    tgt_idx = _draw_with_replacement(pools.by_contrast_field[contrast][field_t], cfg.batch_size, sampler)
+    z0, dom_s = _load_normalized(index, stats, src_idx, device)
+    z1, dom_t = _load_normalized(index, stats, tgt_idx, device)
+    return z0, dom_s, z1, dom_t
 
 
 @torch.no_grad()
 def _validate(
     translator: BaseTranslator,
     index: LatentBankIndex,
+    pools: _FieldPools,
     stats: LatentStats,
     cfg: Stage2TransportConfig,
     device: torch.device,
@@ -349,10 +476,13 @@ def _validate(
     generator = torch.Generator().manual_seed(cfg.seed + 1)
     total = 0.0
     for _ in range(max(1, cfg.val_batches)):
-        z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
-        z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
+        if cfg.same_contrast:
+            z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, generator)
+        else:
+            z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
+            z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
         if cfg.coupling == "ot":
-            perm = _ot_assignment(z0, z1)
+            perm = _ot_assignment(z0, z1, pool_size=cfg.ot_pool_size)
             z1 = z1[perm]
             dom_t = [dom_t[i] for i in perm.tolist()]
         t = _sample_time(cfg.batch_size, device, generator, cfg.time_eps)
@@ -404,6 +534,10 @@ def _validate_config(cfg: Stage2TransportConfig) -> None:
         raise ValueError(f"Unknown bridge {cfg.bridge!r}.")
     if cfg.bridge == "schrodinger" and cfg.sigma <= 0:
         raise ValueError("schrodinger bridge requires sigma > 0.")
+    if cfg.field_pairing not in ("cross", "any"):
+        raise ValueError(f"Unknown field_pairing {cfg.field_pairing!r}.")
+    if cfg.ot_pool_size < 0:
+        raise ValueError("ot_pool_size must be >= 0.")
 
 
 def _coerce_config(config: Stage2TransportConfig | Mapping[str, Any] | None) -> Stage2TransportConfig:

@@ -106,6 +106,33 @@ def test_evaluate_transport_travellers_zero_field_matches_identity(tmp_path) -> 
     assert set(result["overall"]) == {"transport", "identity", "ceiling"}
 
 
+def test_subjects_filter_stays_within_prospective(tmp_path) -> None:
+    # Prospective traveller 0006 at {0.1, 3.0}, plus a colliding RETROSPECTIVE R_..._0006 at 7.0T
+    # (different person, same numeric id). --subjects 0006 must ignore the retrospective one.
+    records, manifest = _make_traveller_bank(tmp_path)
+    collider = f"R_{Contrast.T1W.name}_7.0_0006"
+    torch.save({"case_id": collider, "latent": torch.rand(C, X, X, X, dtype=torch.float16)},
+               tmp_path / "train" / f"{collider}.pt")
+    manifest["records"].append({"case_id": collider, "path": f"train/{collider}.pt"})
+    records.append(VolumeRecord(
+        case_id=collider, image_path=f"/nonexistent/{collider}.nii.gz",
+        domain=Domain(7.0, Contrast.T1W), subject_id="0006", split="Training_retrospective",
+        metadata={"prefix": "R"},
+    ))
+    stats = LatentStats.from_json(tmp_path / "latent_stats.json")
+    result = evaluate_transport_travellers(
+        translator=_ConstantField(torch.zeros(1, C, X, X, X)), decoder=_StubDecoder(),
+        records=records, bank_manifest=manifest, bank_dir=tmp_path, stats=stats,
+        sampler=TransportSamplerConfig(solver="euler", n_steps=2), decode=DecodeSpec(precision="float32"),
+        device=torch.device("cpu"), metrics=("nrmse",), subjects=["0006"],
+        metric_fn=_stub_metric, volume_loader=lambda record: torch.zeros(1, 1, X * FACTOR, X * FACTOR, X * FACTOR),
+        log=False,
+    )
+    # Only the 2 prospective fields (0.1<->3.0) => 2 ordered pairs; the retrospective 7.0T is dropped.
+    assert result["num_pairs"] == 2
+    assert {(r["source_field_t"], r["target_field_t"]) for r in result["pairs"]} == {(0.1, 3.0), (3.0, 0.1)}
+
+
 def test_evaluate_transport_raises_without_travellers(tmp_path) -> None:
     records, manifest = _make_traveller_bank(tmp_path)
     stats = LatentStats.from_json(tmp_path / "latent_stats.json")

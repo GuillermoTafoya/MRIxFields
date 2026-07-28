@@ -160,13 +160,16 @@ def _traveller_cases(
     subject_filter = set(subjects) if subjects else None
     cases: list[_TravellerCase] = []
     for record in records:
+        # Only prospective (P_) travellers are cross-field paired. This filter ALWAYS applies:
+        # retrospective and prospective share numeric subject_ids (e.g. R_..._0007 and P_..._0007
+        # are different people), so ``subjects`` can only further restrict *within* prospective —
+        # it must never let a retrospective same-number subject into a traveller's field group.
         is_prospective = str(record.case_id).startswith("P_") or (
             isinstance(record.metadata, Mapping) and record.metadata.get("prefix") == "P"
         )
-        if subject_filter is not None:
-            if record.subject_id not in subject_filter:
-                continue
-        elif not is_prospective:
+        if not is_prospective:
+            continue
+        if subject_filter is not None and record.subject_id not in subject_filter:
             continue
         latent_path = latent_path_by_case.get(str(record.case_id))
         if latent_path is None:

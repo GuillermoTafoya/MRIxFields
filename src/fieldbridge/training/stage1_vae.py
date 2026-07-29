@@ -61,8 +61,8 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.warm_start import load_state_dict_tolerant
 from fieldbridge.utils.seeding import seed_everything
 
-# Order in which per-term losses appear in the per-step console line (only terms with a
-# positive weight are actually computed/printed). `total` is logged separately.
+# Order in which active losses and always-reported detached diagnostics appear in the
+# per-step console line. ``total`` is logged separately.
 _LOSS_TERM_ORDER = (
     "l1",
     "masked_l1",
@@ -826,7 +826,14 @@ def run_stage1_vae_train(
         if "decoder" in state:
             load_state_dict_tolerant(decoder, state["decoder"])
 
-    trainable_params = list(encoder.parameters()) + list(decoder.parameters())
+    named_trainable_params = [
+        (f"encoder.{name}", parameter)
+        for name, parameter in encoder.named_parameters()
+    ] + [
+        (f"decoder.{name}", parameter)
+        for name, parameter in decoder.named_parameters()
+    ]
+    trainable_params = [parameter for _, parameter in named_trainable_params]
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.lr)
 
     tracker: _EarlyStopTracker | None = None
@@ -964,8 +971,9 @@ def run_stage1_vae_train(
         total_loss = components["total"]
         total_loss.backward()
         if cfg.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                trainable_params, cfg.grad_clip_norm, error_if_nonfinite=True
+            _clip_gradients_fail_closed(
+                named_trainable_params,
+                cfg.grad_clip_norm,
             )
         else:
             for parameter in trainable_params:
@@ -1281,11 +1289,12 @@ def _compute_vae_loss_components(
     lpips_net: nn.Module | None,
     global_step: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Weighted `total` plus each *unweighted* term, so logging can show where the loss
-    lives (l1/ssim/nrmse/lpips/kl) rather than one opaque number.
+    """Weighted ``total`` plus unweighted active terms and detached diagnostics.
 
-    Only the terms with positive weight are computed (LPIPS especially is expensive), so a
-    swept-off term is simply absent from the returned dict — callers read with `.get`.
+    Expensive optional terms are computed only when active. Always-reported diagnostics
+    such as nRMSE and raw KL remain available for logging, but an effective zero weight
+    detaches that value and excludes it from ``total``. This is stronger than multiplying
+    by zero because a forward-finite diagnostic may have a singular backward.
     """
 
     # Reparameterize once, here, rather than calling encode() and then encode_dist()
@@ -1340,15 +1349,13 @@ def _compute_vae_loss_components(
         else reconstructed.sum() * 0.0
     )
 
-    total = reconstructed.sum() * 0.0
-    for name, value in components.items():
-        if name == "raw_kl":
-            continue
-        weight = weights.get(name, 0.0)
-        if name == "kl":
-            weight *= _kl_warmup_factor(global_step, cfg)
-        total = total + weight * value
-    components["total"] = total
+    components["total"] = _compose_vae_total(
+        reconstructed,
+        components,
+        weights,
+        cfg,
+        global_step=global_step,
+    )
     _require_finite_components(components)
     return components
 
@@ -1601,17 +1608,46 @@ def _reconstruction_components(
         if cfg.latent_mode == "stochastic"
         else reconstructed.sum() * 0.0
     )
-    total = reconstructed.sum() * 0.0
-    for name, value in components.items():
-        if name == "raw_kl":
-            continue
-        weight = weights.get(name, 0.0)
-        if name == "kl":
-            weight *= _kl_warmup_factor(global_step, cfg)
-        total = total + weight * value
-    components["total"] = total
+    components["total"] = _compose_vae_total(
+        reconstructed,
+        components,
+        weights,
+        cfg,
+        global_step=global_step,
+    )
     _require_finite_components(components)
     return components
+
+
+def _compose_vae_total(
+    reference: torch.Tensor,
+    components: dict[str, torch.Tensor],
+    weights: Mapping[str, float],
+    cfg: Stage1VAEConfig,
+    *,
+    global_step: int,
+) -> torch.Tensor:
+    """Build the backward target without connecting zero-weight diagnostics.
+
+    Multiplying a diagnostic by zero is not sufficient: a finite forward value may have
+    an infinite derivative, and IEEE ``0 * inf`` then produces NaN during backward.
+    Diagnostics remain reportable as detached scalars, while only nonzero effective
+    weights enter the autograd graph.
+    """
+
+    total = reference.sum() * 0.0
+    for name, value in list(components.items()):
+        if name == "raw_kl":
+            components[name] = value.detach()
+            continue
+        effective_weight = float(weights.get(name, 0.0))
+        if name == "kl":
+            effective_weight *= _kl_warmup_factor(global_step, cfg)
+        if effective_weight == 0.0:
+            components[name] = value.detach()
+            continue
+        total = total + effective_weight * value
+    return total
 
 
 def _kl_warmup_factor(global_step: int, cfg: Stage1VAEConfig) -> float:
@@ -1633,6 +1669,44 @@ def _masked_l1_or_zero(
 def _require_finite_tensor(value: torch.Tensor, name: str) -> None:
     if not bool(torch.isfinite(value).all()):
         raise FloatingPointError(f"{name} contains non-finite values.")
+
+
+def _clip_gradients_fail_closed(
+    named_parameters: list[tuple[str, nn.Parameter]],
+    max_norm: float,
+) -> torch.Tensor:
+    """Clip gradients and identify offending parameters only on failure."""
+
+    parameters = [parameter for _, parameter in named_parameters]
+    try:
+        return torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm,
+            error_if_nonfinite=True,
+        )
+    except RuntimeError as exc:
+        affected: list[str] = []
+        for name, parameter in named_parameters:
+            gradient = parameter.grad
+            if gradient is None or bool(torch.isfinite(gradient).all()):
+                continue
+            nan_count = int(torch.isnan(gradient).sum().detach().cpu().item())
+            inf_count = int(torch.isinf(gradient).sum().detach().cpu().item())
+            affected.append(f"{name}(nan={nan_count},inf={inf_count})")
+        if not affected and "non-finite" not in str(exc).lower():
+            raise
+        if affected:
+            preview = ", ".join(affected[:12])
+            remainder = len(affected) - min(len(affected), 12)
+            if remainder:
+                preview += f", ... (+{remainder} more)"
+            detail = f" affected parameters: {preview}."
+        else:
+            detail = " no individual non-finite parameter gradient was found."
+        raise FloatingPointError(
+            "Stage-1 gradient norm is non-finite before optimizer.step;"
+            + detail
+        ) from exc
 
 
 def _require_finite_components(components: Mapping[str, torch.Tensor]) -> None:

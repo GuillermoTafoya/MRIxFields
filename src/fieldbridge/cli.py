@@ -101,6 +101,9 @@ from fieldbridge.training.pseudo_pair_epochs import (
     train_pseudo_pair_epochs,
 )
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from fieldbridge.training.stage1_gradient_smoke import (
+    run_stage1_gradient_smoke,
+)
 from fieldbridge.training.stage1_vae import (
     Stage1VAEConfig,
     preflight_stage1_resume,
@@ -129,6 +132,35 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--batch-size", type=int, default=None)
     smoke.add_argument("--seed", type=int, default=None)
     smoke.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    stage1_gradient_smoke = subparsers.add_parser(
+        "smoke-stage1-gradient",
+        help=(
+            "Run one synthetic exact-zero-background Arm-A backward, gradient clip, "
+            "and optimizer step."
+        ),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage1_ae_v3_joint_domain.yaml"),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default=None,
+        help="Override the config device; omit to exercise its CUDA setting.",
+    )
+    stage1_gradient_smoke.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default=None,
+        help="Override the config precision; omit to exercise its bf16 setting.",
+    )
+    stage1_gradient_smoke.add_argument("--patch-size", type=int, default=16)
+    stage1_gradient_smoke.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON."
+    )
 
     train = subparsers.add_parser("train", help="Run the configurable Etapa 2 translator training loop.")
     train.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
@@ -688,6 +720,29 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"smoke-train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "smoke-stage1-gradient":
+        config = _load_optional_config(args.config)
+        result = run_stage1_gradient_smoke(
+            config,
+            device=args.device,
+            precision=args.precision,
+            patch_size=args.patch_size,
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(
+                "smoke-stage1-gradient completed: "
+                f"device={result.device} precision={result.precision} "
+                f"loss={result.components['total']:.6f} "
+                f"gradient_norm={result.gradient_norm:.6f} "
+                f"finite_gradients="
+                f"{result.finite_gradient_parameter_tensors}/"
+                f"{result.trainable_parameter_tensors} "
+                f"updated={result.updated_parameter_tensors}"
+            )
         return 0
 
     if args.command == "train":

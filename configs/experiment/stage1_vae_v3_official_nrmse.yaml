@@ -62,10 +62,11 @@ training:
   loss_weights:
     l1: 1.0
     ssim: 1.0
-    # NOTE: the official term is ~10x larger in magnitude than the range-normalized one it
-    # replaces, so at weight 1.0 it carries proportionally more of the gradient than it did
-    # in run C. That is the intent, but the weight is set from the measured per-term
-    # breakdown of the 100-step probe run, not guessed — see the run log before the long run.
+    # Weight kept at 1.0, set from the 100-step probe's measured per-term breakdown rather
+    # than guessed. On 64^3 patches with the 70% foreground crop quota the official term
+    # lands at 0.076-0.155, i.e. the same order as ssim (0.028-0.19) and lpips (0.056-0.12),
+    # so the balance run C was tuned at carries over. (It would NOT carry over at volume
+    # level, where the target is ~88% background and ||t|| is far smaller.)
     nrmse: 1.0
     lpips: 1.0
     kl: 0.0001

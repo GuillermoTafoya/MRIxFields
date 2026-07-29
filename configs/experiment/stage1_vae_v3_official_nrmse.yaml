@@ -1,0 +1,108 @@
+# Etapa-1 KL-VAE · run D (FINAL) — v2 bundle + the official Task-3 nRMSE as the loss term.
+#
+# Motivation (measured, not assumed). The `nrmse` term run C optimized is
+# `RMSE / data_range` (evaluation/metrics.py). The challenge evaluator is
+# `||p - t|| / ||t||` (evaluation/mrixfields2026_official.py). On run C's own frozen ep15
+# reconstruction the two disagree by 5-70x, because the official form divides by the
+# target's L2 norm and these volumes are dark:
+#
+#     T1w 7T reconstruction:  0.0066 range-normalized   vs   0.4449 official
+#
+# Measured on the held-out traveller gate, the frozen-VAE ceiling under the official metric
+# is nRMSE 0.285 (SSIM 0.957) — i.e. the VAE reconstructs structure well but its *relative*
+# intensity error on low-energy volumes is large, and that is precisely what Task 3 scores.
+# This run keeps everything else in the v2 bundle fixed and changes only which nRMSE is
+# optimized, so the delta is attributable.
+#
+# Everything below is identical to stage1_vae_v2_fgw_freebits.yaml except:
+#   * training.nrmse_mode: official      (was: the implicit "range")
+#   * training.nrmse_rms_floor           (new; bounds the term on air patches)
+#   * training.warm_start_checkpoint     (weights from run C ep15; NOT resume — new objective
+#                                         gets a fresh optimizer and a fresh cosine curve)
+#   * training.checkpoint_dir            (isolated; run C is a frozen baseline, never touched)
+#   * training.lr                        (1e-4 fine-tune, not the 2e-4 from-scratch value)
+#
+# Launch on the RTX 5070 Ti box (16 GB) — see D:\MRI_Field_2026\launch_stage1_v3.bat:
+#   python -m fieldbridge.cli train-stage1-vae \
+#     --config configs/experiment/stage1_vae_v3_official_nrmse.yaml \
+#     --split-json D:\MRI_Field_2026\split_v3.json --epochs 25
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+  patch_size: [64, 64, 64]
+  patches_per_volume: 16
+  foreground_threshold: 0.0
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
+  field_balance:
+    enabled: true
+    mode: inverse_frequency
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  loss_weights:
+    l1: 1.0
+    ssim: 1.0
+    # NOTE: the official term is ~10x larger in magnitude than the range-normalized one it
+    # replaces, so at weight 1.0 it carries proportionally more of the gradient than it did
+    # in run C. That is the intent, but the weight is set from the measured per-term
+    # breakdown of the 100-step probe run, not guessed — see the run log before the long run.
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+  # Which nRMSE the `nrmse` term optimizes: "official" = ||p - t|| / ||t||, the evaluator's.
+  nrmse_mode: official
+  # Floor on the official denominator, in RMS units of the [0, 1] contract. The stratified
+  # crop's 10% air quota yields patches with ||t|| ~ 0, which would otherwise diverge. 0.02
+  # sits below the RMS of every real volume in the split (measured range ~0.015-0.09), so it
+  # binds only on air/near-air patches, where the term degrades to RMSE / 0.02.
+  nrmse_rms_floor: 0.02
+  ssim_window_size: 7
+  data_range: 1.0
+  lpips_num_slices: 8
+  grad_clip_norm: 1.0
+  early_stopping: false
+  val_early_stopping: true
+  val_early_stopping_patience: 7
+  val_every_epochs: 1
+  latent_active_kl_threshold: 0.01
+  recon_dump_every_epochs: 5
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_factor: 0.05
+  # 25 epochs * 3180 steps/epoch. Fine-tune horizon, not the 75-epoch from-scratch one:
+  # run C's best was ep15 of 22, and this starts from those weights.
+  lr_cosine_total_steps: 79500
+  foreground_loss_weighting: true
+  foreground_weight: 4.0
+  foreground_threshold: 0.0
+  kl_free_bits: 0.5
+  # Weights only (no optimizer/step state) from run C's best-by-val checkpoint. The objective
+  # changed, so resuming the optimizer and the cosine curve would be wrong.
+  warm_start_checkpoint: outputs/stage1_vae_v2_fgw_freebits/checkpoints/vae_kl_vae_best.pt
+  resume_from: null
+  # Isolated from run C — never overwrite a frozen baseline.
+  checkpoint_dir: outputs/stage1_vae_v3_official_nrmse/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 50

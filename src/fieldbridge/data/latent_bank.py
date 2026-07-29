@@ -264,6 +264,55 @@ def decode_latent_tiled(
     return image.clamp(0.0, 1.0) if clamp else image
 
 
+@torch.inference_mode()
+def decode_latent(
+    decoder: Any,
+    latent: torch.Tensor,
+    domain: Domain,
+    *,
+    factor: int,
+    strategy: EncodeStrategy,
+    block_size: Sequence[int],
+    halo: Sequence[int],
+    precision: Precision,
+    clamp: bool = True,
+) -> tuple[torch.Tensor, str]:
+    """Decode a latent, full-volume when it fits and tiled only as an OOM fallback.
+
+    Tiled decode is NOT seam-free, and no halo size makes it so. The decoder's GroupNorm
+    normalizes over the spatial extent of whatever tensor it is handed, which makes it a
+    *non-local* function of the latent: measured on the frozen run-C decoder, perturbing the
+    latent 16 voxels away (twice the ~8-voxel convolutional receptive field) changes the
+    output inside an untouched region by 2.8% relative L2, and decoding a slab alone versus
+    in context differs by 3.1% of which only 0.03 pp is a removable DC offset. Enlarging the
+    halo shrinks the convolutional part of that error and cannot touch the normalization
+    part. End to end the difference is worth ~0.04 of official nRMSE on a brain-like volume.
+
+    So the contract is: ``full`` is correct, ``tiled`` is an approximation used when the
+    volume does not fit, and the caller is told which one it got.
+    """
+
+    if latent.ndim != 5:
+        raise ValueError(f"decode_latent expects (1,C,x,y,z), got {tuple(latent.shape)}.")
+    device = latent.device
+    if strategy in ("full", "auto"):
+        try:
+            with _autocast(device, precision):
+                image = decoder.decode(latent, domain)
+            image = image.float()
+            return (image.clamp(0.0, 1.0) if clamp else image), "full"
+        except RuntimeError as error:
+            if strategy == "full" or not _is_oom(error):
+                raise
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    tiled = decode_latent_tiled(
+        decoder, latent, domain, factor=factor,
+        block_size=block_size, halo=halo, precision=precision, clamp=clamp,
+    )
+    return tiled, "tiled"
+
+
 def _core_blocks_latent(dim: int, block: int) -> list[tuple[int, int]]:
     if block <= 0:
         raise ValueError(f"latent block must be positive, got {block}.")
@@ -540,6 +589,7 @@ __all__ = [
     "LatentBankConfig",
     "build_latent_bank",
     "encode_latent",
+    "decode_latent",
     "decode_latent_tiled",
     "downsample_factor",
     "load_volume",

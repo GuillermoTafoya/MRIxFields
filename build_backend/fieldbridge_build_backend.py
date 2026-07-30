@@ -106,6 +106,7 @@ def _metadata() -> str:
         "License: MIT",
         "Requires-Dist: torch>=2.0",
         "Requires-Dist: numpy>=1.23.5,<3",
+        "Requires-Dist: scipy>=1.10,<2",
         "Requires-Dist: PyYAML>=6.0",
         "Provides-Extra: dev",
         'Requires-Dist: matplotlib>=3.7,<4; extra == "dev"',

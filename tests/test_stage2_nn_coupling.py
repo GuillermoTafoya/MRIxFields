@@ -89,7 +89,7 @@ def test_nn_batch_is_paired_elementwise_and_stays_in_the_transition(tmp_path: Pa
     )
     cfg = Stage2TransportConfig(coupling="nn", batch_size=4, same_contrast=True, ot_pool_size=2)
 
-    z0, dom_s, z1, dom_t = _sample_constrained_pair(
+    z0, dom_s, z1, dom_t, _ = _sample_constrained_pair(
         index, pools, _stats(), cfg, torch.device("cpu"), torch.Generator().manual_seed(0)
     )
 
@@ -112,7 +112,7 @@ def test_nn_candidates_greater_than_one_does_not_always_return_the_same_target(t
 
     seen = set()
     for seed in range(6):
-        _, _, z1, _ = _sample_constrained_pair(
+        _, _, z1, _, _ = _sample_constrained_pair(
             index, pools, _stats(), cfg, torch.device("cpu"), torch.Generator().manual_seed(seed)
         )
         seen.add(float(z1.sum()))

@@ -164,6 +164,7 @@ class _TravellerCase:
     domain: Domain
     latent_path: Path
     image_record: VolumeRecord
+    split: str | None = None
 
 
 def _traveller_cases(
@@ -171,6 +172,7 @@ def _traveller_cases(
     manifest: Mapping[str, Any],
     bank_dir: Path,
     subjects: Sequence[str] | None,
+    split_of_case: Mapping[str, str] | None = None,
 ) -> list[_TravellerCase]:
     """Join split records (real target volumes) to bank latents by case_id, keeping travellers."""
 
@@ -201,6 +203,7 @@ def _traveller_cases(
                 domain=record.domain,
                 latent_path=latent_path,
                 image_record=record,
+                split=(split_of_case or {}).get(str(record.case_id)),
             )
         )
     return cases
@@ -235,6 +238,9 @@ def evaluate_transport_travellers(
     device: torch.device,
     metrics: Sequence[str] = DEFAULT_METRICS,
     subjects: Sequence[str] | None = None,
+    split_of_case: Mapping[str, str] | None = None,
+    training_splits: Sequence[str] = ("train",),
+    allow_training_subjects: bool = False,
     field_pairs: Sequence[tuple[float, float]] | None = None,
     metric_fn: Callable[..., dict[str, float]] = official_metric_fn,
     volume_loader: Callable[[VolumeRecord], torch.Tensor] = load_volume,
@@ -245,11 +251,28 @@ def evaluate_transport_travellers(
     translator = translator.to(device).eval()
     decoder = decoder.to(device).eval()
     factor = downsample_factor(decoder)
-    cases = _traveller_cases(records, bank_manifest, bank_dir, subjects)
+    cases = _traveller_cases(records, bank_manifest, bank_dir, subjects, split_of_case)
     if not cases:
         raise ValueError(
             "No traveller (prospective) cases found that are also encoded in the bank. "
             "Pass --subjects, or check the split/bank."
+        )
+
+    # Fail closed on scoring a subject the transport was trained on. With the `nn` coupling a
+    # traveller in the training pool retrieves its OWN volume at the target field as the nearest
+    # neighbour — the same anatomy is trivially nearest — so it receives real paired supervision
+    # and any score on it measures memorization. Nothing in the numbers distinguishes that from a
+    # clean read, which is exactly why this has to be refused rather than warned about.
+    subject_splits = {case.subject_id: case.split for case in cases}
+    contaminated = sorted(
+        subject for subject, split in subject_splits.items() if split in set(training_splits)
+    )
+    if contaminated and not allow_training_subjects:
+        raise ValueError(
+            f"Refusing to score subject(s) {contaminated}: they are in the transport's training "
+            f"split(s) {list(training_splits)}, so the result measures memorization, not "
+            "generalization. Score a held-out traveller, or pass allow_training_subjects=True "
+            "(--allow-training-subjects) if an optimistic upper bound is what you want."
         )
 
     by_group: dict[tuple[str, Contrast], dict[float, _TravellerCase]] = {}
@@ -319,6 +342,9 @@ def evaluate_transport_travellers(
     result = {
         "num_pairs": len(pairs),
         "subjects": sorted({row["subject_id"] for row in pairs}),
+        # Provenance, so a contaminated read is never mistaken for a clean one after the fact.
+        "subject_splits": {k: v for k, v in sorted(subject_splits.items())},
+        "scored_training_subjects": contaminated,
         "metrics": list(metrics),
         "sampler": {"solver": sampler.solver, "n_steps": sampler.n_steps},
         # "tiled" here means the numbers carry a decode approximation; see decode_latent.

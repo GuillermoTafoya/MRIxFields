@@ -63,6 +63,17 @@ training:
   # Building descriptors reads every latent once (~11 GB for train). Point this at Drive so
   # the cost is paid once across runs; null = alongside the bank.
   descriptor_cache: null
+  # Fraction of steps drawn as TRUE same-subject cross-field pairs from the traveller(s) in
+  # this split, instead of the unpaired coupling above. OFF by default (project convention:
+  # a new behaviour is a one-number switch, not a silent default). This is the explicit,
+  # measurable version of what the nn coupling used to do by accident: before the 1-1-1
+  # resplit, a traveller left in train would retrieve its own target-field volume as its
+  # nearest neighbour and get real paired supervision with no way to tell how much it
+  # mattered. Turn this on as its own ablation (0.1-0.3 is a reasonable starting range) only
+  # AFTER running with the resplit that keeps 0006 out of train — see the notebook's resplit
+  # cell. With one traveller in train this draws from 60 ordered pairs of a single anatomy;
+  # watch the held-out (0006) gate for overfitting if this is raised.
+  paired_fraction: 0.0
   sigma: 0.1            # bridge volatility
   time_eps: 0.001
   loss_weights:

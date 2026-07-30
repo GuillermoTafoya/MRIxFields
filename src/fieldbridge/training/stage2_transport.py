@@ -88,6 +88,21 @@ class Stage2TransportConfig:
     # 1-NN would pin every source to one fixed partner for the whole run, which both
     # overfits that anatomy and removes the stochasticity the flow-matching objective needs.
     nn_candidates: int = 5
+    # Fraction of steps drawn as TRUE same-subject cross-field pairs from the prospective
+    # travellers in this split, instead of from the unpaired coupling. 0.0 = pure unpaired
+    # (the v3.1 thesis). The official baseline recipe is "unpaired pretrain on retrospective +
+    # paired fine-tune on prospective", and Task 3 is scored exclusively on travellers, so this
+    # is the knob that implements that second half.
+    #
+    # It exists to make the paired signal EXPLICIT and measurable. With coupling="nn" a
+    # traveller in the training pool already retrieves its own target-field volume as the
+    # nearest neighbour (same anatomy is trivially nearest), so paired supervision was leaking
+    # in by accident at an unmeasurable rate. Keep travellers out of train (1-1-1 resplit) and
+    # dial this instead, so `+/- paired` is an ablation rather than a side effect.
+    #
+    # Caveat worth stating: with one traveller in train this is 60 ordered pairs from a single
+    # anatomy. Overfitting to it is a real risk; that is what the held-out traveller gate is for.
+    paired_fraction: float = 0.0
     # Where the pooled per-record descriptors are cached. Building them reads every latent
     # in the bank once (~11 GB for the train split), which is not something to repeat per
     # run. None = alongside the bank.
@@ -131,6 +146,7 @@ class Stage2TransportConfig:
             field_pairing=pick("field_pairing", defaults.field_pairing),
             ot_pool_size=int(pick("ot_pool_size", defaults.ot_pool_size)),
             nn_candidates=int(pick("nn_candidates", defaults.nn_candidates)),
+            paired_fraction=float(pick("paired_fraction", defaults.paired_fraction)),
             descriptor_cache=(
                 Path(descriptor_cache) if (descriptor_cache := pick("descriptor_cache", None)) else None
             ),
@@ -162,6 +178,7 @@ class Stage2TransportConfig:
             "field_pairing": self.field_pairing,
             "ot_pool_size": self.ot_pool_size,
             "nn_candidates": self.nn_candidates,
+            "paired_fraction": self.paired_fraction,
             "sigma": self.sigma,
             "time_eps": self.time_eps,
             "loss_weights": dict(self.loss_weights),
@@ -302,13 +319,17 @@ def _transport_loss(
     sampler: torch.Generator,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if cfg.same_contrast:
-        z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, sampler)
+        z0, dom_s, z1, dom_t, already_paired = _sample_constrained_pair(
+            index, pools, stats, cfg, device, sampler
+        )
     else:
         z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
         z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, sampler)
-    # "nn" already paired each source with a specific target when the batch was drawn;
-    # permuting again would throw that pairing away.
-    if cfg.coupling == "ot":
+        already_paired = False
+    # "nn" and the paired draw both fix a specific target per source when the batch is drawn;
+    # permuting again would throw that pairing away. This is per-batch, not per-run: with
+    # 0 < paired_fraction < 1 the unpaired batches still get their OT assignment.
+    if cfg.coupling == "ot" and not already_paired:
         perm = _ot_assignment(z0, z1, pool_size=cfg.ot_pool_size)
         z1 = z1[perm]
         dom_t = [dom_t[i] for i in perm.tolist()]
@@ -514,17 +535,29 @@ class _FieldPools:
     # row i holding the k globally nearest targets to pool_s[i]. Precomputed once because the
     # pools are static; the largest table is 191x k.
     nn_tables: dict[tuple[Contrast, float, float], torch.Tensor] | None = None
+    # (contrast, field_s, field_t) -> ((src_position, tgt_position), ...) for the SAME
+    # prospective subject. This is genuine paired supervision and the only such data that
+    # exists: retrospective subject_ids are field-scoped, so the same number at two fields is
+    # two different people. Empty when the split holds no traveller (which is the point of a
+    # 1-1-1 resplit — see `paired_fraction`).
+    paired_by_transition: dict[tuple[Contrast, float, float], tuple[tuple[int, int], ...]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_index(cls, index: LatentBankIndex) -> "_FieldPools":
         table: dict[Contrast, dict[float, list[int]]] = {}
         for position, record in enumerate(index.records):
             contrast = Contrast.parse(record.domain.contrast)
-            field = float(record.domain.field_strength_t)
-            table.setdefault(contrast, {}).setdefault(field, []).append(position)
+            field_strength = float(record.domain.field_strength_t)
+            table.setdefault(contrast, {}).setdefault(field_strength, []).append(position)
         frozen = {c: {f: tuple(idx) for f, idx in fields.items()} for c, fields in table.items()}
         pairable = tuple(c for c, fields in frozen.items() if len(fields) >= 2)
-        return cls(by_contrast_field=frozen, pairable_contrasts=pairable)
+        return cls(
+            by_contrast_field=frozen,
+            pairable_contrasts=pairable,
+            paired_by_transition=_paired_transitions(index),
+        )
 
     def with_nn_tables(self, descriptors: torch.Tensor, *, candidates: int) -> "_FieldPools":
         """Return a copy carrying the global NN table for every (contrast, f_s, f_t)."""
@@ -542,7 +575,11 @@ class _FieldPools:
             by_contrast_field=self.by_contrast_field,
             pairable_contrasts=self.pairable_contrasts,
             nn_tables=tables,
+            paired_by_transition=self.paired_by_transition,
         )
+
+    def paired_pair_count(self) -> int:
+        return sum(len(v) for v in self.paired_by_transition.values())
 
     def require_pairable(self, field_pairing: FieldPairing) -> None:
         if field_pairing == "cross" and not self.pairable_contrasts:
@@ -553,6 +590,34 @@ class _FieldPools:
             )
         if not self.by_contrast_field:
             raise ValueError("Latent bank has no records to sample contrast-constrained pairs from.")
+
+
+def _paired_transitions(
+    index: LatentBankIndex,
+) -> dict[tuple[Contrast, float, float], tuple[tuple[int, int], ...]]:
+    """Same-subject cross-field position pairs, restricted to the prospective cohort.
+
+    The cohort restriction is not cosmetic. The official data description gives retrospective
+    IDs disjoint per field strength (0001-1056, each field its own range) and prospective IDs
+    0001-0040 where the same ID *is* the same volunteer at every field. Keying on the bare
+    subject_id would therefore fabricate "pairs" out of two unrelated retrospective people.
+    """
+
+    by_identity: dict[tuple[str, Contrast], dict[float, int]] = {}
+    for position, record in enumerate(index.records):
+        if not str(record.case_id).startswith("P_"):
+            continue
+        key = (str(record.subject_id), Contrast.parse(record.domain.contrast))
+        by_identity.setdefault(key, {})[float(record.domain.field_strength_t)] = position
+
+    paired: dict[tuple[Contrast, float, float], list[tuple[int, int]]] = {}
+    for (_subject, contrast), field_map in by_identity.items():
+        for field_s, source in field_map.items():
+            for field_t, target in field_map.items():
+                if field_s == field_t:
+                    continue
+                paired.setdefault((contrast, field_s, field_t), []).append((source, target))
+    return {key: tuple(value) for key, value in paired.items()}
 
 
 def _attach_nn_tables(
@@ -596,7 +661,7 @@ def _sample_constrained_pair(
     cfg: Stage2TransportConfig,
     device: torch.device,
     sampler: torch.Generator,
-) -> tuple[torch.Tensor, list[Domain], torch.Tensor, list[Domain]]:
+) -> tuple[torch.Tensor, list[Domain], torch.Tensor, list[Domain], bool]:
     """Draw a same-contrast (field_s -> field_t) batch: source and target share the contrast.
 
     One (contrast, field_s, field_t) transition is chosen per batch so the minibatch-OT coupling
@@ -616,15 +681,28 @@ def _sample_constrained_pair(
     else:
         field_s = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
         field_t = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
-    pool_s = pools.by_contrast_field[contrast][field_s]
-    src_idx = _draw_with_replacement(pool_s, cfg.batch_size, sampler)
-    if cfg.coupling == "nn":
-        tgt_idx = _nn_targets(pools, contrast, field_s, field_t, pool_s, src_idx, cfg, sampler)
+    paired = pools.paired_by_transition.get((contrast, field_s, field_t), ())
+    if paired and cfg.paired_fraction > 0.0 and (
+        float(torch.rand(1, generator=sampler)) < cfg.paired_fraction
+    ):
+        picks = torch.randint(0, len(paired), (cfg.batch_size,), generator=sampler).tolist()
+        src_idx = [paired[i][0] for i in picks]
+        tgt_idx = [paired[i][1] for i in picks]
+        already_paired = True
     else:
-        tgt_idx = _draw_with_replacement(pools.by_contrast_field[contrast][field_t], cfg.batch_size, sampler)
+        pool_s = pools.by_contrast_field[contrast][field_s]
+        src_idx = _draw_with_replacement(pool_s, cfg.batch_size, sampler)
+        if cfg.coupling == "nn":
+            tgt_idx = _nn_targets(pools, contrast, field_s, field_t, pool_s, src_idx, cfg, sampler)
+            already_paired = True
+        else:
+            tgt_idx = _draw_with_replacement(
+                pools.by_contrast_field[contrast][field_t], cfg.batch_size, sampler
+            )
+            already_paired = False
     z0, dom_s = _load_normalized(index, stats, src_idx, device)
     z1, dom_t = _load_normalized(index, stats, tgt_idx, device)
-    return z0, dom_s, z1, dom_t
+    return z0, dom_s, z1, dom_t, already_paired
 
 
 def _nn_targets(
@@ -670,13 +748,14 @@ def _validate(
     total = 0.0
     for _ in range(max(1, cfg.val_batches)):
         if cfg.same_contrast:
-            z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, generator)
+            z0, dom_s, z1, dom_t, already_paired = _sample_constrained_pair(
+                index, pools, stats, cfg, device, generator
+            )
         else:
             z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
             z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
-        # "nn" already paired each source with a specific target when the batch was drawn;
-        # permuting again would throw that pairing away.
-        if cfg.coupling == "ot":
+            already_paired = False
+        if cfg.coupling == "ot" and not already_paired:
             perm = _ot_assignment(z0, z1, pool_size=cfg.ot_pool_size)
             z1 = z1[perm]
             dom_t = [dom_t[i] for i in perm.tolist()]
@@ -733,6 +812,10 @@ def _validate_config(cfg: Stage2TransportConfig) -> None:
             )
         if cfg.nn_candidates < 1:
             raise ValueError("nn_candidates must be >= 1.")
+    if not 0.0 <= cfg.paired_fraction <= 1.0:
+        raise ValueError(f"paired_fraction must be in [0, 1]; got {cfg.paired_fraction}.")
+    if cfg.paired_fraction > 0.0 and not cfg.same_contrast:
+        raise ValueError("paired_fraction > 0 pairs within a contrast, so needs same_contrast=true.")
     if cfg.bridge not in ("ot_cfm", "schrodinger"):
         raise ValueError(f"Unknown bridge {cfg.bridge!r}.")
     if cfg.bridge == "schrodinger" and cfg.sigma <= 0:

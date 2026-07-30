@@ -1,0 +1,136 @@
+# Etapa-1 KL-VAE · run D (FINAL) — v2 bundle + the official Task-3 nRMSE as the loss term.
+#
+# Motivation (measured, not assumed). The `nrmse` term run C optimized is
+# `RMSE / data_range` (evaluation/metrics.py). The challenge evaluator is
+# `||p - t|| / ||t||` (evaluation/mrixfields2026_official.py). On run C's own frozen ep15
+# reconstruction the two disagree by 5-70x, because the official form divides by the
+# target's L2 norm and these volumes are dark:
+#
+#     T1w 7T reconstruction:  0.0066 range-normalized   vs   0.4449 official
+#
+# Measured on the held-out traveller gate, the frozen-VAE ceiling under the official metric
+# is nRMSE 0.285 (SSIM 0.957) — i.e. the VAE reconstructs structure well but its *relative*
+# intensity error on low-energy volumes is large, and that is precisely what Task 3 scores.
+# This run keeps everything else in the v2 bundle fixed and changes only which nRMSE is
+# optimized, so the delta is attributable.
+#
+# Everything below is identical to stage1_vae_v2_fgw_freebits.yaml except:
+#   * training.nrmse_mode: official      (was: the implicit "range")
+#   * training.nrmse_rms_floor           (new; bounds the term on air patches)
+#   * training.warm_start_checkpoint     (weights from run C ep15; NOT resume — new objective
+#                                         gets a fresh optimizer and a fresh cosine curve)
+#   * training.checkpoint_dir            (isolated; run C is a frozen baseline, never touched)
+#   * training.lr                        (1e-4 fine-tune, not the 2e-4 from-scratch value)
+#
+# === RUN D.1: fixes a background-leakage divergence measured in the first attempt ===
+# The first D run (nrmse_rms_floor=0.02, foreground_weight=4.0 unchanged from run C) diverged
+# on validation from epoch ~4 on and never recovered: ssim3d 0.951 (ep1) -> 0.475 (ep19),
+# background_leakage 0.003 -> 0.162, while train_total stayed flat (~0.96-1.05) the whole time
+# — the divergence was invisible in the training loss because the stratified 70%-foreground
+# crop dilutes exactly what broke. Diagnosed mechanism, two compounding effects:
+#   1. foreground_weight=4.0 (inherited from run C, tuned WITHOUT the official term in the
+#      loss) down-weights every background voxel's L1 gradient by ~4x relative to a
+#      foreground voxel — the one anchor that was holding background at exactly 0 got weaker.
+#   2. The official term's denominator ||t|| varies per SAMPLE (not per voxel), so a dark or
+#      near-air patch gets a disproportionately large gradient purely from having small ||t||
+#      — an implicit cross-sample reweighting the range-normalized term (constant denominator)
+#      never had. Warm-starting a converged model with that instability is what tipped it over.
+# Fix, as a paired change (not isolated — re-isolate later if this needs an ablation):
+#   * foreground_weight: 4.0 -> 2.0   (weakens effect 1; still favors foreground, less starkly)
+#   * nrmse_rms_floor:  0.02 -> 0.05  (raises the floor that caps effect 2's per-sample
+#                                     reweighting; 0.05 sits at the upper edge of the measured
+#                                     real-volume RMS range ~0.015-0.09, so it now binds on
+#                                     more than just air/near-air patches)
+# Sanity contract before committing the full 25-epoch run again: a 100-step probe must show
+# ssim (raw) not degrading and background_leakage-relevant terms stable — training-conventions
+# requires this, and skipping it is exactly what let the first divergence run 5+ GPU-hours.
+#
+# Launch on the RTX 5070 Ti box (16 GB) — see D:\MRI_Field_2026\launch_stage1_v3.bat:
+#   python -m fieldbridge.cli train-stage1-vae \
+#     --config configs/experiment/stage1_vae_v3_official_nrmse.yaml \
+#     --split-json D:\MRI_Field_2026\split_v3.json --epochs 25
+seed: 13
+data:
+  name: nifti_manifest
+  root: ${MRIXFIELDS_DATA_ROOT}
+  manifest: ${MRIXFIELDS_MANIFEST}
+  patch_size: [64, 64, 64]
+  patches_per_volume: 16
+  foreground_threshold: 0.0
+  stratified_crop:
+    foreground: 0.7
+    border: 0.2
+    air: 0.1
+    min_foreground_fraction: 0.1
+    max_attempts: 50
+  field_balance:
+    enabled: true
+    mode: inverse_frequency
+model:
+  name: kl_vae
+  in_channels: 1
+  base_channels: 32
+  latent_channels: 4
+  num_res_blocks: 2
+  spatial_dims: 3
+  activation: silu
+training:
+  steps: 1000
+  batch_size: 8
+  lr: 0.0001
+  device: cuda
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  loss_weights:
+    l1: 1.0
+    ssim: 1.0
+    # Weight kept at 1.0, set from the 100-step probe's measured per-term breakdown rather
+    # than guessed. On 64^3 patches with the 70% foreground crop quota the official term
+    # lands at 0.076-0.155, i.e. the same order as ssim (0.028-0.19) and lpips (0.056-0.12),
+    # so the balance run C was tuned at carries over. (It would NOT carry over at volume
+    # level, where the target is ~88% background and ||t|| is far smaller.)
+    nrmse: 1.0
+    lpips: 1.0
+    kl: 0.0001
+  # Which nRMSE the `nrmse` term optimizes: "official" = ||p - t|| / ||t||, the evaluator's.
+  nrmse_mode: official
+  # Floor on the official denominator, in RMS units of the [0, 1] contract. The stratified
+  # crop's 10% air quota yields patches with ||t|| ~ 0, which would otherwise diverge.
+  # Raised from 0.02 -> 0.05 after the first D run diverged (see the note above): 0.02 bound
+  # only air/near-air patches; 0.05 sits at the upper edge of the measured real-volume RMS
+  # range (~0.015-0.09), so it now damps the per-sample reweighting on dark real patches too.
+  nrmse_rms_floor: 0.05
+  ssim_window_size: 7
+  data_range: 1.0
+  lpips_num_slices: 8
+  grad_clip_norm: 1.0
+  early_stopping: false
+  val_early_stopping: true
+  val_early_stopping_patience: 7
+  val_every_epochs: 1
+  latent_active_kl_threshold: 0.01
+  recon_dump_every_epochs: 5
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_factor: 0.05
+  # 25 epochs * 3180 steps/epoch. Fine-tune horizon, not the 75-epoch from-scratch one:
+  # run C's best was ep15 of 22, and this starts from those weights.
+  lr_cosine_total_steps: 79500
+  foreground_loss_weighting: true
+  # 4.0 -> 2.0: the run-C value was tuned without the official nrmse term in the loss; at 4.0
+  # it left background L1-anchored ~4x weaker than foreground, which the official term's
+  # per-sample reweighting (see nrmse_rms_floor note) then exploited. See the note above.
+  foreground_weight: 2.0
+  foreground_threshold: 0.0
+  kl_free_bits: 0.5
+  # Weights only (no optimizer/step state) from run C's best-by-val checkpoint. The objective
+  # changed, so resuming the optimizer and the cosine curve would be wrong.
+  warm_start_checkpoint: outputs/stage1_vae_v2_fgw_freebits/checkpoints/vae_kl_vae_best.pt
+  resume_from: null
+  # Isolated from run C — never overwrite a frozen baseline.
+  checkpoint_dir: outputs/stage1_vae_v3_official_nrmse/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 200000000
+  log_every_steps: 50

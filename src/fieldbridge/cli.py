@@ -101,6 +101,9 @@ from fieldbridge.training.pseudo_pair_epochs import (
     train_pseudo_pair_epochs,
 )
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from fieldbridge.training.stage1_gradient_smoke import (
+    run_stage1_gradient_smoke,
+)
 from fieldbridge.training.stage1_vae import (
     Stage1VAEConfig,
     preflight_stage1_resume,
@@ -129,6 +132,35 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--batch-size", type=int, default=None)
     smoke.add_argument("--seed", type=int, default=None)
     smoke.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    stage1_gradient_smoke = subparsers.add_parser(
+        "smoke-stage1-gradient",
+        help=(
+            "Run one synthetic exact-zero-background Arm-A backward, gradient clip, "
+            "and optimizer step."
+        ),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage1_ae_v3_joint_domain.yaml"),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default=None,
+        help="Override the config device; omit to exercise its CUDA setting.",
+    )
+    stage1_gradient_smoke.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default=None,
+        help="Override the config precision; omit to exercise its bf16 setting.",
+    )
+    stage1_gradient_smoke.add_argument("--patch-size", type=int, default=16)
+    stage1_gradient_smoke.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON."
+    )
 
     train = subparsers.add_parser("train", help="Run the configurable Etapa 2 translator training loop.")
     train.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
@@ -444,7 +476,15 @@ def build_parser() -> argparse.ArgumentParser:
     train_transport.add_argument("--steps", type=int, default=None)
     train_transport.add_argument("--batch-size", type=int, default=None)
     train_transport.add_argument("--seed", type=int, default=None)
-    train_transport.add_argument("--coupling", choices=("independent", "ot"), default=None)
+    train_transport.add_argument(
+        "--split-json",
+        type=Path,
+        default=None,
+        help="Override the split recorded in the bank manifest with this VAE split JSON. "
+        "Required after a resplit: the bank bakes each record's split in at build time, so "
+        "without this a resplit is silently ignored and training keeps the old membership.",
+    )
+    train_transport.add_argument("--coupling", choices=("independent", "ot", "nn"), default=None)
     train_transport.add_argument("--bridge", choices=("ot_cfm", "schrodinger"), default=None)
     train_transport.add_argument("--resume-from", type=Path, default=None)
     train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
@@ -478,6 +518,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--subjects", nargs="+", default=None,
         help="Restrict to these subject_ids (default: all prospective travellers in the split).",
     )
+    eval_transport.add_argument(
+        "--allow-training-subjects",
+        action="store_true",
+        help="Score travellers that are in the transport's training split. Refused by default: "
+        "with the nn coupling a training traveller retrieves its own target-field volume as the "
+        "nearest neighbour, so its score measures memorization. Use only for an explicit "
+        "optimistic upper bound.",
+    )
     eval_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
 
     resplit_parser = subparsers.add_parser(
@@ -486,7 +534,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resplit_parser.add_argument("--split-json", type=Path, required=True, help="Input split JSON.")
     resplit_parser.add_argument("--out", type=Path, required=True, help="Output split JSON (must differ from input).")
-    resplit_parser.add_argument("--subjects", nargs="+", required=True, help="Subject ids to move, e.g. 0006 0007.")
+    resplit_parser.add_argument(
+        "--subjects",
+        nargs="+",
+        required=True,
+        help="Subject ids to move, qualified by cohort: 'P:0006'. A bare '0006' is accepted only "
+        "when unambiguous — the cohorts have overlapping numeric ranges, so P_..._0006 and "
+        "R_..._0006 are DIFFERENT people and both may sit in the same split.",
+    )
     resplit_parser.add_argument("--to", dest="to_split", choices=("train", "validation", "test"), required=True)
 
     build_latent_bank_parser = subparsers.add_parser(
@@ -688,6 +743,29 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"smoke-train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "smoke-stage1-gradient":
+        config = _load_optional_config(args.config)
+        result = run_stage1_gradient_smoke(
+            config,
+            device=args.device,
+            precision=args.precision,
+            patch_size=args.patch_size,
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(
+                "smoke-stage1-gradient completed: "
+                f"device={result.device} precision={result.precision} "
+                f"loss={result.components['total']:.6f} "
+                f"gradient_norm={result.gradient_norm:.6f} "
+                f"finite_gradients="
+                f"{result.finite_gradient_parameter_tensors}/"
+                f"{result.trainable_parameter_tensors} "
+                f"updated={result.updated_parameter_tensors}"
+            )
         return 0
 
     if args.command == "train":
@@ -1307,8 +1385,12 @@ def main(argv: list[str] | None = None) -> int:
 
         stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
         stats = LatentStats.from_json(stats_path)
-        train_index = LatentBankIndex(args.bank_dir, "train")
-        val_index = LatentBankIndex(args.bank_dir, "validation") if args.val else None
+        train_index = LatentBankIndex(args.bank_dir, "train", split_json=args.split_json)
+        val_index = (
+            LatentBankIndex(args.bank_dir, "validation", split_json=args.split_json)
+            if args.val
+            else None
+        )
 
         stage_config = Stage2TransportConfig.from_mapping(config)
         result = run_stage2_transport_train(
@@ -1350,6 +1432,11 @@ def main(argv: list[str] | None = None) -> int:
         bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
         splits = load_vae_splits(args.split_json)
         records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
         device = _resolve_device(args.device)
         result = evaluate_transport_travellers(
             translator=translator,
@@ -1363,10 +1450,14 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             metrics=tuple(args.metrics),
             subjects=args.subjects,
+            split_of_case=split_of_case,
+            allow_training_subjects=args.allow_training_subjects,
         )
         if args.out is not None:
             write_transport_eval(result, args.out)
-        print(json.dumps({k: result[k] for k in ("num_pairs", "subjects", "metrics", "sampler", "overall", "by_contrast")},
+        print(json.dumps({k: result[k] for k in ("num_pairs", "subjects", "subject_splits",
+                                                 "scored_training_subjects", "metrics", "sampler",
+                                                 "decode", "overall", "by_contrast")},
                          indent=2, sort_keys=True))
         return 0
 

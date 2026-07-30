@@ -254,6 +254,44 @@ def nrmse_loss(prediction: torch.Tensor, target: torch.Tensor, **kwargs: object)
     return nrmse(prediction, target, **kwargs)
 
 
+def official_nrmse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    rms_floor: float,
+) -> torch.Tensor:
+    """Per-sample ``||p - t||_2 / ||t||_2`` — the published Task-3 nRMSE as a training term.
+
+    This is NOT `nrmse_loss`, which is ``RMSE / data_range``. The published evaluator divides
+    by the *target's* L2 norm (`evaluation.mrixfields2026_official.official_task3_nrmse`), so
+    for the same absolute RMSE a dark volume scores far worse than a bright one. Optimizing
+    the range-normalized form therefore leaves the official metric unconstrained on exactly
+    the low-energy volumes the challenge punishes hardest — measured on the frozen run-C VAE,
+    the two disagree by 5-70x on the same reconstruction.
+
+    ``rms_floor`` floors the denominator in RMS units, so it does not depend on patch size.
+    Stage-1 trains on stratified 64^3 crops whose air quota gives patches with ``||t|| ~ 0``;
+    without the floor those produce an unbounded ratio. Below the floor the term degrades
+    continuously into ``RMSE / rms_floor`` instead of exploding.
+    """
+
+    _validate_same_shape(prediction, target)
+    if rms_floor <= 0.0:
+        raise ValueError(f"rms_floor must be positive, got {rms_floor}.")
+    batch = int(prediction.shape[0])
+    difference = (prediction - target).reshape(batch, -1).float()
+    flat_target = target.reshape(batch, -1).float()
+    floor = rms_floor * float(flat_target.shape[1]) ** 0.5
+    # Numerical rail, not a swept hyperparameter: sqrt has an infinite gradient at exactly 0,
+    # which a perfectly reconstructed (e.g. all-air) patch would hit.
+    numerator = difference.square().sum(dim=1).add(1e-12).sqrt()
+    denominator = flat_target.square().sum(dim=1).sqrt().clamp_min(floor)
+    loss = (numerator / denominator).mean()
+    if not bool(torch.isfinite(loss)):
+        raise ValueError("official_nrmse_loss produced a non-finite value.")
+    return loss.to(prediction.dtype)
+
+
 def transport_cost_loss(z_source: torch.Tensor, z_translated: torch.Tensor) -> torch.Tensor:
     """Penalize latent displacement between source and translated latents."""
 

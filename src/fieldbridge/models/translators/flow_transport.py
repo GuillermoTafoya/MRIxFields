@@ -53,6 +53,7 @@ class FlowMatchingLatentTranslator(ConditionalUNetFieldTranslator):
         upsample_mode: str = "interpolate",
         skip_mode: str = "concat",
         pad_to_multiple: bool = True,
+        zero_init_output: bool = False,
     ) -> None:
         super().__init__(
             in_channels=latent_channels,
@@ -83,6 +84,21 @@ class FlowMatchingLatentTranslator(ConditionalUNetFieldTranslator):
             nn.SiLU(),
             nn.Linear(self.cond_dim, self.cond_dim),
         )
+        # Off by default (project convention: a new behaviour is a one-number config change,
+        # not a silent default flip). The FM/SB v2 configs turn it on.
+        self.zero_init_output = bool(zero_init_output)
+        if self.zero_init_output:
+            # v_theta == 0 at initialization, so the probability-flow ODE integrates to
+            # z1 == z0: the untrained transport IS the identity baseline. Without this the
+            # run starts at a random velocity field, which the held-out gate showed is a
+            # real cost — the trained transport ended up *below* identity on 47 of 60
+            # traveller pairs. Standard zero-init-final-layer trick from diffusion U-Nets;
+            # gradients still reach every earlier layer through the FiLM conditioning.
+            # NOTE: while it holds, the model is output-constant in t, so any test asserting
+            # that time conditioning changes the output must construct it with this off.
+            nn.init.zeros_(self.output_projection.weight)
+            if self.output_projection.bias is not None:
+                nn.init.zeros_(self.output_projection.bias)
 
     def _time_conditioning(
         self, t: torch.Tensor | float, *, batch_size: int, device: torch.device, dtype: torch.dtype

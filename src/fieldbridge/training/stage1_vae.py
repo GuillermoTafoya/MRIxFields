@@ -55,13 +55,14 @@ from fieldbridge.training.losses import (
     masked_l1_loss,
     masked_mse_loss,
     nrmse_loss,
+    official_nrmse_loss,
     ssim_loss,
 )
 from fieldbridge.training.warm_start import load_state_dict_tolerant
 from fieldbridge.utils.seeding import seed_everything
 
-# Order in which per-term losses appear in the per-step console line (only terms with a
-# positive weight are actually computed/printed). `total` is logged separately.
+# Order in which active losses and always-reported detached diagnostics appear in the
+# per-step console line. ``total`` is logged separately.
 _LOSS_TERM_ORDER = (
     "l1",
     "masked_l1",
@@ -76,6 +77,7 @@ _LOSS_TERM_ORDER = (
 Precision = Literal["fp32", "bf16"]
 Device = Literal["auto", "cpu", "cuda"]
 LatentMode = Literal["stochastic", "deterministic"]
+NrmseMode = Literal["range", "official"]
 
 # Unlike Etapa 2's "everything 0 except reconstruction" ladder convention, all terms here
 # are active by default: L1+SSIM+nRMSE+LPIPS+KL is a fixed composition whose *relative*
@@ -111,6 +113,18 @@ class Stage1VAEConfig:
     # Intensity range the range-normalized losses assume. 1.0 on the official [0, 1]
     # contract; must stay equal to evaluation/stage1_report.py's _DATA_RANGE.
     data_range: float = 1.0
+    # Which nRMSE the `nrmse` loss term optimizes.
+    #   "range"    -> RMSE / data_range (the historical term; what run C was trained on)
+    #   "official" -> ||p - t|| / ||t||, the published Task-3 evaluator's definition
+    # These are NOT interchangeable: on the frozen run-C VAE the same reconstruction scores
+    # 0.0066 range-normalized and 0.4449 official (T1w 7T), because the official form divides
+    # by the target's own L2 norm and these volumes are dark. "range" stays the default so
+    # run C remains reproducible; the final run sets "official".
+    nrmse_mode: NrmseMode = "range"
+    # Floor on the official denominator, in RMS units of the [0, 1] contract. The stratified
+    # crop's air quota yields patches with ||t|| ~ 0; below this floor the term degrades into
+    # RMSE / nrmse_rms_floor instead of diverging. Only used when nrmse_mode="official".
+    nrmse_rms_floor: float = 0.02
     lpips_num_slices: int = 8
     # Per-epoch validation (runs only when a val loader is passed and steps_per_epoch>0).
     # `val_max_batches`=0 uses the whole val loader; a positive cap bounds the per-epoch
@@ -202,6 +216,10 @@ class Stage1VAEConfig:
     def __post_init__(self) -> None:
         if self.latent_mode not in ("stochastic", "deterministic"):
             raise ValueError("latent_mode must be 'stochastic' or 'deterministic'.")
+        if self.nrmse_mode not in ("range", "official"):
+            raise ValueError("nrmse_mode must be 'range' or 'official'.")
+        if self.nrmse_rms_floor <= 0.0:
+            raise ValueError("nrmse_rms_floor must be positive.")
         if self.decoder_domain not in ("source", "target"):
             raise ValueError("decoder_domain must be 'source' or 'target'.")
         if self.latent_activity_rule not in ("kl", "std", "std_and_kl"):
@@ -253,6 +271,10 @@ class Stage1VAEConfig:
                 training.get("ssim_window_size", data.get("ssim_window_size", defaults.ssim_window_size))
             ),
             data_range=float(training.get("data_range", data.get("data_range", defaults.data_range))),
+            nrmse_mode=str(training.get("nrmse_mode", data.get("nrmse_mode", defaults.nrmse_mode))),  # type: ignore[arg-type]
+            nrmse_rms_floor=float(
+                training.get("nrmse_rms_floor", data.get("nrmse_rms_floor", defaults.nrmse_rms_floor))
+            ),
             lpips_num_slices=int(
                 training.get("lpips_num_slices", data.get("lpips_num_slices", defaults.lpips_num_slices))
             ),
@@ -436,6 +458,8 @@ class Stage1VAEConfig:
             "loss_weights": dict(self.loss_weights),
             "ssim_window_size": self.ssim_window_size,
             "data_range": self.data_range,
+            "nrmse_mode": self.nrmse_mode,
+            "nrmse_rms_floor": self.nrmse_rms_floor,
             "val_max_batches": self.val_max_batches,
             "history_filename": self.history_filename,
             "val_every_epochs": self.val_every_epochs,
@@ -802,7 +826,14 @@ def run_stage1_vae_train(
         if "decoder" in state:
             load_state_dict_tolerant(decoder, state["decoder"])
 
-    trainable_params = list(encoder.parameters()) + list(decoder.parameters())
+    named_trainable_params = [
+        (f"encoder.{name}", parameter)
+        for name, parameter in encoder.named_parameters()
+    ] + [
+        (f"decoder.{name}", parameter)
+        for name, parameter in decoder.named_parameters()
+    ]
+    trainable_params = [parameter for _, parameter in named_trainable_params]
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.lr)
 
     tracker: _EarlyStopTracker | None = None
@@ -940,8 +971,9 @@ def run_stage1_vae_train(
         total_loss = components["total"]
         total_loss.backward()
         if cfg.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                trainable_params, cfg.grad_clip_norm, error_if_nonfinite=True
+            _clip_gradients_fail_closed(
+                named_trainable_params,
+                cfg.grad_clip_norm,
             )
         else:
             for parameter in trainable_params:
@@ -1257,11 +1289,12 @@ def _compute_vae_loss_components(
     lpips_net: nn.Module | None,
     global_step: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Weighted `total` plus each *unweighted* term, so logging can show where the loss
-    lives (l1/ssim/nrmse/lpips/kl) rather than one opaque number.
+    """Weighted ``total`` plus unweighted active terms and detached diagnostics.
 
-    Only the terms with positive weight are computed (LPIPS especially is expensive), so a
-    swept-off term is simply absent from the returned dict — callers read with `.get`.
+    Expensive optional terms are computed only when active. Always-reported diagnostics
+    such as nRMSE and raw KL remain available for logging, but an effective zero weight
+    detaches that value and excludes it from ``total``. This is stronger than multiplying
+    by zero because a forward-finite diagnostic may have a singular backward.
     """
 
     # Reparameterize once, here, rather than calling encode() and then encode_dist()
@@ -1285,7 +1318,7 @@ def _compute_vae_loss_components(
     # data_range must match evaluation's (_DATA_RANGE in evaluation/stage1_report.py).
     # It was previously left at the 1.0 default here while eval used 2.0, so the SSIM
     # being optimized had different c1/c2 stabilizers than the SSIM being reported.
-    components["nrmse"] = nrmse_loss(reconstructed, batch.image, data_range=cfg.data_range)
+    components["nrmse"] = _nrmse_term(reconstructed, batch.image, cfg)
     if weights.get("l1", 0.0) > 0:
         # Plain image-space L1 (no mask): the flat per-voxel absolute-error term that
         # anchors the DC level and drives the background to exactly 0. With the (default-off)
@@ -1316,15 +1349,13 @@ def _compute_vae_loss_components(
         else reconstructed.sum() * 0.0
     )
 
-    total = reconstructed.sum() * 0.0
-    for name, value in components.items():
-        if name == "raw_kl":
-            continue
-        weight = weights.get(name, 0.0)
-        if name == "kl":
-            weight *= _kl_warmup_factor(global_step, cfg)
-        total = total + weight * value
-    components["total"] = total
+    components["total"] = _compose_vae_total(
+        reconstructed,
+        components,
+        weights,
+        cfg,
+        global_step=global_step,
+    )
     _require_finite_components(components)
     return components
 
@@ -1556,9 +1587,7 @@ def _reconstruction_components(
     weights = cfg.loss_weights
     _require_finite_tensor(reconstructed, "validation reconstruction")
     mask = (target > cfg.foreground_mask_threshold).to(target.dtype)
-    components: dict[str, torch.Tensor] = {
-        "nrmse": nrmse_loss(reconstructed, target, data_range=cfg.data_range)
-    }
+    components: dict[str, torch.Tensor] = {"nrmse": _nrmse_term(reconstructed, target, cfg)}
     if weights.get("l1", 0.0) > 0:
         components["l1"] = _l1_term(reconstructed, target, cfg)
     if weights.get("masked_l1", 0.0) > 0:
@@ -1579,17 +1608,46 @@ def _reconstruction_components(
         if cfg.latent_mode == "stochastic"
         else reconstructed.sum() * 0.0
     )
-    total = reconstructed.sum() * 0.0
-    for name, value in components.items():
-        if name == "raw_kl":
-            continue
-        weight = weights.get(name, 0.0)
-        if name == "kl":
-            weight *= _kl_warmup_factor(global_step, cfg)
-        total = total + weight * value
-    components["total"] = total
+    components["total"] = _compose_vae_total(
+        reconstructed,
+        components,
+        weights,
+        cfg,
+        global_step=global_step,
+    )
     _require_finite_components(components)
     return components
+
+
+def _compose_vae_total(
+    reference: torch.Tensor,
+    components: dict[str, torch.Tensor],
+    weights: Mapping[str, float],
+    cfg: Stage1VAEConfig,
+    *,
+    global_step: int,
+) -> torch.Tensor:
+    """Build the backward target without connecting zero-weight diagnostics.
+
+    Multiplying a diagnostic by zero is not sufficient: a finite forward value may have
+    an infinite derivative, and IEEE ``0 * inf`` then produces NaN during backward.
+    Diagnostics remain reportable as detached scalars, while only nonzero effective
+    weights enter the autograd graph.
+    """
+
+    total = reference.sum() * 0.0
+    for name, value in list(components.items()):
+        if name == "raw_kl":
+            components[name] = value.detach()
+            continue
+        effective_weight = float(weights.get(name, 0.0))
+        if name == "kl":
+            effective_weight *= _kl_warmup_factor(global_step, cfg)
+        if effective_weight == 0.0:
+            components[name] = value.detach()
+            continue
+        total = total + effective_weight * value
+    return total
 
 
 def _kl_warmup_factor(global_step: int, cfg: Stage1VAEConfig) -> float:
@@ -1611,6 +1669,44 @@ def _masked_l1_or_zero(
 def _require_finite_tensor(value: torch.Tensor, name: str) -> None:
     if not bool(torch.isfinite(value).all()):
         raise FloatingPointError(f"{name} contains non-finite values.")
+
+
+def _clip_gradients_fail_closed(
+    named_parameters: list[tuple[str, nn.Parameter]],
+    max_norm: float,
+) -> torch.Tensor:
+    """Clip gradients and identify offending parameters only on failure."""
+
+    parameters = [parameter for _, parameter in named_parameters]
+    try:
+        return torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm,
+            error_if_nonfinite=True,
+        )
+    except RuntimeError as exc:
+        affected: list[str] = []
+        for name, parameter in named_parameters:
+            gradient = parameter.grad
+            if gradient is None or bool(torch.isfinite(gradient).all()):
+                continue
+            nan_count = int(torch.isnan(gradient).sum().detach().cpu().item())
+            inf_count = int(torch.isinf(gradient).sum().detach().cpu().item())
+            affected.append(f"{name}(nan={nan_count},inf={inf_count})")
+        if not affected and "non-finite" not in str(exc).lower():
+            raise
+        if affected:
+            preview = ", ".join(affected[:12])
+            remainder = len(affected) - min(len(affected), 12)
+            if remainder:
+                preview += f", ... (+{remainder} more)"
+            detail = f" affected parameters: {preview}."
+        else:
+            detail = " no individual non-finite parameter gradient was found."
+        raise FloatingPointError(
+            "Stage-1 gradient norm is non-finite before optimizer.step;"
+            + detail
+        ) from exc
 
 
 def _require_finite_components(components: Mapping[str, torch.Tensor]) -> None:
@@ -1641,6 +1737,21 @@ def _l1_term(reconstructed: torch.Tensor, target: torch.Tensor, cfg: Stage1VAECo
             foreground_weight=cfg.foreground_weight,
         )
     return masked_l1_loss(reconstructed, target)
+
+
+def _nrmse_term(reconstructed: torch.Tensor, target: torch.Tensor, cfg: Stage1VAEConfig) -> torch.Tensor:
+    """nRMSE reconstruction term, in the mode `cfg.nrmse_mode` selects.
+
+    "range" reproduces the historical term exactly (`RMSE / data_range`). "official" is the
+    published evaluator's `||p - t|| / ||t||` — see `losses.official_nrmse_loss` for why the
+    two are not interchangeable. Train and validation both route through here so the term
+    being optimized and the term being selected on can never drift apart."""
+
+    if cfg.nrmse_mode == "official":
+        return official_nrmse_loss(reconstructed, target, rms_floor=cfg.nrmse_rms_floor)
+    if cfg.nrmse_mode == "range":
+        return nrmse_loss(reconstructed, target, data_range=cfg.data_range)
+    raise ValueError(f"Unknown nrmse_mode {cfg.nrmse_mode!r}; expected 'range' or 'official'.")
 
 
 def _lr_at_step(current_step: int, cfg: Stage1VAEConfig, total_steps: int) -> float:

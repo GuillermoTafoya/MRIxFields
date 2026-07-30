@@ -1,0 +1,89 @@
+seed: 13
+# Etapa-2 rung 2 (OT-CFM), v2 — the corrections the held-out traveller gate forced.
+#
+# What the v1 gate actually showed (subject 0009, 60 pairs, frozen — do not re-tune on it):
+#   overall  transport nRMSE 0.694 vs identity 0.977   <- looks like a win
+#   overall  transport SSIM  0.8755 vs identity 0.8730 <- against a 0.9573 ceiling: no gain
+#   split by difficulty: on the 13 pairs where identity is catastrophic (nRMSE > 1) transport
+#   gains -1.41; on the other 47 it LOSES (+0.029 nRMSE, -0.005 SSIM). corr(identity nRMSE,
+#   improvement) = -0.897. Up-field pairs: nRMSE 1.534 -> 0.875 while SSIM 0.8608 -> 0.8618.
+# Read together: v1 learned a per-field intensity rescaling and nothing structural. It only
+# pays where source and target intensity scales are far apart, and costs elsewhere — which is
+# why T2w, the contrast already scale-matched across fields, regressed (5/20 and 2/20 wins).
+#
+# This is a BUNDLE, not an ablation — three changes at once, so a gain is attributable to the
+# bundle. Each is individually switchable for the follow-up ablation:
+#   1. coupling: nn      — global nearest-neighbour over the whole field pool instead of a
+#                          Hungarian assignment inside a batch of 8 drawn from 37-191
+#                          candidates (which is much closer to random pairing than to OT).
+#                          Deviates from the v3.1 plan's "minibatch-OT"; `coupling: ot`
+#                          restores it exactly.
+#   2. zero_init_output  — v_theta == 0 at init, so the untrained transport IS identity.
+#                          v1 started from a random velocity field and ended below identity
+#                          on 47/60 pairs; there is no reason to start worse than the baseline.
+#   3. transport_cost + identity — the next two rungs of the training-conventions loss ladder,
+#                          both at 0 in v1. transport_cost penalizes ||v||^2 (minimal
+#                          displacement, which is what makes an OT map anatomy-preserving);
+#                          identity enforces v(z, t, c, c) = 0.
+#
+# The two new loss weights are NOT measured yet — unlike the coupling change, they are a
+# starting guess. The notebook's sanity run prints the per-term breakdown; set them from that
+# before committing to the long run, the same way run D's nRMSE weight was set.
+model:
+  name: flow_matching_latent
+  latent_channels: 4
+  hidden_channels: [64, 128]
+  bottleneck_channels: 256
+  cond_dim: 128
+  time_embed_dim: 128
+  time_scale: 1000.0
+  spatial_dims: 3
+  activation: silu
+  skip_mode: concat
+  zero_init_output: true
+training:
+  steps: 20000
+  batch_size: 8
+  lr: 0.0002
+  device: auto
+  precision: bf16
+  coupling: nn          # global nearest-neighbour retrieval (was: ot)
+  bridge: ot_cfm        # deterministic linear interpolation, target velocity z1 - z0
+  same_contrast: true   # required by coupling=nn
+  field_pairing: cross  # field_s != field_t (a real translation)
+  # Descriptor grid for the NN cost. Shared with the OT cost for the same reason: full-latent
+  # L2 concentrates at ~3.6M dims, where "nearest" stops meaning anything.
+  ot_pool_size: 4
+  # Pair each source with one of its 5 nearest targets rather than the single nearest, so a
+  # source is not pinned to one fixed partner for the whole run.
+  nn_candidates: 5
+  # Building descriptors reads every latent once (~11 GB for train). Point this at Drive so
+  # the cost is paid once across runs; null = alongside the bank.
+  descriptor_cache: null
+  # Fraction of steps drawn as TRUE same-subject cross-field pairs from the traveller(s) in
+  # this split, instead of the unpaired coupling above. OFF by default (project convention:
+  # a new behaviour is a one-number switch, not a silent default). This is the explicit,
+  # measurable version of what the nn coupling used to do by accident: before the 1-1-1
+  # resplit, a traveller left in train would retrieve its own target-field volume as its
+  # nearest neighbour and get real paired supervision with no way to tell how much it
+  # mattered. Turn this on as its own ablation (0.1-0.3 is a reasonable starting range) only
+  # AFTER running with the resplit that keeps 0006 out of train — see the notebook's resplit
+  # cell. With one traveller in train this draws from 60 ordered pairs of a single anatomy;
+  # watch the held-out (0006) gate for overfitting if this is raised.
+  paired_fraction: 0.0
+  sigma: 0.1            # unused for ot_cfm
+  time_eps: 0.001
+  loss_weights:
+    flow: 1.0
+    transport_cost: 0.1
+    identity: 0.1
+    cycle: 0.0          # needs the ODE sampler; not implemented (raises if > 0)
+  checkpoint_dir: outputs/stage2_transport_fm_v2/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 500000000
+  val_every_steps: 1000
+  val_batches: 8
+  log_every_steps: 50
+  resume_from: null
+  variant: fm_ot_cfm_v2

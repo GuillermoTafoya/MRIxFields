@@ -29,7 +29,7 @@ import torch
 
 from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.domains import Contrast, Domain
-from fieldbridge.data.latent_bank import decode_latent_tiled, downsample_factor, load_volume
+from fieldbridge.data.latent_bank import decode_latent, downsample_factor, load_volume
 from fieldbridge.data.latent_bank_dataset import LatentStats
 from fieldbridge.evaluation.mrixfields2026_official import (
     official_task3_lpips,
@@ -57,22 +57,42 @@ class TransportSamplerConfig:
 
 @dataclass(frozen=True, slots=True)
 class DecodeSpec:
-    """Halo-tiled decode parameters — mirror the latent bank so recon matches its round-trip."""
+    """Decode parameters for the gate. Full-volume by default; tiling is the fallback.
+
+    The tiled path is an approximation, not an equivalent: the decoder's GroupNorm makes it a
+    non-local function of the latent, so no halo makes tiled decode match full decode (see
+    ``latent_bank.decode_latent``). It costs ~0.04 of official nRMSE, applied equally to the
+    transport, identity and ceiling columns.
+
+    ``halo`` deliberately does NOT come from the bank manifest. The bank's halo is an *encode*
+    parameter — and when the bank was built with ``strategy="full"`` it was never even used,
+    yet it was still being inherited here, which is how the run-C gate silently decoded at a
+    4-latent-voxel halo, roughly half the decoder's receptive field.
+    """
 
     block_size: tuple[int, int, int] = (128, 128, 128)
-    halo: tuple[int, int, int] = (16, 16, 16)
+    halo: tuple[int, int, int] = (64, 64, 64)
     precision: Literal["float32", "bfloat16"] = "bfloat16"
+    strategy: Literal["auto", "full", "tiled"] = "auto"
 
     @classmethod
-    def from_bank_manifest(cls, manifest: Mapping[str, Any]) -> "DecodeSpec":
+    def from_bank_manifest(cls, manifest: Mapping[str, Any], **overrides: Any) -> "DecodeSpec":
+        """Take only ``precision`` from the bank; decode geometry is a decode-side choice."""
+
         config = manifest.get("config", {}) if isinstance(manifest, Mapping) else {}
         defaults = cls()
-        block = config.get("block_size", defaults.block_size)
-        halo = config.get("halo", defaults.halo)
+        spec = {
+            "block_size": defaults.block_size,
+            "halo": defaults.halo,
+            "precision": config.get("precision", defaults.precision),
+            "strategy": defaults.strategy,
+        }
+        spec.update({key: value for key, value in overrides.items() if value is not None})
         return cls(
-            block_size=tuple(int(v) for v in block),  # type: ignore[arg-type]
-            halo=tuple(int(v) for v in halo),  # type: ignore[arg-type]
-            precision=config.get("precision", defaults.precision),
+            block_size=tuple(int(v) for v in spec["block_size"]),  # type: ignore[arg-type]
+            halo=tuple(int(v) for v in spec["halo"]),  # type: ignore[arg-type]
+            precision=spec["precision"],  # type: ignore[arg-type]
+            strategy=spec["strategy"],  # type: ignore[arg-type]
         )
 
 
@@ -144,6 +164,7 @@ class _TravellerCase:
     domain: Domain
     latent_path: Path
     image_record: VolumeRecord
+    split: str | None = None
 
 
 def _traveller_cases(
@@ -151,6 +172,7 @@ def _traveller_cases(
     manifest: Mapping[str, Any],
     bank_dir: Path,
     subjects: Sequence[str] | None,
+    split_of_case: Mapping[str, str] | None = None,
 ) -> list[_TravellerCase]:
     """Join split records (real target volumes) to bank latents by case_id, keeping travellers."""
 
@@ -181,6 +203,7 @@ def _traveller_cases(
                 domain=record.domain,
                 latent_path=latent_path,
                 image_record=record,
+                split=(split_of_case or {}).get(str(record.case_id)),
             )
         )
     return cases
@@ -215,6 +238,9 @@ def evaluate_transport_travellers(
     device: torch.device,
     metrics: Sequence[str] = DEFAULT_METRICS,
     subjects: Sequence[str] | None = None,
+    split_of_case: Mapping[str, str] | None = None,
+    training_splits: Sequence[str] = ("train",),
+    allow_training_subjects: bool = False,
     field_pairs: Sequence[tuple[float, float]] | None = None,
     metric_fn: Callable[..., dict[str, float]] = official_metric_fn,
     volume_loader: Callable[[VolumeRecord], torch.Tensor] = load_volume,
@@ -225,11 +251,28 @@ def evaluate_transport_travellers(
     translator = translator.to(device).eval()
     decoder = decoder.to(device).eval()
     factor = downsample_factor(decoder)
-    cases = _traveller_cases(records, bank_manifest, bank_dir, subjects)
+    cases = _traveller_cases(records, bank_manifest, bank_dir, subjects, split_of_case)
     if not cases:
         raise ValueError(
             "No traveller (prospective) cases found that are also encoded in the bank. "
             "Pass --subjects, or check the split/bank."
+        )
+
+    # Fail closed on scoring a subject the transport was trained on. With the `nn` coupling a
+    # traveller in the training pool retrieves its OWN volume at the target field as the nearest
+    # neighbour — the same anatomy is trivially nearest — so it receives real paired supervision
+    # and any score on it measures memorization. Nothing in the numbers distinguishes that from a
+    # clean read, which is exactly why this has to be refused rather than warned about.
+    subject_splits = {case.subject_id: case.split for case in cases}
+    contaminated = sorted(
+        subject for subject, split in subject_splits.items() if split in set(training_splits)
+    )
+    if contaminated and not allow_training_subjects:
+        raise ValueError(
+            f"Refusing to score subject(s) {contaminated}: they are in the transport's training "
+            f"split(s) {list(training_splits)}, so the result measures memorization, not "
+            "generalization. Score a held-out traveller, or pass allow_training_subjects=True "
+            "(--allow-training-subjects) if an optimistic upper bound is what you want."
         )
 
     by_group: dict[tuple[str, Contrast], dict[float, _TravellerCase]] = {}
@@ -238,12 +281,13 @@ def evaluate_transport_travellers(
         by_group.setdefault(key, {})[float(case.domain.field_strength_t)] = case
 
     decoded_cache: dict[str, torch.Tensor] = {}
+    decode_paths: set[str] = set()
 
     def decoded_from_latent(case: _TravellerCase) -> torch.Tensor:
         if case.case_id not in decoded_cache:
             latent = _load_raw_latent(case.latent_path, device)
-            decoded_cache[case.case_id] = decode_latent_tiled(
-                decoder, latent, case.domain, factor=factor,
+            decoded_cache[case.case_id], _ = decode_latent(
+                decoder, latent, case.domain, factor=factor, strategy=decode.strategy,
                 block_size=decode.block_size, halo=decode.halo, precision=decode.precision,
             )
         return decoded_cache[case.case_id]
@@ -262,10 +306,12 @@ def evaluate_transport_travellers(
 
             z0_norm = stats.normalize(_load_raw_latent(src.latent_path, device))
             z1_norm = sample_transport(translator, z0_norm, src.domain, tgt.domain, sampler)
-            transport_image = decode_latent_tiled(
+            transport_image, decode_path = decode_latent(
                 decoder, stats.denormalize(z1_norm), tgt.domain, factor=factor,
-                block_size=decode.block_size, halo=decode.halo, precision=decode.precision,
+                strategy=decode.strategy, block_size=decode.block_size, halo=decode.halo,
+                precision=decode.precision,
             )
+            decode_paths.add(decode_path)
 
             row = {
                 "subject_id": subject_id,
@@ -296,8 +342,14 @@ def evaluate_transport_travellers(
     result = {
         "num_pairs": len(pairs),
         "subjects": sorted({row["subject_id"] for row in pairs}),
+        # Provenance, so a contaminated read is never mistaken for a clean one after the fact.
+        "subject_splits": {k: v for k, v in sorted(subject_splits.items())},
+        "scored_training_subjects": contaminated,
         "metrics": list(metrics),
         "sampler": {"solver": sampler.solver, "n_steps": sampler.n_steps},
+        # "tiled" here means the numbers carry a decode approximation; see decode_latent.
+        "decode": {"strategy": decode.strategy, "path_used": sorted(decode_paths),
+                   "halo": list(decode.halo), "block_size": list(decode.block_size)},
         "overall": overall,
         "by_contrast": by_contrast,
         "pairs": pairs,

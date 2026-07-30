@@ -57,15 +57,55 @@ class LatentRecord:
     subject_id: str | None
 
 
-class LatentBankIndex:
-    """Index of one split's latent files, with lazy per-record loading."""
+def split_assignment_from_json(path: str | Path) -> dict[str, str]:
+    """case_id -> split name, read from a VAE split JSON.
 
-    def __init__(self, bank_dir: str | Path, split: str) -> None:
+    Lets a resplit take effect without re-encoding. The bank bakes each record's split into
+    its manifest at build time, so moving a subject between splits in the JSON is otherwise a
+    silent no-op for everything that reads the bank — which is every Stage-2 consumer.
+    """
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    splits = payload.get("splits", payload)
+    assignment: dict[str, str] = {}
+    for name in ("train", "validation", "test"):
+        for record in splits.get(name, []):
+            assignment[str(record["case_id"])] = name
+    if not assignment:
+        raise ValueError(f"Split file {path} has no records under train/validation/test.")
+    return assignment
+
+
+class LatentBankIndex:
+    """Index of one split's latent files, with lazy per-record loading.
+
+    ``split_json`` overrides the split recorded in the bank manifest. Pass it whenever the
+    split has been revised since the bank was built; without it a resplit is silently ignored.
+    """
+
+    def __init__(
+        self,
+        bank_dir: str | Path,
+        split: str,
+        *,
+        split_json: str | Path | None = None,
+    ) -> None:
         self.bank_dir = Path(bank_dir)
         self.split = split
+        self.split_override = (
+            split_assignment_from_json(split_json) if split_json is not None else None
+        )
         self.records: list[LatentRecord] = self._load_index()
         if not self.records:
-            raise ValueError(f"Latent bank {self.bank_dir} has no records for split {split!r}.")
+            source = f" under {split_json}" if split_json is not None else ""
+            raise ValueError(
+                f"Latent bank {self.bank_dir} has no records for split {split!r}{source}."
+            )
+
+    def _split_of(self, case_id: str, manifest_split: str | None) -> str | None:
+        if self.split_override is None:
+            return manifest_split
+        return self.split_override.get(case_id)
 
     def _load_index(self) -> list[LatentRecord]:
         manifest_path = self.bank_dir / "latent_bank_manifest.json"
@@ -73,11 +113,12 @@ class LatentBankIndex:
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             for entry in manifest.get("records", []):
-                if entry.get("split") != self.split:
+                case_id = str(entry["case_id"])
+                if self._split_of(case_id, entry.get("split")) != self.split:
                     continue
                 records.append(
                     LatentRecord(
-                        case_id=str(entry["case_id"]),
+                        case_id=case_id,
                         path=self.bank_dir / entry["path"],
                         domain=Domain.from_dict(entry["domain"]),
                         subject_id=entry.get("subject_id"),

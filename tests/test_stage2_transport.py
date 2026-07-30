@@ -84,7 +84,7 @@ def test_same_contrast_coupling_shares_contrast_and_crosses_field(tmp_path) -> N
     cfg = Stage2TransportConfig(batch_size=4, same_contrast=True, field_pairing="cross")
     gen = torch.Generator().manual_seed(0)
     for _ in range(25):
-        _, dom_s, _, dom_t = _sample_constrained_pair(index, pools, stats, cfg, torch.device("cpu"), gen)
+        _, dom_s, _, dom_t, _ = _sample_constrained_pair(index, pools, stats, cfg, torch.device("cpu"), gen)
         s_contrast = {Contrast.parse(d.contrast) for d in dom_s}
         t_contrast = {Contrast.parse(d.contrast) for d in dom_t}
         assert s_contrast == t_contrast and len(s_contrast) == 1  # one shared contrast per batch

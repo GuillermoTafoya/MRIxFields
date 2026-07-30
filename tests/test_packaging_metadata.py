@@ -38,6 +38,14 @@ def test_matplotlib_is_declared_for_dev_and_evaluation() -> None:
     assert f'Requires-Dist: {requirement}; extra == "evaluation"' in metadata_lines
 
 
+def test_scipy_is_declared_for_default_ot_coupling() -> None:
+    lines = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+    requirement = "scipy>=1.10,<2"
+
+    assert requirement in _read_toml_array(lines, "dependencies")
+    assert f"Requires-Dist: {requirement}" in _build_backend()._metadata().splitlines()
+
+
 def _pyproject_requirements() -> tuple[list[str], list[str]]:
     lines = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
     requirements = _read_toml_array(lines, "dependencies")

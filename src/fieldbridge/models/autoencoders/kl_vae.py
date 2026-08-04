@@ -148,6 +148,9 @@ class KLVAEDecoder(BaseDecoder):
         if self.domain_conditioning_dim < 0:
             raise ValueError("domain_conditioning_dim must be non-negative.")
         base = _positive_int(base_channels, "base_channels")
+        # Mirrors the encoder. Tiled decoding (`latent_bank.decode_latent`) reads this off the
+        # decoder to size latent-space blocks, so it must be present on both halves.
+        self.downsample_factor = _DOWNSAMPLE_FACTOR
 
         conv = _conv_nd(self.spatial_dims)
         self.from_latent = conv(self.latent_channels, base * 4, kernel_size=1)

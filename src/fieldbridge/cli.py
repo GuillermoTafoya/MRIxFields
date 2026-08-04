@@ -117,9 +117,49 @@ from fieldbridge.evaluation.stage2_transport_eval import (
     DecodeSpec,
     TransportSamplerConfig,
     evaluate_transport_travellers,
+    traveller_cases,
     write_transport_eval,
 )
+from fieldbridge.evaluation.stage2_gate0 import (
+    ReferenceGateSpec,
+    ResidualGateSpec,
+    RobustNormSpec,
+    StratumSpec,
+    SweepSpec,
+    assert_full_volume_bank,
+    build_sb_transport,
+    compose_minus,
+    evaluate_reference_gate,
+    load_raw_latents,
+    residual_energy_gate,
+    wrong_target_sweep,
+    write_gate0_result,
+)
+from fieldbridge.models.translators.affine_baseline import (
+    MOMENT_SPACES,
+    AffineLatentBaseline,
+    fit_affine_baselines,
+)
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
+
+
+def _add_gate0_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """Arguments every Gate-0 subcommand needs to locate the bank, the split and the travellers."""
+
+    parser.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory (must be a FULL-volume bank).")
+    parser.add_argument("--split-json", type=Path, required=True, help="VAE split JSON (post-resplit).")
+    parser.add_argument("--latent-stats", type=Path, default=None, help="Defaults to <bank-dir>/latent_stats.json.")
+    parser.add_argument("--out", type=Path, default=None, help="Write the full per-pair JSON here.")
+    parser.add_argument(
+        "--subjects", nargs="+", default=None,
+        help="Restrict to these prospective traveller subject_ids.",
+    )
+    parser.add_argument(
+        "--allow-training-subjects", action="store_true",
+        help="Score travellers in the transport's training split. Refused by default: their "
+        "score measures memorization, not generalization.",
+    )
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,6 +567,79 @@ def build_parser() -> argparse.ArgumentParser:
         "optimistic upper bound.",
     )
     eval_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    # --- Etapa-2 Gate 0 (cheap diagnostics before spending A100 hours on Gate 1) -----------
+    fit_affine = subparsers.add_parser(
+        "fit-affine-baseline",
+        help="Fit the closed-form per-channel affine latent baseline from the unpaired pool.",
+    )
+    fit_affine.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory.")
+    fit_affine.add_argument(
+        "--split-json", type=Path, required=True,
+        help="VAE split JSON. Required: the bank bakes split membership in at build time, so "
+        "without this a resplit is silently ignored and the pool is the pre-resplit one.",
+    )
+    fit_affine.add_argument("--out", type=Path, required=True, help="Output JSON (one file per moment space).")
+    fit_affine.add_argument(
+        "--pool-split", default="train", choices=("train", "validation", "test"),
+        help="Split the moments are estimated over.",
+    )
+    fit_affine.add_argument(
+        "--cohort", default="R", choices=("R", "P", "all"),
+        help="Cohort to fit on. 'R' (default) is the retrospective unpaired pool; the "
+        "prospective travellers are the evaluation anchor and must not define the baseline.",
+    )
+    fit_affine.add_argument("--foreground-percentile", type=float, default=50.0)
+    fit_affine.add_argument("--log-every", type=int, default=100)
+
+    gate0_sweep = subparsers.add_parser(
+        "gate0-sweep",
+        help="Step 1: request every target field from a fixed source and measure the response.",
+    )
+    _add_gate0_common_arguments(gate0_sweep)
+    gate0_sweep.add_argument("--transport-config", type=Path, required=True)
+    gate0_sweep.add_argument("--transport-checkpoint", type=Path, required=True)
+    gate0_sweep.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    gate0_sweep.add_argument("--n-steps", type=int, default=20)
+    gate0_sweep.add_argument("--responsiveness-min", type=float, default=0.10)
+    gate0_sweep.add_argument(
+        "--exclude-identity-target", action="store_true",
+        help="Drop f_t == f_s from the sweep. Kept by default: it is the identity request, and "
+        "a model that ignores the target field answers it like every other request.",
+    )
+
+    gate0_reference = subparsers.add_parser(
+        "gate0-reference-gate",
+        help="Steps 3+4: identity / affine / SB / SB-minus-affine on the traveller pairs.",
+    )
+    _add_gate0_common_arguments(gate0_reference)
+    gate0_reference.add_argument("--affine-baseline", type=Path, required=True, help="Fitted affine JSON.")
+    gate0_reference.add_argument("--transport-config", type=Path, default=None)
+    gate0_reference.add_argument(
+        "--transport-checkpoint", type=Path, default=None,
+        help="Omit to run identity + affine only (no trained model needed).",
+    )
+    gate0_reference.add_argument("--vae-config", type=Path, default=Path("configs/experiment/stage1_vae_v2_fgw_freebits.yaml"))
+    gate0_reference.add_argument("--vae-checkpoint", type=Path, required=True)
+    gate0_reference.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    gate0_reference.add_argument("--n-steps", type=int, default=20)
+    gate0_reference.add_argument("--metrics", nargs="+", default=["ssim", "nrmse", "lpips"], choices=("ssim", "nrmse", "lpips"))
+    gate0_reference.add_argument("--catastrophic-identity-nrmse", type=float, default=1.0)
+    gate0_reference.add_argument("--robust-percentiles", type=float, nargs=2, default=[1.0, 99.0], metavar=("LOW", "HIGH"))
+    gate0_reference.add_argument("--no-ceiling", action="store_true", help="Skip the frozen-VAE ceiling row.")
+
+    gate0_residual = subparsers.add_parser(
+        "gate0-residual-gate",
+        help="Step 5 (decisive): energy and cross-traveller predictability of the affine residual.",
+    )
+    _add_gate0_common_arguments(gate0_residual)
+    gate0_residual.add_argument("--affine-baseline", type=Path, nargs="+", required=True, help="One JSON per moment space.")
+    gate0_residual.add_argument("--residual-snr-min", type=float, default=10.0)
+    gate0_residual.add_argument("--predictable-fraction-min", type=float, default=0.05)
+    gate0_residual.add_argument(
+        "--excluded-subjects", nargs="+", default=["0009"],
+        help="Travellers that must not be touched. 0009 is the frozen confirmatory test subject.",
+    )
 
     resplit_parser = subparsers.add_parser(
         "resplit-travellers",
@@ -1459,6 +1572,179 @@ def main(argv: list[str] | None = None) -> int:
                                                  "scored_training_subjects", "metrics", "sampler",
                                                  "decode", "overall", "by_contrast")},
                          indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "fit-affine-baseline":
+        import torch
+
+        bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
+        provenance = assert_full_volume_bank(bank_manifest)
+        index = LatentBankIndex(args.bank_dir, args.pool_split, split_json=args.split_json)
+        records = [
+            record
+            for record in index.records
+            if args.cohort == "all" or str(record.case_id).split("_", 1)[0] == args.cohort
+        ]
+        if not records:
+            raise SystemExit(
+                f"No {args.cohort!r}-cohort records in split {args.pool_split!r} of {args.bank_dir}."
+            )
+        channels = int(len(bank_manifest["latent_stats"]["per_channel_mean"]))
+
+        def _stream():
+            for record in records:
+                payload = torch.load(record.path, map_location="cpu")
+                yield payload["latent"].to(torch.float32), record.domain
+
+        baselines = fit_affine_baselines(
+            _stream(),
+            channels=channels,
+            foreground_percentile=args.foreground_percentile,
+            provenance={
+                "bank_dir": str(args.bank_dir),
+                "split_json": str(args.split_json),
+                "pool_split": args.pool_split,
+                "cohort": args.cohort,
+                "bank": provenance,
+            },
+            log_every=args.log_every,
+        )
+        written = {}
+        for space, baseline in baselines.items():
+            path = args.out.with_name(f"{args.out.stem}_{space}{args.out.suffix or '.json'}")
+            baseline.save(path)
+            written[space] = str(path)
+        print(json.dumps({"written": written, "pool_volumes": len(records),
+                          "channels": channels, "bank": provenance}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command in ("gate0-sweep", "gate0-reference-gate", "gate0-residual-gate"):
+        import torch
+
+        bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
+        bank_provenance = assert_full_volume_bank(bank_manifest)
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
+        cases = traveller_cases(records, bank_manifest, args.bank_dir, args.subjects, split_of_case)
+        if not cases:
+            raise SystemExit(
+                "No prospective travellers found that are also encoded in this bank. "
+                "Check --subjects and --split-json."
+            )
+        contaminated = sorted(
+            {case.subject_id for case in cases if case.split == "train"}
+        )
+        # The guard applies to the two commands that SCORE A MODEL. The residual gate scores
+        # no model: it measures a property of the latents themselves (what a closed-form affine
+        # leaves behind, and whether one traveller's leftover predicts the other's), and it
+        # needs both paired travellers by construction — refusing the training one would leave
+        # a single subject and no cross-subject estimate at all.
+        if (
+            contaminated
+            and args.command != "gate0-residual-gate"
+            and not args.allow_training_subjects
+        ):
+            raise SystemExit(
+                f"Refusing to run {args.command} on subject(s) {contaminated}: they are in the "
+                "transport's training split, so the result measures memorization. Resplit "
+                "first, or pass --allow-training-subjects for an explicit optimistic bound."
+            )
+        device = _resolve_device(args.device)
+        latents = load_raw_latents(cases, device)
+        stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
+        stats = LatentStats.from_json(stats_path)
+        header = {
+            "bank": bank_provenance,
+            "split_json": str(args.split_json),
+            "subjects_scored": sorted({case.subject_id for case in cases}),
+            "scored_training_subjects": contaminated,
+            "device": str(device),
+        }
+
+        def _sb_transport():
+            model_config = _model_config(_load_optional_config(args.transport_config))
+            translator = build_translator(
+                str(model_config.get("name", "flow_matching_latent")),
+                **{k: v for k, v in model_config.items() if k != "name"},
+            )
+            translator.load_state_dict(load_checkpoint(args.transport_checkpoint)["translator"])
+            translator = translator.to(device).eval()
+            return build_sb_transport(
+                translator, stats, TransportSamplerConfig(solver=args.solver, n_steps=args.n_steps)
+            )
+
+        if args.command == "gate0-sweep":
+            result = wrong_target_sweep(
+                transport=_sb_transport(),
+                latents_by_case=latents,
+                cases=cases,
+                spec=SweepSpec(
+                    responsiveness_min=args.responsiveness_min,
+                    include_identity_target=not args.exclude_identity_target,
+                ),
+            )
+        elif args.command == "gate0-reference-gate":
+            baseline = AffineLatentBaseline.load(args.affine_baseline)
+            vae_model_config = _model_config(_load_optional_config(args.vae_config))
+            decoder = build_decoder("kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder"))
+            decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"])
+            decoder.requires_grad_(False)
+
+            methods: dict[str, Any] = {
+                "identity": lambda z, s, t: z,
+                "affine": baseline.transport,
+            }
+            if args.transport_checkpoint is not None:
+                if args.transport_config is None:
+                    raise SystemExit("--transport-checkpoint also needs --transport-config.")
+                sb = _sb_transport()
+                methods["sb_v2"] = sb
+                methods["sb_v2_minus_affine"] = compose_minus(sb, baseline.transport)
+            result = evaluate_reference_gate(
+                methods=methods,
+                decoder=decoder,
+                records=records,
+                latents_by_case=latents,
+                cases=cases,
+                decode=DecodeSpec.from_bank_manifest(bank_manifest),
+                device=device,
+                spec=ReferenceGateSpec(
+                    metrics=tuple(args.metrics),
+                    robust=RobustNormSpec(
+                        low_percentile=args.robust_percentiles[0],
+                        high_percentile=args.robust_percentiles[1],
+                    ),
+                    strata=StratumSpec(catastrophic_identity_nrmse=args.catastrophic_identity_nrmse),
+                ),
+                include_ceiling=not args.no_ceiling,
+            )
+            result["affine_baseline"] = str(args.affine_baseline)
+        else:
+            baselines = {}
+            for path in args.affine_baseline:
+                loaded = AffineLatentBaseline.load(path)
+                baselines[loaded.space] = loaded
+            result = residual_energy_gate(
+                baselines=baselines,
+                latents_by_case=latents,
+                cases=cases,
+                spec=ResidualGateSpec(
+                    residual_snr_min=args.residual_snr_min,
+                    predictable_fraction_min=args.predictable_fraction_min,
+                    excluded_subjects=tuple(args.excluded_subjects),
+                ),
+            )
+
+        result["provenance"] = header
+        if args.out is not None:
+            write_gate0_result(result, args.out)
+        summary = {k: v for k, v in result.items() if k not in ("pairs", "cases")}
+        print(json.dumps(summary, indent=2, sort_keys=True, default=str))
         return 0
 
     if args.command == "resplit-travellers":

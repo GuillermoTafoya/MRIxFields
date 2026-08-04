@@ -1,0 +1,71 @@
+seed: 13
+# Etapa-2 Gate 0 — cheap diagnostics that decide whether Gate 1 (residual objective +
+# contrast pretraining) is worth A100 hours. No training happens here.
+#
+# What v2 measured on held-out traveller 0006 (60 pairs, full-volume decode):
+#   transport nRMSE 0.459 / SSIM 0.880   vs   identity 0.595 / 0.876   vs ceiling 0.131 / 0.966
+# nRMSE moved a lot, SSIM did not move at all against a 0.966 ceiling. That is the signature of
+# a global intensity rescaling, not of structure — the same diagnosis v1 got, one bundle later.
+#
+# The hypothesis this gate tests: the nn coupling over an unpaired pool hands the model the
+# nearest ANOTHER-subject volume at the target field, so the conditional mean it can learn is
+# roughly that field's population mean. With log(f_t/f_s) supplied explicitly in the
+# conditioning, "multiply by k" is the cheapest function of that input. If that is all that was
+# learned, then a closed-form per-channel affine — no network, no gradient steps — should match
+# it, and whatever the affine leaves behind is the entire budget available to Gate 1.
+#
+# Every threshold below is a declared decision rule, fixed BEFORE the numbers are read.
+gate0:
+  # --- step 1: wrong-target sweep -----------------------------------------------------------
+  sweep:
+    # A case "responds" to the requested target field if the spread of its five outputs reaches
+    # this fraction of the spread of the five REAL target latents. 0.10 is deliberately lenient:
+    # it asks the model to move a tenth of the distance it should, not the whole way. Failing a
+    # bar this low means the target-field conditioning is inert.
+    responsiveness_min: 0.10
+    # Keep f_t == f_s in the sweep. It is the identity request, and a model that ignores the
+    # target field answers it identically to every other request — which is the tell.
+    include_identity_target: true
+
+  # --- steps 3 + 4: the four-reference gate -------------------------------------------------
+  reference_gate:
+    metrics: [ssim, nrmse, lpips]   # LPIPS was omitted in v2; it is the third official metric.
+    solver: heun
+    n_steps: 20                     # same sampler settings as the v2 gate, so rows stay comparable
+    # Difficulty stratification. v1 measured 13 of 60 traveller pairs with identity nRMSE > 1,
+    # and the whole v1/v2 aggregate nRMSE win lived inside that stratum. Reporting only the
+    # aggregate is how that got missed the first time, so every table is stratified.
+    catastrophic_identity_nrmse: 1.0
+    # Robust intensity normalization applied to prediction AND target before the extra SSIM
+    # column. Percentiles are taken inside a target-derived mask because the volumes are [0, 1]
+    # with a large near-zero background that would otherwise pin the low percentile at 0.
+    robust_low_percentile: 1.0
+    robust_high_percentile: 99.0
+    robust_mask_threshold: 0.0
+
+  # --- step 2: the closed-form affine baseline ----------------------------------------------
+  affine:
+    pool_split: train
+    # Retrospective only. The prospective travellers are the evaluation anchor; letting them
+    # define the baseline would be the same leak the v2 audit found in the nn coupling.
+    cohort: R
+    # Latent voxels above this per-volume quantile of the across-channel norm count as
+    # foreground. Background is near-constant across field strengths and would otherwise drag
+    # the moments toward "do nothing"; both tables are fitted and both are reported.
+    foreground_percentile: 50.0
+
+  # --- step 5: the decisive residual gate ---------------------------------------------------
+  residual:
+    # Residual mean-square energy over the float16 storage floor. Because the bank stores the
+    # DETERMINISTIC posterior mean, re-encoding a volume returns the identical latent — there is
+    # no stochastic encode noise, and storage quantization is the only true in-latent floor.
+    residual_snr_min: 10.0
+    # Fraction of one traveller's residual that the other traveller's residual predicts, which
+    # is exactly the squared cosine between them. This is the ceiling on what a model that
+    # learned a shared per-field-pair residual could transfer to an unseen subject.
+    #
+    # Read the caveat with the number: the project has two paired travellers (0007, 0006), so
+    # this is a 1-vs-1 indicator, not a statistic, and it carries no confidence interval.
+    predictable_fraction_min: 0.05
+    # 0009 was spent once as held-out evidence and is frozen. Gate 0 must not touch it.
+    excluded_subjects: ["0009"]

@@ -209,6 +209,12 @@ def _traveller_cases(
     return cases
 
 
+# Public alias: Gate 0 reuses this join rather than reimplementing it. The prospective-only
+# filter and the cohort caveat it encodes are leakage-critical, and two copies of that logic
+# is exactly how they drift apart.
+traveller_cases = _traveller_cases
+
+
 def _load_raw_latent(path: Path, device: torch.device) -> torch.Tensor:
     payload = torch.load(path, map_location="cpu")
     return payload["latent"].to(torch.float32).unsqueeze(0).to(device)
@@ -380,6 +386,7 @@ def write_transport_eval(result: Mapping[str, Any], out_path: str | Path) -> Pat
 __all__ = [
     "TransportSamplerConfig",
     "DecodeSpec",
+    "traveller_cases",
     "sample_transport",
     "official_metric_fn",
     "evaluate_transport_travellers",

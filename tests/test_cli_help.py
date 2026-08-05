@@ -28,3 +28,9 @@ def test_official_task3_directory_evaluator_is_exposed() -> None:
             ["mrixfields2026-evaluate-task3", "--help"]
         )
     assert exc_info.value.code == 0
+
+
+def test_stage1_gradient_smoke_is_exposed() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["smoke-stage1-gradient", "--help"])
+    assert exc_info.value.code == 0

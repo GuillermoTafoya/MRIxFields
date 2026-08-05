@@ -101,6 +101,9 @@ from fieldbridge.training.pseudo_pair_epochs import (
     train_pseudo_pair_epochs,
 )
 from fieldbridge.training.smoke_train import SmokeTrainConfig, run_smoke_train
+from fieldbridge.training.stage1_gradient_smoke import (
+    run_stage1_gradient_smoke,
+)
 from fieldbridge.training.stage1_vae import (
     Stage1VAEConfig,
     preflight_stage1_resume,
@@ -114,9 +117,57 @@ from fieldbridge.evaluation.stage2_transport_eval import (
     DecodeSpec,
     TransportSamplerConfig,
     evaluate_transport_travellers,
+    traveller_cases,
     write_transport_eval,
 )
+from fieldbridge.evaluation.stage2_gate0 import (
+    ReferenceGateSpec,
+    ResidualGateSpec,
+    RobustNormSpec,
+    StratumSpec,
+    SweepSpec,
+    assert_full_volume_bank,
+    build_sb_transport,
+    compose_minus,
+    coupling_quality_by_contrast,
+    evaluate_reference_gate,
+    load_raw_latents,
+    per_contrast_diagnostics,
+    residual_energy_gate,
+    wrong_target_sweep,
+    write_gate0_result,
+)
+from fieldbridge.evaluation.intensity_baselines import (
+    ImageIntensityBaseline,
+    fit_image_intensity_baselines,
+    reference_volume_records,
+)
+from fieldbridge.data.latent_bank import load_volume
+from fieldbridge.models.translators.affine_baseline import (
+    MOMENT_SPACES,
+    AffineLatentBaseline,
+    fit_affine_baselines,
+)
 from fieldbridge.training.train_loop import TrainLoopConfig, run_train_loop
+
+
+def _add_gate0_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """Arguments every Gate-0 subcommand needs to locate the bank, the split and the travellers."""
+
+    parser.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory (must be a FULL-volume bank).")
+    parser.add_argument("--split-json", type=Path, required=True, help="VAE split JSON (post-resplit).")
+    parser.add_argument("--latent-stats", type=Path, default=None, help="Defaults to <bank-dir>/latent_stats.json.")
+    parser.add_argument("--out", type=Path, default=None, help="Write the full per-pair JSON here.")
+    parser.add_argument(
+        "--subjects", nargs="+", default=None,
+        help="Restrict to these prospective traveller subject_ids.",
+    )
+    parser.add_argument(
+        "--allow-training-subjects", action="store_true",
+        help="Score travellers in the transport's training split. Refused by default: their "
+        "score measures memorization, not generalization.",
+    )
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,6 +180,35 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--batch-size", type=int, default=None)
     smoke.add_argument("--seed", type=int, default=None)
     smoke.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    stage1_gradient_smoke = subparsers.add_parser(
+        "smoke-stage1-gradient",
+        help=(
+            "Run one synthetic exact-zero-background Arm-A backward, gradient clip, "
+            "and optimizer step."
+        ),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage1_ae_v3_joint_domain.yaml"),
+    )
+    stage1_gradient_smoke.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default=None,
+        help="Override the config device; omit to exercise its CUDA setting.",
+    )
+    stage1_gradient_smoke.add_argument(
+        "--precision",
+        choices=("fp32", "bf16"),
+        default=None,
+        help="Override the config precision; omit to exercise its bf16 setting.",
+    )
+    stage1_gradient_smoke.add_argument("--patch-size", type=int, default=16)
+    stage1_gradient_smoke.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON."
+    )
 
     train = subparsers.add_parser("train", help="Run the configurable Etapa 2 translator training loop.")
     train.add_argument("--config", type=Path, default=Path("configs/experiment/smoke.yaml"))
@@ -444,7 +524,15 @@ def build_parser() -> argparse.ArgumentParser:
     train_transport.add_argument("--steps", type=int, default=None)
     train_transport.add_argument("--batch-size", type=int, default=None)
     train_transport.add_argument("--seed", type=int, default=None)
-    train_transport.add_argument("--coupling", choices=("independent", "ot"), default=None)
+    train_transport.add_argument(
+        "--split-json",
+        type=Path,
+        default=None,
+        help="Override the split recorded in the bank manifest with this VAE split JSON. "
+        "Required after a resplit: the bank bakes each record's split in at build time, so "
+        "without this a resplit is silently ignored and training keeps the old membership.",
+    )
+    train_transport.add_argument("--coupling", choices=("independent", "ot", "nn"), default=None)
     train_transport.add_argument("--bridge", choices=("ot_cfm", "schrodinger"), default=None)
     train_transport.add_argument("--resume-from", type=Path, default=None)
     train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
@@ -478,7 +566,132 @@ def build_parser() -> argparse.ArgumentParser:
         "--subjects", nargs="+", default=None,
         help="Restrict to these subject_ids (default: all prospective travellers in the split).",
     )
+    eval_transport.add_argument(
+        "--allow-training-subjects",
+        action="store_true",
+        help="Score travellers that are in the transport's training split. Refused by default: "
+        "with the nn coupling a training traveller retrieves its own target-field volume as the "
+        "nearest neighbour, so its score measures memorization. Use only for an explicit "
+        "optimistic upper bound.",
+    )
     eval_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    # --- Etapa-2 Gate 0 (cheap diagnostics before spending A100 hours on Gate 1) -----------
+    fit_affine = subparsers.add_parser(
+        "fit-affine-baseline",
+        help="Fit the closed-form per-channel affine latent baseline from the unpaired pool.",
+    )
+    fit_affine.add_argument("--bank-dir", type=Path, required=True, help="Latent bank directory.")
+    fit_affine.add_argument(
+        "--split-json", type=Path, required=True,
+        help="VAE split JSON. Required: the bank bakes split membership in at build time, so "
+        "without this a resplit is silently ignored and the pool is the pre-resplit one.",
+    )
+    fit_affine.add_argument("--out", type=Path, required=True, help="Output JSON (one file per moment space).")
+    fit_affine.add_argument(
+        "--pool-split", default="train", choices=("train", "validation", "test"),
+        help="Split the moments are estimated over.",
+    )
+    fit_affine.add_argument(
+        "--cohort", default="R", choices=("R", "P", "all"),
+        help="Cohort to fit on. 'R' (default) is the retrospective unpaired pool; the "
+        "prospective travellers are the evaluation anchor and must not define the baseline.",
+    )
+    fit_affine.add_argument("--foreground-percentile", type=float, default=50.0)
+    fit_affine.add_argument("--log-every", type=int, default=100)
+
+    gate0_sweep = subparsers.add_parser(
+        "gate0-sweep",
+        help="Step 1: request every target field from a fixed source and measure the response.",
+    )
+    _add_gate0_common_arguments(gate0_sweep)
+    gate0_sweep.add_argument("--transport-config", type=Path, required=True)
+    gate0_sweep.add_argument("--transport-checkpoint", type=Path, required=True)
+    gate0_sweep.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    gate0_sweep.add_argument("--n-steps", type=int, default=20)
+    gate0_sweep.add_argument("--responsiveness-min", type=float, default=0.10)
+    gate0_sweep.add_argument(
+        "--exclude-identity-target", action="store_true",
+        help="Drop f_t == f_s from the sweep. Kept by default: it is the identity request, and "
+        "a model that ignores the target field answers it like every other request.",
+    )
+
+    fit_intensity = subparsers.add_parser(
+        "fit-intensity-baseline",
+        help="Fit the image-space intensity baselines (robust affine + histogram) from training subjects.",
+    )
+    fit_intensity.add_argument("--split-json", type=Path, required=True)
+    fit_intensity.add_argument("--out", type=Path, required=True, help="Output JSON stem (one file per mode).")
+    fit_intensity.add_argument(
+        "--per-domain", type=int, default=8,
+        help="Reference volumes per domain, taken from the training split only.",
+    )
+    fit_intensity.add_argument("--num-quantiles", type=int, default=256)
+    fit_intensity.add_argument("--mask-threshold", type=float, default=0.0)
+    fit_intensity.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    gate0_coupling = subparsers.add_parser(
+        "gate0-coupling-quality",
+        help="Per-contrast quality of the nn coupling's pseudo-pairs (descriptor distances).",
+    )
+    _add_gate0_common_arguments(gate0_coupling)
+    gate0_coupling.add_argument("--pool-size", type=int, default=4, help="Must equal training.ot_pool_size.")
+    gate0_coupling.add_argument("--nn-candidates", type=int, default=5)
+    gate0_coupling.add_argument("--descriptor-cache", type=Path, default=None)
+
+    gate0_report = subparsers.add_parser(
+        "gate0-report",
+        help="Assemble the per-contrast diagnostic table from the Gate-0 result JSONs.",
+    )
+    gate0_report.add_argument("--reference", type=Path, default=None)
+    gate0_report.add_argument("--sweep", type=Path, default=None)
+    gate0_report.add_argument("--residual", type=Path, default=None)
+    gate0_report.add_argument("--coupling", type=Path, default=None)
+    gate0_report.add_argument("--residual-baseline", default="foreground", choices=("all", "foreground"))
+    gate0_report.add_argument("--out", type=Path, default=None)
+
+    gate0_reference = subparsers.add_parser(
+        "gate0-reference-gate",
+        help="Steps 3+4: identity / affine / intensity / SB / SB-minus-affine on the traveller pairs.",
+    )
+    _add_gate0_common_arguments(gate0_reference)
+    gate0_reference.add_argument("--affine-baseline", type=Path, required=True, help="Fitted affine JSON.")
+    gate0_reference.add_argument(
+        "--intensity-baseline", type=Path, nargs="*", default=(),
+        help="Fitted image-space intensity baseline JSON(s). Applied to the identity "
+        "reconstruction, so they add no decode cost.",
+    )
+    gate0_reference.add_argument(
+        "--resume", action="store_true",
+        help="Reuse pairs already scored into <out>.pairs.jsonl. Full-volume decoding is ~1 h; "
+        "a Colab disconnect should not cost all of it.",
+    )
+    gate0_reference.add_argument("--transport-config", type=Path, default=None)
+    gate0_reference.add_argument(
+        "--transport-checkpoint", type=Path, default=None,
+        help="Omit to run identity + affine only (no trained model needed).",
+    )
+    gate0_reference.add_argument("--vae-config", type=Path, default=Path("configs/experiment/stage1_vae_v2_fgw_freebits.yaml"))
+    gate0_reference.add_argument("--vae-checkpoint", type=Path, required=True)
+    gate0_reference.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    gate0_reference.add_argument("--n-steps", type=int, default=20)
+    gate0_reference.add_argument("--metrics", nargs="+", default=["ssim", "nrmse", "lpips"], choices=("ssim", "nrmse", "lpips"))
+    gate0_reference.add_argument("--catastrophic-identity-nrmse", type=float, default=1.0)
+    gate0_reference.add_argument("--robust-percentiles", type=float, nargs=2, default=[1.0, 99.0], metavar=("LOW", "HIGH"))
+    gate0_reference.add_argument("--no-ceiling", action="store_true", help="Skip the frozen-VAE ceiling row.")
+
+    gate0_residual = subparsers.add_parser(
+        "gate0-residual-gate",
+        help="Step 5 (decisive): energy and cross-traveller predictability of the affine residual.",
+    )
+    _add_gate0_common_arguments(gate0_residual)
+    gate0_residual.add_argument("--affine-baseline", type=Path, nargs="+", required=True, help="One JSON per moment space.")
+    gate0_residual.add_argument("--residual-snr-min", type=float, default=10.0)
+    gate0_residual.add_argument("--predictable-fraction-min", type=float, default=0.05)
+    gate0_residual.add_argument(
+        "--excluded-subjects", nargs="+", default=["0009"],
+        help="Travellers that must not be touched. 0009 is the frozen confirmatory test subject.",
+    )
 
     resplit_parser = subparsers.add_parser(
         "resplit-travellers",
@@ -486,7 +699,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resplit_parser.add_argument("--split-json", type=Path, required=True, help="Input split JSON.")
     resplit_parser.add_argument("--out", type=Path, required=True, help="Output split JSON (must differ from input).")
-    resplit_parser.add_argument("--subjects", nargs="+", required=True, help="Subject ids to move, e.g. 0006 0007.")
+    resplit_parser.add_argument(
+        "--subjects",
+        nargs="+",
+        required=True,
+        help="Subject ids to move, qualified by cohort: 'P:0006'. A bare '0006' is accepted only "
+        "when unambiguous — the cohorts have overlapping numeric ranges, so P_..._0006 and "
+        "R_..._0006 are DIFFERENT people and both may sit in the same split.",
+    )
     resplit_parser.add_argument("--to", dest="to_split", choices=("train", "validation", "test"), required=True)
 
     build_latent_bank_parser = subparsers.add_parser(
@@ -688,6 +908,29 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"smoke-train completed: steps={result.steps} final_loss={result.final_loss:.6f}")
+        return 0
+
+    if args.command == "smoke-stage1-gradient":
+        config = _load_optional_config(args.config)
+        result = run_stage1_gradient_smoke(
+            config,
+            device=args.device,
+            precision=args.precision,
+            patch_size=args.patch_size,
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(
+                "smoke-stage1-gradient completed: "
+                f"device={result.device} precision={result.precision} "
+                f"loss={result.components['total']:.6f} "
+                f"gradient_norm={result.gradient_norm:.6f} "
+                f"finite_gradients="
+                f"{result.finite_gradient_parameter_tensors}/"
+                f"{result.trainable_parameter_tensors} "
+                f"updated={result.updated_parameter_tensors}"
+            )
         return 0
 
     if args.command == "train":
@@ -1307,8 +1550,12 @@ def main(argv: list[str] | None = None) -> int:
 
         stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
         stats = LatentStats.from_json(stats_path)
-        train_index = LatentBankIndex(args.bank_dir, "train")
-        val_index = LatentBankIndex(args.bank_dir, "validation") if args.val else None
+        train_index = LatentBankIndex(args.bank_dir, "train", split_json=args.split_json)
+        val_index = (
+            LatentBankIndex(args.bank_dir, "validation", split_json=args.split_json)
+            if args.val
+            else None
+        )
 
         stage_config = Stage2TransportConfig.from_mapping(config)
         result = run_stage2_transport_train(
@@ -1350,6 +1597,11 @@ def main(argv: list[str] | None = None) -> int:
         bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
         splits = load_vae_splits(args.split_json)
         records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
         device = _resolve_device(args.device)
         result = evaluate_transport_travellers(
             translator=translator,
@@ -1363,11 +1615,300 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             metrics=tuple(args.metrics),
             subjects=args.subjects,
+            split_of_case=split_of_case,
+            allow_training_subjects=args.allow_training_subjects,
         )
         if args.out is not None:
             write_transport_eval(result, args.out)
-        print(json.dumps({k: result[k] for k in ("num_pairs", "subjects", "metrics", "sampler", "overall", "by_contrast")},
+        print(json.dumps({k: result[k] for k in ("num_pairs", "subjects", "subject_splits",
+                                                 "scored_training_subjects", "metrics", "sampler",
+                                                 "decode", "overall", "by_contrast")},
                          indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "fit-affine-baseline":
+        import torch
+
+        bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
+        provenance = assert_full_volume_bank(bank_manifest)
+        index = LatentBankIndex(args.bank_dir, args.pool_split, split_json=args.split_json)
+        records = [
+            record
+            for record in index.records
+            if args.cohort == "all" or str(record.case_id).split("_", 1)[0] == args.cohort
+        ]
+        if not records:
+            raise SystemExit(
+                f"No {args.cohort!r}-cohort records in split {args.pool_split!r} of {args.bank_dir}."
+            )
+        channels = int(len(bank_manifest["latent_stats"]["per_channel_mean"]))
+
+        def _stream():
+            for record in records:
+                payload = torch.load(record.path, map_location="cpu")
+                yield payload["latent"].to(torch.float32), record.domain
+
+        baselines = fit_affine_baselines(
+            _stream(),
+            channels=channels,
+            foreground_percentile=args.foreground_percentile,
+            provenance={
+                "bank_dir": str(args.bank_dir),
+                "split_json": str(args.split_json),
+                "pool_split": args.pool_split,
+                "cohort": args.cohort,
+                "bank": provenance,
+            },
+            log_every=args.log_every,
+        )
+        written = {}
+        for space, baseline in baselines.items():
+            path = args.out.with_name(f"{args.out.stem}_{space}{args.out.suffix or '.json'}")
+            baseline.save(path)
+            written[space] = str(path)
+        print(json.dumps({"written": written, "pool_volumes": len(records),
+                          "channels": channels, "bank": provenance}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "fit-intensity-baseline":
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
+        chosen = reference_volume_records(
+            records, split_of_case=split_of_case, per_domain=args.per_domain
+        )
+        if not chosen:
+            raise SystemExit("No training-split records found to fit intensity references on.")
+        device = _resolve_device(args.device)
+
+        def _stream():
+            for record in chosen:
+                yield load_volume(record).to(device), record.domain
+
+        baselines = fit_image_intensity_baselines(
+            _stream(),
+            num_quantiles=args.num_quantiles,
+            mask_threshold=args.mask_threshold,
+            provenance={"split_json": str(args.split_json), "per_domain": args.per_domain},
+            log=True,
+        )
+        written = {}
+        for mode, baseline in baselines.items():
+            path = args.out.with_name(f"{args.out.stem}_{mode}{args.out.suffix or '.json'}")
+            baseline.save(path)
+            written[mode] = str(path)
+        print(json.dumps({"written": written, "reference_volumes": len(chosen)},
+                         indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "gate0-report":
+        def _read(path):
+            return json.loads(path.read_text(encoding="utf-8")) if path is not None else None
+
+        table = per_contrast_diagnostics(
+            reference=_read(args.reference),
+            sweep=_read(args.sweep),
+            residual=_read(args.residual),
+            coupling=_read(args.coupling),
+            residual_baseline=args.residual_baseline,
+        )
+        if args.out is not None:
+            write_gate0_result(table, args.out)
+        print(json.dumps(table, indent=2, sort_keys=True, default=str))
+        return 0
+
+    if args.command in (
+        "gate0-sweep",
+        "gate0-reference-gate",
+        "gate0-residual-gate",
+        "gate0-coupling-quality",
+    ):
+        import torch
+
+        bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
+        bank_provenance = assert_full_volume_bank(bank_manifest)
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
+        cases = traveller_cases(records, bank_manifest, args.bank_dir, args.subjects, split_of_case)
+        if not cases:
+            raise SystemExit(
+                "No prospective travellers found that are also encoded in this bank. "
+                "Check --subjects and --split-json."
+            )
+        contaminated = sorted(
+            {case.subject_id for case in cases if case.split == "train"}
+        )
+        # The guard applies to the two commands that SCORE A MODEL. The residual gate scores
+        # no model: it measures a property of the latents themselves (what a closed-form affine
+        # leaves behind, and whether one traveller's leftover predicts the other's), and it
+        # needs both paired travellers by construction — refusing the training one would leave
+        # a single subject and no cross-subject estimate at all.
+        if (
+            contaminated
+            and args.command not in ("gate0-residual-gate", "gate0-coupling-quality")
+            and not args.allow_training_subjects
+        ):
+            raise SystemExit(
+                f"Refusing to run {args.command} on subject(s) {contaminated}: they are in the "
+                "transport's training split, so the result measures memorization. Resplit "
+                "first, or pass --allow-training-subjects for an explicit optimistic bound."
+            )
+        device = _resolve_device(args.device)
+        latents = load_raw_latents(cases, device)
+        stats_path = args.latent_stats or (args.bank_dir / "latent_stats.json")
+        stats = LatentStats.from_json(stats_path)
+        header = {
+            "bank": bank_provenance,
+            "split_json": str(args.split_json),
+            "subjects_scored": sorted({case.subject_id for case in cases}),
+            "scored_training_subjects": contaminated,
+            "device": str(device),
+        }
+
+        def _sb_transport():
+            model_config = _model_config(_load_optional_config(args.transport_config))
+            translator = build_translator(
+                str(model_config.get("name", "flow_matching_latent")),
+                **{k: v for k, v in model_config.items() if k != "name"},
+            )
+            translator.load_state_dict(load_checkpoint(args.transport_checkpoint)["translator"])
+            translator = translator.to(device).eval()
+            return build_sb_transport(
+                translator, stats, TransportSamplerConfig(solver=args.solver, n_steps=args.n_steps)
+            )
+
+        if args.command == "gate0-sweep":
+            result = wrong_target_sweep(
+                transport=_sb_transport(),
+                latents_by_case=latents,
+                cases=cases,
+                spec=SweepSpec(
+                    responsiveness_min=args.responsiveness_min,
+                    include_identity_target=not args.exclude_identity_target,
+                ),
+            )
+        elif args.command == "gate0-coupling-quality":
+            from fieldbridge.training.stage2_transport import build_latent_descriptors
+
+            train_index = LatentBankIndex(args.bank_dir, "train", split_json=args.split_json)
+            cache = args.descriptor_cache or (
+                args.bank_dir / f"descriptors_train_pool{args.pool_size}.pt"
+            )
+            descriptors = build_latent_descriptors(
+                train_index, stats, pool_size=args.pool_size, cache_path=cache, log=True
+            )
+            result = coupling_quality_by_contrast(
+                train_index=train_index,
+                train_descriptors=descriptors,
+                cases=cases,
+                latents_by_case=latents,
+                stats=stats,
+                pool_size=args.pool_size,
+                nn_candidates=args.nn_candidates,
+            )
+        elif args.command == "gate0-reference-gate":
+            baseline = AffineLatentBaseline.load(args.affine_baseline)
+            vae_model_config = _model_config(_load_optional_config(args.vae_config))
+            decoder = build_decoder("kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder"))
+            decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"])
+            decoder.requires_grad_(False)
+
+            methods: dict[str, Any] = {
+                "identity": lambda z, s, t: z,
+                "affine": baseline.transport,
+            }
+            if args.transport_checkpoint is not None:
+                if args.transport_config is None:
+                    raise SystemExit("--transport-checkpoint also needs --transport-config.")
+                sb = _sb_transport()
+                methods["sb_v2"] = sb
+                # Diagnostic decomposition, not a model variant: see compose_minus.
+                methods["sb_v2_minus_affine_diagnostic"] = compose_minus(sb, baseline.transport)
+
+            image_methods: dict[str, Any] = {}
+            for path in args.intensity_baseline:
+                intensity = ImageIntensityBaseline.load(path)
+                image_methods[f"identity_{intensity.mode}"] = (
+                    lambda image, source, target, _b=intensity: _b.apply(image, target)
+                )
+
+            # Per-pair streaming so a disconnect costs one pair, not the whole hour.
+            partial_path = (
+                args.out.with_name(f"{args.out.name}.pairs.jsonl") if args.out is not None else None
+            )
+            completed: list[dict[str, Any]] = []
+            if args.resume and partial_path is not None and partial_path.exists():
+                completed = [
+                    json.loads(line)
+                    for line in partial_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            handle = partial_path.open("a", encoding="utf-8") if partial_path is not None else None
+
+            def _record_pair(row: Mapping[str, Any]) -> None:
+                if handle is not None:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+                    handle.flush()
+
+            try:
+                result = evaluate_reference_gate(
+                    methods=methods,
+                    image_methods=image_methods,
+                    decoder=decoder,
+                    records=records,
+                    latents_by_case=latents,
+                    cases=cases,
+                    decode=DecodeSpec.from_bank_manifest(bank_manifest),
+                    device=device,
+                    spec=ReferenceGateSpec(
+                        metrics=tuple(args.metrics),
+                        robust=RobustNormSpec(
+                            low_percentile=args.robust_percentiles[0],
+                            high_percentile=args.robust_percentiles[1],
+                        ),
+                        strata=StratumSpec(
+                            catastrophic_identity_nrmse=args.catastrophic_identity_nrmse
+                        ),
+                    ),
+                    include_ceiling=not args.no_ceiling,
+                    on_pair=_record_pair,
+                    completed_pairs=completed,
+                )
+            finally:
+                if handle is not None:
+                    handle.close()
+            result["affine_baseline"] = str(args.affine_baseline)
+            result["intensity_baselines"] = [str(p) for p in args.intensity_baseline]
+        else:
+            baselines = {}
+            for path in args.affine_baseline:
+                loaded = AffineLatentBaseline.load(path)
+                baselines[loaded.space] = loaded
+            result = residual_energy_gate(
+                baselines=baselines,
+                latents_by_case=latents,
+                cases=cases,
+                spec=ResidualGateSpec(
+                    residual_snr_min=args.residual_snr_min,
+                    predictable_fraction_min=args.predictable_fraction_min,
+                    excluded_subjects=tuple(args.excluded_subjects),
+                ),
+            )
+
+        result["provenance"] = header
+        if args.out is not None:
+            write_gate0_result(result, args.out)
+        summary = {k: v for k, v in result.items() if k not in ("pairs", "cases")}
+        print(json.dumps(summary, indent=2, sort_keys=True, default=str))
         return 0
 
     if args.command == "resplit-travellers":

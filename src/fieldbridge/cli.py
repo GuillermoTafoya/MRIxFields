@@ -129,12 +129,20 @@ from fieldbridge.evaluation.stage2_gate0 import (
     assert_full_volume_bank,
     build_sb_transport,
     compose_minus,
+    coupling_quality_by_contrast,
     evaluate_reference_gate,
     load_raw_latents,
+    per_contrast_diagnostics,
     residual_energy_gate,
     wrong_target_sweep,
     write_gate0_result,
 )
+from fieldbridge.evaluation.intensity_baselines import (
+    ImageIntensityBaseline,
+    fit_image_intensity_baselines,
+    reference_volume_records,
+)
+from fieldbridge.data.latent_bank import load_volume
 from fieldbridge.models.translators.affine_baseline import (
     MOMENT_SPACES,
     AffineLatentBaseline,
@@ -608,12 +616,56 @@ def build_parser() -> argparse.ArgumentParser:
         "a model that ignores the target field answers it like every other request.",
     )
 
+    fit_intensity = subparsers.add_parser(
+        "fit-intensity-baseline",
+        help="Fit the image-space intensity baselines (robust affine + histogram) from training subjects.",
+    )
+    fit_intensity.add_argument("--split-json", type=Path, required=True)
+    fit_intensity.add_argument("--out", type=Path, required=True, help="Output JSON stem (one file per mode).")
+    fit_intensity.add_argument(
+        "--per-domain", type=int, default=8,
+        help="Reference volumes per domain, taken from the training split only.",
+    )
+    fit_intensity.add_argument("--num-quantiles", type=int, default=256)
+    fit_intensity.add_argument("--mask-threshold", type=float, default=0.0)
+    fit_intensity.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+
+    gate0_coupling = subparsers.add_parser(
+        "gate0-coupling-quality",
+        help="Per-contrast quality of the nn coupling's pseudo-pairs (descriptor distances).",
+    )
+    _add_gate0_common_arguments(gate0_coupling)
+    gate0_coupling.add_argument("--pool-size", type=int, default=4, help="Must equal training.ot_pool_size.")
+    gate0_coupling.add_argument("--nn-candidates", type=int, default=5)
+    gate0_coupling.add_argument("--descriptor-cache", type=Path, default=None)
+
+    gate0_report = subparsers.add_parser(
+        "gate0-report",
+        help="Assemble the per-contrast diagnostic table from the Gate-0 result JSONs.",
+    )
+    gate0_report.add_argument("--reference", type=Path, default=None)
+    gate0_report.add_argument("--sweep", type=Path, default=None)
+    gate0_report.add_argument("--residual", type=Path, default=None)
+    gate0_report.add_argument("--coupling", type=Path, default=None)
+    gate0_report.add_argument("--residual-baseline", default="foreground", choices=("all", "foreground"))
+    gate0_report.add_argument("--out", type=Path, default=None)
+
     gate0_reference = subparsers.add_parser(
         "gate0-reference-gate",
-        help="Steps 3+4: identity / affine / SB / SB-minus-affine on the traveller pairs.",
+        help="Steps 3+4: identity / affine / intensity / SB / SB-minus-affine on the traveller pairs.",
     )
     _add_gate0_common_arguments(gate0_reference)
     gate0_reference.add_argument("--affine-baseline", type=Path, required=True, help="Fitted affine JSON.")
+    gate0_reference.add_argument(
+        "--intensity-baseline", type=Path, nargs="*", default=(),
+        help="Fitted image-space intensity baseline JSON(s). Applied to the identity "
+        "reconstruction, so they add no decode cost.",
+    )
+    gate0_reference.add_argument(
+        "--resume", action="store_true",
+        help="Reuse pairs already scored into <out>.pairs.jsonl. Full-volume decoding is ~1 h; "
+        "a Colab disconnect should not cost all of it.",
+    )
     gate0_reference.add_argument("--transport-config", type=Path, default=None)
     gate0_reference.add_argument(
         "--transport-checkpoint", type=Path, default=None,
@@ -1618,7 +1670,63 @@ def main(argv: list[str] | None = None) -> int:
                           "channels": channels, "bank": provenance}, indent=2, sort_keys=True))
         return 0
 
-    if args.command in ("gate0-sweep", "gate0-reference-gate", "gate0-residual-gate"):
+    if args.command == "fit-intensity-baseline":
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): name
+            for name in ("train", "validation", "test")
+            for record in splits.records_for(name)
+        }
+        chosen = reference_volume_records(
+            records, split_of_case=split_of_case, per_domain=args.per_domain
+        )
+        if not chosen:
+            raise SystemExit("No training-split records found to fit intensity references on.")
+        device = _resolve_device(args.device)
+
+        def _stream():
+            for record in chosen:
+                yield load_volume(record).to(device), record.domain
+
+        baselines = fit_image_intensity_baselines(
+            _stream(),
+            num_quantiles=args.num_quantiles,
+            mask_threshold=args.mask_threshold,
+            provenance={"split_json": str(args.split_json), "per_domain": args.per_domain},
+            log=True,
+        )
+        written = {}
+        for mode, baseline in baselines.items():
+            path = args.out.with_name(f"{args.out.stem}_{mode}{args.out.suffix or '.json'}")
+            baseline.save(path)
+            written[mode] = str(path)
+        print(json.dumps({"written": written, "reference_volumes": len(chosen)},
+                         indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "gate0-report":
+        def _read(path):
+            return json.loads(path.read_text(encoding="utf-8")) if path is not None else None
+
+        table = per_contrast_diagnostics(
+            reference=_read(args.reference),
+            sweep=_read(args.sweep),
+            residual=_read(args.residual),
+            coupling=_read(args.coupling),
+            residual_baseline=args.residual_baseline,
+        )
+        if args.out is not None:
+            write_gate0_result(table, args.out)
+        print(json.dumps(table, indent=2, sort_keys=True, default=str))
+        return 0
+
+    if args.command in (
+        "gate0-sweep",
+        "gate0-reference-gate",
+        "gate0-residual-gate",
+        "gate0-coupling-quality",
+    ):
         import torch
 
         bank_manifest = json.loads((args.bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
@@ -1646,7 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
         # a single subject and no cross-subject estimate at all.
         if (
             contaminated
-            and args.command != "gate0-residual-gate"
+            and args.command not in ("gate0-residual-gate", "gate0-coupling-quality")
             and not args.allow_training_subjects
         ):
             raise SystemExit(
@@ -1688,6 +1796,25 @@ def main(argv: list[str] | None = None) -> int:
                     include_identity_target=not args.exclude_identity_target,
                 ),
             )
+        elif args.command == "gate0-coupling-quality":
+            from fieldbridge.training.stage2_transport import build_latent_descriptors
+
+            train_index = LatentBankIndex(args.bank_dir, "train", split_json=args.split_json)
+            cache = args.descriptor_cache or (
+                args.bank_dir / f"descriptors_train_pool{args.pool_size}.pt"
+            )
+            descriptors = build_latent_descriptors(
+                train_index, stats, pool_size=args.pool_size, cache_path=cache, log=True
+            )
+            result = coupling_quality_by_contrast(
+                train_index=train_index,
+                train_descriptors=descriptors,
+                cases=cases,
+                latents_by_case=latents,
+                stats=stats,
+                pool_size=args.pool_size,
+                nn_candidates=args.nn_candidates,
+            )
         elif args.command == "gate0-reference-gate":
             baseline = AffineLatentBaseline.load(args.affine_baseline)
             vae_model_config = _model_config(_load_optional_config(args.vae_config))
@@ -1704,26 +1831,63 @@ def main(argv: list[str] | None = None) -> int:
                     raise SystemExit("--transport-checkpoint also needs --transport-config.")
                 sb = _sb_transport()
                 methods["sb_v2"] = sb
-                methods["sb_v2_minus_affine"] = compose_minus(sb, baseline.transport)
-            result = evaluate_reference_gate(
-                methods=methods,
-                decoder=decoder,
-                records=records,
-                latents_by_case=latents,
-                cases=cases,
-                decode=DecodeSpec.from_bank_manifest(bank_manifest),
-                device=device,
-                spec=ReferenceGateSpec(
-                    metrics=tuple(args.metrics),
-                    robust=RobustNormSpec(
-                        low_percentile=args.robust_percentiles[0],
-                        high_percentile=args.robust_percentiles[1],
-                    ),
-                    strata=StratumSpec(catastrophic_identity_nrmse=args.catastrophic_identity_nrmse),
-                ),
-                include_ceiling=not args.no_ceiling,
+                # Diagnostic decomposition, not a model variant: see compose_minus.
+                methods["sb_v2_minus_affine_diagnostic"] = compose_minus(sb, baseline.transport)
+
+            image_methods: dict[str, Any] = {}
+            for path in args.intensity_baseline:
+                intensity = ImageIntensityBaseline.load(path)
+                image_methods[f"identity_{intensity.mode}"] = (
+                    lambda image, source, target, _b=intensity: _b.apply(image, target)
+                )
+
+            # Per-pair streaming so a disconnect costs one pair, not the whole hour.
+            partial_path = (
+                args.out.with_name(f"{args.out.name}.pairs.jsonl") if args.out is not None else None
             )
+            completed: list[dict[str, Any]] = []
+            if args.resume and partial_path is not None and partial_path.exists():
+                completed = [
+                    json.loads(line)
+                    for line in partial_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            handle = partial_path.open("a", encoding="utf-8") if partial_path is not None else None
+
+            def _record_pair(row: Mapping[str, Any]) -> None:
+                if handle is not None:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+                    handle.flush()
+
+            try:
+                result = evaluate_reference_gate(
+                    methods=methods,
+                    image_methods=image_methods,
+                    decoder=decoder,
+                    records=records,
+                    latents_by_case=latents,
+                    cases=cases,
+                    decode=DecodeSpec.from_bank_manifest(bank_manifest),
+                    device=device,
+                    spec=ReferenceGateSpec(
+                        metrics=tuple(args.metrics),
+                        robust=RobustNormSpec(
+                            low_percentile=args.robust_percentiles[0],
+                            high_percentile=args.robust_percentiles[1],
+                        ),
+                        strata=StratumSpec(
+                            catastrophic_identity_nrmse=args.catastrophic_identity_nrmse
+                        ),
+                    ),
+                    include_ceiling=not args.no_ceiling,
+                    on_pair=_record_pair,
+                    completed_pairs=completed,
+                )
+            finally:
+                if handle is not None:
+                    handle.close()
             result["affine_baseline"] = str(args.affine_baseline)
+            result["intensity_baselines"] = [str(p) for p in args.intensity_baseline]
         else:
             baselines = {}
             for path in args.affine_baseline:

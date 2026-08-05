@@ -10,6 +10,39 @@ VAE sha256 `74132b9c…`, roundtrip SSIM3D 0.9735, counts 1590/189/205
 **Split:** `split_v4_111` regenerated after the fingerprint fix — 0007 train / 0006 validation /
 0009 test. **0009 untouched.**
 
+## Revision, 2026-08-05 (post-review)
+
+The question this gate answers was sharpened: not "can Stage 1 reconstruct" (run C settled
+that) but **is Stage 2 learning conditional field translation from unpaired distributions, or
+mostly an intensity/statistical shortcut?** Four corrections followed, and they change what the
+results below may be used to claim:
+
+1. **The latent affine alone cannot test the shortcut hypothesis.** Its closed form is exact
+   only under a 1-D Gaussian marginal approximation per channel, while the channels are
+   spatial, non-Gaussian and decoded nonlinearly. So `latent affine ≈ SB` is strong evidence of
+   a shortcut, but `latent affine ≠ SB` rules out only a per-channel latent affine. Image-space
+   baselines were added — robust-affine and full histogram matching applied to the identity
+   reconstruction, fitted from training subjects only. Histogram matching is the strongest
+   purely photometric map available, so anything a model gains over it is not photometric.
+2. **Responsiveness is not direction.** The sweep now also assigns each output to the nearest
+   of that subject's five real target latents (chance 1/5), reporting correct-target fraction,
+   rank of the requested field, and the margin against the wrong domains.
+3. **The cross-subject residual cosine is descriptive, not a ceiling.** Registration error and
+   anatomical variation attenuate a voxelwise cosine even when a transferable effect exists. It
+   is reported as a reference scale, excluded from the decision rule, and the verdict is
+   explicitly one Gate-0 input rather than a standalone decision.
+4. **`sb_v2_minus_affine` is a diagnostic decomposition, not a model variant** — renamed
+   accordingly. It can leave the latent manifold, so its metrics are not a claim about any
+   deployable system and it is never promoted on its score. `ssim_robust` likewise stays
+   labelled diagnostic and is never substituted for official SSIM.
+
+Also added: per-contrast coupling-quality measurement in the coupling's own descriptor space,
+an assembled per-contrast evidence table, per-pair resumable decoding, a provenance contract,
+and a `RUN_EXPENSIVE_REFERENCE` gate so the A100 step is turned on deliberately.
+
+The step-2 and step-5 numbers below are unchanged by this revision; their **interpretation** is
+narrowed as described.
+
 ## What this gate asked
 
 v2 scored held-out 0006 at nRMSE 0.459 / SSIM 0.880 against identity 0.595 / 0.876 and a frozen
@@ -112,6 +145,17 @@ latent displacement is **48 % as large as a whole different brain** (0.133 vs an
 of 0.277) and only **0.5–1.4 % of it transfers between the two travellers** — 3.8–11.9 % of what
 imperfect anatomical alignment would even allow. The cross-field transformation, as this frozen
 VAE encodes it, is close to subject-specific.
+
+## Evaluation protocol from here
+
+Develop and debug on training traveller **0007**, with `--allow-training-subjects` and the
+result labelled development evidence. Freeze code, thresholds and report format. Then evaluate
+**once** on 0006. 0009 stays untouched.
+
+Once a design is locked, the final read is three-fold traveller LOSO with all three
+subject-level results reported. With three subjects that is descriptive evidence, not a
+population estimate; the safeguard is that no model choice or threshold may change after a fold
+is inspected.
 
 ## Honest limits of this verdict
 

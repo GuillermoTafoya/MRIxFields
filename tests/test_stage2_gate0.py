@@ -22,6 +22,7 @@ from fieldbridge.evaluation.stage2_gate0 import (
     f16_quantization_energy,
     gate0_metric_fn,
     latent_rms,
+    per_contrast_diagnostics,
     residual_energy_gate,
     robust_normalize,
     wrong_target_sweep,
@@ -208,6 +209,47 @@ def test_sweep_passes_an_oracle_that_returns_the_real_target_latent() -> None:
     )
 
 
+def test_sweep_separates_responding_from_responding_correctly() -> None:
+    """A model can react strongly to its conditioning and still go to the wrong domain."""
+
+    cases = _cases(subjects=("0006",))
+    latents = _latents(cases, seed=41)
+    by_domain = {(c.subject_id, c.domain.field_strength_t): c.case_id for c in cases}
+    # Answer every request with the real target of a DIFFERENT field: maximal responsiveness,
+    # zero directional correctness.
+    wrong = {FIELDS[i]: FIELDS[(i + 1) % len(FIELDS)] for i in range(len(FIELDS))}
+
+    def misdirected(z, source, target):
+        return latents[by_domain[("0006", wrong[target.field_strength_t])]]
+
+    result = wrong_target_sweep(
+        transport=misdirected, latents_by_case=latents, cases=cases, log=False
+    )
+    summary = result["summary"]
+    assert summary["responds_fraction"] == 1.0  # it moves plenty
+    assert summary["correct_target_fraction"] == 0.0  # never to the requested domain
+    assert summary["directionally_correct_fraction"] == 0.0
+    assert summary["mean_classification_margin"] < 0  # actively resembles the wrong domain
+
+
+def test_sweep_oracle_is_directionally_perfect() -> None:
+    cases = _cases(subjects=("0006",))
+    latents = _latents(cases, seed=42)
+    by_domain = {(c.subject_id, c.domain.field_strength_t): c.case_id for c in cases}
+
+    def oracle(z, source, target):
+        return latents[by_domain[("0006", target.field_strength_t)]]
+
+    result = wrong_target_sweep(
+        transport=oracle, latents_by_case=latents, cases=cases, log=False
+    )
+    summary = result["summary"]
+    assert summary["correct_target_fraction"] == 1.0
+    assert summary["mean_rank_of_requested"] == 1.0
+    assert summary["mean_classification_margin"] > 0
+    assert summary["chance_correct_target_fraction"] == pytest.approx(1.0 / len(FIELDS))
+
+
 def test_sweep_threshold_is_config_driven() -> None:
     cases = _cases(subjects=("0006",))
     latents = _latents(cases, seed=3)
@@ -348,8 +390,8 @@ def test_residual_gate_proceeds_on_a_shared_learnable_residual() -> None:
     assert "1-vs-1" in result["verdict"]["caveat"]
 
 
-def test_predictability_is_reported_against_the_anatomical_alignment_ceiling() -> None:
-    """A voxelwise cross-subject cosine is capped by how well the two brains line up."""
+def test_predictability_is_reported_against_the_anatomical_alignment_scale() -> None:
+    """The cross-subject cosine is descriptive context, never a bound on learnability."""
 
     cases = _cases()
     latents = _latents(cases, seed=31)
@@ -366,14 +408,16 @@ def test_predictability_is_reported_against_the_anatomical_alignment_ceiling() -
     # One cross-subject comparison per (contrast, field): 1 contrast x 3 fields.
     assert alignment["num_comparisons"] == len(FIELDS)
     assert set(alignment["per_domain_cosine"]) == {f"{f:g}T/{CONTRAST.value}" for f in FIELDS}
-    assert alignment["predictable_fraction_ceiling"] == pytest.approx(
+    assert alignment["predictable_fraction_reference_scale"] == pytest.approx(
         alignment["mean_cosine"] ** 2
     )
-    assert predictability["median_predictable_fraction_of_ceiling"] == pytest.approx(
+    assert predictability["median_predictable_fraction_vs_reference_scale"] == pytest.approx(
         predictability["median_predictable_fraction"]
-        / alignment["predictable_fraction_ceiling"]
+        / alignment["predictable_fraction_reference_scale"]
     )
-    # The ceiling is reported, never used to decide: the raw fraction drives the verdict.
+    # It must be labelled descriptive, not as a bound on what a model could learn.
+    assert "NOT an upper bound" in alignment["interpretation"]
+    # And it is reported, never used to decide: the raw fraction drives the verdict.
     checks = result["verdict"]["checks"]["all"]
     assert checks["predictable_above_threshold"] == (
         checks["median_predictable_fraction"] >= result["spec"]["predictable_fraction_min"]
@@ -560,6 +604,121 @@ def test_reference_gate_plumbing_runs_without_the_official_metric_backend() -> N
     for row in result["pairs"]:
         assert row["affine_minus_affine"] == row["identity"]
     assert set(result["by_contrast"]) == {CONTRAST.value}
+
+
+def test_reference_gate_scores_image_methods_without_extra_decodes() -> None:
+    """The intensity baselines are post-decode transforms; they must cost zero extra decodes."""
+
+    cases = _cases(subjects=("0006",))
+    latents = _latents(cases, seed=24)
+    decode_calls: list[str] = []
+
+    class _CountingDecoder(_ToyDecoder):
+        def decode(self, latent, domain):
+            decode_calls.append(domain.label)
+            return super().decode(latent, domain)
+
+    def loader(record: VolumeRecord) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(abs(hash(record.case_id)) % (2**31))
+        return torch.rand(1, 1, 8, 8, 8, generator=generator)
+
+    result = evaluate_reference_gate(
+        methods={"identity": lambda z, s, t: z},
+        image_methods={"identity_scaled": lambda image, s, t: image * 0.5},
+        decoder=_CountingDecoder().eval(),
+        records=_records_for(cases),
+        latents_by_case=latents,
+        cases=cases,
+        decode=DecodeSpec(block_size=(8, 8, 8), halo=(2, 2, 2), precision="float32"),
+        device=torch.device("cpu"),
+        spec=ReferenceGateSpec(metrics=("ssim", "nrmse")),
+        metric_fn=_fake_metric_fn,
+        volume_loader=loader,
+        log=False,
+    )
+
+    # Only the per-case identity/ceiling decodes: no decode is attributable to the image method.
+    assert len(decode_calls) == len(FIELDS)
+    assert result["method_names"] == ["identity", "identity_scaled", "ceiling"]
+    assert all("identity_scaled" in row for row in result["pairs"])
+    assert result["metric_roles"]["diagnostic"] == ["ssim_robust"]
+
+
+def test_reference_gate_resumes_from_completed_pairs() -> None:
+    """An hour of full-volume decoding must survive a Colab disconnect."""
+
+    cases = _cases(subjects=("0006",))
+    latents = _latents(cases, seed=25)
+
+    def loader(record: VolumeRecord) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(abs(hash(record.case_id)) % (2**31))
+        return torch.rand(1, 1, 8, 8, 8, generator=generator)
+
+    kwargs = dict(
+        methods={"identity": lambda z, s, t: z},
+        decoder=_ToyDecoder().eval(),
+        records=_records_for(cases),
+        latents_by_case=latents,
+        cases=cases,
+        decode=DecodeSpec(block_size=(8, 8, 8), halo=(2, 2, 2), precision="float32"),
+        device=torch.device("cpu"),
+        spec=ReferenceGateSpec(metrics=("ssim", "nrmse")),
+        metric_fn=_fake_metric_fn,
+        volume_loader=loader,
+        log=False,
+    )
+
+    streamed: list[dict] = []
+    full = evaluate_reference_gate(on_pair=streamed.append, **kwargs)
+    assert len(streamed) == full["num_pairs"]
+
+    # Resume after an interruption three pairs in.
+    partial = streamed[:3]
+    resumed = evaluate_reference_gate(completed_pairs=partial, **kwargs)
+    assert resumed["num_pairs"] == full["num_pairs"]
+    assert resumed["overall"]["methods"]["identity"] == full["overall"]["methods"]["identity"]
+
+    key = lambda row: (row["subject_id"], row["contrast"], row["source_field_t"], row["target_field_t"])  # noqa: E731
+    assert sorted(map(key, resumed["pairs"])) == sorted(map(key, full["pairs"]))
+
+
+def test_per_contrast_diagnostics_assembles_available_sources_and_flags_the_missing_row() -> None:
+    cases = _cases(subjects=("0006",))
+    latents = _latents(cases, seed=26)
+
+    def loader(record: VolumeRecord) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(abs(hash(record.case_id)) % (2**31))
+        return torch.rand(1, 1, 8, 8, 8, generator=generator)
+
+    reference = evaluate_reference_gate(
+        methods={"identity": lambda z, s, t: z},
+        decoder=_ToyDecoder().eval(),
+        records=_records_for(cases),
+        latents_by_case=latents,
+        cases=cases,
+        decode=DecodeSpec(block_size=(8, 8, 8), halo=(2, 2, 2), precision="float32"),
+        device=torch.device("cpu"),
+        spec=ReferenceGateSpec(metrics=("ssim", "nrmse")),
+        metric_fn=_fake_metric_fn,
+        volume_loader=loader,
+        log=False,
+    )
+    sweep = wrong_target_sweep(
+        transport=lambda z, s, t: z, latents_by_case=latents, cases=cases, log=False
+    )
+
+    table = per_contrast_diagnostics(reference=reference, sweep=sweep)
+    entry = table["by_contrast"][CONTRAST.value]
+    assert "stage1_ceiling" in entry and "identity" in entry
+    assert "target_conditioning" in entry
+    assert table["sources_present"] == {
+        "reference_gate": True,
+        "wrong_target_sweep": True,
+        "residual_gate": False,
+        "coupling_quality": False,
+    }
+    # The one row Gate 0 structurally cannot fill must say so rather than be silently absent.
+    assert "loss_contribution" in table["not_measured"]
 
 
 def test_reference_gate_requires_an_identity_method() -> None:

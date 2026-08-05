@@ -26,6 +26,11 @@ gate0:
     # Keep f_t == f_s in the sweep. It is the identity request, and a model that ignores the
     # target field answers it identically to every other request — which is the tell.
     include_identity_target: true
+    # Responsiveness only says the output CHANGED with the requested field, not that it changed
+    # correctly. Each output is additionally assigned to the nearest of that subject's five real
+    # target latents — same anatomy throughout, so only the field distinguishes the candidates.
+    # Chance is 1/5 = 0.20, so this bar has to clear chance by a real margin to mean anything.
+    correct_target_fraction_min: 0.60
 
   # --- steps 3 + 4: the four-reference gate -------------------------------------------------
   reference_gate:
@@ -42,6 +47,30 @@ gate0:
     robust_low_percentile: 1.0
     robust_high_percentile: 99.0
     robust_mask_threshold: 0.0
+
+  # --- step 2b: image-space intensity baselines ---------------------------------------------
+  # The latent affine tests one narrow mechanism, and its closed form is exact only under a 1-D
+  # Gaussian marginal approximation per channel — while the real channels are spatial,
+  # non-Gaussian and decoded nonlinearly. So the asymmetry in how it may be read is:
+  #   latent affine ~= SB  -> strong evidence of an intensity shortcut.
+  #   latent affine != SB  -> rules out a per-channel latent affine and NOTHING more.
+  # These baselines close that gap in the space where the shortcut is visible. `histogram` is
+  # the strongest purely photometric map available: it reproduces the target domain's entire
+  # intensity distribution while leaving spatial structure untouched, so anything a model gains
+  # over it is by construction not photometric.
+  intensity:
+    per_domain: 8          # reference volumes per domain, TRAINING split only
+    num_quantiles: 256
+    mask_threshold: 0.0
+    low_probability: 0.01
+    high_probability: 0.99
+
+  # --- coupling quality (per-contrast diagnostic) -------------------------------------------
+  # Is the nn coupling handing the transport worse pseudo-pairs for T2/T2-FLAIR than for T1w?
+  # Measured in the coupling's OWN descriptor space, so this is what the coupling actually saw.
+  coupling:
+    pool_size: 4           # must equal training.ot_pool_size in the v2 configs
+    nn_candidates: 5
 
   # --- step 2: the closed-form affine baseline ----------------------------------------------
   affine:
@@ -61,11 +90,17 @@ gate0:
     # no stochastic encode noise, and storage quantization is the only true in-latent floor.
     residual_snr_min: 10.0
     # Fraction of one traveller's residual that the other traveller's residual predicts, which
-    # is exactly the squared cosine between them. This is the ceiling on what a model that
-    # learned a shared per-field-pair residual could transfer to an unseen subject.
+    # is exactly the squared cosine between them.
     #
-    # Read the caveat with the number: the project has two paired travellers (0007, 0006), so
-    # this is a 1-vs-1 indicator, not a statistic, and it carries no confidence interval.
+    # Read the caveats with the number. (1) The project has two paired travellers (0007, 0006),
+    # so this is a 1-vs-1 indicator, not a statistic, and carries no confidence interval.
+    # (2) It is a VOXELWISE statistic across two different brains, so registration error and
+    # anatomical variation attenuate it even when a transferable effect exists. The gate
+    # measures that attenuation (cross-subject same-domain latent cosine) and reports the
+    # residual cosine against it as descriptive context — NOT as a ceiling, and NOT as part of
+    # the decision rule. A low value is consistent both with "no transferable field effect" and
+    # with "an effect a fixed inner product cannot see". This verdict is one Gate-0 input among
+    # several, not a standalone decision.
     predictable_fraction_min: 0.05
     # 0009 was spent once as held-out evidence and is frozen. Gate 0 must not touch it.
     excluded_subjects: ["0009"]

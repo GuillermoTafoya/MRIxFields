@@ -192,11 +192,17 @@ class SweepSpec:
     # Include f_t == f_s in the sweep. It is the identity request, and a model that ignores
     # the target field answers it identically to every other request, which is the tell.
     include_identity_target: bool = True
+    # Fraction of requests whose output must land nearest its OWN real target for the case to
+    # count as directionally correct. Chance is 1/5 = 0.20 with five candidate fields, so this
+    # has to clear chance by a margin to mean anything.
+    correct_target_fraction_min: float = 0.60
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "responsiveness_min": self.responsiveness_min,
             "include_identity_target": self.include_identity_target,
+            "correct_target_fraction_min": self.correct_target_fraction_min,
+            "chance_correct_target_fraction": None,  # filled per case from the field count
         }
 
 
@@ -209,12 +215,19 @@ def wrong_target_sweep(
     spec: SweepSpec = SweepSpec(),
     log: bool = True,
 ) -> dict[str, Any]:
-    """Fix a real source, request all five target fields, and see whether the output moves.
+    """Fix a real source, request all five target fields, and see whether the output moves —
+    and whether it moves in the right direction.
 
-    For every (subject, contrast, source field): transport to each of the five fields, then
-    report distance-to-source per target, the full pairwise distance matrix between the five
-    outputs, and the same two quantities for the REAL target latents as the yardstick of how
-    far the output *should* travel. Latent-space only — no decode, so this is nearly free.
+    Two separate questions, deliberately not conflated:
+
+    - **Responsiveness.** Does the output change at all with the requested field? Reported as
+      the spread of the five outputs against the spread of the five REAL target latents.
+    - **Direction.** Does it change *correctly*? For each request, the output is assigned to
+      the nearest of that subject's five real target latents — a target-domain classifier with
+      no training and no extra data. Responsiveness without direction is a model that reacts to
+      its conditioning by moving somewhere arbitrary, which is not translation.
+
+    Latent-space only, no decode, so this is nearly free.
     """
 
     by_group: dict[tuple[str, str], dict[float, Any]] = {}
@@ -253,6 +266,31 @@ def wrong_target_sweep(
             real_spread = _mean(real_pairwise.values())
             responsiveness = spread / real_spread if real_spread > 0 else 0.0
 
+            # Target-domain classification: assign each output to the nearest real target
+            # latent of this same subject and contrast. Same anatomy throughout, so the only
+            # thing distinguishing the candidates is the field.
+            classification: list[dict[str, Any]] = []
+            for requested in targets:
+                distances = {other: latent_rms(outputs[requested], reals[other]) for other in targets}
+                ordered_by_distance = sorted(targets, key=lambda f: distances[f])
+                nearest = ordered_by_distance[0]
+                wrong = [distances[f] for f in targets if f != requested]
+                classification.append(
+                    {
+                        "requested_field_t": requested,
+                        "nearest_real_field_t": nearest,
+                        "correct": nearest == requested,
+                        "rank_of_requested": ordered_by_distance.index(requested) + 1,
+                        "distance_to_requested": distances[requested],
+                        "mean_distance_to_wrong": _mean(wrong),
+                        # Positive means the requested target is closer than the average wrong
+                        # one; negative means the output actively resembles the wrong domain.
+                        "margin": _mean(wrong) - distances[requested],
+                    }
+                )
+            correct_fraction = _mean([float(item["correct"]) for item in classification])
+            chance = 1.0 / len(targets)
+
             # Monotone in |log(f_t / f_s)|: the further the requested field, the further the
             # output should sit from the source.
             ordered = sorted(targets, key=lambda f: abs(math.log(f / source_field)))
@@ -280,50 +318,63 @@ def wrong_target_sweep(
                 "monotone_in_log_field_ratio": monotone,
                 "real_monotone_in_log_field_ratio": real_monotone,
                 "responds": responsiveness >= spec.responsiveness_min,
+                "target_classification": classification,
+                "correct_target_fraction": correct_fraction,
+                "chance_correct_target_fraction": chance,
+                "mean_classification_margin": _mean(
+                    [item["margin"] for item in classification]
+                ),
+                "mean_rank_of_requested": _mean(
+                    [item["rank_of_requested"] for item in classification]
+                ),
+                "directionally_correct": correct_fraction >= spec.correct_target_fraction_min,
             }
             rows.append(row)
             if log:
                 print(
                     f"gate0_sweep {subject_id} {contrast} src={source_field:g}T "
-                    f"spread={spread:.4f} real_spread={real_spread:.4f} "
-                    f"R={responsiveness:.3f} monotone={monotone} responds={row['responds']}",
+                    f"R={responsiveness:.3f} responds={row['responds']} "
+                    f"correct_target={correct_fraction:.2f} (chance {chance:.2f}) "
+                    f"margin={row['mean_classification_margin']:+.4f} monotone={monotone}",
                     flush=True,
                 )
 
-    summary = {
-        "num_cases": len(rows),
-        "responds_fraction": _mean([float(r["responds"]) for r in rows]),
-        "monotone_fraction": _mean([float(r["monotone_in_log_field_ratio"]) for r in rows]),
-        "real_monotone_fraction": _mean(
-            [float(r["real_monotone_in_log_field_ratio"]) for r in rows]
-        ),
-        "mean_responsiveness": _mean([r["responsiveness"] for r in rows]),
-    }
-    by_contrast = {
-        contrast: {
-            "num_cases": sum(1 for r in rows if r["contrast"] == contrast),
-            "responds_fraction": _mean(
-                [float(r["responds"]) for r in rows if r["contrast"] == contrast]
-            ),
+    def block(subset: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        return {
+            "num_cases": len(subset),
+            "responds_fraction": _mean([float(r["responds"]) for r in subset]),
+            "mean_responsiveness": _mean([r["responsiveness"] for r in subset]),
             "monotone_fraction": _mean(
-                [
-                    float(r["monotone_in_log_field_ratio"])
-                    for r in rows
-                    if r["contrast"] == contrast
-                ]
+                [float(r["monotone_in_log_field_ratio"]) for r in subset]
             ),
-            "mean_responsiveness": _mean(
-                [r["responsiveness"] for r in rows if r["contrast"] == contrast]
+            "real_monotone_fraction": _mean(
+                [float(r["real_monotone_in_log_field_ratio"]) for r in subset]
+            ),
+            "correct_target_fraction": _mean([r["correct_target_fraction"] for r in subset]),
+            "chance_correct_target_fraction": _mean(
+                [r["chance_correct_target_fraction"] for r in subset]
+            ),
+            "mean_classification_margin": _mean(
+                [r["mean_classification_margin"] for r in subset]
+            ),
+            "mean_rank_of_requested": _mean([r["mean_rank_of_requested"] for r in subset]),
+            "directionally_correct_fraction": _mean(
+                [float(r["directionally_correct"]) for r in subset]
             ),
         }
+
+    summary = block(rows)
+    by_contrast = {
+        contrast: block([r for r in rows if r["contrast"] == contrast])
         for contrast in sorted({r["contrast"] for r in rows})
     }
     if log:
         print(
             f"gate0_sweep DONE cases={summary['num_cases']} "
             f"responds={summary['responds_fraction']:.3f} "
-            f"monotone={summary['monotone_fraction']:.3f} "
-            f"mean_R={summary['mean_responsiveness']:.3f}",
+            f"correct_target={summary['correct_target_fraction']:.3f} "
+            f"(chance {summary['chance_correct_target_fraction']:.3f}) "
+            f"margin={summary['mean_classification_margin']:+.4f}",
             flush=True,
         )
     return {
@@ -378,14 +429,26 @@ def evaluate_reference_gate(
     device: torch.device,
     spec: ReferenceGateSpec = ReferenceGateSpec(),
     include_ceiling: bool = True,
+    image_methods: Mapping[str, Callable[[torch.Tensor, Domain, Domain], torch.Tensor]] | None = None,
     metric_fn: Callable[..., dict[str, float]] = gate0_metric_fn,
     volume_loader: Callable[[VolumeRecord], torch.Tensor] = load_volume,
+    on_pair: Callable[[dict[str, Any]], None] | None = None,
+    completed_pairs: Sequence[Mapping[str, Any]] = (),
     log: bool = True,
 ) -> dict[str, Any]:
-    """Score N named latent-space references on every traveller pair, one decode per reference.
+    """Score N named references on every traveller pair, one decode per latent reference.
 
-    ``methods`` maps a name to a raw-latent transport. ``identity`` should be one of them; the
-    stratification is defined by its official nRMSE, so it is required.
+    ``methods`` maps a name to a raw-latent transport. ``identity`` is required: the difficulty
+    strata are defined by its official nRMSE.
+
+    ``image_methods`` maps a name to a post-decode transform of the IDENTITY reconstruction.
+    That is where the intensity baselines live — they are photometric maps of a volume the gate
+    has already decoded, so they add no decode cost, and they test the shortcut hypothesis in
+    the space where it is actually visible.
+
+    ``on_pair`` is called with each completed row, and ``completed_pairs`` seeds the run with
+    rows from a previous attempt. Together they make an hour of full-volume decoding resumable
+    across a Colab disconnect instead of restartable from zero.
     """
 
     if "identity" not in methods:
@@ -424,12 +487,22 @@ def evaluate_reference_gate(
             decoded_cache[case.case_id] = decode_raw(latents_by_case[case.case_id], case.domain)
         return decoded_cache[case.case_id]
 
-    pairs: list[dict[str, Any]] = []
+    pairs: list[dict[str, Any]] = [dict(row) for row in completed_pairs]
+    already_done = {
+        (str(row["subject_id"]), str(row["contrast"]), float(row["source_field_t"]),
+         float(row["target_field_t"]))
+        for row in pairs
+    }
+    if pairs and log:
+        print(f"gate0_ref resuming with {len(pairs)} pair(s) already scored", flush=True)
+
     for (subject_id, contrast), field_map in sorted(by_group.items()):
         fields = sorted(field_map)
         for field_s in fields:
             for field_t in fields:
                 if field_s == field_t:
+                    continue
+                if (subject_id, contrast, field_s, field_t) in already_done:
                     continue
                 src, tgt = field_map[field_s], field_map[field_t]
                 target_image = volume_loader(record_by_case[tgt.case_id]).to(device)
@@ -461,6 +534,16 @@ def evaluate_reference_gate(
                     )
                     if name != "identity":
                         del image
+                # Post-decode photometric maps of the identity reconstruction. No extra decode:
+                # this is the same volume, intensity-remapped onto the target domain.
+                for name, transform in (image_methods or {}).items():
+                    row[name] = metric_fn(
+                        transform(decoded_case(src), src.domain, tgt.domain),
+                        target_image,
+                        metrics=spec.metrics,
+                        device=device.type,
+                        robust=spec.robust,
+                    )
                 if include_ceiling:
                     row["ceiling"] = metric_fn(
                         decoded_case(tgt),
@@ -470,18 +553,20 @@ def evaluate_reference_gate(
                         robust=spec.robust,
                     )
                 pairs.append(row)
+                if on_pair is not None:
+                    on_pair(row)
                 if log:
                     print(
                         f"gate0_ref {subject_id} {contrast} {field_s:g}T->{field_t:g}T "
                         + " ".join(
                             f"{name}={_fmt(row[name])}"
-                            for name in list(methods) + (["ceiling"] if include_ceiling else [])
+                            for name in _method_names(methods, image_methods, include_ceiling)
                         ),
                         flush=True,
                     )
                 del target_image
 
-    method_names = list(methods) + (["ceiling"] if include_ceiling else [])
+    method_names = _method_names(methods, image_methods, include_ceiling)
     # Index-based split: two traveller pairs can legitimately produce identical metric dicts,
     # and a value-equality `not in` would then drop the duplicate out of `ordinary`.
     catastrophic_index = {
@@ -504,6 +589,14 @@ def evaluate_reference_gate(
         "contract_version": GATE0_CONTRACT_VERSION,
         "spec": spec.to_dict(),
         "method_names": method_names,
+        # Kept explicit so a diagnostic column can never be mistaken for, or substituted into,
+        # the official Task-3 scoring. `ssim_robust` rescales both volumes by their own
+        # percentiles first; it answers "is the structure right" and is not comparable with
+        # any leaderboard number.
+        "metric_roles": {
+            "official": [m for m in spec.metrics],
+            "diagnostic": ["ssim_robust"] if spec.robust.enabled else [],
+        },
         "num_pairs": len(pairs),
         "subjects": sorted({row["subject_id"] for row in pairs}),
         "decode": {
@@ -736,15 +829,18 @@ def _anatomical_alignment(
 ) -> dict[str, Any]:
     """Voxelwise cosine between DIFFERENT subjects' latents in the SAME domain.
 
-    The predictable fraction is a voxelwise comparison across two brains, so it is capped by
-    how well those brains line up in the first place: if the volumes were not in a shared
-    space the comparison would be meaningless, and even in a shared space imperfect alignment
-    attenuates any genuinely shared effect. This measures that cap directly instead of
-    assuming it.
+    Context for the predictable fraction, which is a voxelwise comparison across two brains:
+    if the volumes were not in a shared space the comparison would be near-meaningless, and
+    even in a shared space, registration error and anatomical variation attenuate any
+    genuinely shared effect. This measures that attenuation instead of assuming it.
 
-    It is a generous cap. A residual is a difference field, higher-frequency and less
-    spatially forgiving than the raw latents measured here, so the real transferability
-    ceiling for residuals sits at or below this number.
+    **This is a descriptive reference scale, not a ceiling.** A low cross-subject residual
+    cosine is consistent with "no transferable field effect" AND with "a transferable effect
+    that voxelwise cosine cannot see across unaligned anatomy". Nothing here separates those
+    two, and the number must not be read as an upper bound on what a model could learn — a
+    model can exploit spatially adaptive structure that a fixed voxelwise inner product
+    cannot. Treat it as the scale against which the residual cosine is small or not, and
+    nothing more.
     """
 
     cosines: list[float] = []
@@ -776,10 +872,17 @@ def _anatomical_alignment(
     mean_cosine = _mean(cosines)
     return {
         "mean_cosine": mean_cosine,
-        # The ceiling on a squared-cosine (variance-explained) statistic between subjects.
-        "predictable_fraction_ceiling": mean_cosine * mean_cosine,
+        # Squared, to be comparable with the squared-cosine predictable fraction. Named a
+        # reference scale, not a ceiling: see this function's docstring.
+        "predictable_fraction_reference_scale": mean_cosine * mean_cosine,
         "num_comparisons": len(cosines),
         "per_domain_cosine": per_domain,
+        "interpretation": (
+            "Descriptive reference scale for the cross-subject residual cosine. NOT an upper "
+            "bound on learnability: a low value is equally consistent with no transferable "
+            "field effect and with a transferable effect that voxelwise cosine cannot detect "
+            "across imperfectly aligned anatomy."
+        ),
     }
 
 
@@ -831,7 +934,7 @@ def _predictability(
 
     cosines = [item["cosine"] for item in aligned]
     fractions = [item["predictable_fraction"] for item in aligned]
-    ceiling = float(alignment["predictable_fraction_ceiling"])
+    reference_scale = float(alignment["predictable_fraction_reference_scale"])
     median_fraction = _median(fractions)
     summary = {
         "space": space,
@@ -843,10 +946,10 @@ def _predictability(
         "control_mean_cosine_mismatched_field_pair": _mean(control),
         "control_num_comparisons": len(control),
         "anatomical_alignment": dict(alignment),
-        # The raw fraction against the cap that imperfect cross-subject alignment imposes:
-        # "of the transferable signal that COULD be measured this way, how much is there?"
-        "median_predictable_fraction_of_ceiling": (
-            median_fraction / ceiling if ceiling > 0 else 0.0
+        # The raw fraction expressed relative to the cross-subject alignment scale. Descriptive
+        # context, not a normalized score: the denominator is a reference scale, not a bound.
+        "median_predictable_fraction_vs_reference_scale": (
+            median_fraction / reference_scale if reference_scale > 0 else 0.0
         ),
         "per_field_pair": aligned,
     }
@@ -855,7 +958,7 @@ def _predictability(
             f"gate0_predictability[{space}] pairs={len(aligned)} "
             f"median_cos={summary['median_cosine']:.4f} "
             f"median_predictable={median_fraction:.4f} "
-            f"of_ceiling={summary['median_predictable_fraction_of_ceiling']:.4f} "
+            f"vs_reference={summary['median_predictable_fraction_vs_reference_scale']:.4f} "
             f"alignment_cos={alignment['mean_cosine']:.4f} "
             f"control_cos={summary['control_mean_cosine_mismatched_field_pair']:.4f}",
             flush=True,
@@ -909,13 +1012,12 @@ def _residual_verdict(result: Mapping[str, Any], spec: ResidualGateSpec) -> dict
             "above_storage_floor": above_storage_floor,
             "median_predictable_fraction": predictable,
             "predictable_above_threshold": learnable,
-            # Reported, NOT part of the decision rule. The alignment ceiling was measured
-            # after the first run exposed the confound, and moving a pre-declared threshold
-            # onto a statistic chosen once the numbers were visible is the exact failure mode
-            # the pre-registration in the config exists to prevent. It is here so the reader
-            # can see how much of the gap is measurement attenuation rather than absent signal.
-            "median_predictable_fraction_of_ceiling": block["predictability"][
-                "median_predictable_fraction_of_ceiling"
+            # Reported, NOT part of the decision rule, and not a normalized score. The
+            # alignment scale was measured after the first run exposed the confound, and
+            # moving a pre-declared threshold onto a statistic chosen once the numbers were
+            # visible is the exact failure mode the pre-registration exists to prevent.
+            "median_predictable_fraction_vs_reference_scale": block["predictability"][
+                "median_predictable_fraction_vs_reference_scale"
             ],
             "anatomical_alignment_cosine": block["predictability"]["anatomical_alignment"][
                 "mean_cosine"
@@ -938,8 +1040,186 @@ def _residual_verdict(result: Mapping[str, Any], spec: ResidualGateSpec) -> dict
         "checks": checks,
         "caveat": (
             "The predictable fraction is estimated from two paired travellers (1-vs-1). It is "
-            "an indicator, not a statistic, and cannot be given a confidence interval."
+            "an indicator, not a statistic, and cannot be given a confidence interval. It is "
+            "also a voxelwise statistic across imperfectly aligned anatomy, so a low value "
+            "does not by itself establish that no transferable field effect exists — only "
+            "that this measurement does not see one. This verdict is one input among the "
+            "Gate-0 diagnostics, not a standalone decision."
         ),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Per-contrast diagnostics: why T2w and T2-FLAIR look worse
+# --------------------------------------------------------------------------------------
+
+
+@torch.inference_mode()
+def coupling_quality_by_contrast(
+    *,
+    train_index: Any,
+    train_descriptors: torch.Tensor,
+    cases: Sequence[Any],
+    latents_by_case: Mapping[str, torch.Tensor],
+    stats: LatentStats,
+    pool_size: int,
+    nn_candidates: int = 5,
+    log: bool = True,
+) -> dict[str, Any]:
+    """How good the ``nn`` unpaired coupling's pseudo-pairs are, per contrast.
+
+    For each traveller source and each other field, find the nearest training-pool records of
+    the target domain in descriptor space and report that distance. If T2/T2-FLAIR sources sit
+    systematically further from their retrieved partner than T1w sources do, the coupling is
+    handing the transport a worse pseudo-pair for those contrasts, and any per-contrast
+    difference downstream is at least partly a data-association problem rather than a modelling
+    one. Descriptor distance is the coupling's own cost, so this is what the coupling saw —
+    not a proxy for it.
+    """
+
+    # The coupling's own pooling, imported rather than reimplemented: a second copy that
+    # drifted would silently measure a different space than the one the coupling ranked in.
+    from fieldbridge.training.stage2_transport import _spatial_pool
+
+    records = list(train_index.records)
+    by_domain: dict[str, list[int]] = {}
+    for position, record in enumerate(records):
+        by_domain.setdefault(record.domain.label, []).append(position)
+
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        contrast = Contrast.parse(case.domain.contrast).value
+        source_descriptor = _spatial_pool(
+            stats.normalize(latents_by_case[case.case_id].unsqueeze(0)), pool_size
+        ).reshape(-1)
+        for target_label, positions in sorted(by_domain.items()):
+            if not target_label.endswith(f"/{contrast}"):
+                continue
+            if target_label == case.domain.label:
+                continue
+            candidates = train_descriptors[positions].to(source_descriptor.device)
+            distances = torch.cdist(
+                source_descriptor.reshape(1, -1), candidates.reshape(len(positions), -1)
+            ).reshape(-1)
+            best = torch.topk(distances, k=min(nn_candidates, distances.numel()), largest=False)
+            rows.append(
+                {
+                    "subject_id": case.subject_id,
+                    "contrast": contrast,
+                    "source_field_t": float(case.domain.field_strength_t),
+                    "target_domain": target_label,
+                    "pool_size": len(positions),
+                    "nearest_distance": float(best.values[0]),
+                    "mean_candidate_distance": float(best.values.mean()),
+                    "median_pool_distance": float(distances.median()),
+                }
+            )
+            if log:
+                print(
+                    f"gate0_coupling {case.subject_id} {case.domain.label} -> {target_label} "
+                    f"nearest={rows[-1]['nearest_distance']:.4f} "
+                    f"pool_median={rows[-1]['median_pool_distance']:.4f} n={len(positions)}",
+                    flush=True,
+                )
+
+    def block(subset: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        return {
+            "num_retrievals": len(subset),
+            "mean_nearest_distance": _mean([r["nearest_distance"] for r in subset]),
+            "mean_candidate_distance": _mean([r["mean_candidate_distance"] for r in subset]),
+            "mean_pool_median_distance": _mean([r["median_pool_distance"] for r in subset]),
+            # How much closer the retrieved partner is than a random pool member. Near 1.0 means
+            # the retrieval found nothing special and the coupling is effectively random.
+            "retrieval_advantage": (
+                _mean([r["nearest_distance"] for r in subset])
+                / _mean([r["median_pool_distance"] for r in subset])
+                if subset and _mean([r["median_pool_distance"] for r in subset]) > 0
+                else 0.0
+            ),
+        }
+
+    return {
+        "contract_version": GATE0_CONTRACT_VERSION,
+        "pool_size": pool_size,
+        "nn_candidates": nn_candidates,
+        "overall": block(rows),
+        "by_contrast": {
+            contrast: block([r for r in rows if r["contrast"] == contrast])
+            for contrast in sorted({r["contrast"] for r in rows})
+        },
+        "retrievals": rows,
+    }
+
+
+def per_contrast_diagnostics(
+    *,
+    reference: Mapping[str, Any] | None = None,
+    sweep: Mapping[str, Any] | None = None,
+    residual: Mapping[str, Any] | None = None,
+    coupling: Mapping[str, Any] | None = None,
+    residual_baseline: str = "foreground",
+) -> dict[str, Any]:
+    """Assemble the per-contrast evidence table from whichever Gate-0 outputs are available.
+
+    The question this answers: T2w and T2-FLAIR look worse — is that a Stage-1 ceiling, a
+    coupling-quality problem, or a shortcut that only works for T1w? Each column comes from a
+    different diagnostic, so a contrast that is bad in only one column is a different problem
+    from one that is bad in all of them.
+
+    ``loss_contribution`` is deliberately absent: it needs per-contrast loss/gradient
+    instrumentation inside the training loop, which Gate 0 does not run.
+    """
+
+    contrasts: set[str] = set()
+    for payload, key in ((reference, "by_contrast"), (sweep, "by_contrast"), (coupling, "by_contrast")):
+        if payload:
+            contrasts.update(payload.get(key, {}))
+    if residual:
+        block = residual.get("baselines", {}).get(residual_baseline, {})
+        contrasts.update(block.get("by_contrast", {}))
+
+    table: dict[str, dict[str, Any]] = {}
+    for contrast in sorted(contrasts):
+        entry: dict[str, Any] = {}
+        if reference and contrast in reference.get("by_contrast", {}):
+            methods = reference["by_contrast"][contrast]["methods"]
+            entry["stage1_ceiling"] = methods.get("ceiling")
+            entry["identity"] = methods.get("identity")
+            for name in ("sb_v2", "affine", "identity_histogram_matched", "identity_robust_affine"):
+                if name in methods:
+                    entry[name] = methods[name]
+        if coupling and contrast in coupling.get("by_contrast", {}):
+            entry["coupling"] = coupling["by_contrast"][contrast]
+        if sweep and contrast in sweep.get("by_contrast", {}):
+            block = sweep["by_contrast"][contrast]
+            entry["target_conditioning"] = {
+                "responds_fraction": block.get("responds_fraction"),
+                "correct_target_fraction": block.get("correct_target_fraction"),
+                "chance_correct_target_fraction": block.get("chance_correct_target_fraction"),
+                "mean_classification_margin": block.get("mean_classification_margin"),
+            }
+        if residual:
+            block = residual.get("baselines", {}).get(residual_baseline, {})
+            if contrast in block.get("by_contrast", {}):
+                entry["residual"] = block["by_contrast"][contrast]
+        table[contrast] = entry
+
+    return {
+        "contract_version": GATE0_CONTRACT_VERSION,
+        "residual_baseline": residual_baseline,
+        "sources_present": {
+            "reference_gate": reference is not None,
+            "wrong_target_sweep": sweep is not None,
+            "residual_gate": residual is not None,
+            "coupling_quality": coupling is not None,
+        },
+        "not_measured": {
+            "loss_contribution": (
+                "Needs per-contrast loss/gradient instrumentation inside the Stage-2 training "
+                "loop. Gate 0 runs no training, so this row cannot be filled here."
+            )
+        },
+        "by_contrast": table,
     }
 
 
@@ -967,11 +1247,16 @@ def build_sb_transport(
 def compose_minus(primary: TransportFn, subtracted: TransportFn) -> TransportFn:
     """``z + (primary(z) - subtracted(z))`` — primary's displacement with the other's removed.
 
-    This is the "SB v2 minus affine" reference. The literal difference of the two output
-    latents is not it: that leaves the latent manifold entirely (it is a near-zero-mean
-    difference image, not a brain), and decoding it would measure nothing. Removing the affine
-    part of SB's DISPLACEMENT, on the other hand, answers the question the row is there to
-    answer — what does the network contribute beyond the closed-form rescaling?
+    **This is a diagnostic decomposition, not a model variant.** Subtracting one displacement
+    from another is not guaranteed to land on the latent manifold the decoder was trained on,
+    so its decoded output can be off-distribution and its official metrics are not a claim
+    about a system anyone could deploy. It answers exactly one question — how much of SB's
+    displacement survives once the closed-form rescaling is taken out — and it must never be
+    reported as a candidate model or promoted on its score.
+
+    The literal difference of the two output latents would be worse still: that leaves the
+    manifold outright (a near-zero-mean difference field, not a brain), which is why the
+    displacement form is used instead.
     """
 
     def transport(z: torch.Tensor, source: Domain, target: Domain) -> torch.Tensor:
@@ -988,6 +1273,18 @@ def load_raw_latents(cases: Sequence[Any], device: torch.device) -> dict[str, to
         payload = torch.load(case.latent_path, map_location="cpu")
         out[str(case.case_id)] = payload["latent"].to(torch.float32).to(device)
     return out
+
+
+def _method_names(
+    methods: Mapping[str, Any],
+    image_methods: Mapping[str, Any] | None,
+    include_ceiling: bool,
+) -> list[str]:
+    return (
+        list(methods)
+        + list(image_methods or {})
+        + (["ceiling"] if include_ceiling else [])
+    )
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -1048,11 +1345,13 @@ __all__ = [
     "assert_subjects_excluded",
     "build_sb_transport",
     "compose_minus",
+    "coupling_quality_by_contrast",
     "evaluate_reference_gate",
     "f16_quantization_energy",
     "gate0_metric_fn",
     "latent_rms",
     "load_raw_latents",
+    "per_contrast_diagnostics",
     "residual_energy_gate",
     "robust_normalize",
     "traveller_cases",

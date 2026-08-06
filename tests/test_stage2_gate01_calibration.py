@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import gc
+import inspect
+import weakref
 
 import pytest
 import torch
@@ -83,16 +86,18 @@ def test_calibration_uses_prediction_and_frozen_target_template_only(
     paired_target_a = torch.zeros_like(prediction)
     paired_target_b = torch.full_like(prediction, 0.987)
 
-    first = calibrator.apply(prediction, requested_domain)
+    support = prediction != 0
+    first = calibrator.apply(prediction, requested_domain, support_mask=support)
     # Paired targets are deliberately changed but are not accepted by or visible to apply().
     paired_target_a.copy_(paired_target_b)
-    second = calibrator.apply(prediction, requested_domain)
+    second = calibrator.apply(prediction, requested_domain, support_mask=support)
 
     torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
     assert calibrator.to_dict()["semantics"] == GATE01_CALIBRATION_SEMANTICS
     assert calibrator.to_dict()["target_independence"]["calibration_inputs"] == [
         "method_prediction",
         "requested_target_domain",
+        "frozen_source_support_mask",
     ]
 
 
@@ -121,8 +126,9 @@ def test_calibration_is_deterministic_monotonic_and_preserves_exact_zero_backgro
         dtype=torch.float32,
     )
     target = Domain(5.0, "T2w")
-    first = calibrator.apply(prediction, target)
-    second = calibrator.apply(prediction.clone(), target)
+    support = prediction != 0
+    first = calibrator.apply(prediction, target, support_mask=support)
+    second = calibrator.apply(prediction.clone(), target, support_mask=support)
 
     torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
     assert first[0, 0, 0].item() == 0.0
@@ -133,13 +139,38 @@ def test_calibration_is_deterministic_monotonic_and_preserves_exact_zero_backgro
     assert bool((ordered[1:] >= ordered[:-1]).all())
 
 
+def test_frozen_source_support_removes_tiny_decoder_background_identically(
+    calibrator: PosthocTargetCalibrator,
+) -> None:
+    support = torch.zeros(4, 4, 4, dtype=torch.bool)
+    support[1:3, 1:3, 1:3] = True
+    identity = torch.full((4, 4, 4), 1e-7)
+    sb = torch.full((4, 4, 4), 9e-7)
+    identity[support] = torch.linspace(0.1, 0.8, int(support.sum()))
+    sb[support] = torch.linspace(0.2, 0.9, int(support.sum()))
+    domain = Domain(3.0, "T1w")
+
+    calibrated_identity = calibrator.apply(identity, domain, support_mask=support)
+    calibrated_sb = calibrator.apply(sb, domain, support_mask=support)
+
+    assert bool((calibrated_identity[~support] == 0).all())
+    assert bool((calibrated_sb[~support] == 0).all())
+    assert bool((calibrated_identity[support] != 0).all())
+    assert bool((calibrated_sb[support] != 0).all())
+
+
 def test_robust_affine_is_deterministic_and_background_safe(
     calibrator: PosthocTargetCalibrator,
 ) -> None:
     prediction = _training_volume(1.5, 2, 0)
     target = Domain(3.0, "T2-FLAIR")
-    first = calibrator.apply(prediction, target, mode="robust_affine")
-    second = calibrator.apply(prediction, target, mode="robust_affine")
+    support = prediction != 0
+    first = calibrator.apply(
+        prediction, target, support_mask=support, mode="robust_affine"
+    )
+    second = calibrator.apply(
+        prediction, target, support_mask=support, mode="robust_affine"
+    )
     torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
     assert bool((first[prediction == 0] == 0).all())
 
@@ -148,12 +179,32 @@ def test_gate01_calibrator_fails_closed_on_shape_finite_and_unknown_domain(
     calibrator: PosthocTargetCalibrator,
 ) -> None:
     with pytest.raises(ValueError, match="full volume"):
-        calibrator.apply(torch.ones(3, 3), Domain(3.0, "T1w"))
+        calibrator.apply(
+            torch.ones(3, 3),
+            Domain(3.0, "T1w"),
+            support_mask=torch.ones(3, 3, dtype=torch.bool),
+        )
 
     nonfinite = torch.ones(3, 3, 3)
     nonfinite[0, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="non-finite"):
-        calibrator.apply(nonfinite, Domain(3.0, "T1w"))
+        calibrator.apply(
+            nonfinite,
+            Domain(3.0, "T1w"),
+            support_mask=torch.ones_like(nonfinite, dtype=torch.bool),
+        )
+    with pytest.raises(ValueError, match="support-mask shape mismatch"):
+        calibrator.apply(
+            torch.ones(3, 3, 3),
+            Domain(3.0, "T1w"),
+            support_mask=torch.ones(2, 3, 3, dtype=torch.bool),
+        )
+    with pytest.raises(ValueError, match="boolean dtype"):
+        calibrator.apply(
+            torch.ones(3, 3, 3),
+            Domain(3.0, "T1w"),
+            support_mask=torch.ones(3, 3, 3),
+        )
 
     # Domain itself fails closed before lookup for an unsupported field strength.
     with pytest.raises(ValueError, match="Unsupported field strength"):
@@ -201,6 +252,43 @@ def test_training_only_and_retrospective_only_fit_guards() -> None:
         )
 
 
+def test_calibrator_fit_is_streaming_with_bounded_full_volume_liveness() -> None:
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+    maximum_alive = 0
+
+    def volumes():
+        nonlocal maximum_alive
+        for repeat in range(3):
+            for contrast_index, contrast in enumerate(CONTRASTS):
+                for field in FIELD_STRENGTHS_T:
+                    tensor = _training_volume(field, contrast_index, repeat)
+                    references.append(weakref.ref(tensor))
+                    gc.collect()
+                    maximum_alive = max(
+                        maximum_alive,
+                        sum(reference() is not None for reference in references),
+                    )
+                    yield TrainingTemplateVolume(
+                        volume=tensor,
+                        domain=Domain(field, contrast),
+                        record_identity=f"stream-{repeat}-{contrast.value}-{field:g}",
+                    )
+
+    fitted = fit_posthoc_target_calibrator(
+        volumes(),
+        split_fingerprint=RESPLIT_FINGERPRINT,
+        training_cohort_identity="synthetic-stream",
+        code_commit="stream-test",
+        num_quantiles=9,
+    )
+    gc.collect()
+    assert fitted.provenance["domain_volume_counts"]
+    assert maximum_alive <= 2
+    assert sum(reference() is not None for reference in references) == 0
+    source = inspect.getsource(fit_posthoc_target_calibrator)
+    assert "list(volumes)" not in source
+
+
 def test_stale_split_template_and_artifact_provenance_are_rejected(
     calibrator: PosthocTargetCalibrator,
 ) -> None:
@@ -238,8 +326,12 @@ def test_calibrator_json_round_trip_preserves_exact_mapping(
     )
     prediction = _training_volume(3.0, 0, 0)
     torch.testing.assert_close(
-        calibrator.apply(prediction, Domain(7.0, "T1w")),
-        loaded.apply(prediction, Domain(7.0, "T1w")),
+        calibrator.apply(
+            prediction, Domain(7.0, "T1w"), support_mask=prediction != 0
+        ),
+        loaded.apply(
+            prediction, Domain(7.0, "T1w"), support_mask=prediction != 0
+        ),
         rtol=0.0,
         atol=0.0,
     )

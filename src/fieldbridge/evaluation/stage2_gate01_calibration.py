@@ -21,7 +21,7 @@ import torch
 
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 
-GATE01_CALIBRATOR_CONTRACT_VERSION = "stage2-gate01-target-cdf-v1"
+GATE01_CALIBRATOR_CONTRACT_VERSION = "stage2-gate01-target-cdf-v2"
 GATE01_CALIBRATION_SEMANTICS = "prediction-cdf-to-frozen-training-target-cdf"
 CalibrationMode = Literal["histogram", "robust_affine"]
 
@@ -175,9 +175,15 @@ class PosthocTargetCalibrator:
         payload = {
             "contract_version": GATE01_CALIBRATOR_CONTRACT_VERSION,
             "semantics": GATE01_CALIBRATION_SEMANTICS,
-            "background_contract": "prediction exact-zero voxels remain exact zero",
+            "background_contract": (
+                "output is exact zero outside the frozen source-derived support mask"
+            ),
             "target_independence": {
-                "calibration_inputs": ["method_prediction", "requested_target_domain"],
+                "calibration_inputs": [
+                    "method_prediction",
+                    "requested_target_domain",
+                    "frozen_source_support_mask",
+                ],
                 "template_source": "retrospective training records only",
                 "forbidden": [
                     "paired evaluation target image",
@@ -292,9 +298,15 @@ class PosthocTargetCalibrator:
         prediction: torch.Tensor,
         requested_target: Domain,
         *,
+        support_mask: torch.Tensor,
         mode: CalibrationMode = "histogram",
     ) -> torch.Tensor:
-        """Calibrate one prediction without accepting any evaluation-target argument."""
+        """Calibrate one prediction on a frozen source-derived support mask.
+
+        ``support_mask`` is deliberately required.  It is derived from the source image
+        before either method is evaluated and is therefore identical for identity and
+        SB.  The API has no paired-target image or paired-target mask parameter.
+        """
 
         if mode not in ("histogram", "robust_affine"):
             raise ValueError(f"Unknown Gate 0.1 calibration mode {mode!r}.")
@@ -306,6 +318,15 @@ class PosthocTargetCalibrator:
             )
         if not bool(torch.isfinite(prediction).all()):
             raise ValueError("Gate 0.1 prediction contains non-finite values.")
+        if not isinstance(support_mask, torch.Tensor):
+            raise TypeError("Gate 0.1 support_mask must be a torch.Tensor.")
+        if tuple(support_mask.shape) != tuple(prediction.shape):
+            raise ValueError(
+                "Gate 0.1 support-mask shape mismatch: "
+                f"{tuple(support_mask.shape)} != {tuple(prediction.shape)}."
+            )
+        if support_mask.dtype != torch.bool:
+            raise ValueError("Gate 0.1 support_mask must have boolean dtype.")
         template = self.templates.get(requested_target.label)
         if template is None:
             raise KeyError(f"Unknown Gate 0.1 target domain {requested_target.label!r}.")
@@ -314,7 +335,7 @@ class PosthocTargetCalibrator:
         original_dtype = prediction.dtype
         values = prediction.detach().cpu().to(torch.float64)
         flat = values.reshape(-1)
-        foreground = flat.abs() > self.mask_threshold
+        foreground = support_mask.detach().cpu().reshape(-1)
         if not bool(foreground.any()):
             return torch.zeros_like(prediction)
         source_values = flat[foreground]
@@ -369,18 +390,20 @@ def fit_posthoc_target_calibrator(
     if mask_threshold < 0 or not math.isfinite(mask_threshold):
         raise ValueError("Gate 0.1 mask_threshold must be finite and non-negative.")
 
-    items = sorted(
-        list(volumes), key=lambda item: (item.domain.label, item.record_identity)
-    )
-    if not items:
-        raise ValueError("Gate 0.1 fitting received no training volumes.")
-    identities = [item.record_identity for item in items]
-    if len(set(identities)) != len(identities):
-        raise ValueError("Gate 0.1 fitting received duplicate training record identities.")
-
     probabilities = torch.linspace(0.0, 1.0, num_quantiles, dtype=torch.float64)
-    accumulated: dict[str, list[torch.Tensor]] = {}
-    for item in items:
+    # This is intentionally a one-pass stream.  Only the fixed-size per-volume
+    # quantile vector and small provenance metadata survive an iteration; full
+    # volumes are never collected, on either CPU or CUDA.
+    accumulated: dict[str, list[tuple[str, torch.Tensor]]] = {}
+    identities: set[str] = set()
+    record_metadata: list[tuple[str, str]] = []
+    item_count = 0
+    for item in volumes:
+        item_count += 1
+        if item.record_identity in identities:
+            raise ValueError("Gate 0.1 fitting received duplicate training record identities.")
+        identities.add(item.record_identity)
+        record_metadata.append((item.record_identity, item.domain.label))
         if item.split != "train":
             raise ValueError(
                 f"Gate 0.1 templates may use training records only; "
@@ -407,8 +430,15 @@ def fit_posthoc_target_calibrator(
                 f"Training template {item.record_identity!r} has no foreground voxels."
             )
         accumulated.setdefault(item.domain.label, []).append(
-            _deterministic_quantiles(foreground, probabilities)
+            (
+                item.record_identity,
+                _deterministic_quantiles(foreground, probabilities),
+            )
         )
+        del foreground, volume
+
+    if item_count == 0:
+        raise ValueError("Gate 0.1 fitting received no training volumes.")
 
     expected_labels = set(all_domain_labels())
     if set(accumulated) != expected_labels:
@@ -420,7 +450,10 @@ def fit_posthoc_target_calibrator(
 
     templates: dict[str, TargetDomainTemplate] = {}
     for label, domain_items in sorted(accumulated.items()):
-        quantiles = torch.stack(domain_items).mean(dim=0)
+        ordered_quantiles = [
+            quantiles for _, quantiles in sorted(domain_items, key=lambda value: value[0])
+        ]
+        quantiles = torch.stack(ordered_quantiles).mean(dim=0)
         templates[label] = TargetDomainTemplate(
             quantiles=quantiles,
             volume_count=len(domain_items),
@@ -435,7 +468,8 @@ def fit_posthoc_target_calibrator(
         "training_cohort_identity": training_cohort_identity,
         "training_records_sha256": _sha256_text(
             "\n".join(
-                f"{item.record_identity}|{item.domain.label}" for item in items
+                f"{identity}|{label}"
+                for identity, label in sorted(record_metadata)
             )
         ),
         "code_commit": code_commit,
@@ -444,7 +478,10 @@ def fit_posthoc_target_calibrator(
             "mask_threshold": mask_threshold,
             "low_probability": low_probability,
             "high_probability": high_probability,
-            "foreground_rule": "abs(prediction voxel) > mask_threshold",
+            "template_foreground_rule": "abs(training target voxel) > mask_threshold",
+            "inference_foreground_rule": (
+                "required frozen source-derived boolean support mask; identical for all methods"
+            ),
             **dict(extra_config or {}),
         },
         "balancing": {

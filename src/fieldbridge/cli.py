@@ -77,8 +77,14 @@ from fieldbridge.evaluation.intensity_baselines import (
 )
 from fieldbridge.evaluation.stage2_gate01 import (
     evaluate_gate01,
+    fixed_montage_specifications,
+    gate01_code_provenance,
     load_gate01_input_manifest,
     write_gate01_outputs,
+)
+from fieldbridge.evaluation.stage2_gate01_montage import (
+    Gate01MontageCollector,
+    render_gate01_montages,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     PosthocTargetCalibrator,
@@ -752,6 +758,12 @@ def build_parser() -> argparse.ArgumentParser:
     gate01.add_argument("--out", type=Path, default=None)
     gate01.add_argument("--markdown-out", type=Path, default=None)
     gate01.add_argument("--contract-out", type=Path, default=None)
+    gate01.add_argument(
+        "--montage-dir",
+        type=Path,
+        default=None,
+        help="Render the frozen deterministic montage PNGs and provenance manifest.",
+    )
 
     return parser
 
@@ -1526,10 +1538,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "gate01-equal-photometry":
         cases, input_metadata = load_gate01_input_manifest(args.manifest)
+        if input_metadata["execution_mode"] == "scientific" and args.montage_dir is None:
+            raise ValueError(
+                "Scientific Gate 0.1 mode requires --montage-dir for frozen rendering."
+            )
         calibrator = PosthocTargetCalibrator.load(
             args.calibrator,
             expected_split_fingerprint=RESPLIT_FINGERPRINT,
         )
+        montage_collector = (
+            Gate01MontageCollector(fixed_montage_specifications())
+            if args.montage_dir is not None
+            else None
+        )
+        code_provenance = gate01_code_provenance()
         result = evaluate_gate01(
             cases,
             calibrator=calibrator,
@@ -1537,10 +1559,32 @@ def main(argv: list[str] | None = None) -> int:
             code_commit=resolve_git_commit(),
             evidence_scope=input_metadata["evidence_scope"],
             input_manifest_sha256=input_metadata["sha256"],
+            execution_mode=input_metadata["execution_mode"],
+            selection_fingerprint_sha256=input_metadata[
+                "selection_fingerprint_sha256"
+            ],
+            code_provenance=code_provenance,
             metrics=tuple(args.metrics),
             device=args.device,
             include_robust_affine=args.include_robust_affine,
+            case_observer=(
+                montage_collector.observe if montage_collector is not None else None
+            ),
         )
+        if montage_collector is not None and args.montage_dir is not None:
+            montage = render_gate01_montages(
+                montage_collector,
+                args.montage_dir,
+                require_complete=input_metadata["execution_mode"] == "scientific",
+            )
+            result["montage_rendering"] = montage
+            result["contract"]["montage_rendering"] = {
+                "contract_version": montage["contract_version"],
+                "manifest_sha256": montage["manifest_sha256"],
+                "complete_frozen_selection": montage[
+                    "complete_frozen_selection"
+                ],
+            }
         written = write_gate01_outputs(
             result,
             json_path=args.out,

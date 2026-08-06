@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+import subprocess
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from fieldbridge.evaluation.mrixfields2026_official import (
     load_official_nifti,
     official_task3_lpips,
     official_task3_nrmse,
+    official_task3_runtime_provenance,
     official_task3_ssim,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
@@ -39,7 +41,14 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
 )
 
 GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v1"
-GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v1"
+GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v2"
+GATE01_SCIENTIFIC_CASE_COUNT = 60
+GATE01_EXECUTION_MODES = ("scientific", "development-incomplete")
+GATE01_SCIENTIFIC_MODULES = (
+    "src/fieldbridge/evaluation/stage2_gate01.py",
+    "src/fieldbridge/evaluation/stage2_gate01_calibration.py",
+    "src/fieldbridge/evaluation/mrixfields2026_official.py",
+)
 
 OFFICIAL_METRICS = ("nrmse", "ssim", "lpips")
 LOWER_IS_BETTER = {"nrmse": True, "ssim": False, "lpips": True}
@@ -69,6 +78,9 @@ class Gate01Case:
     raw_identity: torch.Tensor
     raw_sb_v2: torch.Tensor
     stage1_reconstruction_ceiling: torch.Tensor
+    support_mask: torch.Tensor
+    traveller_identity_sha256: str = ""
+    array_sha256: Mapping[str, str] = field(default_factory=dict)
     wrong_target_sb_v2: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -105,12 +117,35 @@ class Gate01Case:
             if not bool(torch.isfinite(tensor).all()):
                 raise ValueError(f"Gate 0.1 {name} contains non-finite values.")
 
+        if not isinstance(self.support_mask, torch.Tensor):
+            raise TypeError("Gate 0.1 support_mask must be a torch.Tensor.")
+        if self.support_mask.dtype != torch.bool:
+            raise ValueError("Gate 0.1 support_mask must have boolean dtype.")
+        if tuple(self.support_mask.shape) != target_shape:
+            raise ValueError(
+                "Gate 0.1 support-mask shape mismatch: "
+                f"{tuple(self.support_mask.shape)} != {target_shape}."
+            )
+        if not bool(self.support_mask.any()):
+            raise ValueError("Gate 0.1 support_mask has no foreground voxels.")
+
         for label in self.wrong_target_sb_v2:
             wrong = _wrong_target_domain(label, target_contrast)
             if wrong.field_strength_t == self.target_domain.field_strength_t:
                 raise ValueError(
                     "wrong_target_sb_v2 must not repeat the requested target field."
                 )
+
+        if self.traveller_identity_sha256 and not _is_sha256(
+            self.traveller_identity_sha256
+        ):
+            raise ValueError("Gate 0.1 traveller identity must be a SHA-256 digest.")
+
+    @property
+    def case_identity_sha256(self) -> str:
+        """Sanitized case identity used in committed/reportable result structures."""
+
+        return hashlib.sha256(self.case_id.encode("utf-8")).hexdigest()
 
 
 def frozen_artifact_provenance() -> dict[str, str]:
@@ -167,28 +202,36 @@ def official_gate01_metric_fn(
 
 @torch.inference_mode()
 def evaluate_gate01(
-    cases: Sequence[Gate01Case],
+    cases: Iterable[Gate01Case],
     *,
     calibrator: PosthocTargetCalibrator,
     artifact_provenance: Mapping[str, Any],
     code_commit: str,
     evidence_scope: Mapping[str, Any],
     input_manifest_sha256: str,
+    execution_mode: str = "development-incomplete",
+    selection_fingerprint_sha256: str | None = None,
+    code_provenance: Mapping[str, Any] | None = None,
     metrics: Sequence[str] = OFFICIAL_METRICS,
     device: str = "cuda",
     include_robust_affine: bool = False,
     metric_fn: MetricFn = official_gate01_metric_fn,
+    case_observer: Callable[[Gate01Case, Mapping[str, torch.Tensor]], None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate raw/equal-calibrated references and reduce the frozen Gate 0.1 tables."""
 
-    if not cases:
-        raise ValueError("Gate 0.1 requires at least one full-volume case.")
+    if execution_mode not in GATE01_EXECUTION_MODES:
+        raise ValueError(f"Unknown Gate 0.1 execution mode {execution_mode!r}.")
     requested_metrics = tuple(metrics)
     unsupported = sorted(set(requested_metrics) - set(OFFICIAL_METRICS))
     if unsupported:
         raise ValueError(f"Unsupported Gate 0.1 official metrics: {unsupported}.")
     if "nrmse" not in requested_metrics:
         raise ValueError("Gate 0.1 requires official nRMSE to freeze difficulty strata.")
+    if execution_mode == "scientific" and set(requested_metrics) != set(OFFICIAL_METRICS):
+        raise ValueError(
+            "Scientific Gate 0.1 mode requires nRMSE, SSIM, and LPIPS together."
+        )
     if not code_commit:
         raise ValueError("Gate 0.1 requires the evaluation code commit.")
     if not input_manifest_sha256:
@@ -196,18 +239,61 @@ def evaluate_gate01(
     evidence_scope = _validated_evidence_scope(evidence_scope)
     validate_frozen_artifact_provenance(artifact_provenance)
     calibrator.assert_split_fingerprint(RESPLIT_FINGERPRINT)
+    normalized_code_provenance = dict(code_provenance or {})
+    if execution_mode == "scientific":
+        _validate_scientific_code_provenance(normalized_code_provenance, code_commit)
+        if selection_fingerprint_sha256 is None or not _is_sha256(
+            selection_fingerprint_sha256
+        ):
+            raise ValueError(
+                "Scientific Gate 0.1 mode requires a predeclared selection fingerprint."
+            )
 
     method_names = list(CORE_METHODS)
     if include_robust_affine:
         method_names.extend(DIAGNOSTIC_METHODS)
 
     rows: list[dict[str, Any]] = []
+    selection_descriptors: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
+    seen_directions: set[tuple[str, float, float]] = set()
+    traveller_hashes: set[str] = set()
     for case in cases:
+        if case.case_identity_sha256 in seen_case_ids:
+            raise ValueError("Gate 0.1 input contains duplicate case IDs.")
+        seen_case_ids.add(case.case_identity_sha256)
+        direction = (
+            Contrast.parse(case.target_domain.contrast).value,
+            float(case.source_domain.field_strength_t),
+            float(case.target_domain.field_strength_t),
+        )
+        if direction in seen_directions:
+            raise ValueError(
+                "Gate 0.1 input contains a duplicate contrast/directed-field pair."
+            )
+        seen_directions.add(direction)
+        if case.traveller_identity_sha256:
+            traveller_hashes.add(case.traveller_identity_sha256)
+        selection_descriptors.append(
+            {
+                "case_identity_sha256": case.case_identity_sha256,
+                "traveller_identity_sha256": case.traveller_identity_sha256,
+                "contrast": direction[0],
+                "source_field_t": direction[1],
+                "target_field_t": direction[2],
+            }
+        )
         calibrated_identity = calibrator.apply(
-            case.raw_identity, case.target_domain, mode="histogram"
+            case.raw_identity,
+            case.target_domain,
+            support_mask=case.support_mask,
+            mode="histogram",
         )
         calibrated_sb = calibrator.apply(
-            case.raw_sb_v2, case.target_domain, mode="histogram"
+            case.raw_sb_v2,
+            case.target_domain,
+            support_mask=case.support_mask,
+            mode="histogram",
         )
         predictions: dict[str, torch.Tensor] = {
             "raw_identity": case.raw_identity,
@@ -222,15 +308,20 @@ def evaluate_gate01(
                     "diagnostic_robust_affine_identity": calibrator.apply(
                         case.raw_identity,
                         case.target_domain,
+                        support_mask=case.support_mask,
                         mode="robust_affine",
                     ),
                     "diagnostic_robust_affine_sb_v2": calibrator.apply(
                         case.raw_sb_v2,
                         case.target_domain,
+                        support_mask=case.support_mask,
                         mode="robust_affine",
                     ),
                 }
             )
+
+        if case_observer is not None:
+            case_observer(case, predictions)
 
         method_metrics = {
             name: _validated_metric_result(
@@ -246,7 +337,7 @@ def evaluate_gate01(
             requested_metrics,
         )
         row = {
-            "case_id": case.case_id,
+            "case_identity_sha256": case.case_identity_sha256,
             "contrast": Contrast.parse(case.target_domain.contrast).value,
             "source_field_t": float(case.source_domain.field_strength_t),
             "target_field_t": float(case.target_domain.field_strength_t),
@@ -257,6 +348,14 @@ def evaluate_gate01(
             ),
             "methods": method_metrics,
             "central_comparison": central,
+            "raw_pre_mask_background_leakage": {
+                "raw_identity": _background_leakage(case.raw_identity, case.support_mask),
+                "raw_sb_v2": _background_leakage(case.raw_sb_v2, case.support_mask),
+                "stage1_reconstruction_ceiling": _background_leakage(
+                    case.stage1_reconstruction_ceiling, case.support_mask
+                ),
+            },
+            "array_sha256": dict(sorted(case.array_sha256.items())),
             "requested_vs_wrong_target": _wrong_target_diagnostic(
                 case,
                 calibrator=calibrator,
@@ -274,9 +373,26 @@ def evaluate_gate01(
             row["contrast"],
             row["source_field_t"],
             row["target_field_t"],
-            row["case_id"],
+            row["case_identity_sha256"],
         )
     )
+    if not rows:
+        raise ValueError("Gate 0.1 requires at least one full-volume case.")
+    computed_selection_fingerprint = gate01_selection_fingerprint(selection_descriptors)
+    if len(traveller_hashes) > 1:
+        raise ValueError("Gate 0.1 input mixes multiple travellers.")
+    if traveller_hashes and evidence_scope["traveller_identity_sha256"] not in traveller_hashes:
+        raise ValueError(
+            "Gate 0.1 evidence scope and cases identify different travellers."
+        )
+    if execution_mode == "scientific":
+        _validate_scientific_selection(
+            rows=rows,
+            seen_directions=seen_directions,
+            traveller_hashes=traveller_hashes,
+            expected_fingerprint=str(selection_fingerprint_sha256),
+            computed_fingerprint=computed_selection_fingerprint,
+        )
     overall = _reduce_rows(rows, method_names, requested_metrics)
     catastrophic = [row for row in rows if row["stratum"] == "catastrophic_identity"]
     ordinary = [row for row in rows if row["stratum"] == "ordinary"]
@@ -294,7 +410,10 @@ def evaluate_gate01(
     contract = {
         "contract_version": GATE01_CONTRACT_VERSION,
         "code_commit": code_commit,
+        "code_provenance": normalized_code_provenance,
         "input_manifest_sha256": input_manifest_sha256,
+        "execution_mode": execution_mode,
+        "selection_fingerprint_sha256": computed_selection_fingerprint,
         "evidence_scope": dict(evidence_scope),
         "scientific_promotion_decision": "unset_pending_private_data_run",
         "split_fingerprint": RESPLIT_FINGERPRINT,
@@ -320,6 +439,16 @@ def evaluate_gate01(
             "fit_code_commit": calibrator.provenance["code_commit"],
         },
         "artifact_provenance": dict(artifact_provenance),
+        "verified_loaded_array_sha256": [
+            {
+                "case_identity_sha256": row["case_identity_sha256"],
+                "arrays": row["array_sha256"],
+            }
+            for row in rows
+        ],
+        "official_runtime_provenance": official_task3_runtime_provenance(
+            metrics=requested_metrics, device=device
+        ),
         "method_provenance": {
             "raw_identity": {
                 "kind": "Stage-1 reconstruction of the source; no Stage-2 checkpoint"
@@ -347,13 +476,17 @@ def evaluate_gate01(
             },
         },
         "target_independence_guarantee": {
-            "calibrator_signature": "prediction + requested target domain only",
+            "calibrator_signature": (
+                "prediction + requested target domain + frozen source-derived support mask"
+            ),
             "template_fit": "retrospective training records only",
             "paired_target_use": "official metrics and qualitative comparison only",
             "paired_target_for_calibration": False,
             "paired_target_mask_for_calibration": False,
             "paired_target_statistics_for_calibration": False,
-            "background": "prediction exact-zero voxels remain exact zero",
+            "support_mask_source": "frozen source image only; shared by identity and SB",
+            "background": "exact zero outside the frozen source-derived support mask",
+            "raw_pre_mask_background_leakage_reported": True,
         },
     }
 
@@ -361,7 +494,14 @@ def evaluate_gate01(
         "contract_version": GATE01_CONTRACT_VERSION,
         "evidence_scope": dict(evidence_scope),
         "scientific_status": {
-            "evidence": "development diagnostic",
+            "execution_mode": execution_mode,
+            "selection_contract_complete": execution_mode == "scientific",
+            "eligible_for_scientific_conclusions": execution_mode == "scientific",
+            "evidence": (
+                "scientific-contract diagnostic"
+                if execution_mode == "scientific"
+                else "development-only incomplete diagnostic"
+            ),
             "promotion_decision": "unset_pending_private_data_run",
             "population_or_challenge_claim": False,
         },
@@ -411,6 +551,15 @@ def evaluate_gate01(
                 catastrophic, method_names, requested_metrics
             ),
             "ordinary": _reduce_rows(ordinary, method_names, requested_metrics),
+        },
+        "raw_pre_mask_background_leakage": {
+            "overall": _reduce_background_leakage(rows),
+            "by_contrast": {
+                contrast.value: _reduce_background_leakage(
+                    [row for row in rows if row["contrast"] == contrast.value]
+                )
+                for contrast in CONTRASTS
+            },
         },
         "by_contrast": by_contrast,
         "directed_pair_results": directed_pairs["results"],
@@ -467,8 +616,13 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
         "",
         "## Scientific status",
         "",
-        "This is development evidence only. Scientific promotion remains "
-        "**unset pending a private-data run**; no population or challenge claim is made.",
+        (
+            "The strict 60-case scientific selection contract is complete. "
+            if result["scientific_status"]["execution_mode"] == "scientific"
+            else "This is development evidence only and is ineligible for scientific conclusions. "
+        )
+        + "Scientific promotion remains **unset pending a private-data run**; no population "
+        "or challenge claim is made.",
         "",
         "Evidence scope: " + json.dumps(result["evidence_scope"], sort_keys=True),
         "",
@@ -477,7 +631,9 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
         "Both identity and SB-v2 are projected from their own prediction CDF onto the same "
         "frozen requested-target-domain foreground CDF fitted from retrospective training "
         "records. The paired evaluation target is used only by the official metrics and is "
-        "never passed to calibration. Exact-zero prediction background remains zero.",
+        "never passed to calibration. One frozen source-derived support mask is shared by "
+        "identity and SB; calibrated output is exact zero outside it, and raw pre-mask "
+        "background leakage is reported.",
         "",
         "## Official aggregate metrics",
         "",
@@ -498,7 +654,18 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
                 "",
             ]
         )
-    lines.extend(["## Per contrast", ""])
+    lines.extend(
+        [
+            "## Raw pre-mask background leakage",
+            "",
+            _markdown_background_leakage(
+                result["raw_pre_mask_background_leakage"]["overall"]
+            ),
+            "",
+            "## Per contrast",
+            "",
+        ]
+    )
     for contrast, block in result["by_contrast"].items():
         lines.extend(
             [
@@ -520,7 +687,12 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
             "## Directed-pair matrices and qualitative panels",
             "",
             "All 20 directed field pairs for every contrast, their paired deltas/wins, and "
-            "the frozen montage specification are included in the machine-readable JSON.",
+            "the frozen montage specification are included in the machine-readable JSON. "
+            + (
+                "Deterministic PNG hashes and their provenance manifest are recorded."
+                if "montage_rendering" in result
+                else "Montage rendering was not requested for this development invocation."
+            ),
             "",
             "## Known limitations",
             "",
@@ -566,27 +738,53 @@ def write_gate01_outputs(
 
 _ROOT_INPUT_KEYS = {
     "contract_version",
+    "execution_mode",
+    "selection_fingerprint_sha256",
     "evidence_scope",
     "split_fingerprint",
     "artifact_provenance",
+    "source_support_contract",
     "cases",
 }
 _CASE_INPUT_KEYS = {
     "case_id",
+    "traveller_identity_sha256",
     "source_domain",
     "target_domain",
+    "source_image",
+    "source_support_mask",
     "target",
     "raw_identity",
     "raw_sb_v2",
     "stage1_reconstruction_ceiling",
     "wrong_target_sb_v2",
 }
+_ARRAY_REFERENCE_KEYS = {"path", "sha256"}
+_SOURCE_SUPPORT_KEYS = {"derivation", "threshold"}
+
+
+@dataclass(frozen=True, slots=True)
+class Gate01InputManifest:
+    """Metadata-only manifest whose iterator loads and releases one case at a time."""
+
+    root: Path
+    case_specs: tuple[Mapping[str, Any], ...]
+    support_threshold: float
+
+    def __iter__(self) -> Iterator[Gate01Case]:
+        for index, item in enumerate(self.case_specs):
+            yield _load_gate01_case(
+                self.root,
+                item,
+                index=index,
+                support_threshold=self.support_threshold,
+            )
 
 
 def load_gate01_input_manifest(
     path: str | Path,
-) -> tuple[list[Gate01Case], dict[str, Any]]:
-    """Load a strict external prediction manifest without copying paths into outputs."""
+) -> tuple[Gate01InputManifest, dict[str, Any]]:
+    """Validate metadata now and stream verified loaded arrays during evaluation."""
 
     source = Path(path)
     raw = source.read_bytes()
@@ -601,9 +799,29 @@ def load_gate01_input_manifest(
         raise ValueError("Gate 0.1 input manifest has a stale split fingerprint.")
     validate_frozen_artifact_provenance(payload["artifact_provenance"])
     evidence_scope = _validated_evidence_scope(payload["evidence_scope"])
+    execution_mode = str(payload["execution_mode"])
+    if execution_mode not in GATE01_EXECUTION_MODES:
+        raise ValueError(f"Unknown Gate 0.1 execution mode {execution_mode!r}.")
+    selection_fingerprint = str(payload["selection_fingerprint_sha256"])
+    if not _is_sha256(selection_fingerprint):
+        raise ValueError("Gate 0.1 selection fingerprint must be a SHA-256 digest.")
+    support_contract = payload["source_support_contract"]
+    if not isinstance(support_contract, Mapping):
+        raise ValueError("Gate 0.1 source_support_contract must be a mapping.")
+    _assert_exact_keys(
+        support_contract, _SOURCE_SUPPORT_KEYS, "Gate 0.1 source support contract"
+    )
+    if support_contract["derivation"] != "abs(source_image)>threshold":
+        raise ValueError("Gate 0.1 source support derivation is incompatible.")
+    support_threshold = float(support_contract["threshold"])
+    if support_threshold < 0 or not math.isfinite(support_threshold):
+        raise ValueError("Gate 0.1 source support threshold must be finite and non-negative.")
 
-    cases: list[Gate01Case] = []
-    manifest_root = source.resolve().parent
+    case_specs: list[Mapping[str, Any]] = []
+    selection_descriptors: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
+    seen_directions: set[tuple[str, float, float]] = set()
+    traveller_hashes: set[str] = set()
     for index, item in enumerate(payload["cases"]):
         if not isinstance(item, Mapping):
             raise ValueError(f"Gate 0.1 case {index} must be a mapping.")
@@ -613,41 +831,148 @@ def load_gate01_input_manifest(
             f"Gate 0.1 case {index}",
             optional={"wrong_target_sb_v2"},
         )
+        case_id = str(item["case_id"])
+        case_hash = hashlib.sha256(case_id.encode("utf-8")).hexdigest()
+        if case_hash in seen_case_ids:
+            raise ValueError("Gate 0.1 input contains duplicate case IDs.")
+        seen_case_ids.add(case_hash)
+        traveller_hash = str(item["traveller_identity_sha256"])
+        if not _is_sha256(traveller_hash):
+            raise ValueError(f"Gate 0.1 case {index} has an invalid traveller digest.")
+        traveller_hashes.add(traveller_hash)
         source_domain = Domain.from_dict(dict(item["source_domain"]))
         target_domain = Domain.from_dict(dict(item["target_domain"]))
-        wrong = {
-            str(label): _load_external_volume(_resolve_manifest_path(manifest_root, value))
-            for label, value in dict(item.get("wrong_target_sb_v2", {})).items()
-        }
-        cases.append(
-            Gate01Case(
-                case_id=str(item["case_id"]),
-                source_domain=source_domain,
-                target_domain=target_domain,
-                target=_load_external_volume(
-                    _resolve_manifest_path(manifest_root, item["target"])
-                ),
-                raw_identity=_load_external_volume(
-                    _resolve_manifest_path(manifest_root, item["raw_identity"])
-                ),
-                raw_sb_v2=_load_external_volume(
-                    _resolve_manifest_path(manifest_root, item["raw_sb_v2"])
-                ),
-                stage1_reconstruction_ceiling=_load_external_volume(
-                    _resolve_manifest_path(
-                        manifest_root, item["stage1_reconstruction_ceiling"]
-                    )
-                ),
-                wrong_target_sb_v2=wrong,
+        if Contrast.parse(source_domain.contrast) != Contrast.parse(target_domain.contrast):
+            raise ValueError("Gate 0.1 evaluates same-contrast field translation only.")
+        direction = (
+            Contrast.parse(target_domain.contrast).value,
+            float(source_domain.field_strength_t),
+            float(target_domain.field_strength_t),
+        )
+        if direction in seen_directions:
+            raise ValueError(
+                "Gate 0.1 input contains a duplicate contrast/directed-field pair."
             )
+        seen_directions.add(direction)
+        for key in (
+            "source_image",
+            "source_support_mask",
+            "target",
+            "raw_identity",
+            "raw_sb_v2",
+            "stage1_reconstruction_ceiling",
+        ):
+            _validated_array_reference(item[key], f"Gate 0.1 case {index}.{key}")
+        wrong = item.get("wrong_target_sb_v2", {})
+        if not isinstance(wrong, Mapping):
+            raise ValueError(f"Gate 0.1 case {index}.wrong_target_sb_v2 must be a mapping.")
+        for label, reference in wrong.items():
+            _wrong_target_domain(str(label), Contrast.parse(target_domain.contrast))
+            _validated_array_reference(
+                reference, f"Gate 0.1 case {index}.wrong_target_sb_v2[{label}]"
+            )
+        selection_descriptors.append(
+            {
+                "case_identity_sha256": case_hash,
+                "traveller_identity_sha256": traveller_hash,
+                "contrast": direction[0],
+                "source_field_t": direction[1],
+                "target_field_t": direction[2],
+            }
+        )
+        case_specs.append(dict(item))
+
+    if len(traveller_hashes) > 1:
+        raise ValueError("Gate 0.1 input mixes multiple travellers.")
+    if traveller_hashes and evidence_scope["traveller_identity_sha256"] not in traveller_hashes:
+        raise ValueError(
+            "Gate 0.1 evidence scope and cases identify different travellers."
+        )
+    computed_selection = gate01_selection_fingerprint(selection_descriptors)
+    if computed_selection != selection_fingerprint:
+        raise ValueError(
+            "Gate 0.1 predeclared selection fingerprint does not match the cases."
+        )
+    if execution_mode == "scientific":
+        _validate_scientific_selection(
+            rows=[{}] * len(case_specs),
+            seen_directions=seen_directions,
+            traveller_hashes=traveller_hashes,
+            expected_fingerprint=selection_fingerprint,
+            computed_fingerprint=computed_selection,
         )
     metadata = {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "evidence_scope": dict(evidence_scope),
         "artifact_provenance": dict(payload["artifact_provenance"]),
         "split_fingerprint": str(payload["split_fingerprint"]),
+        "execution_mode": execution_mode,
+        "selection_fingerprint_sha256": selection_fingerprint,
     }
-    return cases, metadata
+    return (
+        Gate01InputManifest(
+            root=source.resolve().parent,
+            case_specs=tuple(case_specs),
+            support_threshold=support_threshold,
+        ),
+        metadata,
+    )
+
+
+def _load_gate01_case(
+    root: Path,
+    item: Mapping[str, Any],
+    *,
+    index: int,
+    support_threshold: float,
+) -> Gate01Case:
+    arrays: dict[str, torch.Tensor] = {}
+    identities: dict[str, str] = {}
+    source_image, source_hash = _load_verified_array(
+        root, item["source_image"], f"case {index} source_image"
+    )
+    support_mask, support_hash = _load_verified_array(
+        root,
+        item["source_support_mask"],
+        f"case {index} source_support_mask",
+        mask=True,
+    )
+    if tuple(source_image.shape) != tuple(support_mask.shape):
+        raise ValueError("Gate 0.1 source image/support-mask shape mismatch.")
+    derived_mask = source_image.abs() > support_threshold
+    if not torch.equal(derived_mask, support_mask):
+        raise ValueError(
+            "Gate 0.1 frozen support mask does not match its source-derived contract."
+        )
+    identities["source_image"] = source_hash
+    identities["source_support_mask"] = support_hash
+    for key in (
+        "target",
+        "raw_identity",
+        "raw_sb_v2",
+        "stage1_reconstruction_ceiling",
+    ):
+        arrays[key], identities[key] = _load_verified_array(
+            root, item[key], f"case {index} {key}"
+        )
+    wrong: dict[str, torch.Tensor] = {}
+    for label, reference in sorted(dict(item.get("wrong_target_sb_v2", {})).items()):
+        wrong[label], identities[f"wrong_target_sb_v2[{label}]"] = _load_verified_array(
+            root, reference, f"case {index} wrong_target_sb_v2[{label}]"
+        )
+    return Gate01Case(
+        case_id=str(item["case_id"]),
+        traveller_identity_sha256=str(item["traveller_identity_sha256"]),
+        source_domain=Domain.from_dict(dict(item["source_domain"])),
+        target_domain=Domain.from_dict(dict(item["target_domain"])),
+        target=arrays["target"],
+        raw_identity=arrays["raw_identity"],
+        raw_sb_v2=arrays["raw_sb_v2"],
+        stage1_reconstruction_ceiling=arrays["stage1_reconstruction_ceiling"],
+        support_mask=support_mask,
+        array_sha256=identities,
+        wrong_target_sb_v2=wrong,
+    )
 
 
 def _load_external_volume(path: Path) -> torch.Tensor:
@@ -663,10 +988,214 @@ def _load_external_volume(path: Path) -> torch.Tensor:
     return torch.from_numpy(np.asarray(array, dtype=np.float32))
 
 
+def _load_verified_array(
+    root: Path,
+    reference: Any,
+    role: str,
+    *,
+    mask: bool = False,
+) -> tuple[torch.Tensor, str]:
+    validated = _validated_array_reference(reference, role)
+    path = _resolve_manifest_path(root, validated["path"])
+    if mask:
+        if path.suffix.lower() != ".npy":
+            raise ValueError("Gate 0.1 source support masks must use .npy.")
+        raw = np.load(path, allow_pickle=False)
+        if raw.dtype != np.bool_ and not np.isin(raw, (0, 1)).all():
+            raise ValueError("Gate 0.1 source support mask must contain boolean values.")
+        tensor = torch.from_numpy(np.asarray(raw, dtype=np.bool_))
+    else:
+        tensor = _load_external_volume(path)
+        if tensor.ndim < 3:
+            raise ValueError(f"Gate 0.1 {role} is not a full volume.")
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"Gate 0.1 {role} contains non-finite values.")
+    actual = canonical_loaded_array_sha256(tensor)
+    if actual != validated["sha256"]:
+        raise ValueError(
+            f"Gate 0.1 loaded-array SHA-256 mismatch for {role}; file changed "
+            "after manifest creation or was loaded incompatibly."
+        )
+    return tensor, actual
+
+
+def _validated_array_reference(value: Any, role: str) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{role} must be a path/SHA-256 mapping.")
+    _assert_exact_keys(value, _ARRAY_REFERENCE_KEYS, role)
+    path = str(value["path"])
+    digest = str(value["sha256"])
+    if not path or not _is_sha256(digest):
+        raise ValueError(f"{role} has an invalid path or SHA-256 digest.")
+    return {"path": path, "sha256": digest}
+
+
+def canonical_loaded_array_sha256(value: torch.Tensor | np.ndarray) -> str:
+    """Hash the canonical loaded array identity, independent of container bytes."""
+
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        array = tensor.numpy()
+    else:
+        array = np.asarray(value)
+    if array.dtype == np.bool_:
+        canonical = np.ascontiguousarray(array, dtype=np.bool_)
+        dtype = "bool"
+    else:
+        canonical = np.ascontiguousarray(array, dtype="<f4")
+        dtype = "float32-le"
+    header = json.dumps(
+        {"dtype": dtype, "shape": list(canonical.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(canonical.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def gate01_selection_fingerprint(descriptors: Iterable[Mapping[str, Any]]) -> str:
+    """Hash the external case selection without exposing case or traveller identifiers."""
+
+    normalized = [
+        {
+            "case_identity_sha256": str(item["case_identity_sha256"]),
+            "traveller_identity_sha256": str(item["traveller_identity_sha256"]),
+            "contrast": Contrast.parse(item["contrast"]).value,
+            "source_field_t": float(item["source_field_t"]),
+            "target_field_t": float(item["target_field_t"]),
+        }
+        for item in descriptors
+    ]
+    normalized.sort(
+        key=lambda item: (
+            item["contrast"],
+            item["source_field_t"],
+            item["target_field_t"],
+            item["case_identity_sha256"],
+        )
+    )
+    encoded = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_scientific_selection(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    seen_directions: set[tuple[str, float, float]],
+    traveller_hashes: set[str],
+    expected_fingerprint: str,
+    computed_fingerprint: str,
+) -> None:
+    expected_directions = {
+        (contrast.value, float(source), float(target))
+        for contrast in CONTRASTS
+        for source in FIELD_STRENGTHS_T
+        for target in FIELD_STRENGTHS_T
+        if source != target
+    }
+    if len(rows) != GATE01_SCIENTIFIC_CASE_COUNT:
+        raise ValueError(
+            "Scientific Gate 0.1 mode requires exactly 60 unique full-volume cases."
+        )
+    if seen_directions != expected_directions:
+        missing = sorted(expected_directions - seen_directions)
+        unexpected = sorted(seen_directions - expected_directions)
+        raise ValueError(
+            "Scientific Gate 0.1 directed selection is incomplete or unexpected: "
+            f"missing={missing}, unexpected={unexpected}."
+        )
+    if len(traveller_hashes) != 1:
+        raise ValueError("Scientific Gate 0.1 mode requires exactly one traveller.")
+    if computed_fingerprint != expected_fingerprint:
+        raise ValueError("Scientific Gate 0.1 selection fingerprint mismatch.")
+
+
+def gate01_code_provenance(repo_root: str | Path | None = None) -> dict[str, Any]:
+    """Capture clean-checkout and scientific module identities for a run."""
+
+    root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else Path(__file__).resolve().parents[3]
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return {
+        "git_head": head,
+        "checkout_clean": not bool(status.strip()),
+        "module_sha256": {
+            relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+            for relative in GATE01_SCIENTIFIC_MODULES
+        },
+    }
+
+
+def _validate_scientific_code_provenance(
+    provenance: Mapping[str, Any], code_commit: str
+) -> None:
+    if provenance.get("checkout_clean") is not True:
+        raise ValueError("Scientific Gate 0.1 mode requires a clean checkout.")
+    if provenance.get("git_head") != code_commit:
+        raise ValueError("Scientific Gate 0.1 code commit does not match checkout HEAD.")
+    module_hashes = provenance.get("module_sha256")
+    if not isinstance(module_hashes, Mapping) or set(module_hashes) != set(
+        GATE01_SCIENTIFIC_MODULES
+    ):
+        raise ValueError("Scientific Gate 0.1 module/source hashes are incomplete.")
+    if not all(_is_sha256(str(value)) for value in module_hashes.values()):
+        raise ValueError("Scientific Gate 0.1 module/source hash is invalid.")
+
+
+def _background_leakage(
+    prediction: torch.Tensor, support_mask: torch.Tensor
+) -> dict[str, float | int]:
+    background = prediction.detach().cpu().to(torch.float64)[
+        ~support_mask.detach().cpu()
+    ].abs()
+    if background.numel() == 0:
+        return {
+            "voxel_count": 0,
+            "nonzero_voxel_count": 0,
+            "nonzero_fraction": 0.0,
+            "mean_abs": 0.0,
+            "rms": 0.0,
+            "max_abs": 0.0,
+        }
+    return {
+        "voxel_count": int(background.numel()),
+        "nonzero_voxel_count": int(torch.count_nonzero(background).item()),
+        "nonzero_fraction": float(torch.count_nonzero(background).item() / background.numel()),
+        "mean_abs": float(background.mean().item()),
+        "rms": float(torch.sqrt(torch.mean(background.square())).item()),
+        "max_abs": float(background.max().item()),
+    }
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _validated_evidence_scope(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("Gate 0.1 evidence_scope must be a mapping.")
-    required = {"role", "traveller", "private_data_run"}
+    required = {"role", "traveller_identity_sha256", "private_data_run"}
     missing = sorted(required - set(value))
     if missing:
         raise ValueError(
@@ -674,9 +1203,11 @@ def _validated_evidence_scope(value: Any) -> dict[str, Any]:
         )
     if not isinstance(value["private_data_run"], bool):
         raise ValueError("Gate 0.1 evidence_scope.private_data_run must be boolean.")
-    if not str(value["role"]).strip() or not str(value["traveller"]).strip():
+    if not str(value["role"]).strip():
+        raise ValueError("Gate 0.1 evidence_scope role must be non-empty.")
+    if not _is_sha256(str(value["traveller_identity_sha256"])):
         raise ValueError(
-            "Gate 0.1 evidence_scope role and traveller must be non-empty."
+            "Gate 0.1 evidence_scope traveller identity must be a SHA-256 digest."
         )
     return dict(value)
 
@@ -746,6 +1277,36 @@ def _paired_comparison(
             "calibrated_sb_minus_calibrated_identity": raw_delta,
             "improvement_favoring_sb": improvement,
             "winner": winner,
+        }
+    return result
+
+
+def _reduce_background_leakage(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    methods = (
+        "raw_identity",
+        "raw_sb_v2",
+        "stage1_reconstruction_ceiling",
+    )
+    result: dict[str, Any] = {"num_pairs": len(rows), "methods": {}}
+    for method in methods:
+        blocks = [row["raw_pre_mask_background_leakage"][method] for row in rows]
+        voxel_count = sum(int(block["voxel_count"]) for block in blocks)
+        nonzero_count = sum(int(block["nonzero_voxel_count"]) for block in blocks)
+        result["methods"][method] = {
+            "background_voxel_count": voxel_count,
+            "nonzero_voxel_count": nonzero_count,
+            "nonzero_fraction": (
+                float(nonzero_count / voxel_count) if voxel_count else 0.0
+            ),
+            "mean_case_mean_abs": _mean_or_none(
+                [float(block["mean_abs"]) for block in blocks]
+            ),
+            "mean_case_rms": _mean_or_none(
+                [float(block["rms"]) for block in blocks]
+            ),
+            "max_abs": max(
+                (float(block["max_abs"]) for block in blocks), default=0.0
+            ),
         }
     return result
 
@@ -884,7 +1445,10 @@ def _wrong_target_diagnostic(
             metric_fn(prediction, case.target, metrics, device), metrics, "wrong_target_raw"
         )
         calibrated_prediction = calibrator.apply(
-            prediction, wrong_domain, mode="histogram"
+            prediction,
+            wrong_domain,
+            support_mask=case.support_mask,
+            mode="histogram",
         )
         calibrated = _validated_metric_result(
             metric_fn(calibrated_prediction, case.target, metrics, device),
@@ -997,6 +1561,20 @@ def _markdown_central_table(block: Mapping[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _markdown_background_leakage(block: Mapping[str, Any]) -> str:
+    rows = [
+        "| Method | Nonzero / background voxels | Fraction | Mean case | Max |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for method, values in block["methods"].items():
+        rows.append(
+            f"| {method} | {values['nonzero_voxel_count']} / "
+            f"{values['background_voxel_count']} | {values['nonzero_fraction']:.6f} | "
+            f"{_fmt_optional(values['mean_case_mean_abs'])} | {values['max_abs']:.6f} |"
+        )
+    return "\n".join(rows)
+
+
 def _fmt_optional(value: Any) -> str:
     return "—" if value is None else f"{float(value):.6f}"
 
@@ -1014,9 +1592,13 @@ __all__ = [
     "GATE01_CONTRACT_VERSION",
     "GATE01_INPUT_CONTRACT_VERSION",
     "Gate01Case",
+    "Gate01InputManifest",
+    "canonical_loaded_array_sha256",
     "evaluate_gate01",
     "fixed_montage_specifications",
     "frozen_artifact_provenance",
+    "gate01_code_provenance",
+    "gate01_selection_fingerprint",
     "load_gate01_input_manifest",
     "official_gate01_metric_fn",
     "render_gate01_markdown",

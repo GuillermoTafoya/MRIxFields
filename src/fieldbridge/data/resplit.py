@@ -16,6 +16,10 @@ from typing import Any
 
 SPLIT_KEYS = ("train", "validation", "test")
 
+# Both are membership-sensitive hashes written by `save_vae_splits` and enforced by
+# `load_vae_splits`. Relocating records invalidates both.
+_FINGERPRINT_KEYS = ("fingerprint", "recovery_fingerprint_v3")
+
 
 def promote_subjects_to_split(
     split_data: Mapping[str, Any],
@@ -53,7 +57,9 @@ def promote_subjects_to_split(
     if missing:
         raise ValueError(f"Subjects not found in the split: {missing}.")
 
-    result: dict[str, Any] = {k: v for k, v in split_data.items() if k != "splits"}
+    result: dict[str, Any] = {
+        k: v for k, v in split_data.items() if k not in ("splits", *_FINGERPRINT_KEYS)
+    }
     result["splits"] = {key: list(kept[key]) for key in SPLIT_KEYS}
     result["splits"][to_split].extend(promoted)
     result["resplit"] = {
@@ -61,7 +67,42 @@ def promote_subjects_to_split(
         "to_split": to_split,
         "moved_records_from": {k: v for k, v in moved.items() if v},
     }
+    # The split fingerprints are membership-sensitive, and this function just changed
+    # membership. Carrying the input's fingerprints forward produced a file that
+    # `load_vae_splits` refuses as "stale or altered" — which is every Stage-2 consumer of a
+    # resplit split. They are dropped here and recomputed by `resplit_file`, so an in-memory
+    # result never carries a fingerprint that lies about its own contents.
     return result
+
+
+def recomputed_fingerprints(split_data: Mapping[str, Any]) -> dict[str, str]:
+    """Both membership fingerprints for a relocated split, from the canonical implementations.
+
+    Imported lazily so this module stays usable for plain record relocation without pulling in
+    the split builder, and so the fingerprint definitions live in exactly one place.
+    """
+
+    from fieldbridge.data.manifests import record_from_mapping
+    from fieldbridge.data.vae_splits import (
+        VaeSplits,
+        vae_splits_fingerprint,
+        vae_splits_recovery_fingerprint_v3,
+    )
+
+    splits = split_data["splits"]
+    fractions = [float(value) for value in split_data["fractions"]]
+    rebuilt = VaeSplits(
+        train=tuple(record_from_mapping(r) for r in splits["train"]),
+        validation=tuple(record_from_mapping(r) for r in splits["validation"]),
+        test=tuple(record_from_mapping(r) for r in splits["test"]),
+        seed=int(split_data["seed"]),
+        fractions=(fractions[0], fractions[1], fractions[2]),
+        metadata=dict(split_data.get("metadata", {})),
+    )
+    return {
+        "fingerprint": vae_splits_fingerprint(rebuilt),
+        "recovery_fingerprint_v3": vae_splits_recovery_fingerprint_v3(rebuilt),
+    }
 
 
 def resplit_file(
@@ -78,6 +119,7 @@ def resplit_file(
         raise ValueError("Refusing to overwrite the input split; choose a different --out path.")
     data = json.loads(source.read_text(encoding="utf-8"))
     updated = promote_subjects_to_split(data, subjects, to_split)
+    updated.update(recomputed_fingerprints(updated))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.write_text(json.dumps(updated, indent=2, sort_keys=True), encoding="utf-8")
@@ -86,4 +128,9 @@ def resplit_file(
     return {"out": str(destination), "counts": counts, "resplit": updated["resplit"]}
 
 
-__all__ = ["promote_subjects_to_split", "resplit_file", "SPLIT_KEYS"]
+__all__ = [
+    "promote_subjects_to_split",
+    "recomputed_fingerprints",
+    "resplit_file",
+    "SPLIT_KEYS",
+]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import copy
 import gc
 import weakref
 from dataclasses import replace
@@ -15,11 +16,14 @@ from fieldbridge.evaluation.stage2_gate01 import (
     evaluate_gate01,
     fixed_montage_specifications,
     frozen_artifact_provenance,
+    canonical_loaded_array_sha256,
     gate01_selection_fingerprint,
     render_gate01_markdown,
+    validate_gate01_scientific_hash_graph,
     write_gate01_outputs,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
+    GATE01_CALIBRATOR_SOURCE_MODULES,
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
     fit_posthoc_target_calibrator,
@@ -28,6 +32,21 @@ from fieldbridge.evaluation.stage2_gate01_montage import (
     Gate01MontageCollector,
     render_gate01_montages,
 )
+from fieldbridge.evaluation.stage2_gate01_protocol import (
+    Gate01ProtocolLock,
+    frozen_protocol_artifact_provenance,
+)
+
+
+def _fit_code_provenance(commit: str) -> dict:
+    return {
+        "git_head": commit,
+        "checkout_clean": True,
+        "module_sha256": {
+            name: f"{index + 1:x}" * 64
+            for index, name in enumerate(GATE01_CALIBRATOR_SOURCE_MODULES)
+        },
+    }
 
 
 def _calibrator():
@@ -48,6 +67,7 @@ def _calibrator():
         split_fingerprint=RESPLIT_FINGERPRINT,
         training_cohort_identity="synthetic-retrospective-training",
         code_commit="fit-commit",
+        code_provenance=_fit_code_provenance("fit-commit"),
         num_quantiles=9,
     )
 
@@ -73,27 +93,52 @@ def _case(
     contrast,
     source: float,
     target: float,
-    *,
-    wrong: bool = False,
 ) -> Gate01Case:
+    source_value = 0.25 + 0.02 * FIELD_STRENGTHS_T.index(source)
     target_value = 0.25 + 0.02 * FIELD_STRENGTHS_T.index(target)
-    identity_value = 2.0 if source == 7.0 else target_value + 0.25
+    identity_value = 2.0 if source == 7.0 else source_value + 0.25
+    ceiling_value = 2.0 if target == 7.0 else target_value + 0.25
     sb_value = target_value + (0.08 if source < target else 0.12)
-    wrong_predictions = {"1.5T": _volume(target_value + 0.5)} if wrong else {}
-    if target == 1.5:
-        wrong_predictions = {"3T": _volume(target_value + 0.5)} if wrong else {}
+    source_image = _volume(source_value)
+    target_image = _volume(target_value)
+    raw_identity = _volume(identity_value)
+    raw_sb = _volume(sb_value)
+    ceiling = _volume(ceiling_value)
+    support = _volume(1.0).bool()
+    wrong_predictions = {
+        f"{wrong_target:g}T": _volume(
+            0.25
+            + 0.02 * FIELD_STRENGTHS_T.index(wrong_target)
+            + (0.08 if source < wrong_target else 0.12)
+        )
+        for wrong_target in FIELD_STRENGTHS_T
+        if wrong_target != source and wrong_target != target
+    }
+    array_sha256 = {
+        "source_image": canonical_loaded_array_sha256(source_image),
+        "source_support_mask": canonical_loaded_array_sha256(support),
+        "target": canonical_loaded_array_sha256(target_image),
+        "raw_identity": canonical_loaded_array_sha256(raw_identity),
+        "raw_sb_v2": canonical_loaded_array_sha256(raw_sb),
+        "stage1_reconstruction_ceiling": canonical_loaded_array_sha256(ceiling),
+        **{
+            f"wrong_target_sb_v2[{label}]": canonical_loaded_array_sha256(volume)
+            for label, volume in wrong_predictions.items()
+        },
+    }
     return Gate01Case(
         case_id=f"synthetic-{contrast.value}-{source:g}-{target:g}",
         source_domain=Domain(source, contrast),
         target_domain=Domain(target, contrast),
-        target=_volume(target_value),
-        raw_identity=_volume(identity_value),
-        raw_sb_v2=_volume(sb_value),
-        stage1_reconstruction_ceiling=_volume(target_value + 0.01),
-        support_mask=_volume(1.0).bool(),
+        target=target_image,
+        raw_identity=raw_identity,
+        raw_sb_v2=raw_sb,
+        stage1_reconstruction_ceiling=ceiling,
+        support_mask=support,
         traveller_identity_sha256=hashlib.sha256(
             b"synthetic-traveller"
         ).hexdigest(),
+        array_sha256=array_sha256,
         wrong_target_sb_v2=wrong_predictions,
     )
 
@@ -105,15 +150,22 @@ def _all_cases() -> list[Gate01Case]:
             for target in FIELD_STRENGTHS_T:
                 if source == target:
                     continue
-                cases.append(
-                    _case(
-                        contrast,
-                        source,
-                        target,
-                        wrong=(contrast == CONTRASTS[0] and source == 0.1 and target == 7.0),
-                    )
-                )
+                cases.append(_case(contrast, source, target))
     return cases
+
+
+def _protocol_lock(calibrator, traveller_hash: str, selection_fingerprint: str):
+    return Gate01ProtocolLock(
+        traveller_identity_sha256=traveller_hash,
+        selection_fingerprint_sha256=selection_fingerprint,
+        split_fingerprint=RESPLIT_FINGERPRINT,
+        support_threshold=0.0,
+        calibrator_artifact_sha256=calibrator.artifact_sha256,
+        calibrator_template_sha256=calibrator.template_sha256,
+        artifact_provenance=frozen_protocol_artifact_provenance(),
+        official_metrics=("nrmse", "ssim", "lpips"),
+        montage_specification=fixed_montage_specifications(),
+    )
 
 
 def _evaluate(
@@ -123,6 +175,8 @@ def _evaluate(
     cases=None,
     metrics=("nrmse", "ssim", "lpips"),
     checkout_clean: bool = True,
+    private_data_run: bool = True,
+    evidence_kind: str = "private",
 ):
     cases = list(cases if cases is not None else _all_cases())
     traveller_hash = cases[0].traveller_identity_sha256
@@ -136,15 +190,22 @@ def _evaluate(
         }
         for case in cases
     )
+    calibrator = _calibrator()
+    protocol_lock = (
+        _protocol_lock(calibrator, traveller_hash, selection_fingerprint)
+        if execution_mode == "scientific"
+        else None
+    )
     return evaluate_gate01(
         iter(cases),
-        calibrator=_calibrator(),
+        calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
         code_commit="evaluation-commit",
         evidence_scope={
             "role": "synthetic development evidence",
+            "evidence_kind": evidence_kind,
             "traveller_identity_sha256": traveller_hash,
-            "private_data_run": False,
+            "private_data_run": private_data_run,
         },
         input_manifest_sha256="a" * 64,
         execution_mode=execution_mode,
@@ -158,6 +219,7 @@ def _evaluate(
                 "src/fieldbridge/evaluation/mrixfields2026_official.py": "3" * 64,
             },
         },
+        protocol_lock=protocol_lock,
         metrics=metrics,
         device="cpu",
         include_robust_affine=include_robust_affine,
@@ -226,7 +288,7 @@ def test_per_pair_deltas_wins_and_wrong_target_diagnostics_are_labeled() -> None
 
     diagnostic = result["requested_vs_wrong_target_diagnostic"]
     assert diagnostic["role"].startswith("diagnostic-only")
-    assert diagnostic["available_pairs"] == 1
+    assert diagnostic["available_pairs"] == 60
     assert diagnostic["not_rerun"] is True
 
 
@@ -246,11 +308,147 @@ def test_official_and_diagnostic_roles_are_unambiguous() -> None:
     )
     assert result["scientific_status"]["population_or_challenge_claim"] is False
     assert result["scientific_status"]["eligible_for_scientific_conclusions"] is True
+    assert result["scientific_status"]["ineligibility_reasons"] == []
     runtime = result["contract"]["official_runtime_provenance"]
     assert runtime["python"]
     assert runtime["numpy"]
     assert runtime["torch"]
     assert runtime["lpips_device"] == "cpu"
+
+
+def test_synthetic_or_nonprivate_runs_are_explicitly_ineligible() -> None:
+    synthetic = _evaluate(private_data_run=False, evidence_kind="synthetic")
+    status = synthetic["scientific_status"]
+    assert status["eligible_for_scientific_conclusions"] is False
+    assert "private_data_run_is_not_true" in status["ineligibility_reasons"]
+    assert "evidence_kind_is_not_private" in status["ineligibility_reasons"]
+
+    development = _evaluate(execution_mode="development-incomplete")
+    assert development["scientific_status"]["eligible_for_scientific_conclusions"] is False
+
+
+def _graph_specs(cases=None):
+    return [
+        {
+            "contrast": case.target_domain.contrast,
+            "source_field_t": case.source_domain.field_strength_t,
+            "target_field_t": case.target_domain.field_strength_t,
+            "arrays": dict(case.array_sha256),
+        }
+        for case in (cases or _all_cases())
+    ]
+
+
+def test_scientific_hash_graph_validates_all_acquisitions_and_siblings() -> None:
+    graph = validate_gate01_scientific_hash_graph(_graph_specs())
+    assert graph["validated"] is True
+    assert graph["acquisition_count"] == 15
+    assert graph["direction_count"] == 60
+    assert graph["wrong_target_comparison_count"] == 180
+
+
+def test_scientific_hash_graph_rejects_cross_role_and_repetition_mismatches() -> None:
+    specs = _graph_specs()
+    first = specs[0]
+    node = (first["contrast"], first["source_field_t"])
+    for item in specs:
+        if (item["contrast"], item["source_field_t"]) == node:
+            item["arrays"]["source_image"] = "a" * 64
+    with pytest.raises(ValueError, match="source acquisition does not equal"):
+        validate_gate01_scientific_hash_graph(specs)
+
+    specs = _graph_specs()
+    first = specs[0]
+    node = (first["contrast"], first["source_field_t"])
+    for item in specs:
+        if (item["contrast"], item["source_field_t"]) == node:
+            item["arrays"]["raw_identity"] = "b" * 64
+    with pytest.raises(ValueError, match="raw identity does not equal"):
+        validate_gate01_scientific_hash_graph(specs)
+
+    specs = _graph_specs()
+    specs[0]["arrays"]["source_support_mask"] = "c" * 64
+    with pytest.raises(ValueError, match="repeated acquisition roles"):
+        validate_gate01_scientific_hash_graph(specs)
+
+
+def test_scientific_hash_graph_requires_complete_canonical_wrong_siblings() -> None:
+    specs = _graph_specs()
+    key = next(
+        key for key in specs[0]["arrays"] if key.startswith("wrong_target_sb_v2[")
+    )
+    del specs[0]["arrays"][key]
+    with pytest.raises(ValueError, match="all three sibling wrong-target"):
+        validate_gate01_scientific_hash_graph(specs)
+
+    specs = _graph_specs()
+    key = next(
+        key for key in specs[0]["arrays"] if key.startswith("wrong_target_sb_v2[")
+    )
+    specs[0]["arrays"][key] = "d" * 64
+    with pytest.raises(ValueError, match="canonical sibling prediction"):
+        validate_gate01_scientific_hash_graph(specs)
+
+
+def test_protocol_lock_is_independent_and_hash_sealed(tmp_path) -> None:
+    cases = _all_cases()
+    calibrator = _calibrator()
+    fingerprint = gate01_selection_fingerprint(
+        {
+            "case_identity_sha256": case.case_identity_sha256,
+            "traveller_identity_sha256": case.traveller_identity_sha256,
+            "contrast": case.target_domain.contrast,
+            "source_field_t": case.source_domain.field_strength_t,
+            "target_field_t": case.target_domain.field_strength_t,
+        }
+        for case in cases
+    )
+    lock = _protocol_lock(
+        calibrator, cases[0].traveller_identity_sha256, fingerprint
+    )
+    path = lock.save(tmp_path / "protocol-lock.json")
+    loaded = Gate01ProtocolLock.load(path)
+    assert loaded.artifact_sha256 == lock.artifact_sha256
+    with pytest.raises(ValueError, match="independent protocol lock"):
+        loaded.assert_manifest_contract(
+            traveller_identity_sha256="e" * 64,
+            selection_fingerprint_sha256=fingerprint,
+            split_fingerprint=RESPLIT_FINGERPRINT,
+            support_threshold=0.0,
+            artifact_provenance=frozen_artifact_provenance(),
+        )
+
+    tampered = copy.deepcopy(loaded.to_dict())
+    tampered["selection_fingerprint_sha256"] = "f" * 64
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact hash mismatch"):
+        Gate01ProtocolLock.load(path)
+
+
+def test_protocol_lock_rejects_unfrozen_runtime_contracts() -> None:
+    calibrator = _calibrator()
+    cases = _all_cases()
+    lock = _protocol_lock(calibrator, cases[0].traveller_identity_sha256, "a" * 64)
+    with pytest.raises(ValueError, match="runtime metrics"):
+        lock.assert_runtime_contract(
+            metrics=("nrmse",), montage_specification=fixed_montage_specifications()
+        )
+    montage = fixed_montage_specifications()
+    montage["relative_slice_positions"] = [0.5]
+    with pytest.raises(ValueError, match="montage specification"):
+        lock.assert_runtime_contract(
+            metrics=("nrmse", "ssim", "lpips"), montage_specification=montage
+        )
+    with pytest.raises(ValueError, match="support threshold"):
+        replace(lock, support_threshold=1e-8)
+    with pytest.raises(ValueError, match="incompatible frozen artifacts"):
+        replace(
+            lock,
+            artifact_provenance={
+                **frozen_protocol_artifact_provenance(),
+                "sb_v2_checkpoint_sha256": "0" * 64,
+            },
+        )
 
 
 def test_scientific_mode_rejects_incomplete_duplicate_mixed_and_dirty_inputs() -> None:
@@ -283,6 +481,9 @@ def test_scientific_mode_rejects_incomplete_duplicate_mixed_and_dirty_inputs() -
 def test_raw_pre_mask_background_leakage_is_reported_and_calibration_is_zero() -> None:
     cases = _all_cases()
     cases[0].raw_sb_v2[0, 0, 0] = 1e-7
+    cases[0].array_sha256["raw_sb_v2"] = canonical_loaded_array_sha256(
+        cases[0].raw_sb_v2
+    )
     observed = {}
 
     def observer(case, predictions):
@@ -301,18 +502,20 @@ def test_raw_pre_mask_background_leakage_is_reported_and_calibration_is_zero() -
         }
         for case in cases
     )
+    calibrator = _calibrator()
     result = evaluate_gate01(
         iter(cases),
-        calibrator=_calibrator(),
+        calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
         code_commit="evaluation-commit",
         evidence_scope={
             "role": "synthetic",
+            "evidence_kind": "private",
             "traveller_identity_sha256": traveller_hash,
-            "private_data_run": False,
+            "private_data_run": True,
         },
         input_manifest_sha256="a" * 64,
-        execution_mode="scientific",
+        execution_mode="development-incomplete",
         selection_fingerprint_sha256=fingerprint,
         code_provenance={
             "git_head": "evaluation-commit",
@@ -390,19 +593,22 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
                     )
                     yield case
 
+    calibrator = _calibrator()
+    selection_fingerprint = gate01_selection_fingerprint(descriptors)
     result = evaluate_gate01(
         stream(),
-        calibrator=_calibrator(),
+        calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
         code_commit="evaluation-commit",
         evidence_scope={
             "role": "synthetic",
+            "evidence_kind": "private",
             "traveller_identity_sha256": traveller_hash,
-            "private_data_run": False,
+            "private_data_run": True,
         },
         input_manifest_sha256="a" * 64,
         execution_mode="scientific",
-        selection_fingerprint_sha256=gate01_selection_fingerprint(descriptors),
+        selection_fingerprint_sha256=selection_fingerprint,
         code_provenance={
             "git_head": "evaluation-commit",
             "checkout_clean": True,
@@ -412,6 +618,9 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
                 "src/fieldbridge/evaluation/mrixfields2026_official.py": "3" * 64,
             },
         },
+        protocol_lock=_protocol_lock(
+            calibrator, traveller_hash, selection_fingerprint
+        ),
         metrics=("nrmse", "ssim", "lpips"),
         device="cpu",
         metric_fn=_metric_fn,

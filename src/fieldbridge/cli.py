@@ -79,6 +79,7 @@ from fieldbridge.evaluation.stage2_gate01 import (
     evaluate_gate01,
     fixed_montage_specifications,
     gate01_code_provenance,
+    gate01_selection_fingerprint,
     load_gate01_input_manifest,
     write_gate01_outputs,
 )
@@ -91,6 +92,13 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
     fit_posthoc_target_calibrator,
+    gate01_calibrator_code_provenance,
+)
+from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
+from fieldbridge.evaluation.stage2_gate01_builder import (
+    assert_gate01_external_path,
+    build_gate01_private_manifest,
+    write_gate01_protocol_lock,
 )
 from fieldbridge.evaluation.board_score import (
     aggregate_task3_board,
@@ -732,6 +740,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--device", choices=("auto", "cpu", "cuda"), default="auto"
     )
 
+    lock_gate01 = subparsers.add_parser(
+        "lock-gate01-protocol",
+        help="Hash-seal an independent external Gate-0.1 protocol specification.",
+    )
+    lock_gate01.add_argument("--spec", type=Path, required=True)
+    lock_gate01.add_argument("--out", type=Path, required=True)
+
+    fingerprint_gate01 = subparsers.add_parser(
+        "fingerprint-gate01-selection",
+        help="Hash a sanitized, predeclared Gate-0.1 selection descriptor list.",
+    )
+    fingerprint_gate01.add_argument("--selection", type=Path, required=True)
+
+    build_gate01 = subparsers.add_parser(
+        "build-gate01-private-manifest",
+        help=(
+            "Verify frozen external arrays and resumably build the private Gate-0.1 "
+            "prediction manifest without running inference."
+        ),
+    )
+    build_gate01.add_argument("--plan", type=Path, required=True)
+    build_gate01.add_argument("--protocol-lock", type=Path, required=True)
+    build_gate01.add_argument("--calibrator", type=Path, required=True)
+    build_gate01.add_argument("--out", type=Path, required=True)
+    build_gate01.add_argument("--state", type=Path, required=True)
+    build_gate01.add_argument("--resume", action="store_true")
+
     gate01 = subparsers.add_parser(
         "gate01-equal-photometry",
         help=(
@@ -741,6 +776,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gate01.add_argument("--manifest", type=Path, required=True)
     gate01.add_argument("--calibrator", type=Path, required=True)
+    gate01.add_argument(
+        "--protocol-lock",
+        type=Path,
+        default=None,
+        help="Independent external protocol lock; mandatory for scientific mode.",
+    )
     gate01.add_argument(
         "--metrics",
         nargs="+",
@@ -1472,6 +1513,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "fit-gate01-target-calibrator":
+        assert_gate01_external_path(args.split_json, repo_root=None)
+        assert_gate01_external_path(args.out, repo_root=None)
         splits = load_vae_splits(args.split_json)
         split_fingerprint = vae_splits_fingerprint(splits)
         if split_fingerprint != RESPLIT_FINGERPRINT:
@@ -1507,6 +1550,7 @@ def main(argv: list[str] | None = None) -> int:
             split_fingerprint=split_fingerprint,
             training_cohort_identity=args.training_cohort_identity,
             code_commit=resolve_git_commit(),
+            code_provenance=gate01_calibrator_code_provenance(),
             num_quantiles=args.num_quantiles,
             mask_threshold=args.mask_threshold,
             low_probability=args.low_probability,
@@ -1523,6 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "out": str(args.out),
                     "contract_version": calibrator.to_dict()["contract_version"],
+                    "artifact_sha256": calibrator.artifact_sha256,
                     "template_sha256": calibrator.template_sha256,
                     "split_fingerprint": calibrator.split_fingerprint,
                     "reference_volumes": len(retrospective),
@@ -1536,16 +1581,61 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "lock-gate01-protocol":
+        lock = write_gate01_protocol_lock(args.spec, args.out)
+        print(json.dumps(lock.summary(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "fingerprint-gate01-selection":
+        selection = json.loads(args.selection.read_text(encoding="utf-8"))
+        if not isinstance(selection, list):
+            raise SystemExit("Gate 0.1 selection descriptor root must be a list.")
+        print(gate01_selection_fingerprint(selection))
+        return 0
+
+    if args.command == "build-gate01-private-manifest":
+        result = build_gate01_private_manifest(
+            args.plan,
+            args.protocol_lock,
+            args.calibrator,
+            args.out,
+            args.state,
+            resume=args.resume,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
     if args.command == "gate01-equal-photometry":
-        cases, input_metadata = load_gate01_input_manifest(args.manifest)
+        protocol_lock = (
+            Gate01ProtocolLock.load(args.protocol_lock)
+            if args.protocol_lock is not None
+            else None
+        )
+        calibrator = PosthocTargetCalibrator.load(
+            args.calibrator,
+            expected_split_fingerprint=RESPLIT_FINGERPRINT,
+            expected_template_sha256=(
+                protocol_lock.calibrator_template_sha256
+                if protocol_lock is not None
+                else None
+            ),
+            expected_artifact_sha256=(
+                protocol_lock.calibrator_artifact_sha256
+                if protocol_lock is not None
+                else None
+            ),
+        )
+        if protocol_lock is not None:
+            protocol_lock.assert_calibrator(calibrator)
+        cases, input_metadata = load_gate01_input_manifest(
+            args.manifest,
+            protocol_lock=protocol_lock,
+            calibrator=calibrator,
+        )
         if input_metadata["execution_mode"] == "scientific" and args.montage_dir is None:
             raise ValueError(
                 "Scientific Gate 0.1 mode requires --montage-dir for frozen rendering."
             )
-        calibrator = PosthocTargetCalibrator.load(
-            args.calibrator,
-            expected_split_fingerprint=RESPLIT_FINGERPRINT,
-        )
         montage_collector = (
             Gate01MontageCollector(fixed_montage_specifications())
             if args.montage_dir is not None
@@ -1559,11 +1649,13 @@ def main(argv: list[str] | None = None) -> int:
             code_commit=resolve_git_commit(),
             evidence_scope=input_metadata["evidence_scope"],
             input_manifest_sha256=input_metadata["sha256"],
+            support_threshold=input_metadata["support_threshold"],
             execution_mode=input_metadata["execution_mode"],
             selection_fingerprint_sha256=input_metadata[
                 "selection_fingerprint_sha256"
             ],
             code_provenance=code_provenance,
+            protocol_lock=protocol_lock,
             metrics=tuple(args.metrics),
             device=args.device,
             include_robust_affine=args.include_robust_affine,

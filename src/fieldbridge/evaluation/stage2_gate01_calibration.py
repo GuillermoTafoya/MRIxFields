@@ -12,17 +12,26 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 
-GATE01_CALIBRATOR_CONTRACT_VERSION = "stage2-gate01-target-cdf-v2"
+GATE01_CALIBRATOR_CONTRACT_VERSION = "stage2-gate01-target-cdf-v3"
 GATE01_CALIBRATION_SEMANTICS = "prediction-cdf-to-frozen-training-target-cdf"
+GATE01_SUPPORT_THRESHOLD = 0.0
+GATE01_CALIBRATOR_SOURCE_MODULES = (
+    "src/fieldbridge/evaluation/stage2_gate01_calibration.py",
+    "src/fieldbridge/cli.py",
+    "src/fieldbridge/data/vae_splits.py",
+    "src/fieldbridge/data/sources.py",
+)
 CalibrationMode = Literal["histogram", "robust_affine"]
 
 STAGE1_RUN_C_CHECKPOINT_SHA256 = (
@@ -79,7 +88,10 @@ _PROVENANCE_KEYS = {
     "split_fingerprint",
     "training_cohort_identity",
     "training_records_sha256",
+    "training_volume_content_identities",
+    "training_volume_content_set_sha256",
     "code_commit",
+    "code_provenance",
     "config",
     "balancing",
     "domain_volume_counts",
@@ -94,6 +106,7 @@ class PosthocTargetCalibrator:
     templates: Mapping[str, TargetDomainTemplate]
     provenance: Mapping[str, Any]
     mask_threshold: float = 0.0
+    support_threshold: float = GATE01_SUPPORT_THRESHOLD
     low_probability: float = 0.01
     high_probability: float = 0.99
 
@@ -116,6 +129,8 @@ class PosthocTargetCalibrator:
             raise ValueError(
                 "Gate 0.1 mask_threshold must be finite and non-negative."
             )
+        if self.support_threshold != GATE01_SUPPORT_THRESHOLD:
+            raise ValueError("Gate 0.1 support threshold is frozen at exactly 0.0.")
         object.__setattr__(self, "probabilities", probabilities)
 
         missing_provenance = sorted(_PROVENANCE_KEYS - set(self.provenance))
@@ -124,6 +139,13 @@ class PosthocTargetCalibrator:
                 "Gate 0.1 calibrator provenance is incomplete; missing "
                 f"{missing_provenance}."
             )
+        _validate_calibrator_code_provenance(
+            self.provenance["code_provenance"], str(self.provenance["code_commit"])
+        )
+        _validate_training_content_identities(
+            self.provenance["training_volume_content_identities"],
+            str(self.provenance["training_volume_content_set_sha256"]),
+        )
         expected_labels = set(all_domain_labels())
         actual_labels = set(self.templates)
         if actual_labels != expected_labels:
@@ -159,10 +181,15 @@ class PosthocTargetCalibrator:
     def template_sha256(self) -> str:
         return _sha256_json(self._template_payload())
 
+    @property
+    def artifact_sha256(self) -> str:
+        return str(self.to_dict()["artifact_sha256"])
+
     def _template_payload(self) -> dict[str, Any]:
         return {
             "probabilities": [float(value) for value in self.probabilities],
             "mask_threshold": float(self.mask_threshold),
+            "support_threshold": float(self.support_threshold),
             "low_probability": float(self.low_probability),
             "high_probability": float(self.high_probability),
             "templates": {
@@ -207,6 +234,7 @@ class PosthocTargetCalibrator:
         *,
         expected_split_fingerprint: str | None = None,
         expected_template_sha256: str | None = None,
+        expected_artifact_sha256: str | None = None,
     ) -> "PosthocTargetCalibrator":
         version = str(payload.get("contract_version", ""))
         if version != GATE01_CALIBRATOR_CONTRACT_VERSION:
@@ -235,6 +263,7 @@ class PosthocTargetCalibrator:
             templates=templates,
             provenance=dict(payload.get("provenance", {})),
             mask_threshold=float(payload.get("mask_threshold", 0.0)),
+            support_threshold=float(payload.get("support_threshold", float("nan"))),
             low_probability=float(payload.get("low_probability", 0.01)),
             high_probability=float(payload.get("high_probability", 0.99)),
         )
@@ -249,6 +278,14 @@ class PosthocTargetCalibrator:
             raise ValueError(
                 "Gate 0.1 calibrator artifact hash mismatch: provenance or templates "
                 "are stale or altered."
+            )
+        if (
+            expected_artifact_sha256 is not None
+            and calibrator.artifact_sha256 != expected_artifact_sha256
+        ):
+            raise ValueError(
+                "Gate 0.1 calibrator artifact identity mismatch: "
+                f"{calibrator.artifact_sha256} != {expected_artifact_sha256}."
             )
         if (
             expected_template_sha256 is not None
@@ -268,11 +305,13 @@ class PosthocTargetCalibrator:
         *,
         expected_split_fingerprint: str | None = None,
         expected_template_sha256: str | None = None,
+        expected_artifact_sha256: str | None = None,
     ) -> "PosthocTargetCalibrator":
         return cls.from_dict(
             json.loads(Path(path).read_text(encoding="utf-8")),
             expected_split_fingerprint=expected_split_fingerprint,
             expected_template_sha256=expected_template_sha256,
+            expected_artifact_sha256=expected_artifact_sha256,
         )
 
     def save(self, path: str | Path) -> Path:
@@ -370,8 +409,10 @@ def fit_posthoc_target_calibrator(
     split_fingerprint: str,
     training_cohort_identity: str,
     code_commit: str,
+    code_provenance: Mapping[str, Any],
     num_quantiles: int = 256,
     mask_threshold: float = 0.0,
+    support_threshold: float = GATE01_SUPPORT_THRESHOLD,
     low_probability: float = 0.01,
     high_probability: float = 0.99,
     expected_cohort: str = "R",
@@ -385,10 +426,13 @@ def fit_posthoc_target_calibrator(
         raise ValueError("Gate 0.1 fitting requires a training cohort identity.")
     if not code_commit:
         raise ValueError("Gate 0.1 fitting requires the code commit.")
+    _validate_calibrator_code_provenance(code_provenance, code_commit)
     if num_quantiles < 3:
         raise ValueError("Gate 0.1 fitting requires at least 3 quantiles.")
     if mask_threshold < 0 or not math.isfinite(mask_threshold):
         raise ValueError("Gate 0.1 mask_threshold must be finite and non-negative.")
+    if support_threshold != GATE01_SUPPORT_THRESHOLD:
+        raise ValueError("Gate 0.1 support threshold is frozen at exactly 0.0.")
 
     probabilities = torch.linspace(0.0, 1.0, num_quantiles, dtype=torch.float64)
     # This is intentionally a one-pass stream.  Only the fixed-size per-volume
@@ -397,6 +441,7 @@ def fit_posthoc_target_calibrator(
     accumulated: dict[str, list[tuple[str, torch.Tensor]]] = {}
     identities: set[str] = set()
     record_metadata: list[tuple[str, str]] = []
+    content_identities: list[dict[str, str]] = []
     item_count = 0
     for item in volumes:
         item_count += 1
@@ -423,6 +468,15 @@ def fit_posthoc_target_calibrator(
             raise ValueError(
                 f"Training template {item.record_identity!r} contains non-finite values."
             )
+        content_identities.append(
+            {
+                "record_identity_sha256": _sha256_text(item.record_identity),
+                "domain": item.domain.label,
+                "canonical_loaded_array_sha256": canonical_training_volume_sha256(
+                    item.volume
+                ),
+            }
+        )
         foreground = volume.reshape(-1)
         foreground = foreground[foreground.abs() > mask_threshold]
         if foreground.numel() == 0:
@@ -472,10 +526,22 @@ def fit_posthoc_target_calibrator(
                 for identity, label in sorted(record_metadata)
             )
         ),
+        "training_volume_content_identities": sorted(
+            content_identities,
+            key=lambda item: (item["domain"], item["record_identity_sha256"]),
+        ),
+        "training_volume_content_set_sha256": _sha256_json(
+            sorted(
+                content_identities,
+                key=lambda item: (item["domain"], item["record_identity_sha256"]),
+            )
+        ),
         "code_commit": code_commit,
+        "code_provenance": dict(code_provenance),
         "config": {
             "num_quantiles": num_quantiles,
             "mask_threshold": mask_threshold,
+            "support_threshold": support_threshold,
             "low_probability": low_probability,
             "high_probability": high_probability,
             "template_foreground_rule": "abs(training target voxel) > mask_threshold",
@@ -501,9 +567,127 @@ def fit_posthoc_target_calibrator(
         templates=templates,
         provenance=provenance,
         mask_threshold=mask_threshold,
+        support_threshold=support_threshold,
         low_probability=low_probability,
         high_probability=high_probability,
     )
+
+
+def canonical_training_volume_sha256(volume: torch.Tensor) -> str:
+    """Canonical float32 loaded-array identity for one training volume."""
+
+    if not isinstance(volume, torch.Tensor):
+        raise TypeError("Gate 0.1 training content identity requires a torch.Tensor.")
+    if not bool(torch.isfinite(volume).all()):
+        raise ValueError("Gate 0.1 training content identity contains non-finite values.")
+    array = volume.detach().cpu().to(torch.float32).contiguous().numpy()
+    canonical = np.ascontiguousarray(array, dtype="<f4")
+    header = json.dumps(
+        {"dtype": "float32-le", "shape": list(canonical.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(canonical.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def gate01_calibrator_code_provenance(
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Capture the clean fitting checkout and exact calibrator source identities."""
+
+    root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else Path(__file__).resolve().parents[3]
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return {
+        "git_head": head,
+        "checkout_clean": not bool(status.strip()),
+        "module_sha256": {
+            relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
+            for relative in GATE01_CALIBRATOR_SOURCE_MODULES
+        },
+    }
+
+
+def _validate_calibrator_code_provenance(
+    provenance: Any, code_commit: str
+) -> None:
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Gate 0.1 calibrator code provenance must be a mapping.")
+    if provenance.get("checkout_clean") is not True:
+        raise ValueError("Gate 0.1 calibrator fitting requires a clean checkout.")
+    if provenance.get("git_head") != code_commit:
+        raise ValueError("Gate 0.1 calibrator fitting commit does not match checkout HEAD.")
+    module_hashes = provenance.get("module_sha256")
+    if not isinstance(module_hashes, Mapping) or set(module_hashes) != set(
+        GATE01_CALIBRATOR_SOURCE_MODULES
+    ):
+        raise ValueError("Gate 0.1 calibrator source-module hashes are incomplete.")
+    if not all(_is_sha256(str(value)) for value in module_hashes.values()):
+        raise ValueError("Gate 0.1 calibrator source-module hash is invalid.")
+
+
+def _validate_training_content_identities(
+    identities: Any, expected_set_sha256: str
+) -> None:
+    if not isinstance(identities, Sequence) or isinstance(identities, (str, bytes)):
+        raise ValueError("Gate 0.1 training content identities must be a sequence.")
+    normalized: list[dict[str, str]] = []
+    record_hashes: set[str] = set()
+    for index, item in enumerate(identities):
+        if not isinstance(item, Mapping) or set(item) != {
+            "record_identity_sha256",
+            "domain",
+            "canonical_loaded_array_sha256",
+        }:
+            raise ValueError(
+                f"Gate 0.1 training content identity {index} has an invalid schema."
+            )
+        record_hash = str(item["record_identity_sha256"])
+        content_hash = str(item["canonical_loaded_array_sha256"])
+        domain = str(item["domain"])
+        if not _is_sha256(record_hash) or not _is_sha256(content_hash):
+            raise ValueError("Gate 0.1 training content identity has an invalid SHA-256.")
+        if domain not in set(all_domain_labels()):
+            raise ValueError("Gate 0.1 training content identity has an unknown domain.")
+        if record_hash in record_hashes:
+            raise ValueError("Gate 0.1 training content identities contain a duplicate record.")
+        record_hashes.add(record_hash)
+        normalized.append(
+            {
+                "record_identity_sha256": record_hash,
+                "domain": domain,
+                "canonical_loaded_array_sha256": content_hash,
+            }
+        )
+    normalized.sort(key=lambda item: (item["domain"], item["record_identity_sha256"]))
+    if not normalized or _sha256_json(normalized) != expected_set_sha256:
+        raise ValueError("Gate 0.1 training content identity set hash mismatch.")
+    if {item["domain"] for item in normalized} != set(all_domain_labels()):
+        raise ValueError("Gate 0.1 training content identities do not cover all 15 domains.")
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 _FORBIDDEN_CALIBRATION_KEYS = {

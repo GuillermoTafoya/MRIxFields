@@ -19,6 +19,7 @@ from fieldbridge.evaluation.stage2_gate01 import (
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     GATE01_CALIBRATION_SEMANTICS,
+    GATE01_CALIBRATOR_SOURCE_MODULES,
     PosthocTargetCalibrator,
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
@@ -26,6 +27,17 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     fit_posthoc_target_calibrator,
     reject_target_derived_calibration_fields,
 )
+
+
+def _fit_code_provenance(commit: str) -> dict:
+    return {
+        "git_head": commit,
+        "checkout_clean": True,
+        "module_sha256": {
+            name: f"{index + 1:x}" * 64
+            for index, name in enumerate(GATE01_CALIBRATOR_SOURCE_MODULES)
+        },
+    }
 
 
 def _training_volume(field: float, contrast_index: int, offset: int) -> torch.Tensor:
@@ -54,6 +66,7 @@ def _fit_calibrator() -> PosthocTargetCalibrator:
         split_fingerprint=RESPLIT_FINGERPRINT,
         training_cohort_identity="synthetic-retrospective-training",
         code_commit="synthetic-code-commit",
+        code_provenance=_fit_code_provenance("synthetic-code-commit"),
         num_quantiles=17,
     )
 
@@ -234,6 +247,7 @@ def test_training_only_and_retrospective_only_fit_guards() -> None:
             split_fingerprint=RESPLIT_FINGERPRINT,
             training_cohort_identity="synthetic",
             code_commit="abc",
+            code_provenance=_fit_code_provenance("abc"),
         )
 
     prospective = list(base)
@@ -249,6 +263,7 @@ def test_training_only_and_retrospective_only_fit_guards() -> None:
             split_fingerprint=RESPLIT_FINGERPRINT,
             training_cohort_identity="synthetic",
             code_commit="abc",
+            code_provenance=_fit_code_provenance("abc"),
         )
 
 
@@ -279,6 +294,7 @@ def test_calibrator_fit_is_streaming_with_bounded_full_volume_liveness() -> None
         split_fingerprint=RESPLIT_FINGERPRINT,
         training_cohort_identity="synthetic-stream",
         code_commit="stream-test",
+        code_provenance=_fit_code_provenance("stream-test"),
         num_quantiles=9,
     )
     gc.collect()
@@ -306,13 +322,64 @@ def test_stale_split_template_and_artifact_provenance_are_rejected(
 
     altered_provenance = copy.deepcopy(payload)
     altered_provenance["provenance"]["code_commit"] = "stale-code"
-    with pytest.raises(ValueError, match="artifact hash mismatch"):
+    with pytest.raises(ValueError, match="commit does not match checkout HEAD"):
         PosthocTargetCalibrator.from_dict(altered_provenance)
 
     artifacts = frozen_artifact_provenance()
     artifacts["sb_v2_checkpoint_sha256"] = "stale-checkpoint"
     with pytest.raises(ValueError, match="frozen artifact mismatch"):
         validate_frozen_artifact_provenance(artifacts)
+
+
+def test_calibrator_provenance_rejects_dirty_or_incomplete_source_identity(
+    calibrator: PosthocTargetCalibrator,
+) -> None:
+    dirty = copy.deepcopy(calibrator.to_dict())
+    dirty["provenance"]["code_provenance"]["checkout_clean"] = False
+    with pytest.raises(ValueError, match="clean checkout"):
+        PosthocTargetCalibrator.from_dict(dirty)
+
+    incomplete = copy.deepcopy(calibrator.to_dict())
+    module_hashes = incomplete["provenance"]["code_provenance"]["module_sha256"]
+    del module_hashes[next(iter(module_hashes))]
+    with pytest.raises(ValueError, match="source-module hashes"):
+        PosthocTargetCalibrator.from_dict(incomplete)
+
+
+def test_calibrator_provenance_binds_training_content_and_locked_artifact(
+    calibrator: PosthocTargetCalibrator,
+) -> None:
+    mutated = copy.deepcopy(calibrator.to_dict())
+    identities = mutated["provenance"]["training_volume_content_identities"]
+    identities[0]["canonical_loaded_array_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="content identity set hash mismatch"):
+        PosthocTargetCalibrator.from_dict(mutated)
+
+    with pytest.raises(ValueError, match="artifact identity mismatch"):
+        PosthocTargetCalibrator.from_dict(
+            calibrator.to_dict(), expected_artifact_sha256="0" * 64
+        )
+
+
+def test_calibrator_fit_rejects_unfrozen_support_threshold() -> None:
+    records = [
+        TrainingTemplateVolume(
+            volume=torch.ones(3, 3, 3),
+            domain=Domain(field, contrast),
+            record_identity=f"{contrast.value}-{field:g}",
+        )
+        for contrast in CONTRASTS
+        for field in FIELD_STRENGTHS_T
+    ]
+    with pytest.raises(ValueError, match="support threshold is frozen"):
+        fit_posthoc_target_calibrator(
+            records,
+            split_fingerprint=RESPLIT_FINGERPRINT,
+            training_cohort_identity="synthetic",
+            code_commit="abc",
+            code_provenance=_fit_code_provenance("abc"),
+            support_threshold=1e-9,
+        )
 
 
 def test_calibrator_json_round_trip_preserves_exact_mapping(
@@ -323,6 +390,7 @@ def test_calibrator_json_round_trip_preserves_exact_mapping(
         path,
         expected_split_fingerprint=RESPLIT_FINGERPRINT,
         expected_template_sha256=calibrator.template_sha256,
+        expected_artifact_sha256=calibrator.artifact_sha256,
     )
     prediction = _training_volume(3.0, 0, 0)
     torch.testing.assert_close(

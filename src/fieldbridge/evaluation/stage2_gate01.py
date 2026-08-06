@@ -33,15 +33,17 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
     GATE0_DIAGNOSTIC_COMMIT,
     GATE01_CALIBRATION_SEMANTICS,
+    GATE01_SUPPORT_THRESHOLD,
     PosthocTargetCalibrator,
     RESPLIT_FINGERPRINT,
     SB_V2_CHECKPOINT_SHA256,
     STAGE1_RUN_C_CHECKPOINT_SHA256,
     reject_target_derived_calibration_fields,
 )
+from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
 
 GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v1"
-GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v2"
+GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v3"
 GATE01_SCIENTIFIC_CASE_COUNT = 60
 GATE01_EXECUTION_MODES = ("scientific", "development-incomplete")
 GATE01_SCIENTIFIC_MODULES = (
@@ -209,9 +211,11 @@ def evaluate_gate01(
     code_commit: str,
     evidence_scope: Mapping[str, Any],
     input_manifest_sha256: str,
+    support_threshold: float = GATE01_SUPPORT_THRESHOLD,
     execution_mode: str = "development-incomplete",
     selection_fingerprint_sha256: str | None = None,
     code_provenance: Mapping[str, Any] | None = None,
+    protocol_lock: Gate01ProtocolLock | None = None,
     metrics: Sequence[str] = OFFICIAL_METRICS,
     device: str = "cuda",
     include_robust_affine: bool = False,
@@ -239,8 +243,14 @@ def evaluate_gate01(
     evidence_scope = _validated_evidence_scope(evidence_scope)
     validate_frozen_artifact_provenance(artifact_provenance)
     calibrator.assert_split_fingerprint(RESPLIT_FINGERPRINT)
+    if support_threshold != GATE01_SUPPORT_THRESHOLD:
+        raise ValueError("Gate 0.1 runtime support threshold is frozen at exactly 0.0.")
+    if calibrator.support_threshold != support_threshold:
+        raise ValueError("Gate 0.1 runtime/calibrator support threshold mismatch.")
     normalized_code_provenance = dict(code_provenance or {})
     if execution_mode == "scientific":
+        if protocol_lock is None:
+            raise ValueError("Scientific Gate 0.1 mode requires an external protocol lock.")
         _validate_scientific_code_provenance(normalized_code_provenance, code_commit)
         if selection_fingerprint_sha256 is None or not _is_sha256(
             selection_fingerprint_sha256
@@ -248,6 +258,18 @@ def evaluate_gate01(
             raise ValueError(
                 "Scientific Gate 0.1 mode requires a predeclared selection fingerprint."
             )
+        protocol_lock.assert_calibrator(calibrator)
+        protocol_lock.assert_manifest_contract(
+            traveller_identity_sha256=evidence_scope["traveller_identity_sha256"],
+            selection_fingerprint_sha256=str(selection_fingerprint_sha256),
+            split_fingerprint=RESPLIT_FINGERPRINT,
+            support_threshold=support_threshold,
+            artifact_provenance=artifact_provenance,
+        )
+        protocol_lock.assert_runtime_contract(
+            metrics=requested_metrics,
+            montage_specification=fixed_montage_specifications(),
+        )
 
     method_names = list(CORE_METHODS)
     if include_robust_affine:
@@ -258,7 +280,9 @@ def evaluate_gate01(
     seen_case_ids: set[str] = set()
     seen_directions: set[tuple[str, float, float]] = set()
     traveller_hashes: set[str] = set()
+    graph_specs: list[dict[str, Any]] = []
     for case in cases:
+        _validate_case_content_hashes(case)
         if case.case_identity_sha256 in seen_case_ids:
             raise ValueError("Gate 0.1 input contains duplicate case IDs.")
         seen_case_ids.add(case.case_identity_sha256)
@@ -281,6 +305,14 @@ def evaluate_gate01(
                 "contrast": direction[0],
                 "source_field_t": direction[1],
                 "target_field_t": direction[2],
+            }
+        )
+        graph_specs.append(
+            {
+                "contrast": direction[0],
+                "source_field_t": direction[1],
+                "target_field_t": direction[2],
+                "arrays": dict(case.array_sha256),
             }
         )
         calibrated_identity = calibrator.apply(
@@ -393,6 +425,12 @@ def evaluate_gate01(
             expected_fingerprint=str(selection_fingerprint_sha256),
             computed_fingerprint=computed_selection_fingerprint,
         )
+        hash_graph = validate_gate01_scientific_hash_graph(graph_specs)
+    else:
+        hash_graph = {
+            "validated": False,
+            "reason": "development-incomplete mode",
+        }
     overall = _reduce_rows(rows, method_names, requested_metrics)
     catastrophic = [row for row in rows if row["stratum"] == "catastrophic_identity"]
     ordinary = [row for row in rows if row["stratum"] == "ordinary"]
@@ -414,6 +452,9 @@ def evaluate_gate01(
         "input_manifest_sha256": input_manifest_sha256,
         "execution_mode": execution_mode,
         "selection_fingerprint_sha256": computed_selection_fingerprint,
+        "support_threshold": support_threshold,
+        "protocol_lock": protocol_lock.summary() if protocol_lock is not None else None,
+        "scientific_hash_graph": hash_graph,
         "evidence_scope": dict(evidence_scope),
         "scientific_promotion_decision": "unset_pending_private_data_run",
         "split_fingerprint": RESPLIT_FINGERPRINT,
@@ -423,7 +464,9 @@ def evaluate_gate01(
         "calibrator": {
             "contract_version": calibrator.to_dict()["contract_version"],
             "semantics": GATE01_CALIBRATION_SEMANTICS,
+            "artifact_sha256": calibrator.artifact_sha256,
             "template_sha256": calibrator.template_sha256,
+            "support_threshold": calibrator.support_threshold,
             "template_hashes": {
                 label: template.template_sha256
                 for label, template in sorted(calibrator.templates.items())
@@ -436,7 +479,14 @@ def evaluate_gate01(
             "training_records_sha256": calibrator.provenance[
                 "training_records_sha256"
             ],
+            "training_volume_content_set_sha256": calibrator.provenance[
+                "training_volume_content_set_sha256"
+            ],
+            "training_volume_content_identities": list(
+                calibrator.provenance["training_volume_content_identities"]
+            ),
             "fit_code_commit": calibrator.provenance["code_commit"],
+            "fit_code_provenance": dict(calibrator.provenance["code_provenance"]),
         },
         "artifact_provenance": dict(artifact_provenance),
         "verified_loaded_array_sha256": [
@@ -490,13 +540,25 @@ def evaluate_gate01(
         },
     }
 
+    eligibility_reasons: list[str] = []
+    if execution_mode != "scientific":
+        eligibility_reasons.append("execution_mode_is_not_scientific")
+    if evidence_scope["private_data_run"] is not True:
+        eligibility_reasons.append("private_data_run_is_not_true")
+    if evidence_scope["evidence_kind"] != "private":
+        eligibility_reasons.append("evidence_kind_is_not_private")
+    if protocol_lock is None:
+        eligibility_reasons.append("protocol_lock_not_validated")
+    eligible = not eligibility_reasons
+
     return {
         "contract_version": GATE01_CONTRACT_VERSION,
         "evidence_scope": dict(evidence_scope),
         "scientific_status": {
             "execution_mode": execution_mode,
             "selection_contract_complete": execution_mode == "scientific",
-            "eligible_for_scientific_conclusions": execution_mode == "scientific",
+            "eligible_for_scientific_conclusions": eligible,
+            "ineligibility_reasons": eligibility_reasons,
             "evidence": (
                 "scientific-contract diagnostic"
                 if execution_mode == "scientific"
@@ -616,13 +678,7 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
         "",
         "## Scientific status",
         "",
-        (
-            "The strict 60-case scientific selection contract is complete. "
-            if result["scientific_status"]["execution_mode"] == "scientific"
-            else "This is development evidence only and is ineligible for scientific conclusions. "
-        )
-        + "Scientific promotion remains **unset pending a private-data run**; no population "
-        "or challenge claim is made.",
+        _markdown_scientific_status(result["scientific_status"]),
         "",
         "Evidence scope: " + json.dumps(result["evidence_scope"], sort_keys=True),
         "",
@@ -783,6 +839,9 @@ class Gate01InputManifest:
 
 def load_gate01_input_manifest(
     path: str | Path,
+    *,
+    protocol_lock: Gate01ProtocolLock | None = None,
+    calibrator: PosthocTargetCalibrator | None = None,
 ) -> tuple[Gate01InputManifest, dict[str, Any]]:
     """Validate metadata now and stream verified loaded arrays during evaluation."""
 
@@ -814,8 +873,10 @@ def load_gate01_input_manifest(
     if support_contract["derivation"] != "abs(source_image)>threshold":
         raise ValueError("Gate 0.1 source support derivation is incompatible.")
     support_threshold = float(support_contract["threshold"])
-    if support_threshold < 0 or not math.isfinite(support_threshold):
-        raise ValueError("Gate 0.1 source support threshold must be finite and non-negative.")
+    if support_threshold != GATE01_SUPPORT_THRESHOLD:
+        raise ValueError("Gate 0.1 source support threshold is frozen at exactly 0.0.")
+    if calibrator is not None and calibrator.support_threshold != support_threshold:
+        raise ValueError("Gate 0.1 manifest/calibrator support threshold mismatch.")
 
     case_specs: list[Mapping[str, Any]] = []
     selection_descriptors: list[dict[str, Any]] = []
@@ -894,6 +955,19 @@ def load_gate01_input_manifest(
             "Gate 0.1 predeclared selection fingerprint does not match the cases."
         )
     if execution_mode == "scientific":
+        if protocol_lock is None or calibrator is None:
+            raise ValueError(
+                "Scientific Gate 0.1 manifest validation requires an independent "
+                "protocol lock and calibrator."
+            )
+        protocol_lock.assert_calibrator(calibrator)
+        protocol_lock.assert_manifest_contract(
+            traveller_identity_sha256=evidence_scope["traveller_identity_sha256"],
+            selection_fingerprint_sha256=selection_fingerprint,
+            split_fingerprint=str(payload["split_fingerprint"]),
+            support_threshold=support_threshold,
+            artifact_provenance=payload["artifact_provenance"],
+        )
         _validate_scientific_selection(
             rows=[{}] * len(case_specs),
             seen_directions=seen_directions,
@@ -901,6 +975,12 @@ def load_gate01_input_manifest(
             expected_fingerprint=selection_fingerprint,
             computed_fingerprint=computed_selection,
         )
+        hash_graph = validate_gate01_scientific_hash_graph(case_specs)
+    else:
+        hash_graph = {
+            "validated": False,
+            "reason": "development-incomplete mode",
+        }
     metadata = {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "evidence_scope": dict(evidence_scope),
@@ -908,6 +988,11 @@ def load_gate01_input_manifest(
         "split_fingerprint": str(payload["split_fingerprint"]),
         "execution_mode": execution_mode,
         "selection_fingerprint_sha256": selection_fingerprint,
+        "support_threshold": support_threshold,
+        "scientific_hash_graph": hash_graph,
+        "protocol_lock_artifact_sha256": (
+            protocol_lock.artifact_sha256 if protocol_lock is not None else None
+        ),
     }
     return (
         Gate01InputManifest(
@@ -1056,6 +1141,182 @@ def canonical_loaded_array_sha256(value: torch.Tensor | np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _validate_case_content_hashes(case: Gate01Case) -> None:
+    """Bind in-memory evaluator tensors to the declared canonical identities."""
+
+    if not case.array_sha256:
+        return
+    tensors = {
+        "target": case.target,
+        "raw_identity": case.raw_identity,
+        "raw_sb_v2": case.raw_sb_v2,
+        "stage1_reconstruction_ceiling": case.stage1_reconstruction_ceiling,
+        "source_support_mask": case.support_mask,
+        **{
+            f"wrong_target_sb_v2[{label}]": value
+            for label, value in case.wrong_target_sb_v2.items()
+        },
+    }
+    for role, tensor in tensors.items():
+        expected = str(case.array_sha256.get(role, ""))
+        if not _is_sha256(expected):
+            raise ValueError(f"Gate 0.1 case is missing canonical identity for {role}.")
+        if canonical_loaded_array_sha256(tensor) != expected:
+            raise ValueError(
+                f"Gate 0.1 in-memory array identity mismatch for {role}; "
+                "content changed after manifest verification."
+            )
+
+
+def validate_gate01_scientific_hash_graph(
+    case_specs: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate all acquisition/reconstruction/prediction identities by canonical hash."""
+
+    directions: dict[tuple[str, float, float], dict[str, Any]] = {}
+    for index, item in enumerate(case_specs):
+        if "source_domain" in item:
+            source_domain = Domain.from_dict(dict(item["source_domain"]))
+            target_domain = Domain.from_dict(dict(item["target_domain"]))
+            contrast = Contrast.parse(target_domain.contrast).value
+            source = float(source_domain.field_strength_t)
+            target = float(target_domain.field_strength_t)
+            arrays = {
+                key: str(_validated_array_reference(item[key], f"graph case {index}.{key}")["sha256"])
+                for key in (
+                    "source_image",
+                    "source_support_mask",
+                    "target",
+                    "raw_identity",
+                    "raw_sb_v2",
+                    "stage1_reconstruction_ceiling",
+                )
+            }
+            wrong = {
+                str(label): str(
+                    _validated_array_reference(
+                        reference, f"graph case {index}.wrong_target_sb_v2[{label}]"
+                    )["sha256"]
+                )
+                for label, reference in dict(item.get("wrong_target_sb_v2", {})).items()
+            }
+        else:
+            contrast = Contrast.parse(item["contrast"]).value
+            source = float(item["source_field_t"])
+            target = float(item["target_field_t"])
+            supplied = dict(item["arrays"])
+            arrays = {
+                key: str(supplied.get(key, ""))
+                for key in (
+                    "source_image",
+                    "source_support_mask",
+                    "target",
+                    "raw_identity",
+                    "raw_sb_v2",
+                    "stage1_reconstruction_ceiling",
+                )
+            }
+            wrong = {
+                key[len("wrong_target_sb_v2[") : -1]: str(value)
+                for key, value in supplied.items()
+                if key.startswith("wrong_target_sb_v2[") and key.endswith("]")
+            }
+        if source == target:
+            raise ValueError("Gate 0.1 hash graph contains an identity direction.")
+        if not all(_is_sha256(value) for value in arrays.values()):
+            raise ValueError("Gate 0.1 hash graph has a missing or invalid array identity.")
+        key = (contrast, source, target)
+        if key in directions:
+            raise ValueError("Gate 0.1 hash graph contains a duplicate direction.")
+        directions[key] = {"arrays": arrays, "wrong": wrong}
+
+    expected_directions = {
+        (contrast.value, float(source), float(target))
+        for contrast in CONTRASTS
+        for source in FIELD_STRENGTHS_T
+        for target in FIELD_STRENGTHS_T
+        if source != target
+    }
+    if set(directions) != expected_directions:
+        raise ValueError("Gate 0.1 hash graph does not contain all 60 directions exactly.")
+
+    node_roles: dict[tuple[str, float], dict[str, list[str]]] = {}
+    for (contrast, source, target), entry in directions.items():
+        source_node = node_roles.setdefault(
+            (contrast, source),
+            {"source": [], "target": [], "identity": [], "ceiling": [], "support": []},
+        )
+        target_node = node_roles.setdefault(
+            (contrast, target),
+            {"source": [], "target": [], "identity": [], "ceiling": [], "support": []},
+        )
+        arrays = entry["arrays"]
+        source_node["source"].append(arrays["source_image"])
+        source_node["identity"].append(arrays["raw_identity"])
+        source_node["support"].append(arrays["source_support_mask"])
+        target_node["target"].append(arrays["target"])
+        target_node["ceiling"].append(arrays["stage1_reconstruction_ceiling"])
+
+    if len(node_roles) != 15:
+        raise ValueError("Gate 0.1 hash graph must contain exactly 15 acquisitions.")
+    node_contract: dict[str, dict[str, str]] = {}
+    for (contrast, field_strength), roles in sorted(node_roles.items()):
+        if any(len(roles[name]) != 4 for name in roles):
+            raise ValueError("Gate 0.1 acquisition roles must each repeat exactly four times.")
+        if any(len(set(roles[name])) != 1 for name in roles):
+            raise ValueError("Gate 0.1 repeated acquisition roles have inconsistent hashes.")
+        source_hash = roles["source"][0]
+        target_hash = roles["target"][0]
+        identity_hash = roles["identity"][0]
+        ceiling_hash = roles["ceiling"][0]
+        if source_hash != target_hash:
+            raise ValueError(
+                "Gate 0.1 source acquisition does not equal its corresponding target hash."
+            )
+        if identity_hash != ceiling_hash:
+            raise ValueError(
+                "Gate 0.1 raw identity does not equal its corresponding Stage-1 ceiling hash."
+            )
+        node_contract[f"{contrast}:{field_strength:g}T"] = {
+            "acquisition_sha256": source_hash,
+            "stage1_reconstruction_sha256": identity_hash,
+            "source_support_mask_sha256": roles["support"][0],
+        }
+
+    wrong_comparisons = 0
+    for (contrast, source, requested), entry in directions.items():
+        expected_wrong_fields = {
+            float(value)
+            for value in FIELD_STRENGTHS_T
+            if value != source and value != requested
+        }
+        supplied_wrong: dict[float, str] = {}
+        for label, digest in entry["wrong"].items():
+            wrong_domain = _wrong_target_domain(label, Contrast.parse(contrast))
+            supplied_wrong[float(wrong_domain.field_strength_t)] = digest
+        if set(supplied_wrong) != expected_wrong_fields:
+            raise ValueError(
+                "Scientific Gate 0.1 requires all three sibling wrong-target predictions."
+            )
+        for wrong_field, digest in supplied_wrong.items():
+            sibling = directions[(contrast, source, wrong_field)]["arrays"]["raw_sb_v2"]
+            if digest != sibling:
+                raise ValueError(
+                    "Gate 0.1 wrong-target prediction is not the canonical sibling prediction."
+                )
+            wrong_comparisons += 1
+
+    node_contract_sha256 = _sha256_json(node_contract)
+    return {
+        "validated": True,
+        "acquisition_count": len(node_contract),
+        "direction_count": len(directions),
+        "wrong_target_comparison_count": wrong_comparisons,
+        "node_contract_sha256": node_contract_sha256,
+        "nodes": node_contract,
+    }
+
+
 def gate01_selection_fingerprint(descriptors: Iterable[Mapping[str, Any]]) -> str:
     """Hash the external case selection without exposing case or traveller identifiers."""
 
@@ -1192,10 +1453,22 @@ def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
+def _sha256_json(payload: Any) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validated_evidence_scope(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("Gate 0.1 evidence_scope must be a mapping.")
-    required = {"role", "traveller_identity_sha256", "private_data_run"}
+    required = {
+        "role",
+        "evidence_kind",
+        "traveller_identity_sha256",
+        "private_data_run",
+    }
     missing = sorted(required - set(value))
     if missing:
         raise ValueError(
@@ -1203,6 +1476,10 @@ def _validated_evidence_scope(value: Any) -> dict[str, Any]:
         )
     if not isinstance(value["private_data_run"], bool):
         raise ValueError("Gate 0.1 evidence_scope.private_data_run must be boolean.")
+    if value["evidence_kind"] not in {"private", "synthetic", "development"}:
+        raise ValueError(
+            "Gate 0.1 evidence_scope.evidence_kind must be private, synthetic, or development."
+        )
     if not str(value["role"]).strip():
         raise ValueError("Gate 0.1 evidence_scope role must be non-empty.")
     if not _is_sha256(str(value["traveller_identity_sha256"])):
@@ -1531,6 +1808,26 @@ def _mean_or_none(values: Sequence[float]) -> float | None:
     return float(sum(float(value) for value in values) / len(values)) if values else None
 
 
+def _markdown_scientific_status(status: Mapping[str, Any]) -> str:
+    if status["eligible_for_scientific_conclusions"]:
+        return (
+            "The strict 60-case protocol lock and private-data execution contract are "
+            "validated. Scientific promotion remains **unset pending review**; no "
+            "population or challenge claim is made."
+        )
+    reasons = ", ".join(str(value) for value in status["ineligibility_reasons"])
+    prefix = (
+        "This is development evidence only and is "
+        if status["execution_mode"] != "scientific"
+        else "This result is "
+    )
+    return (
+        prefix + "explicitly ineligible for scientific conclusions "
+        f"(`{reasons}`). Scientific promotion remains **unset pending a private-data "
+        "run** validated against this contract; no population or challenge claim is made."
+    )
+
+
 def _markdown_metrics_table(methods: Mapping[str, Mapping[str, Any]]) -> str:
     metric_names = list(next(iter(methods.values()), {}).keys())
     header = "| Method | " + " | ".join(metric_names) + " |"
@@ -1602,6 +1899,7 @@ __all__ = [
     "load_gate01_input_manifest",
     "official_gate01_metric_fn",
     "render_gate01_markdown",
+    "validate_gate01_scientific_hash_graph",
     "validate_frozen_artifact_provenance",
     "write_gate01_outputs",
 ]

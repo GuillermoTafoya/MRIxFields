@@ -17,10 +17,22 @@ from fieldbridge.evaluation.stage2_gate01 import (
     load_gate01_input_manifest,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
+    GATE01_CALIBRATOR_SOURCE_MODULES,
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
     fit_posthoc_target_calibrator,
 )
+
+
+def _fit_code_provenance(commit: str) -> dict:
+    return {
+        "git_head": commit,
+        "checkout_clean": True,
+        "module_sha256": {
+            name: f"{index + 1:x}" * 64
+            for index, name in enumerate(GATE01_CALIBRATOR_SOURCE_MODULES)
+        },
+    }
 
 
 def _write_calibrator(tmp_path):
@@ -41,6 +53,7 @@ def _write_calibrator(tmp_path):
         split_fingerprint=RESPLIT_FINGERPRINT,
         training_cohort_identity="synthetic-retrospective-training",
         code_commit="fit-commit",
+        code_provenance=_fit_code_provenance("fit-commit"),
         num_quantiles=9,
     )
     return calibrator.save(tmp_path / "calibrator.json")
@@ -103,6 +116,7 @@ def _write_manifest(tmp_path, *, forbidden_field: str | None = None):
         ),
         "evidence_scope": {
             "role": "synthetic development evidence",
+            "evidence_kind": "synthetic",
             "traveller_identity_sha256": traveller_hash,
             "private_data_run": False,
         },
@@ -249,5 +263,23 @@ def test_gate01_modules_are_importable_from_the_package() -> None:
     from fieldbridge.evaluation import stage2_gate01_montage
 
     assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v1")
-    assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v2")
+    assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v3")
     assert stage2_gate01_montage.Gate01MontageCollector
+
+
+def test_gate01_selection_fingerprint_cli_uses_sanitized_external_descriptors(
+    tmp_path, capsys
+) -> None:
+    descriptors = [
+        {
+            "case_identity_sha256": "1" * 64,
+            "traveller_identity_sha256": "2" * 64,
+            "contrast": "T1w",
+            "source_field_t": 0.1,
+            "target_field_t": 1.5,
+        }
+    ]
+    path = tmp_path / "selection.json"
+    path.write_text(json.dumps(descriptors), encoding="utf-8")
+    assert main(["fingerprint-gate01-selection", "--selection", str(path)]) == 0
+    assert capsys.readouterr().out.strip() == gate01_selection_fingerprint(descriptors)

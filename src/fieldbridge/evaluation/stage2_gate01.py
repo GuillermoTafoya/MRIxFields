@@ -46,7 +46,10 @@ from fieldbridge.evaluation.stage2_gate01_protocol import (
 )
 
 GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v1"
-GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v3"
+GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v4"
+GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION = (
+    "stage2-gate01-verified-producer-receipt-v1"
+)
 GATE01_SCIENTIFIC_CASE_COUNT = 60
 GATE01_EXECUTION_MODES = ("scientific", "development-incomplete")
 
@@ -209,6 +212,7 @@ def evaluate_gate01(
     code_commit: str,
     evidence_scope: Mapping[str, Any],
     input_manifest_sha256: str,
+    producer_receipt: Mapping[str, Any] | None = None,
     support_threshold: float = GATE01_SUPPORT_THRESHOLD,
     execution_mode: str = "development-incomplete",
     selection_fingerprint_sha256: str | None = None,
@@ -246,9 +250,23 @@ def evaluate_gate01(
     if calibrator.support_threshold != support_threshold:
         raise ValueError("Gate 0.1 runtime/calibrator support threshold mismatch.")
     normalized_code_provenance = dict(code_provenance or {})
+    normalized_producer_receipt = (
+        validate_gate01_verified_producer_receipt(producer_receipt)
+        if producer_receipt is not None
+        else None
+    )
     if execution_mode == "scientific":
         if protocol_lock is None:
             raise ValueError("Scientific Gate 0.1 mode requires an external protocol lock.")
+        if normalized_producer_receipt is None:
+            raise ValueError(
+                "Scientific Gate 0.1 mode requires a verified full-decode producer receipt."
+            )
+        producer_protocol = normalized_producer_receipt["producer_receipt"][
+            "protocol_lock_artifact_sha256"
+        ]
+        if producer_protocol != protocol_lock.artifact_sha256:
+            raise ValueError("Gate 0.1 producer receipt/protocol-lock identity mismatch.")
         protocol_lock.assert_evaluation_code_provenance(
             code_commit=code_commit,
             code_provenance=normalized_code_provenance,
@@ -455,6 +473,8 @@ def evaluate_gate01(
         eligibility_reasons.append("evidence_kind_is_not_private")
     if protocol_lock is None:
         eligibility_reasons.append("protocol_lock_not_validated")
+    if normalized_producer_receipt is None:
+        eligibility_reasons.append("producer_receipt_not_validated")
     eligible = not eligibility_reasons
     promotion_decision = _scientific_promotion_decision(
         private_data_run=evidence_scope["private_data_run"], eligible=eligible
@@ -465,6 +485,7 @@ def evaluate_gate01(
         "code_commit": code_commit,
         "code_provenance": normalized_code_provenance,
         "input_manifest_sha256": input_manifest_sha256,
+        "producer_receipt": normalized_producer_receipt,
         "execution_mode": execution_mode,
         "selection_fingerprint_sha256": computed_selection_fingerprint,
         "support_threshold": support_threshold,
@@ -691,6 +712,10 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
         "",
         "Evidence scope: " + json.dumps(result["evidence_scope"], sort_keys=True),
         "",
+        "## Private producer provenance",
+        "",
+        _markdown_producer_receipt(result["contract"].get("producer_receipt")),
+        "",
         "## Calibration contract",
         "",
         "Both identity and SB-v2 are projected from their own prediction CDF onto the same "
@@ -783,6 +808,23 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _markdown_producer_receipt(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return "No verified producer receipt (development-only invocation)."
+    receipt = value["producer_receipt"]
+    return (
+        "Verified sealed producer spec/state/build-plan handoff: "
+        f"spec file `{value['producer_spec_file_sha256']}`, state file "
+        f"`{value['producer_state_file_sha256']}`, plan `{value['build_plan_sha256']}`; "
+        f"decode strategy `{receipt['decode_strategy']}` with path used "
+        f"`{json.dumps(receipt['path_used'])}`; counts "
+        f"{receipt['acquisition_count']}/"
+        f"{receipt['direction_count']}/"
+        f"{receipt['wrong_target_reference_count']} acquisitions/directions/wrong-target "
+        "references."
+    )
+
+
 def write_gate01_outputs(
     result: Mapping[str, Any],
     *,
@@ -819,6 +861,7 @@ _ROOT_INPUT_KEYS = {
     "split_fingerprint",
     "artifact_provenance",
     "source_support_contract",
+    "producer_receipt",
     "cases",
 }
 _CASE_INPUT_KEYS = {
@@ -856,6 +899,126 @@ class Gate01InputManifest:
             )
 
 
+def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
+    """Fail closed on the builder-authenticated producer/spec/state handoff."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("Gate 0.1 verified producer receipt must be a mapping.")
+    outer_keys = {
+        "contract_version",
+        "producer_spec_contract_version",
+        "producer_state_contract_version",
+        "producer_spec_file_sha256",
+        "producer_spec_artifact_sha256",
+        "producer_state_file_sha256",
+        "build_plan_sha256",
+        "producer_receipt",
+    }
+    _assert_exact_keys(value, outer_keys, "Gate 0.1 verified producer receipt")
+    if value["contract_version"] != GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION:
+        raise ValueError("Gate 0.1 verified producer-receipt contract is incompatible.")
+    if (
+        value["producer_spec_contract_version"]
+        != "stage2-gate01-private-producer-spec-v3"
+        or value["producer_state_contract_version"]
+        != "stage2-gate01-private-producer-state-v2"
+    ):
+        raise ValueError("Gate 0.1 producer spec/state receipt versions are incompatible.")
+    for key in (
+        "producer_spec_file_sha256",
+        "producer_spec_artifact_sha256",
+        "producer_state_file_sha256",
+        "build_plan_sha256",
+    ):
+        if not _is_sha256(str(value[key])):
+            raise ValueError(f"Gate 0.1 verified producer receipt has invalid {key}.")
+    receipt = value["producer_receipt"]
+    if not isinstance(receipt, Mapping):
+        raise ValueError("Gate 0.1 sealed producer receipt must be a mapping.")
+    receipt_keys = {
+        "contract_version",
+        "producer_spec_artifact_sha256",
+        "protocol_lock_artifact_sha256",
+        "selection_artifact_sha256",
+        "selection_fingerprint_sha256",
+        "split_file_sha256",
+        "split_fingerprint",
+        "selected_source_acquisitions_sha256",
+        "selected_payload_identity_set_sha256",
+        "selected_payload_count",
+        "latent_bank",
+        "stage1_config_sha256",
+        "stage1_checkpoint_sha256",
+        "sb_v2_config_sha256",
+        "sb_v2_checkpoint_sha256",
+        "sampler_specification_sha256",
+        "decode_specification_sha256",
+        "decode_strategy",
+        "path_used",
+        "acquisition_count",
+        "stage1_inference_count",
+        "direction_count",
+        "sb_v2_inference_count",
+        "wrong_target_reference_count",
+    }
+    _assert_exact_keys(receipt, receipt_keys, "Gate 0.1 sealed producer receipt")
+    if (
+        receipt["contract_version"]
+        != "stage2-gate01-private-producer-receipt-v1"
+        or receipt["producer_spec_artifact_sha256"]
+        != value["producer_spec_artifact_sha256"]
+        or receipt["decode_strategy"] != "full"
+        or receipt["path_used"] != ["full"]
+        or receipt["selected_payload_count"] != 15
+        or receipt["acquisition_count"] != 15
+        or receipt["stage1_inference_count"] != 15
+        or receipt["direction_count"] != 60
+        or receipt["sb_v2_inference_count"] != 60
+        or receipt["wrong_target_reference_count"] != 180
+    ):
+        raise ValueError("Gate 0.1 producer receipt lacks the exact full-decode proof.")
+    sha_keys = receipt_keys - {
+        "contract_version",
+        "latent_bank",
+        "decode_strategy",
+        "path_used",
+        "selected_payload_count",
+        "acquisition_count",
+        "stage1_inference_count",
+        "direction_count",
+        "sb_v2_inference_count",
+        "wrong_target_reference_count",
+    }
+    if any(not _is_sha256(str(receipt[key])) for key in sha_keys):
+        raise ValueError("Gate 0.1 producer receipt contains an invalid identity digest.")
+    bank = receipt["latent_bank"]
+    if not isinstance(bank, Mapping) or set(bank) != {
+        "artifact_sha256",
+        "manifest_sha256",
+        "stats_sha256",
+        "record_count",
+        "build_git_commit",
+        "vae_checkpoint_sha256",
+        "encode_provenance",
+    }:
+        raise ValueError("Gate 0.1 producer receipt latent-bank identity is malformed.")
+    if (
+        not all(
+            _is_sha256(str(bank[key]))
+            for key in (
+                "artifact_sha256",
+                "manifest_sha256",
+                "stats_sha256",
+                "vae_checkpoint_sha256",
+            )
+        )
+        or int(bank["record_count"]) < 15
+        or bank["encode_provenance"] != {"strategy": "full", "path_used": ["full"]}
+    ):
+        raise ValueError("Gate 0.1 producer receipt latent bank is incompatible.")
+    return {**dict(value), "producer_receipt": dict(receipt)}
+
+
 def load_gate01_input_manifest(
     path: str | Path,
     *,
@@ -870,7 +1033,12 @@ def load_gate01_input_manifest(
     if not isinstance(payload, Mapping):
         raise ValueError("Gate 0.1 input manifest root must be a mapping.")
     reject_target_derived_calibration_fields(payload)
-    _assert_exact_keys(payload, _ROOT_INPUT_KEYS, "Gate 0.1 input manifest")
+    _assert_exact_keys(
+        payload,
+        _ROOT_INPUT_KEYS,
+        "Gate 0.1 input manifest",
+        optional={"producer_receipt"},
+    )
     if payload["contract_version"] != GATE01_INPUT_CONTRACT_VERSION:
         raise ValueError("Gate 0.1 input manifest contract is incompatible.")
     if payload["split_fingerprint"] != RESPLIT_FINGERPRINT:
@@ -880,9 +1048,32 @@ def load_gate01_input_manifest(
     execution_mode = str(payload["execution_mode"])
     if execution_mode not in GATE01_EXECUTION_MODES:
         raise ValueError(f"Unknown Gate 0.1 execution mode {execution_mode!r}.")
+    producer_receipt = (
+        validate_gate01_verified_producer_receipt(payload["producer_receipt"])
+        if "producer_receipt" in payload
+        else None
+    )
+    if execution_mode == "scientific" and producer_receipt is None:
+        raise ValueError(
+            "Scientific Gate 0.1 manifest requires verified full-decode producer provenance."
+        )
     selection_fingerprint = str(payload["selection_fingerprint_sha256"])
     if not _is_sha256(selection_fingerprint):
         raise ValueError("Gate 0.1 selection fingerprint must be a SHA-256 digest.")
+    if producer_receipt is not None:
+        sealed = producer_receipt["producer_receipt"]
+        if (
+            sealed["selection_fingerprint_sha256"] != selection_fingerprint
+            or sealed["split_fingerprint"] != payload["split_fingerprint"]
+            or (
+                protocol_lock is not None
+                and sealed["protocol_lock_artifact_sha256"]
+                != protocol_lock.artifact_sha256
+            )
+        ):
+            raise ValueError(
+                "Gate 0.1 producer receipt/manifest/protocol identities disagree."
+            )
     support_contract = payload["source_support_contract"]
     if not isinstance(support_contract, Mapping):
         raise ValueError("Gate 0.1 source_support_contract must be a mapping.")
@@ -1012,6 +1203,7 @@ def load_gate01_input_manifest(
         "protocol_lock_artifact_sha256": (
             protocol_lock.artifact_sha256 if protocol_lock is not None else None
         ),
+        "producer_receipt": producer_receipt,
     }
     return (
         Gate01InputManifest(
@@ -1976,6 +2168,7 @@ def _write_text_atomic(path: str | Path, text: str) -> Path:
 __all__ = [
     "GATE01_CONTRACT_VERSION",
     "GATE01_INPUT_CONTRACT_VERSION",
+    "GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION",
     "Gate01Case",
     "Gate01InputManifest",
     "canonical_loaded_array_sha256",
@@ -1985,6 +2178,7 @@ __all__ = [
     "gate01_code_provenance",
     "gate01_selection_fingerprint",
     "load_gate01_input_manifest",
+    "validate_gate01_verified_producer_receipt",
     "official_gate01_metric_fn",
     "render_gate01_markdown",
     "validate_gate01_scientific_hash_graph",

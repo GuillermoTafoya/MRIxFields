@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import hashlib
 
 import numpy as np
@@ -267,7 +268,7 @@ def test_gate01_modules_are_importable_from_the_package() -> None:
     assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v1")
     assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v3")
     assert stage2_gate01_montage.Gate01MontageCollector
-    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v2")
+    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v3")
     assert stage2_gate01_protocol.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION.endswith("v2")
 
 
@@ -301,6 +302,30 @@ def test_private_producer_cli_entry_point_is_packaged() -> None:
     )
     assert args.command == "produce-gate01-private-artifacts"
     assert args.resume is False
+
+
+def test_private_manifest_builder_cli_requires_sealed_producer_evidence() -> None:
+    args = build_parser().parse_args(
+        [
+            "build-gate01-private-manifest",
+            "--plan",
+            "plan.json",
+            "--producer-spec",
+            "producer-spec.json",
+            "--producer-state",
+            "producer-state.json",
+            "--protocol-lock",
+            "protocol-lock.json",
+            "--calibrator",
+            "calibrator.json",
+            "--out",
+            "manifest.json",
+            "--state",
+            "builder-state.json",
+        ]
+    )
+    assert args.producer_spec == Path("producer-spec.json")
+    assert args.producer_state == Path("producer-state.json")
 
 
 def test_gate01_selection_fingerprint_cli_uses_sanitized_external_descriptors(

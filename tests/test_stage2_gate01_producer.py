@@ -296,6 +296,8 @@ def test_private_producer_clean_build_has_exact_graph_and_no_manual_cases(
     }
     assert bundle["spec"]["decode"]["strategy"] == "full"
     assert len(bundle["spec"]["selected_source_acquisitions"]) == 15
+    assert bundle["spec"]["selected_payload_count"] == 15
+    assert len(bundle["spec"]["selected_payload_identity_set_sha256"]) == 64
     assert bundle["spec"]["stage1_config_sha256"] == STAGE1_RUN_C_CONFIG_SHA256
     assert bundle["spec"]["sb_v2_config_sha256"] == SB_V2_CONFIG_SHA256
     assert len(backend.stage1_calls) == len(set(backend.stage1_calls)) == 15
@@ -303,6 +305,12 @@ def test_private_producer_clean_build_has_exact_graph_and_no_manual_cases(
     plan = json.loads(Path(result["build_plan"]).read_text(encoding="utf-8"))
     assert len(plan["cases"]) == 60
     assert sum(len(case["wrong_target_sb_v2"]) for case in plan["cases"]) == 180
+    state = json.loads(
+        (tmp_path / "state" / "producer-state.json").read_text(encoding="utf-8")
+    )
+    assert plan["producer_receipt"] == state["producer_receipt"]
+    assert state["producer_receipt"]["decode_strategy"] == "full"
+    assert state["producer_receipt"]["path_used"] == ["full"]
     selection_text = Path(bundle["selection_path"]).read_text(encoding="utf-8")
     assert "SYNTHETIC_0007" not in selection_text
     assert str(bundle["input_root"]) not in json.dumps(plan)
@@ -354,6 +362,9 @@ def test_private_producer_interrupted_resume_is_equivalent_without_duplicate_inf
         resume=False,
     )
     assert resumed["build_plan_sha256"] == clean["build_plan_sha256"]
+    resumed_state = (tmp_path / "resumed-state" / "producer-state.json").read_bytes()
+    clean_state = (tmp_path / "clean-state" / "producer-state.json").read_bytes()
+    assert resumed_state == clean_state
 
 
 def test_private_producer_adopts_atomically_published_pending_inference(

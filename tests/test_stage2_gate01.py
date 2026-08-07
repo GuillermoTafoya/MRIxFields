@@ -12,6 +12,7 @@ import torch
 
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.evaluation.stage2_gate01 import (
+    GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION,
     Gate01Case,
     evaluate_gate01,
     fixed_montage_specifications,
@@ -190,6 +191,54 @@ def _protocol_lock(calibrator, traveller_hash: str, selection_fingerprint: str):
     )
 
 
+def _producer_receipt(lock: Gate01ProtocolLock) -> dict:
+    digest = lambda character: character * 64
+    producer_spec_artifact = digest("1")
+    return {
+        "contract_version": GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION,
+        "producer_spec_contract_version": "stage2-gate01-private-producer-spec-v3",
+        "producer_state_contract_version": "stage2-gate01-private-producer-state-v2",
+        "producer_spec_file_sha256": digest("2"),
+        "producer_spec_artifact_sha256": producer_spec_artifact,
+        "producer_state_file_sha256": digest("3"),
+        "build_plan_sha256": digest("4"),
+        "producer_receipt": {
+            "contract_version": "stage2-gate01-private-producer-receipt-v1",
+            "producer_spec_artifact_sha256": producer_spec_artifact,
+            "protocol_lock_artifact_sha256": lock.artifact_sha256,
+            "selection_artifact_sha256": digest("5"),
+            "selection_fingerprint_sha256": lock.selection_fingerprint_sha256,
+            "split_file_sha256": digest("6"),
+            "split_fingerprint": RESPLIT_FINGERPRINT,
+            "selected_source_acquisitions_sha256": digest("7"),
+            "selected_payload_identity_set_sha256": digest("8"),
+            "selected_payload_count": 15,
+            "latent_bank": {
+                "artifact_sha256": digest("9"),
+                "manifest_sha256": digest("a"),
+                "stats_sha256": digest("b"),
+                "record_count": 15,
+                "build_git_commit": "c" * 40,
+                "vae_checkpoint_sha256": digest("c"),
+                "encode_provenance": {"strategy": "full", "path_used": ["full"]},
+            },
+            "stage1_config_sha256": digest("d"),
+            "stage1_checkpoint_sha256": digest("e"),
+            "sb_v2_config_sha256": digest("f"),
+            "sb_v2_checkpoint_sha256": digest("0"),
+            "sampler_specification_sha256": digest("1"),
+            "decode_specification_sha256": digest("2"),
+            "decode_strategy": "full",
+            "path_used": ["full"],
+            "acquisition_count": 15,
+            "stage1_inference_count": 15,
+            "direction_count": 60,
+            "sb_v2_inference_count": 60,
+            "wrong_target_reference_count": 180,
+        },
+    }
+
+
 def _evaluate(
     *,
     include_robust_affine: bool = True,
@@ -218,6 +267,7 @@ def _evaluate(
         if execution_mode == "scientific"
         else None
     )
+    producer_receipt = _producer_receipt(protocol_lock) if protocol_lock else None
     return evaluate_gate01(
         iter(cases),
         calibrator=calibrator,
@@ -230,6 +280,7 @@ def _evaluate(
             "private_data_run": private_data_run,
         },
         input_manifest_sha256="a" * 64,
+        producer_receipt=producer_receipt,
         execution_mode=execution_mode,
         selection_fingerprint_sha256=selection_fingerprint,
         code_provenance=_evaluation_code_provenance(checkout_clean=checkout_clean),
@@ -243,6 +294,12 @@ def _evaluate(
 
 def test_gate01_reduces_aggregate_contrast_and_all_directed_pairs() -> None:
     result = _evaluate()
+    assert result["contract"]["producer_receipt"]["producer_receipt"][
+        "path_used"
+    ] == ["full"]
+    assert "Verified sealed producer spec/state/build-plan handoff" in render_gate01_markdown(
+        result
+    )
     assert result["num_pairs"] == 60
     assert result["overall"]["num_pairs"] == 60
     assert set(result["by_contrast"]) == {contrast.value for contrast in CONTRASTS}
@@ -680,6 +737,7 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
 
     calibrator = _calibrator()
     selection_fingerprint = gate01_selection_fingerprint(descriptors)
+    protocol_lock = _protocol_lock(calibrator, traveller_hash, selection_fingerprint)
     result = evaluate_gate01(
         stream(),
         calibrator=calibrator,
@@ -692,12 +750,11 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
             "private_data_run": True,
         },
         input_manifest_sha256="a" * 64,
+        producer_receipt=_producer_receipt(protocol_lock),
         execution_mode="scientific",
         selection_fingerprint_sha256=selection_fingerprint,
         code_provenance=_evaluation_code_provenance(),
-        protocol_lock=_protocol_lock(
-            calibrator, traveller_hash, selection_fingerprint
-        ),
+        protocol_lock=protocol_lock,
         metrics=("nrmse", "ssim", "lpips"),
         device="cpu",
         metric_fn=_metric_fn,

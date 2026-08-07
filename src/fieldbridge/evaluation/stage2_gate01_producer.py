@@ -38,7 +38,9 @@ from fieldbridge.evaluation.stage2_gate01 import (
 )
 from fieldbridge.evaluation.stage2_gate01_builder import (
     GATE01_PRIVATE_BUILD_PLAN_VERSION,
+    GATE01_PRIVATE_PRODUCER_SPEC_VERSION,
     assert_gate01_external_path,
+    sealed_gate01_producer_receipt,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
@@ -59,7 +61,6 @@ from fieldbridge.models.factory import build_decoder, build_translator
 from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 
 GATE01_PROSPECTIVE_SELECTION_VERSION = "stage2-gate01-prospective-selection-v1"
-GATE01_PRIVATE_PRODUCER_SPEC_VERSION = "stage2-gate01-private-producer-spec-v2"
 GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v2"
 GATE01_PRODUCER_DECODE_STRATEGY = "full"
 GATE01_VAE_DOWNSAMPLE_FACTOR = 4
@@ -80,6 +81,8 @@ _SPEC_KEYS = {
     "split_file_sha256",
     "split_fingerprint",
     "selected_source_acquisitions",
+    "selected_payload_identity_set_sha256",
+    "selected_payload_count",
     "latent_bank",
     "stage1_config_sha256",
     "stage1_checkpoint_sha256",
@@ -282,11 +285,12 @@ def write_gate01_producer_spec(
     if bank_identity["vae_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256:
         raise ValueError("Gate 0.1 producer latent bank used the wrong Stage-1 checkpoint.")
     source_identities = _selected_source_identities(resolved.records)
-    _selected_latent_paths(
+    _, selected_payload_identity_set_sha256 = _selected_latent_paths(
         paths["bank"],
         resolved.records,
         split_name=str(resolved.payload["split_name"]),
         source_identities=source_identities,
+        hash_file=hash_file,
     )
     payload: dict[str, Any] = {
         "contract_version": GATE01_PRIVATE_PRODUCER_SPEC_VERSION,
@@ -296,6 +300,8 @@ def write_gate01_producer_spec(
         "split_file_sha256": hash_file(paths["split"]),
         "split_fingerprint": RESPLIT_FINGERPRINT,
         "selected_source_acquisitions": source_identities,
+        "selected_payload_identity_set_sha256": selected_payload_identity_set_sha256,
+        "selected_payload_count": 15,
         "latent_bank": bank_identity,
         "stage1_config_sha256": stage1_config_sha,
         "stage1_checkpoint_sha256": stage1_sha,
@@ -376,12 +382,18 @@ def produce_gate01_private_artifacts(
     _reject_unexpected_files(
         output, state, allow_plan=(output / "private-build-plan.json").exists()
     )
-    latent_paths = _selected_latent_paths(
+    latent_paths, selected_payload_identity_set_sha256 = _selected_latent_paths(
         paths["bank"],
         resolved.records,
         split_name=str(resolved.payload["split_name"]),
         source_identities=spec["selected_source_acquisitions"],
+        hash_file=hash_file,
     )
+    if (
+        selected_payload_identity_set_sha256
+        != spec["selected_payload_identity_set_sha256"]
+    ):
+        raise ValueError("Gate 0.1 selected latent payload identity set is stale.")
     actual_backend = backend or _RealGate01Backend.create(
         bank_dir=paths["bank"],
         stage1_config=paths["stage1_config"],
@@ -626,6 +638,7 @@ def produce_gate01_private_artifacts(
         "path_used": [GATE01_PRODUCER_DECODE_STRATEGY],
     }:
         raise ValueError("Gate 0.1 producer did not prove exclusively full-volume decoding.")
+    producer_receipt = sealed_gate01_producer_receipt(spec)
     plan = {
         "contract_version": GATE01_PRIVATE_BUILD_PLAN_VERSION,
         "execution_mode": "scientific",
@@ -642,6 +655,7 @@ def produce_gate01_private_artifacts(
             "derivation": "abs(source_image)>threshold",
             "threshold": GATE01_SUPPORT_THRESHOLD,
         },
+        "producer_receipt": producer_receipt,
         "cases": cases,
     }
     plan_path = output / "private-build-plan.json"
@@ -659,6 +673,7 @@ def produce_gate01_private_artifacts(
             "direction_count": 60,
             "wrong_target_reference_count": 180,
             "producer_provenance": dict(state["producer_provenance"]),
+            "producer_receipt": producer_receipt,
         }
     )
     _write_json_atomic(state_path, state)
@@ -676,6 +691,7 @@ def produce_gate01_private_artifacts(
         "protocol_lock_artifact_sha256": lock.artifact_sha256,
         "producer_spec_artifact_sha256": spec["artifact_sha256"],
         "producer_provenance": dict(state["producer_provenance"]),
+        "producer_receipt": producer_receipt,
     }
 
 
@@ -895,7 +911,8 @@ def _selected_latent_paths(
     *,
     split_name: str,
     source_identities: Mapping[str, Any],
-) -> dict[str, Path]:
+    hash_file: Callable[[Path], str],
+) -> tuple[dict[str, Path], str]:
     manifest = json.loads((bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
     by_case: dict[str, tuple[Path, Mapping[str, Any]]] = {}
     for entry in manifest["records"]:
@@ -909,6 +926,7 @@ def _selected_latent_paths(
             raise ValueError("Gate 0.1 latent-bank path escapes its root.")
         by_case[case_id] = (path, entry)
     result: dict[str, Path] = {}
+    identities: list[dict[str, Any]] = []
     for label, record in records.items():
         found = by_case.get(str(record.case_id))
         if found is None or not found[0].is_file():
@@ -923,7 +941,22 @@ def _selected_latent_paths(
             source_identity=source_identities[label],
         )
         result[label] = path
-    return result
+        identities.append(
+            {
+                "domain": label,
+                "case_identity_sha256": _sha256_text(str(record.case_id)),
+                "payload_file_sha256": hash_file(path),
+                "split": split_name,
+                "latent_shape": [int(value) for value in payload["latent_shape"]],
+                "source_shape": [int(value) for value in payload["source_shape"]],
+                "downsample_factor": int(payload["downsample_factor"]),
+                "encode_strategy": str(payload["encode_strategy"]),
+                "vae_checkpoint_sha256": str(payload["vae_checkpoint_sha256"]),
+                "build_git_commit": str(payload["git_commit"]),
+            }
+        )
+    identities.sort(key=lambda item: item["domain"])
+    return result, _sha256_json(identities)
 
 
 def _selected_source_identities(
@@ -1037,6 +1070,16 @@ def _load_producer_spec(path: Path) -> dict[str, Any]:
     if payload["sb_v2_config_sha256"] != SB_V2_CONFIG_SHA256:
         raise ValueError("Gate 0.1 producer specification has the wrong SB-v2 config hash.")
     _validate_source_identity_contract(payload["selected_source_acquisitions"])
+    if (
+        int(payload["selected_payload_count"]) != 15
+        or not isinstance(payload["selected_payload_identity_set_sha256"], str)
+        or len(payload["selected_payload_identity_set_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in payload["selected_payload_identity_set_sha256"]
+        )
+    ):
+        raise ValueError("Gate 0.1 producer selected-payload identity contract is invalid.")
     if int(payload["deterministic_seed"]) < 0:
         raise ValueError("Gate 0.1 producer deterministic seed must be non-negative.")
     return dict(payload)

@@ -26,6 +26,7 @@ $Gate01ProtocolLock = Join-Path $Gate01External "gate01-protocol-lock.json"
 $Gate01ProducerSpec = Join-Path $Gate01External "gate01-producer-spec.json"
 $Gate01ProducerOutput = Join-Path $Gate01External "producer-output"
 $Gate01ProducerState = Join-Path $Gate01External "producer-state"
+$Gate01ProducerStateFile = Join-Path $Gate01ProducerState "producer-state.json"
 $Gate01BuildPlan = Join-Path $Gate01ProducerOutput "private-build-plan.json"
 $Gate01Manifest = Join-Path $Gate01External "gate01-private-manifest.json"
 $Gate01BuildState = Join-Path $Gate01External "gate01-private-build-state.json"
@@ -248,6 +249,8 @@ record `decode_strategy="full"` and `path_used=["full"]`.
 ```powershell
 fieldbridge build-gate01-private-manifest `
   --plan $Gate01BuildPlan `
+  --producer-spec $Gate01ProducerSpec `
+  --producer-state $Gate01ProducerStateFile `
   --protocol-lock $Gate01ProtocolLock `
   --calibrator $Gate01Calibrator `
   --out $Gate01Manifest `
@@ -259,6 +262,8 @@ After interruption, repeat it exactly with `--resume`:
 ```powershell
 fieldbridge build-gate01-private-manifest `
   --plan $Gate01BuildPlan `
+  --producer-spec $Gate01ProducerSpec `
+  --producer-state $Gate01ProducerStateFile `
   --protocol-lock $Gate01ProtocolLock `
   --calibrator $Gate01Calibrator `
   --out $Gate01Manifest `
@@ -266,9 +271,15 @@ fieldbridge build-gate01-private-manifest `
   --resume
 ```
 
-This second-stage builder performs no inference. It reloads and hashes every array,
-verifies the 15-node/60-direction/180-sibling graph, lock, calibrator and threshold, then
-atomically writes the scientific manifest.
+This second-stage builder performs no inference. It rejects every v1 build plan and
+independently verifies the sealed producer-spec artifact hash, the complete v2 producer
+state, the state's exact build-plan hash, the lock and all configuration/checkpoint/full-bank/
+source-array/selected-payload identities. It requires `decode_strategy="full"` and
+`path_used=["full"]`, reloads and hashes every array, verifies the exact
+15-node/60-direction/180-sibling graph, calibrator and threshold, then atomically writes
+the scientific manifest. The manifest embeds a verified receipt containing the spec-file,
+state-file and build-plan hashes plus the complete full-decode proof; the evaluator carries
+that receipt unchanged into its result contract and Markdown report.
 
 ## 8. Execute the official diagnostic
 
@@ -306,10 +317,18 @@ Require `scientific_status.eligible_for_scientific_conclusions=true` and
 and archive only in the external area:
 
 ```powershell
+$Gate01ResultContract = Get-Content $Gate01Contract -Raw | ConvertFrom-Json
+$Gate01Receipt = $Gate01ResultContract.producer_receipt
+if ($Gate01Receipt.producer_spec_file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01ProducerSpec).Hash.ToLowerInvariant()) { throw "Archived producer spec differs from evaluated receipt" }
+if ($Gate01Receipt.producer_state_file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01ProducerStateFile).Hash.ToLowerInvariant()) { throw "Archived producer state differs from evaluated receipt" }
+if ($Gate01Receipt.build_plan_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01BuildPlan).Hash.ToLowerInvariant()) { throw "Archived build plan differs from evaluated receipt" }
+if ($Gate01Receipt.producer_receipt.decode_strategy -ne "full") { throw "Producer receipt is not full-decode sealed" }
+if (($Gate01Receipt.producer_receipt.path_used -join ",") -ne "full") { throw "Producer receipt used a non-full path" }
 New-Item -ItemType Directory -Force $Gate01Archive | Out-Null
 $Gate01ArchiveInputs = @(
   $Gate01Calibrator, $Gate01Selection, $Gate01ProtocolSpec, $Gate01ProtocolLock,
-  $Gate01ProducerSpec, $Gate01BuildPlan, $Gate01Manifest, $Gate01BuildState,
+  $Gate01ProducerSpec, $Gate01ProducerStateFile, $Gate01BuildPlan,
+  $Gate01Manifest, $Gate01BuildState,
   $Gate01Results, $Gate01Report, $Gate01Contract
 )
 $Gate01ArchiveInputs | ForEach-Object {

@@ -829,6 +829,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_gate01.add_argument("--plan", type=Path, required=True)
+    build_gate01.add_argument("--producer-spec", type=Path, required=True)
+    build_gate01.add_argument("--producer-state", type=Path, required=True)
     build_gate01.add_argument("--protocol-lock", type=Path, required=True)
     build_gate01.add_argument("--calibrator", type=Path, required=True)
     build_gate01.add_argument("--out", type=Path, required=True)
@@ -1712,6 +1714,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build-gate01-private-manifest":
         result = build_gate01_private_manifest(
             args.plan,
+            args.producer_spec,
+            args.producer_state,
             args.protocol_lock,
             args.calibrator,
             args.out,
@@ -1765,6 +1769,7 @@ def main(argv: list[str] | None = None) -> int:
             code_commit=resolve_git_commit(),
             evidence_scope=input_metadata["evidence_scope"],
             input_manifest_sha256=input_metadata["sha256"],
+            producer_receipt=input_metadata["producer_receipt"],
             support_threshold=input_metadata["support_threshold"],
             execution_mode=input_metadata["execution_mode"],
             selection_fingerprint_sha256=input_metadata[

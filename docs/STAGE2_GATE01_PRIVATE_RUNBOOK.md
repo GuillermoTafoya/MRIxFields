@@ -158,7 +158,13 @@ does not hardcode a PR head or predict the future merge commit.
 
 The command below verifies and pins the selection, split file, every latent-bank record,
 latent statistics/manifest/build commit, both configs/checkpoints, solver, step count,
-full-volume decode path, deterministic seed, and protocol-lock identity.
+full-volume decode path, deterministic seed, and protocol-lock identity. It also loads each
+of the 15 selected source acquisitions once at a time and seals its canonical loaded-array
+SHA-256 and exact `(1, 1, X, Y, Z)` shape in the external producer specification. The
+frozen configuration file hashes are:
+
+- Stage-1 Run C: `55921ffc53bac074883b66d368051589dd3cc3f2ce5c8e2cc1d304be4245888f`
+- SB-v2: `d66a197533a9fa574146cfa21ac7c53c8471071c2b337325cf871c65588ff1aa`
 
 ```powershell
 fieldbridge lock-gate01-producer-spec `
@@ -181,6 +187,9 @@ fieldbridge lock-gate01-producer-spec `
 
 Use the reviewed frozen SB-v2 sampler/decode values. A changed config, checkpoint, bank,
 selection, split, lock, solver, step count, or decode value requires a new reviewed spec.
+The emitted decode specification must contain `"strategy": "full"`. The block/halo
+arguments remain required only by the shared decode configuration schema; Gate 0.1 never
+invokes the tiled decoder with them.
 
 ## 6. Produce the external 15/60/180 artifact graph
 
@@ -203,8 +212,9 @@ fieldbridge produce-gate01-private-artifacts `
 ```
 
 After interruption, run the identical command with `--resume`. Resume re-hashes every
-completed array and rejects stale state, mutation, missing or unexpected paths. It never
-repeats verified inference:
+completed array, reloads and revalidates all 15 sealed source hashes/shapes, and rejects
+stale state, source or output mutation, missing or unexpected paths. It never repeats
+verified inference:
 
 ```powershell
 fieldbridge produce-gate01-private-artifacts `
@@ -227,6 +237,11 @@ Verify the command reports 15 acquisitions, 15 Stage-1 inferences, 60 SB-v2 infe
 60 directions, and 180 wrong-target references. The wrong-target entries are references
 to the 60 sibling predictions; no extra inference occurs. The producer writes 15 masks as
 `abs(source) > 0.0`, canonical loaded-array hashes, and `$Gate01BuildPlan` atomically.
+It fails before inference unless the bank manifest and all selected latent payloads prove
+full encoding and match the frozen selected case/domain/split, factor 4, Stage-1 checkpoint,
+and bank-build commit. Decoding is one strict full-volume forward per inference: an OOM is
+a hard failure, tiled fallback is prohibited, and the completed producer state/result must
+record `decode_strategy="full"` and `path_used=["full"]`.
 
 ## 7. Independently verify and build the manifest
 

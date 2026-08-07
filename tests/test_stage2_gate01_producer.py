@@ -16,7 +16,9 @@ from fieldbridge.data.vae_splits import VaeSplits, save_vae_splits, vae_splits_f
 from fieldbridge.evaluation.stage2_gate01 import fixed_montage_specifications
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
+    SB_V2_CONFIG_SHA256,
     SB_V2_CHECKPOINT_SHA256,
+    STAGE1_RUN_C_CONFIG_SHA256,
     STAGE1_RUN_C_CHECKPOINT_SHA256,
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import (
@@ -25,6 +27,7 @@ from fieldbridge.evaluation.stage2_gate01_protocol import (
     frozen_protocol_artifact_provenance,
 )
 from fieldbridge.evaluation.stage2_transport_eval import DecodeSpec, TransportSamplerConfig
+from fieldbridge.models.factory import build_decoder, build_translator
 
 EVALUATION_COMMIT = "e" * 40
 
@@ -33,6 +36,11 @@ class _SyntheticBackend:
     def __init__(self) -> None:
         self.stage1_calls: list[str] = []
         self.sb_calls: list[tuple[str, str]] = []
+        self._decode_paths_used: set[str] = set()
+
+    @property
+    def decode_paths_used(self) -> tuple[str, ...]:
+        return tuple(sorted(self._decode_paths_used))
 
     def source(self, record: VolumeRecord) -> torch.Tensor:
         return torch.from_numpy(np.load(record.image_path, allow_pickle=False))
@@ -40,6 +48,7 @@ class _SyntheticBackend:
     def reconstruct(self, record: VolumeRecord, latent_path: Path) -> torch.Tensor:
         assert latent_path.is_file()
         self.stage1_calls.append(record.domain.label)
+        self._decode_paths_used.add("full")
         return self.source(record) + 0.05
 
     def translate(
@@ -47,15 +56,21 @@ class _SyntheticBackend:
     ) -> torch.Tensor:
         assert latent_path.is_file()
         self.sb_calls.append((record.domain.label, target_domain.label))
+        self._decode_paths_used.add("full")
         return self.source(record) + 0.01 * target_domain.field_strength_t
 
 
 def _file_sha256(path: Path) -> str:
     raw = path.read_bytes()
+    normalized = raw.replace(b"\r\n", b"\n")
     if path.name == "stage1.pt" and raw == b"stage1-frozen":
         return STAGE1_RUN_C_CHECKPOINT_SHA256
     if path.name == "sb-v2.pt" and raw == b"sb-v2-frozen":
         return SB_V2_CHECKPOINT_SHA256
+    if path.name == "stage1.yaml" and normalized == b"model: {name: kl_vae}\n":
+        return STAGE1_RUN_C_CONFIG_SHA256
+    if path.name == "sb-v2.yaml" and normalized == b"model: {name: flow_matching_latent}\n":
+        return SB_V2_CONFIG_SHA256
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -69,7 +84,7 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
             image_path = input_root / "images" / f"{contrast.value}-{field:g}T.npy"
             image_path.parent.mkdir(parents=True, exist_ok=True)
             array = np.full(
-                (1, 1, 2, 2, 2),
+                (1, 1, 4, 4, 4),
                 0.1 + 0.1 * contrast_index + 0.01 * field_index,
                 dtype=np.float32,
             )
@@ -96,6 +111,11 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
     synthetic_fingerprint = vae_splits_fingerprint(splits)
     monkeypatch.setattr(producer, "RESPLIT_FINGERPRINT", synthetic_fingerprint)
     monkeypatch.setattr(protocol, "RESPLIT_FINGERPRINT", synthetic_fingerprint)
+    monkeypatch.setattr(
+        producer,
+        "load_volume",
+        lambda record: torch.from_numpy(np.load(record.image_path, allow_pickle=False)),
+    )
     split_path = save_vae_splits(splits, input_root / "split.json")
     selection_path = input_root / "selection.json"
     selection = producer.prepare_gate01_prospective_selection(
@@ -124,7 +144,22 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
     bank_records = []
     for index, record in enumerate(records):
         latent_path = bank / "latents" / f"latent-{index:02d}.pt"
-        torch.save({"latent": torch.full((1, 1, 1, 1), float(index))}, latent_path)
+        latent = torch.full((1, 1, 1, 1), float(index))
+        latent_payload = {
+            "contract_version": "latent-bank-v1",
+            "case_id": record.case_id,
+            "subject_id": record.subject_id,
+            "split": "validation",
+            "domain": record.domain.to_dict(),
+            "latent": latent,
+            "latent_shape": [1, 1, 1, 1],
+            "source_shape": [1, 4, 4, 4],
+            "downsample_factor": 4,
+            "encode_strategy": "full",
+            "vae_checkpoint_sha256": STAGE1_RUN_C_CHECKPOINT_SHA256,
+            "git_commit": FULL_LATENT_BANK_BUILD_COMMIT,
+        }
+        torch.save(latent_payload, latent_path)
         bank_records.append(
             {
                 "case_id": record.case_id,
@@ -132,21 +167,33 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
                 "split": "validation",
                 "domain": record.domain.to_dict(),
                 "latent_shape": [1, 1, 1, 1],
-                "source_shape": [1, 1, 2, 2, 2],
+                "source_shape": [1, 4, 4, 4],
                 "path": latent_path.relative_to(bank).as_posix(),
             }
         )
     (bank / "latent_stats.json").write_text(
-        json.dumps({"per_channel_mean": [0.0], "per_channel_std": [1.0]}),
+        json.dumps(
+            {
+                "per_channel_mean": [0.0],
+                "per_channel_std": [1.0],
+                "vae_checkpoint_sha256": STAGE1_RUN_C_CHECKPOINT_SHA256,
+                "git_commit": FULL_LATENT_BANK_BUILD_COMMIT,
+            }
+        ),
         encoding="utf-8",
     )
     (bank / "latent_bank_manifest.json").write_text(
         json.dumps(
             {
                 "contract_version": "latent-bank-v1",
-                "config": {"block_size": [2, 2, 2], "halo": [0, 0, 0]},
+                "config": {
+                    "strategy": "full",
+                    "block_size": [4, 4, 4],
+                    "halo": [0, 0, 0],
+                },
                 "vae_checkpoint_sha256": STAGE1_RUN_C_CHECKPOINT_SHA256,
                 "git_commit": FULL_LATENT_BANK_BUILD_COMMIT,
+                "strategy_used": ["full"],
                 "records": bank_records,
             }
         ),
@@ -172,7 +219,7 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
         protocol_lock_path=lock_path,
         sampler=TransportSamplerConfig(solver="heun", n_steps=20),
         decode=DecodeSpec(
-            block_size=(2, 2, 2), halo=(0, 0, 0), precision="float32"
+            block_size=(4, 4, 4), halo=(0, 0, 0), precision="float32"
         ),
         out_path=spec_path,
         file_sha256=_file_sha256,
@@ -243,6 +290,14 @@ def test_private_producer_clean_build_has_exact_graph_and_no_manual_cases(
     assert result["direction_count"] == 60
     assert result["sb_v2_inference_count"] == 60
     assert result["wrong_target_reference_count"] == 180
+    assert result["producer_provenance"] == {
+        "decode_strategy": "full",
+        "path_used": ["full"],
+    }
+    assert bundle["spec"]["decode"]["strategy"] == "full"
+    assert len(bundle["spec"]["selected_source_acquisitions"]) == 15
+    assert bundle["spec"]["stage1_config_sha256"] == STAGE1_RUN_C_CONFIG_SHA256
+    assert bundle["spec"]["sb_v2_config_sha256"] == SB_V2_CONFIG_SHA256
     assert len(backend.stage1_calls) == len(set(backend.stage1_calls)) == 15
     assert len(backend.sb_calls) == len(set(backend.sb_calls)) == 60
     plan = json.loads(Path(result["build_plan"]).read_text(encoding="utf-8"))
@@ -392,3 +447,217 @@ def test_private_producer_rejects_mutation_stale_inputs_and_unexpected_paths(
             _SyntheticBackend(),
             resume=False,
         )
+
+
+def test_private_producer_rejects_selected_source_mutation_before_inference(
+    tmp_path, monkeypatch
+) -> None:
+    bundle = _bundle(tmp_path, monkeypatch)
+    image_path = next((Path(bundle["input_root"]) / "images").glob("*.npy"))
+    changed = np.load(image_path, allow_pickle=False)
+    changed[..., -1, -1, -1] += 0.125
+    np.save(image_path, changed, allow_pickle=False)
+    backend = _SyntheticBackend()
+
+    with pytest.raises(ValueError, match="selected_source_acquisitions"):
+        _produce(
+            bundle,
+            tmp_path / "outputs",
+            tmp_path / "state",
+            backend,
+            resume=False,
+        )
+    assert backend.stage1_calls == []
+    assert backend.sb_calls == []
+
+    resumed_bundle = _bundle(tmp_path / "resume", monkeypatch)
+    resumed_output = tmp_path / "resume-output"
+    resumed_state = tmp_path / "resume-state"
+    _produce(
+        resumed_bundle,
+        resumed_output,
+        resumed_state,
+        _SyntheticBackend(),
+        resume=False,
+    )
+    resumed_image = next(
+        (Path(resumed_bundle["input_root"]) / "images").glob("*.npy")
+    )
+    resumed_changed = np.load(resumed_image, allow_pickle=False)
+    resumed_changed[..., 1, 1, 1] += 0.25
+    np.save(resumed_image, resumed_changed, allow_pickle=False)
+    resumed_backend = _SyntheticBackend()
+    with pytest.raises(ValueError, match="selected_source_acquisitions"):
+        _produce(
+            resumed_bundle,
+            resumed_output,
+            resumed_state,
+            resumed_backend,
+            resume=True,
+        )
+    assert resumed_backend.stage1_calls == []
+    assert resumed_backend.sb_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("case_id", "wrong-case", "case identity"),
+        ("split", "train", "split identity"),
+        ("domain", Domain(7.0, "T2w").to_dict(), "domain identity"),
+        ("downsample_factor", 2, "downsample factor"),
+        ("encode_strategy", "tiled", "not encoded as a full volume"),
+        ("source_shape", [1, 8, 4, 4], "source shape"),
+        ("vae_checkpoint_sha256", "0" * 64, "Stage-1 checkpoint"),
+        ("git_commit", "0" * 40, "bank-build commit"),
+    ],
+)
+def test_selected_latent_payload_fails_closed_on_stale_provenance(
+    tmp_path, monkeypatch, field, replacement, message
+) -> None:
+    bundle = _bundle(tmp_path, monkeypatch)
+    manifest = json.loads(
+        (Path(bundle["bank"]) / "latent_bank_manifest.json").read_text(encoding="utf-8")
+    )
+    entry = manifest["records"][0]
+    latent_path = Path(bundle["bank"]) / entry["path"]
+    payload = torch.load(latent_path, map_location="cpu")
+    payload[field] = replacement
+    resolved = producer.load_gate01_prospective_selection(
+        bundle["selection_path"], bundle["split_path"]
+    )
+    record = resolved.records[Domain.from_dict(entry["domain"]).label]
+
+    with pytest.raises(ValueError, match=message):
+        producer._validate_selected_latent_payload(
+            payload,
+            entry=entry,
+            record=record,
+            split_name="validation",
+            source_identity=bundle["spec"]["selected_source_acquisitions"][
+                record.domain.label
+            ],
+        )
+
+
+def test_real_gate01_backend_constructs_with_verified_decoder_factor(tmp_path) -> None:
+    stage_model = {
+        "name": "kl_vae",
+        "base_channels": 2,
+        "latent_channels": 1,
+        "spatial_dims": 3,
+        "use_norm": False,
+        "num_res_blocks": 1,
+        "out_channels": 1,
+    }
+    sb_model = {
+        "name": "flow_matching_latent",
+        "latent_channels": 1,
+        "hidden_channels": [2],
+        "bottleneck_channels": 4,
+        "cond_dim": 4,
+        "time_embed_dim": 4,
+        "spatial_dims": 3,
+        "use_norm": False,
+    }
+    stage_config = tmp_path / "stage1.yaml"
+    sb_config = tmp_path / "sb.yaml"
+    stage_config.write_text(json.dumps({"model": stage_model}), encoding="utf-8")
+    sb_config.write_text(json.dumps({"model": sb_model}), encoding="utf-8")
+    decoder = build_decoder("kl_vae", **producer._kl_decoder_kwargs(stage_model))
+    translator_parameters = dict(sb_model)
+    translator_name = translator_parameters.pop("name")
+    translator = build_translator(translator_name, **translator_parameters)
+    stage_checkpoint = tmp_path / "stage1.pt"
+    sb_checkpoint = tmp_path / "sb.pt"
+    torch.save({"decoder": decoder.state_dict()}, stage_checkpoint)
+    torch.save({"translator": translator.state_dict()}, sb_checkpoint)
+    bank = tmp_path / "bank"
+    bank.mkdir()
+    (bank / "latent_stats.json").write_text(
+        json.dumps({"per_channel_mean": [0.0], "per_channel_std": [1.0]}),
+        encoding="utf-8",
+    )
+
+    backend = producer._RealGate01Backend.create(
+        bank_dir=bank,
+        stage1_config=stage_config,
+        stage1_checkpoint=stage_checkpoint,
+        sb_config=sb_config,
+        sb_checkpoint=sb_checkpoint,
+        sampler=TransportSamplerConfig(solver="heun", n_steps=1),
+        decode=DecodeSpec(
+            block_size=(4, 4, 4), halo=(0, 0, 0), precision="float32"
+        ),
+        device="cpu",
+    )
+
+    assert backend.factor == 4
+    assert backend.decoder.downsample_factor == 4
+    assert backend.decode_paths_used == ()
+
+
+def test_producer_decode_contract_rejects_non_full_strategy() -> None:
+    with pytest.raises(ValueError, match="full-volume decode specification"):
+        producer._validate_sampler_decode(
+            {"solver": "heun", "n_steps": 20},
+            {
+                "strategy": "auto",
+                "block_size": [128, 128, 128],
+                "halo": [16, 16, 16],
+                "precision": "bfloat16",
+            },
+        )
+
+
+def test_real_backend_seals_full_decode_path(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_decode(_decoder, latent, _domain, **kwargs):
+        observed.update(kwargs)
+        return torch.zeros(1, 1, 4, 4, 4), "full"
+
+    monkeypatch.setattr(producer, "decode_latent", fake_decode)
+    backend = producer._RealGate01Backend(
+        decoder=object(),
+        translator=object(),
+        stats=object(),  # type: ignore[arg-type]
+        sampler=TransportSamplerConfig(solver="heun", n_steps=1),
+        decode=DecodeSpec(
+            block_size=(4, 4, 4), halo=(0, 0, 0), precision="float32"
+        ),
+        device=torch.device("cpu"),
+        factor=4,
+    )
+
+    result = backend._decode(
+        torch.zeros(1, 1, 1, 1, 1), Domain(3.0, "T1w")
+    )
+
+    assert tuple(result.shape) == (1, 1, 4, 4, 4)
+    assert observed["strategy"] == "full"
+    assert backend.decode_paths_used == ("full",)
+
+
+def test_producer_rejects_non_full_backend_path_before_publishing_inference(
+    tmp_path, monkeypatch
+) -> None:
+    class _TiledBackend(_SyntheticBackend):
+        def reconstruct(self, record: VolumeRecord, latent_path: Path) -> torch.Tensor:
+            assert latent_path.is_file()
+            self.stage1_calls.append(record.domain.label)
+            self._decode_paths_used.add("tiled")
+            return self.source(record)
+
+    bundle = _bundle(tmp_path, monkeypatch)
+    output = tmp_path / "outputs"
+    with pytest.raises(ValueError, match="non-full decode path"):
+        _produce(
+            bundle,
+            output,
+            tmp_path / "state",
+            _TiledBackend(),
+            resume=False,
+        )
+
+    assert list((output / "arrays").glob("stage1-*.npy")) == []

@@ -12,7 +12,7 @@ import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,7 +22,12 @@ import torch
 from fieldbridge.config import load_yaml_config
 from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Contrast, Domain
-from fieldbridge.data.latent_bank import decode_latent_tiled, downsample_factor, load_volume
+from fieldbridge.data.latent_bank import (
+    LATENT_BANK_CONTRACT_VERSION,
+    decode_latent,
+    downsample_factor,
+    load_volume,
+)
 from fieldbridge.data.latent_bank_dataset import LatentStats
 from fieldbridge.data.vae_splits import load_vae_splits, vae_splits_fingerprint
 from fieldbridge.evaluation.stage2_gate01 import (
@@ -39,7 +44,9 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
     GATE01_SUPPORT_THRESHOLD,
     RESPLIT_FINGERPRINT,
+    SB_V2_CONFIG_SHA256,
     SB_V2_CHECKPOINT_SHA256,
+    STAGE1_RUN_C_CONFIG_SHA256,
     STAGE1_RUN_C_CHECKPOINT_SHA256,
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
@@ -52,8 +59,10 @@ from fieldbridge.models.factory import build_decoder, build_translator
 from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 
 GATE01_PROSPECTIVE_SELECTION_VERSION = "stage2-gate01-prospective-selection-v1"
-GATE01_PRIVATE_PRODUCER_SPEC_VERSION = "stage2-gate01-private-producer-spec-v1"
-GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v1"
+GATE01_PRIVATE_PRODUCER_SPEC_VERSION = "stage2-gate01-private-producer-spec-v2"
+GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v2"
+GATE01_PRODUCER_DECODE_STRATEGY = "full"
+GATE01_VAE_DOWNSAMPLE_FACTOR = 4
 
 _SELECTION_KEYS = {
     "contract_version",
@@ -70,6 +79,7 @@ _SPEC_KEYS = {
     "traveller_identity_sha256",
     "split_file_sha256",
     "split_fingerprint",
+    "selected_source_acquisitions",
     "latent_bank",
     "stage1_config_sha256",
     "stage1_checkpoint_sha256",
@@ -93,6 +103,9 @@ class Gate01InferenceBackend(Protocol):
     def translate(
         self, record: VolumeRecord, target_domain: Domain, latent_path: Path
     ) -> torch.Tensor: ...
+
+    @property
+    def decode_paths_used(self) -> Sequence[str]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +233,7 @@ def write_gate01_producer_spec(
     _validate_sampler_decode(
         {"solver": sampler.solver, "n_steps": int(sampler.n_steps)},
         {
+            "strategy": GATE01_PRODUCER_DECODE_STRATEGY,
             "block_size": [int(value) for value in decode.block_size],
             "halo": [int(value) for value in decode.halo],
             "precision": decode.precision,
@@ -256,11 +270,24 @@ def write_gate01_producer_spec(
     sb_sha = hash_file(paths["sb_v2_checkpoint"])
     if stage1_sha != STAGE1_RUN_C_CHECKPOINT_SHA256 or sb_sha != SB_V2_CHECKPOINT_SHA256:
         raise ValueError("Gate 0.1 producer checkpoint identity is stale or incompatible.")
+    stage1_config_sha = hash_file(paths["stage1_config"])
+    sb_config_sha = hash_file(paths["sb_v2_config"])
+    if stage1_config_sha != STAGE1_RUN_C_CONFIG_SHA256:
+        raise ValueError("Gate 0.1 producer Stage-1 configuration identity is stale.")
+    if sb_config_sha != SB_V2_CONFIG_SHA256:
+        raise ValueError("Gate 0.1 producer SB-v2 configuration identity is stale.")
     bank_identity = _latent_bank_identity(paths["bank"], hash_file)
     if bank_identity["build_git_commit"] != FULL_LATENT_BANK_BUILD_COMMIT:
         raise ValueError("Gate 0.1 producer latent-bank build commit is stale.")
     if bank_identity["vae_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256:
         raise ValueError("Gate 0.1 producer latent bank used the wrong Stage-1 checkpoint.")
+    source_identities = _selected_source_identities(resolved.records)
+    _selected_latent_paths(
+        paths["bank"],
+        resolved.records,
+        split_name=str(resolved.payload["split_name"]),
+        source_identities=source_identities,
+    )
     payload: dict[str, Any] = {
         "contract_version": GATE01_PRIVATE_PRODUCER_SPEC_VERSION,
         "selection_artifact_sha256": resolved.payload["artifact_sha256"],
@@ -268,13 +295,15 @@ def write_gate01_producer_spec(
         "traveller_identity_sha256": resolved.payload["traveller_identity_sha256"],
         "split_file_sha256": hash_file(paths["split"]),
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "selected_source_acquisitions": source_identities,
         "latent_bank": bank_identity,
-        "stage1_config_sha256": hash_file(paths["stage1_config"]),
+        "stage1_config_sha256": stage1_config_sha,
         "stage1_checkpoint_sha256": stage1_sha,
-        "sb_v2_config_sha256": hash_file(paths["sb_v2_config"]),
+        "sb_v2_config_sha256": sb_config_sha,
         "sb_v2_checkpoint_sha256": sb_sha,
         "sampler": {"solver": sampler.solver, "n_steps": int(sampler.n_steps)},
         "decode": {
+            "strategy": GATE01_PRODUCER_DECODE_STRATEGY,
             "block_size": [int(value) for value in decode.block_size],
             "halo": [int(value) for value in decode.halo],
             "precision": decode.precision,
@@ -347,7 +376,12 @@ def produce_gate01_private_artifacts(
     _reject_unexpected_files(
         output, state, allow_plan=(output / "private-build-plan.json").exists()
     )
-    latent_paths = _selected_latent_paths(paths["bank"], resolved.records)
+    latent_paths = _selected_latent_paths(
+        paths["bank"],
+        resolved.records,
+        split_name=str(resolved.payload["split_name"]),
+        source_identities=spec["selected_source_acquisitions"],
+    )
     actual_backend = backend or _RealGate01Backend.create(
         bank_dir=paths["bank"],
         stage1_config=paths["stage1_config"],
@@ -368,6 +402,7 @@ def produce_gate01_private_artifacts(
         mask: bool = False,
         inference_counter: str | None = None,
         expected_shape: tuple[int, ...] | None = None,
+        expected_sha256: str | None = None,
     ) -> dict[str, str]:
         nonlocal operation
         destination = output / relative
@@ -379,6 +414,11 @@ def produce_gate01_private_artifacts(
                 "relative_path": relative,
                 "mask": mask,
                 "inference_counter": inference_counter,
+                "decode_strategy": (
+                    GATE01_PRODUCER_DECODE_STRATEGY
+                    if inference_counter is not None
+                    else None
+                ),
                 "expected_shape": list(expected_shape) if expected_shape is not None else None,
             }
             pending = state["pending"].get(key)
@@ -389,7 +429,8 @@ def produce_gate01_private_artifacts(
                     raise ValueError("Gate 0.1 producer found an unexpected untracked output file.")
                 state["pending"][key] = pending_expected
                 _write_json_atomic(state_path, state)
-            if destination.exists():
+            adopting_pending_output = destination.exists()
+            if adopting_pending_output:
                 # The array was atomically published before an interrupted state update.
                 # A valid pending journal lets resume adopt it without duplicate inference.
                 tensor = _load_output_tensor(destination, mask=mask)
@@ -401,12 +442,27 @@ def produce_gate01_private_artifacts(
                     )
                 if mask:
                     tensor = tensor.to(torch.bool)
-                _write_array_atomic(destination, tensor, mask=mask)
             if expected_shape is not None and tuple(tensor.shape) != expected_shape:
                 raise ValueError(
                     "Gate 0.1 producer output shape does not match its source acquisition."
                 )
             identity = canonical_loaded_array_sha256(tensor)
+            if expected_sha256 is not None and identity != expected_sha256:
+                raise ValueError(
+                    "Gate 0.1 producer loaded source acquisition differs from its sealed identity."
+                )
+            if inference_counter is not None:
+                paths_used = set(state["producer_provenance"]["path_used"])
+                backend_paths = set(actual_backend.decode_paths_used)
+                if (
+                    not adopting_pending_output
+                    and backend_paths != {GATE01_PRODUCER_DECODE_STRATEGY}
+                ) or backend_paths - {GATE01_PRODUCER_DECODE_STRATEGY}:
+                    raise ValueError("Gate 0.1 producer used a non-full decode path.")
+                paths_used.add(GATE01_PRODUCER_DECODE_STRATEGY)
+                state["producer_provenance"]["path_used"] = sorted(paths_used)
+            if not adopting_pending_output:
+                _write_array_atomic(destination, tensor, mask=mask)
             state["completed"][key] = {
                 "relative_path": relative,
                 "canonical_loaded_array_sha256": identity,
@@ -433,6 +489,15 @@ def produce_gate01_private_artifacts(
                 f"acquisition:{label}",
                 f"arrays/acquisition-{stem}.npy",
                 lambda record=record: actual_backend.source(record),
+                expected_shape=tuple(
+                    int(value)
+                    for value in spec["selected_source_acquisitions"][label]["shape"]
+                ),
+                expected_sha256=str(
+                    spec["selected_source_acquisitions"][label][
+                        "canonical_loaded_array_sha256"
+                    ]
+                ),
             )
             source_tensor = _load_output_tensor(output / acquisition[label]["path"], mask=False)
             shapes[label] = tuple(source_tensor.shape)
@@ -556,6 +621,11 @@ def produce_gate01_private_artifacts(
     )
     if state["counts"] != {"stage1_inference_count": 15, "sb_v2_inference_count": 60}:
         raise ValueError("Gate 0.1 producer inference counts are incomplete or duplicated.")
+    if state["producer_provenance"] != {
+        "decode_strategy": GATE01_PRODUCER_DECODE_STRATEGY,
+        "path_used": [GATE01_PRODUCER_DECODE_STRATEGY],
+    }:
+        raise ValueError("Gate 0.1 producer did not prove exclusively full-volume decoding.")
     plan = {
         "contract_version": GATE01_PRIVATE_BUILD_PLAN_VERSION,
         "execution_mode": "scientific",
@@ -588,6 +658,7 @@ def produce_gate01_private_artifacts(
             "acquisition_count": 15,
             "direction_count": 60,
             "wrong_target_reference_count": 180,
+            "producer_provenance": dict(state["producer_provenance"]),
         }
     )
     _write_json_atomic(state_path, state)
@@ -604,6 +675,7 @@ def produce_gate01_private_artifacts(
         "wrong_target_reference_count": 180,
         "protocol_lock_artifact_sha256": lock.artifact_sha256,
         "producer_spec_artifact_sha256": spec["artifact_sha256"],
+        "producer_provenance": dict(state["producer_provenance"]),
     }
 
 
@@ -616,6 +688,11 @@ class _RealGate01Backend:
     decode: DecodeSpec
     device: torch.device
     factor: int
+    _path_used: set[str] = field(default_factory=set)
+
+    @property
+    def decode_paths_used(self) -> tuple[str, ...]:
+        return tuple(sorted(self._path_used))
 
     @classmethod
     def create(
@@ -672,15 +749,20 @@ class _RealGate01Backend:
         return self._decode(self.stats.denormalize(translated), target_domain).cpu()
 
     def _decode(self, latent: torch.Tensor, domain: Domain) -> torch.Tensor:
-        return decode_latent_tiled(
+        image, path_used = decode_latent(
             self.decoder,
             latent,
             domain,
             factor=self.factor,
+            strategy=GATE01_PRODUCER_DECODE_STRATEGY,
             block_size=self.decode.block_size,
             halo=self.decode.halo,
             precision=self.decode.precision,
         )
+        if path_used != GATE01_PRODUCER_DECODE_STRATEGY:
+            raise RuntimeError("Gate 0.1 producer requires an exact full-volume decode.")
+        self._path_used.add(path_used)
+        return image
 
 
 def _selection_payload(
@@ -731,6 +813,7 @@ def _observed_spec_inputs(
         "traveller_identity_sha256": resolved.payload["traveller_identity_sha256"],
         "split_file_sha256": hash_file(paths["split"]),
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "selected_source_acquisitions": _selected_source_identities(resolved.records),
         "latent_bank": _latent_bank_identity(paths["bank"], hash_file),
         "stage1_config_sha256": hash_file(paths["stage1_config"]),
         "stage1_checkpoint_sha256": hash_file(paths["stage1_checkpoint"]),
@@ -766,6 +849,21 @@ def _latent_bank_identity(bank_dir: Path, hash_file: Callable[[Path], str]) -> d
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, Mapping) or not isinstance(manifest.get("records"), list):
         raise ValueError("Gate 0.1 latent-bank manifest is invalid.")
+    if manifest.get("contract_version") != LATENT_BANK_CONTRACT_VERSION:
+        raise ValueError("Gate 0.1 latent-bank contract is incompatible.")
+    config = manifest.get("config")
+    if not isinstance(config, Mapping) or config.get("strategy") != "full":
+        raise ValueError("Gate 0.1 latent bank does not prove full-volume encoding.")
+    if manifest.get("strategy_used") != ["full"]:
+        raise ValueError("Gate 0.1 latent bank contains a non-full encoding path.")
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    if not isinstance(stats, Mapping):
+        raise ValueError("Gate 0.1 latent-bank statistics are invalid.")
+    if (
+        stats.get("vae_checkpoint_sha256") != manifest.get("vae_checkpoint_sha256")
+        or stats.get("git_commit") != manifest.get("git_commit")
+    ):
+        raise ValueError("Gate 0.1 latent-bank statistics provenance is incompatible.")
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
     for entry in manifest["records"]:
@@ -787,29 +885,140 @@ def _latent_bank_identity(bank_dir: Path, hash_file: Callable[[Path], str]) -> d
         "record_count": len(entries),
         "build_git_commit": str(manifest.get("git_commit")),
         "vae_checkpoint_sha256": str(manifest.get("vae_checkpoint_sha256")),
+        "encode_provenance": {"strategy": "full", "path_used": ["full"]},
     }
 
 
 def _selected_latent_paths(
-    bank_dir: Path, records: Mapping[str, VolumeRecord]
+    bank_dir: Path,
+    records: Mapping[str, VolumeRecord],
+    *,
+    split_name: str,
+    source_identities: Mapping[str, Any],
 ) -> dict[str, Path]:
     manifest = json.loads((bank_dir / "latent_bank_manifest.json").read_text(encoding="utf-8"))
-    by_case: dict[str, Path] = {}
+    by_case: dict[str, tuple[Path, Mapping[str, Any]]] = {}
     for entry in manifest["records"]:
+        if not isinstance(entry, Mapping):
+            raise ValueError("Gate 0.1 latent-bank manifest record is invalid.")
         case_id = str(entry["case_id"])
         if case_id in by_case:
             raise ValueError("Gate 0.1 latent bank contains duplicate case IDs.")
         path = (bank_dir / str(entry["path"])).resolve()
         if not _is_within(path, bank_dir.resolve()):
             raise ValueError("Gate 0.1 latent-bank path escapes its root.")
-        by_case[case_id] = path
+        by_case[case_id] = (path, entry)
     result: dict[str, Path] = {}
     for label, record in records.items():
-        path = by_case.get(str(record.case_id))
-        if path is None or not path.is_file():
+        found = by_case.get(str(record.case_id))
+        if found is None or not found[0].is_file():
             raise ValueError("Gate 0.1 selected acquisition is missing from the latent bank.")
+        path, entry = found
+        payload = torch.load(path, map_location="cpu")
+        _validate_selected_latent_payload(
+            payload,
+            entry=entry,
+            record=record,
+            split_name=split_name,
+            source_identity=source_identities[label],
+        )
         result[label] = path
     return result
+
+
+def _selected_source_identities(
+    records: Mapping[str, VolumeRecord],
+) -> dict[str, dict[str, Any]]:
+    """Stream the 15 selected acquisitions and retain only canonical identities."""
+
+    if set(records) != _all_domain_labels():
+        raise ValueError("Gate 0.1 source identities require exactly all 15 domains.")
+    identities: dict[str, dict[str, Any]] = {}
+    for label in sorted(records):
+        tensor = load_volume(records[label]).detach().to(torch.float32).cpu()
+        if tensor.ndim != 5 or tuple(tensor.shape[:2]) != (1, 1):
+            raise ValueError("Gate 0.1 selected source is not a canonical full volume.")
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError("Gate 0.1 selected source contains non-finite data.")
+        identities[label] = {
+            "canonical_loaded_array_sha256": canonical_loaded_array_sha256(tensor),
+            "shape": [int(value) for value in tensor.shape],
+        }
+        del tensor
+    return identities
+
+
+def _validate_selected_latent_payload(
+    payload: Any,
+    *,
+    entry: Mapping[str, Any],
+    record: VolumeRecord,
+    split_name: str,
+    source_identity: Any,
+) -> None:
+    if not isinstance(payload, Mapping) or not isinstance(source_identity, Mapping):
+        raise ValueError("Gate 0.1 selected latent payload is malformed.")
+    required = {
+        "contract_version",
+        "case_id",
+        "split",
+        "domain",
+        "latent",
+        "latent_shape",
+        "source_shape",
+        "downsample_factor",
+        "encode_strategy",
+        "vae_checkpoint_sha256",
+        "git_commit",
+    }
+    if not required.issubset(payload):
+        raise ValueError("Gate 0.1 selected latent payload lacks required provenance.")
+    if payload["contract_version"] != LATENT_BANK_CONTRACT_VERSION:
+        raise ValueError("Gate 0.1 selected latent payload contract is incompatible.")
+    if str(payload["case_id"]) != str(record.case_id) or str(entry.get("case_id")) != str(
+        record.case_id
+    ):
+        raise ValueError("Gate 0.1 selected latent case identity is incompatible.")
+    if payload["split"] != split_name or entry.get("split") != split_name:
+        raise ValueError("Gate 0.1 selected latent split identity is incompatible.")
+    try:
+        payload_domain = Domain.from_dict(payload["domain"])
+        entry_domain = Domain.from_dict(entry["domain"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Gate 0.1 selected latent domain provenance is malformed.") from error
+    if payload_domain != record.domain or entry_domain != record.domain:
+        raise ValueError("Gate 0.1 selected latent domain identity is incompatible.")
+    if int(payload["downsample_factor"]) != GATE01_VAE_DOWNSAMPLE_FACTOR:
+        raise ValueError("Gate 0.1 selected latent has the wrong VAE downsample factor.")
+    if payload["encode_strategy"] != "full":
+        raise ValueError("Gate 0.1 selected latent was not encoded as a full volume.")
+    if payload["vae_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256:
+        raise ValueError("Gate 0.1 selected latent used the wrong Stage-1 checkpoint.")
+    if payload["git_commit"] != FULL_LATENT_BANK_BUILD_COMMIT:
+        raise ValueError("Gate 0.1 selected latent used the wrong bank-build commit.")
+    latent = payload["latent"]
+    if not isinstance(latent, torch.Tensor) or latent.ndim != 4:
+        raise ValueError("Gate 0.1 selected latent tensor is malformed.")
+    if not bool(torch.isfinite(latent).all()):
+        raise ValueError("Gate 0.1 selected latent tensor contains non-finite data.")
+    latent_shape = [int(value) for value in latent.shape]
+    source_shape = [int(value) for value in source_identity.get("shape", ())]
+    if len(source_shape) != 5 or source_shape[:2] != [1, 1]:
+        raise ValueError("Gate 0.1 sealed selected-source shape is malformed.")
+    stored_source_shape = [int(value) for value in payload["source_shape"]]
+    if stored_source_shape != source_shape[1:]:
+        raise ValueError("Gate 0.1 selected latent source shape is incompatible.")
+    expected_spatial = [value // GATE01_VAE_DOWNSAMPLE_FACTOR for value in source_shape[-3:]]
+    if any(
+        value % GATE01_VAE_DOWNSAMPLE_FACTOR != 0 for value in source_shape[-3:]
+    ) or latent_shape[1:] != expected_spatial:
+        raise ValueError("Gate 0.1 selected latent does not represent the full source extent.")
+    if [int(value) for value in payload["latent_shape"]] != latent_shape:
+        raise ValueError("Gate 0.1 selected latent shape metadata is stale.")
+    if [int(value) for value in entry.get("latent_shape", ())] != latent_shape:
+        raise ValueError("Gate 0.1 latent manifest/payload shape mismatch.")
+    if [int(value) for value in entry.get("source_shape", ())] != stored_source_shape:
+        raise ValueError("Gate 0.1 latent manifest/source shape mismatch.")
 
 
 def _load_producer_spec(path: Path) -> dict[str, Any]:
@@ -823,6 +1032,11 @@ def _load_producer_spec(path: Path) -> dict[str, Any]:
     if payload["artifact_sha256"] != _sha256_json(body):
         raise ValueError("Gate 0.1 producer-spec artifact hash mismatch.")
     _validate_sampler_decode(payload["sampler"], payload["decode"])
+    if payload["stage1_config_sha256"] != STAGE1_RUN_C_CONFIG_SHA256:
+        raise ValueError("Gate 0.1 producer specification has the wrong Stage-1 config hash.")
+    if payload["sb_v2_config_sha256"] != SB_V2_CONFIG_SHA256:
+        raise ValueError("Gate 0.1 producer specification has the wrong SB-v2 config hash.")
+    _validate_source_identity_contract(payload["selected_source_acquisitions"])
     if int(payload["deterministic_seed"]) < 0:
         raise ValueError("Gate 0.1 producer deterministic seed must be non-negative.")
     return dict(payload)
@@ -834,6 +1048,7 @@ def _validate_sampler_decode(sampler: Any, decode: Any) -> None:
     if sampler["solver"] not in {"euler", "heun"} or int(sampler["n_steps"]) < 1:
         raise ValueError("Gate 0.1 producer solver/step-count specification is invalid.")
     if not isinstance(decode, Mapping) or set(decode) != {
+        "strategy",
         "block_size",
         "halo",
         "precision",
@@ -851,8 +1066,32 @@ def _validate_sampler_decode(sampler: Any, decode: Any) -> None:
         or len(halo) != 3
         or any(int(value) < 0 for value in halo)
         or decode["precision"] not in {"float32", "bfloat16"}
+        or decode["strategy"] != GATE01_PRODUCER_DECODE_STRATEGY
     ):
         raise ValueError("Gate 0.1 producer full-volume decode specification is invalid.")
+
+
+def _validate_source_identity_contract(value: Any) -> None:
+    if not isinstance(value, Mapping) or set(value) != _all_domain_labels():
+        raise ValueError("Gate 0.1 producer must seal exactly 15 selected source identities.")
+    for identity in value.values():
+        if not isinstance(identity, Mapping) or set(identity) != {
+            "canonical_loaded_array_sha256",
+            "shape",
+        }:
+            raise ValueError("Gate 0.1 producer selected-source identity is malformed.")
+        digest = identity["canonical_loaded_array_sha256"]
+        shape = identity["shape"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(shape, list)
+            or len(shape) != 5
+            or shape[:2] != [1, 1]
+            or any(not isinstance(item, int) or item <= 0 for item in shape)
+        ):
+            raise ValueError("Gate 0.1 producer selected-source identity is malformed.")
 
 
 def _load_or_initialize_state(
@@ -862,6 +1101,10 @@ def _load_or_initialize_state(
         "contract_version": GATE01_PRIVATE_PRODUCER_STATE_VERSION,
         "producer_spec_artifact_sha256": spec["artifact_sha256"],
         "protocol_lock_artifact_sha256": spec["protocol_lock_artifact_sha256"],
+        "producer_provenance": {
+            "decode_strategy": GATE01_PRODUCER_DECODE_STRATEGY,
+            "path_used": [],
+        },
     }
     if path.exists():
         if not resume:
@@ -870,20 +1113,35 @@ def _load_or_initialize_state(
             )
         state = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(state, Mapping) or any(
-            state.get(key) != value for key, value in expected.items()
+            state.get(key) != value
+            for key, value in expected.items()
+            if key != "producer_provenance"
         ):
             raise ValueError("Gate 0.1 producer state is stale or belongs to different inputs.")
         if (
             not isinstance(state.get("completed"), Mapping)
             or not isinstance(state.get("pending"), Mapping)
             or not isinstance(state.get("counts"), Mapping)
+            or not isinstance(state.get("producer_provenance"), Mapping)
         ):
             raise ValueError("Gate 0.1 producer state is malformed.")
+        producer_provenance = state["producer_provenance"]
+        if (
+            producer_provenance.get("decode_strategy")
+            != GATE01_PRODUCER_DECODE_STRATEGY
+            or producer_provenance.get("path_used") not in ([], ["full"])
+            or (
+                sum(int(value) for value in state["counts"].values()) > 0
+                and producer_provenance.get("path_used") != ["full"]
+            )
+        ):
+            raise ValueError("Gate 0.1 producer state decode provenance is incompatible.")
         return {
             **dict(state),
             "completed": dict(state["completed"]),
             "pending": dict(state["pending"]),
             "counts": dict(state["counts"]),
+            "producer_provenance": dict(producer_provenance),
             "status": "building",
         }
     state = {

@@ -771,7 +771,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     spec_gate01 = subparsers.add_parser(
         "lock-gate01-producer-spec",
-        help="Hash-seal every external input and inference setting for the private producer.",
+        help=(
+            "Hash-seal every external input, selected source array, and strict full-volume "
+            "inference setting for the private producer."
+        ),
     )
     for option in (
         "selection",

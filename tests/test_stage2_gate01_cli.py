@@ -267,7 +267,7 @@ def test_gate01_modules_are_importable_from_the_package() -> None:
     assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v1")
     assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v3")
     assert stage2_gate01_montage.Gate01MontageCollector
-    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v1")
+    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v2")
     assert stage2_gate01_protocol.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION.endswith("v2")
 
 

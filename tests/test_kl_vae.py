@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
+from fieldbridge.data.latent_bank import downsample_factor as bank_downsample_factor
 from fieldbridge.models.autoencoders.kl_vae import (
     _LOGVAR_MAX,
     _LOGVAR_MIN,
@@ -95,6 +96,18 @@ def test_encoder_rejects_spatial_dims_not_divisible_by_downsample_factor() -> No
 
     with pytest.raises(ValueError):
         encoder.encode_dist(x)
+
+
+def test_decoder_exposes_downsample_factor_like_the_encoder() -> None:
+    """`latent_bank.downsample_factor` is called on the DECODER by the stage-2 tiled decode
+    path and by `evaluate_transport_travellers`. The stage-2 eval tests stub the decoder, so
+    only a test against a real one catches a missing attribute -- which is how the held-out
+    traveller gate crashed before scoring a single pair while the suite stayed green."""
+
+    encoder = KLVAEEncoder(base_channels=8, latent_channels=6)
+    decoder = KLVAEDecoder(base_channels=8, latent_channels=6)
+
+    assert bank_downsample_factor(decoder) == bank_downsample_factor(encoder)
 
 
 def test_encode_decode_roundtrip_preserves_shape() -> None:

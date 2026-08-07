@@ -14,11 +14,22 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from fieldbridge.data.vae_splits import load_vae_splits
+
 SPLIT_KEYS = ("train", "validation", "test")
 
 # Both are membership-sensitive hashes written by `save_vae_splits` and enforced by
 # `load_vae_splits`. Relocating records invalidates both.
 _FINGERPRINT_KEYS = ("fingerprint", "recovery_fingerprint_v3")
+
+
+def _is_prospective_record(record: Mapping[str, Any]) -> bool:
+    """Match the prospective-record identity used by Stage-2 evaluation."""
+
+    metadata = record.get("metadata")
+    return str(record.get("case_id", "")).startswith("P_") or (
+        isinstance(metadata, Mapping) and metadata.get("prefix") == "P"
+    )
 
 
 def promote_subjects_to_split(
@@ -44,8 +55,10 @@ def promote_subjects_to_split(
     seen_subjects: set[str] = set()
     for key in SPLIT_KEYS:
         for record in splits[key]:
+            if not isinstance(record, Mapping):
+                raise ValueError(f"split_data.splits.{key} must contain record objects.")
             subject_id = str(record.get("subject_id"))
-            if subject_id in subject_set:
+            if subject_id in subject_set and _is_prospective_record(record):
                 seen_subjects.add(subject_id)
                 if key != to_split:
                     moved[key] += 1
@@ -111,19 +124,29 @@ def resplit_file(
     subjects: Sequence[str],
     to_split: str,
 ) -> dict[str, Any]:
-    """Read a split JSON, promote ``subjects`` to ``to_split``, and write a new file."""
+    """Validate, resplit, revalidate, and atomically publish a VAE split JSON."""
 
     source = Path(in_path)
     destination = Path(out_path)
     if destination.resolve() == source.resolve():
         raise ValueError("Refusing to overwrite the input split; choose a different --out path.")
+    # Validate the persisted identities before reading the raw mapping. Otherwise a stale or
+    # altered split could be transformed and receive freshly computed, apparently valid hashes.
+    load_vae_splits(source)
     data = json.loads(source.read_text(encoding="utf-8"))
     updated = promote_subjects_to_split(data, subjects, to_split)
     updated.update(recomputed_fingerprints(updated))
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
-    temporary.write_text(json.dumps(updated, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(destination)
+    try:
+        temporary.write_text(json.dumps(updated, indent=2, sort_keys=True), encoding="utf-8")
+        # Treat the temporary artifact as an untrusted persisted split. Publication is permitted
+        # only after the same canonical loader used by downstream consumers accepts it.
+        load_vae_splits(temporary)
+        temporary.replace(destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     counts = {key: len(updated["splits"][key]) for key in SPLIT_KEYS}
     return {"out": str(destination), "counts": counts, "resplit": updated["resplit"]}
 

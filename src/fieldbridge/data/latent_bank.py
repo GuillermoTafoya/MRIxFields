@@ -264,6 +264,54 @@ def decode_latent_tiled(
     return image.clamp(0.0, 1.0) if clamp else image
 
 
+@torch.inference_mode()
+def decode_latent(
+    decoder: Any,
+    latent: torch.Tensor,
+    domain: Domain,
+    *,
+    factor: int,
+    strategy: EncodeStrategy,
+    block_size: Sequence[int],
+    halo: Sequence[int],
+    precision: Precision,
+    clamp: bool = True,
+) -> tuple[torch.Tensor, str]:
+    """Decode a latent and report whether the full or approximate path was used.
+
+    This restores the reviewed Gate-0 behavior from ``d3476b9``.  In particular,
+    ``strategy="full"`` propagates an OOM and can never fall back to tiled decode.
+    ``auto`` retains the explicitly requested legacy fallback behavior for callers
+    outside the frozen Gate-0.1 producer.
+    """
+
+    if latent.ndim != 5:
+        raise ValueError(f"decode_latent expects (1,C,x,y,z), got {tuple(latent.shape)}.")
+    device = latent.device
+    if strategy in ("full", "auto"):
+        try:
+            with _autocast(device, precision):
+                image = decoder.decode(latent, domain)
+            image = image.float()
+            return (image.clamp(0.0, 1.0) if clamp else image), "full"
+        except RuntimeError as error:
+            if strategy == "full" or not _is_oom(error):
+                raise
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    tiled = decode_latent_tiled(
+        decoder,
+        latent,
+        domain,
+        factor=factor,
+        block_size=block_size,
+        halo=halo,
+        precision=precision,
+        clamp=clamp,
+    )
+    return tiled, "tiled"
+
+
 def _core_blocks_latent(dim: int, block: int) -> list[tuple[int, int]]:
     if block <= 0:
         raise ValueError(f"latent block must be positive, got {block}.")
@@ -539,6 +587,7 @@ __all__ = [
     "LATENT_BANK_CONTRACT_VERSION",
     "LatentBankConfig",
     "build_latent_bank",
+    "decode_latent",
     "encode_latent",
     "decode_latent_tiled",
     "downsample_factor",

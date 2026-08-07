@@ -11,6 +11,7 @@ from fieldbridge.data.latent_bank import (
     LatentBankConfig,
     _core_blocks,
     build_latent_bank,
+    decode_latent,
     encode_latent,
 )
 from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder, KLVAEEncoder
@@ -79,6 +80,28 @@ def test_tiled_encode_equals_full_when_halo_covers_volume() -> None:
     assert used_full == "full" and used_tiled == "tiled"
     assert full.shape == (1, 2, VOL // FACTOR, VOL // FACTOR, VOL // FACTOR)
     assert torch.allclose(full, tiled, atol=1e-5)
+
+
+def test_full_decode_propagates_oom_without_tiled_fallback(monkeypatch) -> None:
+    class _OOMDecoder:
+        def decode(self, _latent, _domain):
+            raise RuntimeError("CUDA out of memory: synthetic")
+
+    def reject_tiled(*_args, **_kwargs):
+        raise AssertionError("tiled decode must not be called")
+
+    monkeypatch.setattr("fieldbridge.data.latent_bank.decode_latent_tiled", reject_tiled)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        decode_latent(
+            _OOMDecoder(),
+            torch.zeros(1, 1, 1, 1, 1),
+            Domain(3.0, Contrast.T1W),
+            factor=4,
+            strategy="full",
+            block_size=(4, 4, 4),
+            halo=(0, 0, 0),
+            precision="float32",
+        )
 
 
 def test_build_latent_bank_writes_files_stats_and_roundtrip(tmp_path) -> None:

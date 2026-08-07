@@ -71,6 +71,40 @@ from fieldbridge.evaluation.pseudo_pairs import PseudoPairEvalConfig, evaluate_p
 from fieldbridge.evaluation.mrixfields2026_official import (
     evaluate_official_task3_directory,
 )
+from fieldbridge.evaluation.intensity_baselines import (
+    fit_image_intensity_baselines,
+    reference_volume_records,
+)
+from fieldbridge.evaluation.stage2_gate01 import (
+    evaluate_gate01,
+    fixed_montage_specifications,
+    gate01_code_provenance,
+    gate01_selection_fingerprint,
+    load_gate01_input_manifest,
+    write_gate01_outputs,
+)
+from fieldbridge.evaluation.stage2_gate01_montage import (
+    Gate01MontageCollector,
+    render_gate01_montages,
+)
+from fieldbridge.evaluation.stage2_gate01_calibration import (
+    PosthocTargetCalibrator,
+    RESPLIT_FINGERPRINT,
+    TrainingTemplateVolume,
+    fit_posthoc_target_calibrator,
+    gate01_calibrator_code_provenance,
+)
+from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
+from fieldbridge.evaluation.stage2_gate01_builder import (
+    assert_gate01_external_path,
+    build_gate01_private_manifest,
+    write_gate01_protocol_lock,
+)
+from fieldbridge.evaluation.stage2_gate01_producer import (
+    prepare_gate01_prospective_selection,
+    produce_gate01_private_artifacts,
+    write_gate01_producer_spec,
+)
 from fieldbridge.evaluation.board_score import (
     aggregate_task3_board,
     board_units_from_payload,
@@ -93,7 +127,7 @@ from fieldbridge.evaluation.stage1_full_volume_audit import (
     write_audit_comparison,
 )
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
-from fieldbridge.data.latent_bank import LatentBankConfig, build_latent_bank
+from fieldbridge.data.latent_bank import LatentBankConfig, build_latent_bank, load_volume
 from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 from fieldbridge.training.pseudo_pair_epochs import (
     PSEUDO_PAIR_PIPELINE_VERSION,
@@ -670,6 +704,179 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --pred-dir/--board-json, add our aggregate under this name to the ranking.",
     )
     board.add_argument("--out", type=Path, default=None, help="Optional JSON output path.")
+
+    fit_intensity = subparsers.add_parser(
+        "fit-intensity-baseline",
+        help=(
+            "Fit the frozen Gate-0 v1 robust-affine and histogram baselines from "
+            "training records."
+        ),
+    )
+    fit_intensity.add_argument("--split-json", type=Path, required=True)
+    fit_intensity.add_argument(
+        "--out", type=Path, required=True, help="Output stem; one JSON is written per mode."
+    )
+    fit_intensity.add_argument("--per-domain", type=int, default=8)
+    fit_intensity.add_argument("--num-quantiles", type=int, default=256)
+    fit_intensity.add_argument("--mask-threshold", type=float, default=0.0)
+    fit_intensity.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+
+    fit_gate01 = subparsers.add_parser(
+        "fit-gate01-target-calibrator",
+        help=(
+            "Fit the frozen Gate-0.1 post-hoc target-CDF calibrator from all "
+            "retrospective training records."
+        ),
+    )
+    fit_gate01.add_argument("--split-json", type=Path, required=True)
+    fit_gate01.add_argument("--out", type=Path, required=True)
+    fit_gate01.add_argument("--num-quantiles", type=int, default=256)
+    fit_gate01.add_argument("--mask-threshold", type=float, default=0.0)
+    fit_gate01.add_argument("--low-probability", type=float, default=0.01)
+    fit_gate01.add_argument("--high-probability", type=float, default=0.99)
+    fit_gate01.add_argument(
+        "--training-cohort-identity",
+        required=True,
+        help="Auditable label/hash identifying the retrospective training cohort.",
+    )
+    fit_gate01.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+
+    lock_gate01 = subparsers.add_parser(
+        "lock-gate01-protocol",
+        help="Hash-seal an independent external Gate-0.1 protocol specification.",
+    )
+    lock_gate01.add_argument("--spec", type=Path, required=True)
+    lock_gate01.add_argument("--out", type=Path, required=True)
+
+    fingerprint_gate01 = subparsers.add_parser(
+        "fingerprint-gate01-selection",
+        help="Hash a sanitized, predeclared Gate-0.1 selection descriptor list.",
+    )
+    fingerprint_gate01.add_argument("--selection", type=Path, required=True)
+
+    select_gate01 = subparsers.add_parser(
+        "prepare-gate01-private-selection",
+        help=(
+            "Resolve one external prospective traveller to a hash-only frozen "
+            "15-acquisition Gate-0.1 selection."
+        ),
+    )
+    select_gate01.add_argument("--split-json", type=Path, required=True)
+    select_gate01.add_argument("--traveller-subject-id", required=True)
+    select_gate01.add_argument("--out", type=Path, required=True)
+
+    spec_gate01 = subparsers.add_parser(
+        "lock-gate01-producer-spec",
+        help=(
+            "Hash-seal every external input, selected source array, and strict full-volume "
+            "inference setting for the private producer."
+        ),
+    )
+    for option in (
+        "selection",
+        "split-json",
+        "bank-source-split-json",
+        "bank-dir",
+        "stage1-config",
+        "stage1-checkpoint",
+        "sb-v2-config",
+        "sb-v2-checkpoint",
+        "protocol-lock",
+    ):
+        spec_gate01.add_argument(f"--{option}", type=Path, required=True)
+    spec_gate01.add_argument("--solver", choices=("euler", "heun"), required=True)
+    spec_gate01.add_argument("--n-steps", type=int, required=True)
+    spec_gate01.add_argument("--decode-block-size", type=int, nargs=3, required=True)
+    spec_gate01.add_argument("--decode-halo", type=int, nargs=3, required=True)
+    spec_gate01.add_argument(
+        "--decode-precision", choices=("float32", "bfloat16"), required=True
+    )
+    spec_gate01.add_argument("--deterministic-seed", type=int, default=0)
+    spec_gate01.add_argument("--out", type=Path, required=True)
+
+    produce_gate01 = subparsers.add_parser(
+        "produce-gate01-private-artifacts",
+        help=(
+            "Deterministically and resumably infer the complete external 15/60/180 "
+            "Gate-0.1 artifact graph."
+        ),
+    )
+    for option in (
+        "spec",
+        "selection",
+        "split-json",
+        "bank-source-split-json",
+        "bank-dir",
+        "stage1-config",
+        "stage1-checkpoint",
+        "sb-v2-config",
+        "sb-v2-checkpoint",
+        "protocol-lock",
+        "output-dir",
+        "state-dir",
+    ):
+        produce_gate01.add_argument(f"--{option}", type=Path, required=True)
+    produce_gate01.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    produce_gate01.add_argument("--resume", action="store_true")
+
+    build_gate01 = subparsers.add_parser(
+        "build-gate01-private-manifest",
+        help=(
+            "Verify frozen external arrays and resumably build the private Gate-0.1 "
+            "prediction manifest without running inference."
+        ),
+    )
+    build_gate01.add_argument("--plan", type=Path, required=True)
+    build_gate01.add_argument("--producer-spec", type=Path, required=True)
+    build_gate01.add_argument("--producer-state", type=Path, required=True)
+    build_gate01.add_argument("--protocol-lock", type=Path, required=True)
+    build_gate01.add_argument("--calibrator", type=Path, required=True)
+    build_gate01.add_argument("--out", type=Path, required=True)
+    build_gate01.add_argument("--state", type=Path, required=True)
+    build_gate01.add_argument("--resume", action="store_true")
+
+    gate01 = subparsers.add_parser(
+        "gate01-equal-photometry",
+        help=(
+            "Evaluate raw/calibrated identity, raw/calibrated SB-v2, and the "
+            "Stage-1 ceiling on strict external full-volume predictions."
+        ),
+    )
+    gate01.add_argument("--manifest", type=Path, required=True)
+    gate01.add_argument("--calibrator", type=Path, required=True)
+    gate01.add_argument(
+        "--protocol-lock",
+        type=Path,
+        default=None,
+        help="Independent external protocol lock; mandatory for scientific mode.",
+    )
+    gate01.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=("nrmse", "ssim", "lpips"),
+        default=("nrmse", "ssim", "lpips"),
+    )
+    gate01.add_argument(
+        "--device", choices=("cpu", "cuda"), default="cuda"
+    )
+    gate01.add_argument(
+        "--include-robust-affine",
+        action="store_true",
+        help="Add robust-affine-calibrated identity/SB as diagnostic-only methods.",
+    )
+    gate01.add_argument("--out", type=Path, default=None)
+    gate01.add_argument("--markdown-out", type=Path, default=None)
+    gate01.add_argument("--contract-out", type=Path, default=None)
+    gate01.add_argument(
+        "--montage-dir",
+        type=Path,
+        default=None,
+        help="Render the frozen deterministic montage PNGs and provenance manifest.",
+    )
 
     return parser
 
@@ -1326,6 +1533,285 @@ def main(argv: list[str] | None = None) -> int:
                 f"final_loss={result.final_loss:.6f} sec_per_step={result.seconds_per_step:.3f} "
                 f"best_val={result.best_val}"
             )
+        return 0
+
+    if args.command == "fit-intensity-baseline":
+        splits = load_vae_splits(args.split_json)
+        records = list(splits.train) + list(splits.validation) + list(splits.test)
+        split_of_case = {
+            str(record.case_id): split_name
+            for split_name in ("train", "validation", "test")
+            for record in splits.records_for(split_name)
+        }
+        chosen = reference_volume_records(
+            records,
+            split_of_case=split_of_case,
+            per_domain=args.per_domain,
+        )
+        if not chosen:
+            raise SystemExit(
+                "No training-split records found to fit Gate-0 intensity references."
+            )
+        device = _resolve_device(args.device)
+
+        def legacy_stream():
+            for record in chosen:
+                yield load_volume(record).to(device), record.domain
+
+        baselines = fit_image_intensity_baselines(
+            legacy_stream(),
+            num_quantiles=args.num_quantiles,
+            mask_threshold=args.mask_threshold,
+            provenance={
+                "split_fingerprint": vae_splits_fingerprint(splits),
+                "per_domain": args.per_domain,
+            },
+            log=True,
+        )
+        written = {}
+        for mode, baseline in baselines.items():
+            path = args.out.with_name(
+                f"{args.out.stem}_{mode}{args.out.suffix or '.json'}"
+            )
+            baseline.save(path)
+            written[mode] = str(path)
+        print(
+            json.dumps(
+                {"written": written, "reference_volumes": len(chosen)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "fit-gate01-target-calibrator":
+        assert_gate01_external_path(args.split_json, repo_root=None)
+        assert_gate01_external_path(args.out, repo_root=None)
+        splits = load_vae_splits(args.split_json)
+        split_fingerprint = vae_splits_fingerprint(splits)
+        if split_fingerprint != RESPLIT_FINGERPRINT:
+            raise SystemExit(
+                "Gate 0.1 requires the frozen resplit fingerprint; "
+                f"found {split_fingerprint}, expected {RESPLIT_FINGERPRINT}."
+            )
+        retrospective = []
+        for record in splits.train:
+            prefix = str(
+                record.metadata.get("prefix", str(record.case_id).split("_", 1)[0])
+            )
+            if prefix == "R":
+                retrospective.append(record)
+        if not retrospective:
+            raise SystemExit(
+                "No retrospective training records were found for Gate 0.1 fitting."
+            )
+        device = _resolve_device(args.device)
+
+        def template_stream():
+            for record in retrospective:
+                yield TrainingTemplateVolume(
+                    volume=load_volume(record).to(device),
+                    domain=record.domain,
+                    record_identity=str(record.case_id),
+                    split="train",
+                    cohort="R",
+                )
+
+        calibrator = fit_posthoc_target_calibrator(
+            template_stream(),
+            split_fingerprint=split_fingerprint,
+            training_cohort_identity=args.training_cohort_identity,
+            code_commit=resolve_git_commit(),
+            code_provenance=gate01_calibrator_code_provenance(),
+            num_quantiles=args.num_quantiles,
+            mask_threshold=args.mask_threshold,
+            low_probability=args.low_probability,
+            high_probability=args.high_probability,
+            extra_config={
+                "split_recovery_fingerprint_v3": (
+                    vae_splits_recovery_fingerprint_v3(splits)
+                )
+            },
+        )
+        calibrator.save(args.out)
+        print(
+            json.dumps(
+                {
+                    "out": str(args.out),
+                    "contract_version": calibrator.to_dict()["contract_version"],
+                    "artifact_sha256": calibrator.artifact_sha256,
+                    "template_sha256": calibrator.template_sha256,
+                    "split_fingerprint": calibrator.split_fingerprint,
+                    "reference_volumes": len(retrospective),
+                    "domain_volume_counts": calibrator.provenance[
+                        "domain_volume_counts"
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "lock-gate01-protocol":
+        lock = write_gate01_protocol_lock(args.spec, args.out)
+        print(json.dumps(lock.summary(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "fingerprint-gate01-selection":
+        selection = json.loads(args.selection.read_text(encoding="utf-8"))
+        if not isinstance(selection, list):
+            raise SystemExit("Gate 0.1 selection descriptor root must be a list.")
+        print(gate01_selection_fingerprint(selection))
+        return 0
+
+    if args.command == "prepare-gate01-private-selection":
+        result = prepare_gate01_prospective_selection(
+            args.split_json, args.traveller_subject_id, args.out
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "lock-gate01-producer-spec":
+        result = write_gate01_producer_spec(
+            selection_path=args.selection,
+            split_path=args.split_json,
+            bank_source_split_path=args.bank_source_split_json,
+            bank_dir=args.bank_dir,
+            stage1_config_path=args.stage1_config,
+            stage1_checkpoint_path=args.stage1_checkpoint,
+            sb_v2_config_path=args.sb_v2_config,
+            sb_v2_checkpoint_path=args.sb_v2_checkpoint,
+            protocol_lock_path=args.protocol_lock,
+            sampler=TransportSamplerConfig(solver=args.solver, n_steps=args.n_steps),
+            decode=DecodeSpec(
+                block_size=tuple(args.decode_block_size),
+                halo=tuple(args.decode_halo),
+                precision=args.decode_precision,
+            ),
+            deterministic_seed=args.deterministic_seed,
+            out_path=args.out,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "produce-gate01-private-artifacts":
+        result = produce_gate01_private_artifacts(
+            spec_path=args.spec,
+            selection_path=args.selection,
+            split_path=args.split_json,
+            bank_source_split_path=args.bank_source_split_json,
+            bank_dir=args.bank_dir,
+            stage1_config_path=args.stage1_config,
+            stage1_checkpoint_path=args.stage1_checkpoint,
+            sb_v2_config_path=args.sb_v2_config,
+            sb_v2_checkpoint_path=args.sb_v2_checkpoint,
+            protocol_lock_path=args.protocol_lock,
+            output_dir=args.output_dir,
+            state_dir=args.state_dir,
+            device=args.device,
+            resume=args.resume,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "build-gate01-private-manifest":
+        result = build_gate01_private_manifest(
+            args.plan,
+            args.producer_spec,
+            args.producer_state,
+            args.protocol_lock,
+            args.calibrator,
+            args.out,
+            args.state,
+            resume=args.resume,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "gate01-equal-photometry":
+        protocol_lock = (
+            Gate01ProtocolLock.load(args.protocol_lock)
+            if args.protocol_lock is not None
+            else None
+        )
+        calibrator = PosthocTargetCalibrator.load(
+            args.calibrator,
+            expected_split_fingerprint=RESPLIT_FINGERPRINT,
+            expected_template_sha256=(
+                protocol_lock.calibrator_template_sha256
+                if protocol_lock is not None
+                else None
+            ),
+            expected_artifact_sha256=(
+                protocol_lock.calibrator_artifact_sha256
+                if protocol_lock is not None
+                else None
+            ),
+        )
+        if protocol_lock is not None:
+            protocol_lock.assert_calibrator(calibrator)
+        cases, input_metadata = load_gate01_input_manifest(
+            args.manifest,
+            protocol_lock=protocol_lock,
+            calibrator=calibrator,
+        )
+        if input_metadata["execution_mode"] == "scientific" and args.montage_dir is None:
+            raise ValueError(
+                "Scientific Gate 0.1 mode requires --montage-dir for frozen rendering."
+            )
+        montage_collector = (
+            Gate01MontageCollector(fixed_montage_specifications())
+            if args.montage_dir is not None
+            else None
+        )
+        code_provenance = gate01_code_provenance()
+        result = evaluate_gate01(
+            cases,
+            calibrator=calibrator,
+            artifact_provenance=input_metadata["artifact_provenance"],
+            code_commit=resolve_git_commit(),
+            evidence_scope=input_metadata["evidence_scope"],
+            input_manifest_sha256=input_metadata["sha256"],
+            producer_receipt=input_metadata["producer_receipt"],
+            split_provenance=input_metadata["split_provenance"],
+            support_threshold=input_metadata["support_threshold"],
+            execution_mode=input_metadata["execution_mode"],
+            selection_fingerprint_sha256=input_metadata[
+                "selection_fingerprint_sha256"
+            ],
+            code_provenance=code_provenance,
+            protocol_lock=protocol_lock,
+            metrics=tuple(args.metrics),
+            device=args.device,
+            include_robust_affine=args.include_robust_affine,
+            case_observer=(
+                montage_collector.observe if montage_collector is not None else None
+            ),
+        )
+        if montage_collector is not None and args.montage_dir is not None:
+            montage = render_gate01_montages(
+                montage_collector,
+                args.montage_dir,
+                require_complete=input_metadata["execution_mode"] == "scientific",
+            )
+            result["montage_rendering"] = montage
+            result["contract"]["montage_rendering"] = {
+                "contract_version": montage["contract_version"],
+                "manifest_sha256": montage["manifest_sha256"],
+                "complete_frozen_selection": montage[
+                    "complete_frozen_selection"
+                ],
+            }
+        written = write_gate01_outputs(
+            result,
+            json_path=args.out,
+            markdown_path=args.markdown_out,
+            contract_path=args.contract_out,
+        )
+        printable = dict(result)
+        printable["written"] = written
+        print(json.dumps(printable, indent=2, sort_keys=True, allow_nan=False))
         return 0
 
     if args.command == "eval-stage2-transport":

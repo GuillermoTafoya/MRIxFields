@@ -24,6 +24,7 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     fit_posthoc_target_calibrator,
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import (
+    GATE01_SCIENTIFIC_MODULES,
     Gate01ProtocolLock,
     frozen_protocol_artifact_provenance,
 )
@@ -167,6 +168,11 @@ def _private_bundle(tmp_path: Path) -> dict[str, object]:
         "support_threshold": 0.0,
         "calibrator_artifact_sha256": calibrator.artifact_sha256,
         "calibrator_template_sha256": calibrator.template_sha256,
+        "evaluation_git_commit": "e" * 40,
+        "evaluation_module_sha256": {
+            name: f"{index + 1:064x}"
+            for index, name in enumerate(GATE01_SCIENTIFIC_MODULES)
+        },
         "artifact_provenance": frozen_protocol_artifact_provenance(),
         "official_metrics": ["nrmse", "ssim", "lpips"],
         "montage_specification": fixed_montage_specifications(),

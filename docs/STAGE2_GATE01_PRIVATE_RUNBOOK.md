@@ -1,48 +1,56 @@
 # Stage 2 Gate 0.1 private execution runbook
 
-This runbook is the only scientific-mode path for Gate 0.1. It deliberately keeps the
-training-derived calibrator, protocol lock, selection, arrays, manifests, results, and
-figures outside the Git checkout. The repository commands below do not train SB-v2 or
-produce predictions. No private execution was performed while implementing this path.
+This is the required scientific-mode order for Gate 0.1. The calibrator, selection,
+protocol lock, producer specification/state, arrays, build plan, manifest, results, and
+figures remain outside Git. These commands must be run only after the reviewed change is
+merged and its final commit is known. No private execution was performed for this PR.
 
-## 1. Preconditions and external paths
+## 1. Establish external paths and the final reviewed checkout
 
-Run from a reviewed, clean checkout of the exact Gate 0.1 commit. Set each placeholder
-to an existing location on the private system; `GATE01_EXTERNAL` must not be inside the
-repository.
+Run from the repository root. `GATE01_EXTERNAL` and every referenced input/output must
+resolve outside the repository.
 
 ```powershell
 $Gate01Repo = (Get-Location).Path
 $Gate01External = (Resolve-Path $env:GATE01_EXTERNAL).Path
 $Gate01Split = Join-Path $Gate01External "frozen-resplit.json"
+$Gate01Bank = Join-Path $Gate01External "full-latent-bank"
+$Gate01Stage1Config = Join-Path $Gate01External "stage1-run-c.yaml"
+$Gate01Stage1Checkpoint = Join-Path $Gate01External "stage1-run-c.pt"
+$Gate01SbConfig = Join-Path $Gate01External "sb-v2.yaml"
+$Gate01SbCheckpoint = Join-Path $Gate01External "sb-v2.pt"
 $Gate01Calibrator = Join-Path $Gate01External "gate01-target-calibrator.json"
-$Gate01Selection = Join-Path $Gate01External "gate01-selection-descriptors.json"
+$Gate01Selection = Join-Path $Gate01External "gate01-prospective-selection.json"
 $Gate01ProtocolSpec = Join-Path $Gate01External "gate01-protocol-spec.json"
 $Gate01ProtocolLock = Join-Path $Gate01External "gate01-protocol-lock.json"
-$Gate01BuildPlan = Join-Path $Gate01External "gate01-private-build-plan.json"
+$Gate01ProducerSpec = Join-Path $Gate01External "gate01-producer-spec.json"
+$Gate01ProducerOutput = Join-Path $Gate01External "producer-output"
+$Gate01ProducerState = Join-Path $Gate01External "producer-state"
+$Gate01BuildPlan = Join-Path $Gate01ProducerOutput "private-build-plan.json"
 $Gate01Manifest = Join-Path $Gate01External "gate01-private-manifest.json"
 $Gate01BuildState = Join-Path $Gate01External "gate01-private-build-state.json"
 $Gate01Results = Join-Path $Gate01External "gate01-results.json"
 $Gate01Report = Join-Path $Gate01External "gate01-report.md"
 $Gate01Contract = Join-Path $Gate01External "gate01-result-contract.json"
 $Gate01Montages = Join-Path $Gate01External "gate01-montages"
+$Gate01Archive = Join-Path $Gate01External "archive"
 
+$Gate01ReviewedCommit = (git rev-parse HEAD).Trim()
 git status --short
-git rev-parse HEAD
 git diff --quiet
 git diff --cached --quiet
 ```
 
-Stop if either diff command is nonzero, if `git status --short` prints anything, or if
-HEAD is not the reviewed Gate 0.1 commit. Do not copy any external file into the checkout.
+Stop unless status is empty and both diff commands return zero. `$Gate01ReviewedCommit`
+must be the final reviewed/merged Gate 0.1 commit, not a transient PR head. Never copy an
+external artifact into the checkout.
 
-## 2. Fit and seal the training-derived calibrator
+## 2. Fit the training-derived calibrator
 
-The split must have fingerprint
+The split fingerprint is frozen at
 `92187cf5f08ba00c446c08151f0658534efffa917569106a73062fdc70bcaf5f`.
-The fit streams retrospective training volumes, retains only per-volume quantiles and
-content identities, requires all 15 domains, freezes support threshold `0.0`, and rejects
-a dirty checkout.
+The fit streams retrospective training volumes and retains per-volume quantiles/content
+identities only. It requires all 15 domains, a clean checkout, and support threshold 0.0.
 
 ```powershell
 fieldbridge fit-gate01-target-calibrator `
@@ -56,82 +64,85 @@ fieldbridge fit-gate01-target-calibrator `
   --device cpu
 ```
 
-Archive the command JSON output with the external run record. It reports both the
-calibrator artifact SHA-256 and aggregate template SHA-256. Do not hand-edit the
-calibrator.
+Record the printed calibrator artifact and template SHA-256 values. Do not hand-edit it.
 
-## 3. Freeze selection independently of predictions
+## 3. Resolve and freeze the 15 acquisitions
 
-Before reading or building a prediction manifest, create `$Gate01Selection` in the
-external protocol area as a JSON list of exactly 60 sanitized descriptors:
-
-```json
-[
-  {
-    "case_identity_sha256": "<sha256-of-external-case-id>",
-    "traveller_identity_sha256": "<frozen-traveller-sha256>",
-    "contrast": "T1w",
-    "source_field_t": 0.1,
-    "target_field_t": 1.5
-  }
-]
-```
-
-The complete file must contain each of the 20 nonidentity directed field pairs exactly
-once for each of `T1w`, `T2w`, and `T2-FLAIR`, with one traveller digest throughout.
-Compute its canonical fingerprint without consulting the prediction manifest:
+This command reads the external frozen split, resolves one prospective traveller, checks
+one acquisition in every one of the 15 domains, and writes only case/traveller hashes.
+It automatically freezes the 60-direction selection fingerprint; the operator does not
+author 60 cases.
 
 ```powershell
-$Gate01SelectionFingerprint = (fieldbridge fingerprint-gate01-selection `
-  --selection $Gate01Selection).Trim()
+fieldbridge prepare-gate01-private-selection `
+  --split-json $Gate01Split `
+  --traveller-subject-id $env:GATE01_TRAVELLER_SUBJECT_ID `
+  --out $Gate01Selection
 ```
 
-## 4. Create the independent protocol lock
+Verify that the selection contains 15 acquisition identities and no raw case or traveller
+identifier.
 
-Create `$Gate01ProtocolSpec` outside Git. It must contain exactly these fields; replace
-only the four marked digests with the externally frozen values. The montage object must
-be copied exactly.
+## 4. Independently freeze evaluation code and protocol
 
-```json
-{
-  "traveller_identity_sha256": "<frozen-traveller-sha256>",
-  "selection_fingerprint_sha256": "<Gate01SelectionFingerprint>",
-  "split_fingerprint": "92187cf5f08ba00c446c08151f0658534efffa917569106a73062fdc70bcaf5f",
-  "support_threshold": 0.0,
-  "calibrator_artifact_sha256": "<artifact_sha256-from-calibrator>",
-  "calibrator_template_sha256": "<template_sha256-from-calibrator>",
-  "artifact_provenance": {
-    "stage1_run_c_checkpoint_sha256": "74132b9c514bb91b86d8eb43c63542780bce11304e31e67d3bf75c90ff5d4d79",
-    "full_latent_bank_build_commit": "c4b9c399baef588d9547e89100de5036e1ccfcdb",
-    "gate0_diagnostic_commit": "d3476b900866019b428d52d01a6d5b26b93ca65d",
-    "sb_v2_checkpoint_sha256": "39c71b5dae702a68d9518376c2d25c13605abd985a5e74e8fb1b4c58d17a1108",
-    "resplit_fingerprint": "92187cf5f08ba00c446c08151f0658534efffa917569106a73062fdc70bcaf5f"
-  },
-  "official_metrics": ["nrmse", "ssim", "lpips"],
-  "montage_specification": {
-    "version": "gate01-montage-v1",
-    "selection_frozen_before_private_run": true,
-    "selection_basis": "contrast and directed field pair only; never metric rank",
-    "tensor_axis_convention": "volume[..., z]; no anatomical plane name is inferred without affine/orientation",
-    "relative_slice_positions": [0.35, 0.5, 0.65],
-    "display_order": ["target", "raw_identity", "calibrated_identity", "raw_sb_v2", "calibrated_sb_v2", "stage1_reconstruction_ceiling"],
-    "directed_pairs_per_contrast": [
-      {"source_field_t": 0.1, "target_field_t": 7.0},
-      {"source_field_t": 7.0, "target_field_t": 0.1},
-      {"source_field_t": 1.5, "target_field_t": 3.0},
-      {"source_field_t": 3.0, "target_field_t": 1.5}
-    ],
-    "contrasts": ["T1w", "T2w", "T2-FLAIR"],
-    "rendering": {
-      "shared_display_range_within_pair": true,
-      "interpolation": "none",
-      "crop": "none unless a separately frozen source-derived crop is supplied"
-    }
-  }
-}
+The external protocol specification is created only after the final reviewed commit is
+known. Its `evaluation_git_commit` is `$Gate01ReviewedCommit`. Its
+`evaluation_module_sha256` object must contain exactly this reviewed set, with values
+computed once from that clean commit and then frozen outside Git:
+
+```powershell
+$Gate01ScientificModules = @(
+  "src/fieldbridge/cli.py",
+  "src/fieldbridge/config/__init__.py",
+  "src/fieldbridge/data/contracts.py",
+  "src/fieldbridge/data/domains.py",
+  "src/fieldbridge/data/latent_bank.py",
+  "src/fieldbridge/data/latent_bank_dataset.py",
+  "src/fieldbridge/data/manifests.py",
+  "src/fieldbridge/data/sources.py",
+  "src/fieldbridge/data/transforms.py",
+  "src/fieldbridge/data/vae_splits.py",
+  "src/fieldbridge/evaluation/metrics.py",
+  "src/fieldbridge/evaluation/mrixfields2026_official.py",
+  "src/fieldbridge/evaluation/stage2_gate01.py",
+  "src/fieldbridge/evaluation/stage2_gate01_builder.py",
+  "src/fieldbridge/evaluation/stage2_gate01_calibration.py",
+  "src/fieldbridge/evaluation/stage2_gate01_montage.py",
+  "src/fieldbridge/evaluation/stage2_gate01_producer.py",
+  "src/fieldbridge/evaluation/stage2_gate01_protocol.py",
+  "src/fieldbridge/evaluation/stage2_transport_eval.py",
+  "src/fieldbridge/official/mrixfields2026.py",
+  "src/fieldbridge/models/autoencoders/base.py",
+  "src/fieldbridge/models/autoencoders/kl_vae.py",
+  "src/fieldbridge/models/conditioning.py",
+  "src/fieldbridge/models/diffusion/field_conditioner.py",
+  "src/fieldbridge/models/diffusion/timestep_embedding.py",
+  "src/fieldbridge/models/factory.py",
+  "src/fieldbridge/models/film.py",
+  "src/fieldbridge/models/translators/base.py",
+  "src/fieldbridge/models/translators/conditional_unet.py",
+  "src/fieldbridge/models/translators/flow_transport.py",
+  "src/fieldbridge/training/checkpoints.py"
+)
+$Gate01ScientificModules | ForEach-Object {
+  [pscustomobject]@{ module = $_; sha256 = (Get-FileHash -Algorithm SHA256 $_).Hash.ToLower() }
+} | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $Gate01External "reviewed-module-hashes.json")
 ```
 
-Seal it atomically. This command reads no prediction manifest:
+Transcribe those reviewed values into the exact module-keyed map in
+`$Gate01ProtocolSpec`; do not source expected values from a prediction manifest or from
+runtime evaluator output. The specification contains exactly:
+
+- the hash-only traveller and 60-direction fingerprint from `$Gate01Selection`;
+- the frozen split and support threshold `0.0`;
+- calibrator artifact/template SHA-256;
+- `evaluation_git_commit` and the exact 31-entry `evaluation_module_sha256` map above;
+- the frozen Stage-1, latent-bank build, Gate-0, SB-v2, and resplit identities;
+- `official_metrics` equal to `['nrmse', 'ssim', 'lpips']` in that order;
+- the unchanged object returned by
+  `fieldbridge.evaluation.stage2_gate01.fixed_montage_specifications()`.
+
+Seal the independently reviewed specification:
 
 ```powershell
 fieldbridge lock-gate01-protocol `
@@ -139,44 +150,85 @@ fieldbridge lock-gate01-protocol `
   --out $Gate01ProtocolLock
 ```
 
-Any later change to selection, traveller, split, threshold, calibrator, checkpoint/build
-identity, official metrics, or montage requires a new reviewed protocol lock.
+Scientific runtime fails unless the checkout is clean, HEAD equals the externally locked
+commit, and its exact runtime module map equals the externally locked map. The repository
+does not hardcode a PR head or predict the future merge commit.
 
-## 5. Produce frozen arrays and the external build plan
+## 5. Seal the deterministic producer inputs
 
-Use the already reviewed Stage-1/SB-v2 private inference process to produce arrays
-outside Git. Do not retrain. The external build plan is not the protocol lock and cannot
-change its expected values. It has contract version
-`stage2-gate01-private-build-plan-v1`, execution mode `scientific`, the locked selection,
-split, artifact and support contracts, and `evidence_scope` containing
-`"evidence_kind": "private"` and `"private_data_run": true`.
+The command below verifies and pins the selection, split file, every latent-bank record,
+latent statistics/manifest/build commit, both configs/checkpoints, solver, step count,
+full-volume decode path, deterministic seed, and protocol-lock identity.
 
-Each of its 60 cases must contain `case_id`, the traveller digest, source/target domains,
-and these references:
-
-```json
-{
-  "path": "relative/or/absolute/external-volume.npy",
-  "expected_sha256": "<canonical-loaded-array-sha256>"
-}
+```powershell
+fieldbridge lock-gate01-producer-spec `
+  --selection $Gate01Selection `
+  --split-json $Gate01Split `
+  --bank-dir $Gate01Bank `
+  --stage1-config $Gate01Stage1Config `
+  --stage1-checkpoint $Gate01Stage1Checkpoint `
+  --sb-v2-config $Gate01SbConfig `
+  --sb-v2-checkpoint $Gate01SbCheckpoint `
+  --protocol-lock $Gate01ProtocolLock `
+  --solver heun `
+  --n-steps 20 `
+  --decode-block-size 128 128 128 `
+  --decode-halo 16 16 16 `
+  --decode-precision bfloat16 `
+  --deterministic-seed 0 `
+  --out $Gate01ProducerSpec
 ```
 
-Required roles are `source_image`, `source_support_mask`, `target`, `raw_identity`,
-`raw_sb_v2`, and `stage1_reconstruction_ceiling`. `wrong_target_sb_v2` must contain the
-three other non-source, non-requested sibling fields, using the same files and canonical
-hashes as those siblings' requested `raw_sb_v2` predictions. The 15 acquisition nodes
-must reuse exact source/target files and hashes; their Stage-1 source identity/target
-ceiling roles must likewise reuse exact files and hashes. Support masks are boolean
-`.npy` arrays equal to `abs(source_image) > 0.0`.
+Use the reviewed frozen SB-v2 sampler/decode values. A changed config, checkpoint, bank,
+selection, split, lock, solver, step count, or decode value requires a new reviewed spec.
 
-Canonical hashes are over the loaded shape, canonical dtype, and C-order array bytes—not
-container bytes. Use `fieldbridge.evaluation.stage2_gate01.canonical_loaded_array_sha256`
-in the external producer. Never derive an expected hash by reading the manifest under
-validation.
-
-## 6. Verify and resumably build the manifest
+## 6. Produce the external 15/60/180 artifact graph
 
 First attempt:
+
+```powershell
+fieldbridge produce-gate01-private-artifacts `
+  --spec $Gate01ProducerSpec `
+  --selection $Gate01Selection `
+  --split-json $Gate01Split `
+  --bank-dir $Gate01Bank `
+  --stage1-config $Gate01Stage1Config `
+  --stage1-checkpoint $Gate01Stage1Checkpoint `
+  --sb-v2-config $Gate01SbConfig `
+  --sb-v2-checkpoint $Gate01SbCheckpoint `
+  --protocol-lock $Gate01ProtocolLock `
+  --output-dir $Gate01ProducerOutput `
+  --state-dir $Gate01ProducerState `
+  --device cuda
+```
+
+After interruption, run the identical command with `--resume`. Resume re-hashes every
+completed array and rejects stale state, mutation, missing or unexpected paths. It never
+repeats verified inference:
+
+```powershell
+fieldbridge produce-gate01-private-artifacts `
+  --spec $Gate01ProducerSpec `
+  --selection $Gate01Selection `
+  --split-json $Gate01Split `
+  --bank-dir $Gate01Bank `
+  --stage1-config $Gate01Stage1Config `
+  --stage1-checkpoint $Gate01Stage1Checkpoint `
+  --sb-v2-config $Gate01SbConfig `
+  --sb-v2-checkpoint $Gate01SbCheckpoint `
+  --protocol-lock $Gate01ProtocolLock `
+  --output-dir $Gate01ProducerOutput `
+  --state-dir $Gate01ProducerState `
+  --device cuda `
+  --resume
+```
+
+Verify the command reports 15 acquisitions, 15 Stage-1 inferences, 60 SB-v2 inferences,
+60 directions, and 180 wrong-target references. The wrong-target entries are references
+to the 60 sibling predictions; no extra inference occurs. The producer writes 15 masks as
+`abs(source) > 0.0`, canonical loaded-array hashes, and `$Gate01BuildPlan` atomically.
+
+## 7. Independently verify and build the manifest
 
 ```powershell
 fieldbridge build-gate01-private-manifest `
@@ -187,7 +239,7 @@ fieldbridge build-gate01-private-manifest `
   --state $Gate01BuildState
 ```
 
-After an interruption, rerun the same command with `--resume`:
+After interruption, repeat it exactly with `--resume`:
 
 ```powershell
 fieldbridge build-gate01-private-manifest `
@@ -199,22 +251,20 @@ fieldbridge build-gate01-private-manifest `
   --resume
 ```
 
-The builder verifies every canonical array identity, the complete 15-node/60-direction
-graph, all 180 sibling wrong-target references, protocol lock, calibrator identities,
-and support threshold. State and final manifest writes are atomic. Resume is accepted
-only for the same plan, lock, and calibrator. The builder performs no inference.
+This second-stage builder performs no inference. It reloads and hashes every array,
+verifies the 15-node/60-direction/180-sibling graph, lock, calibrator and threshold, then
+atomically writes the scientific manifest.
 
-## 7. Execute the official scientific diagnostic
+## 8. Execute the official diagnostic
 
-Recheck the checkout immediately before execution:
+Immediately recheck the checkout and locked commit:
 
 ```powershell
 git status --short
-git rev-parse HEAD
+if ((git rev-parse HEAD).Trim() -ne $Gate01ReviewedCommit) { throw "Gate 0.1 HEAD changed" }
 ```
 
-Stop unless it is still clean and at the reviewed commit. Then run all official metrics
-together and render the frozen montage:
+Then run all three official metrics and the frozen renderer together:
 
 ```powershell
 fieldbridge gate01-equal-photometry `
@@ -229,8 +279,33 @@ fieldbridge gate01-equal-photometry `
   --montage-dir $Gate01Montages
 ```
 
-Archive the manifest, calibrator, protocol lock, build state, JSON result, Markdown report,
-contract JSON, montage PNGs/manifest, command output, and environment record in the
-external protocol area. Confirm `scientific_status.eligible_for_scientific_conclusions`
-is `true`; otherwise the run is development-only. Promotion remains unset until the
+The wrong-target report contains two distinct endpoints: common requested-domain
+calibration (the equal-photometry mechanistic comparison) and condition-native
+calibration (an endpoint diagnostic that changes both condition and template and therefore
+does not isolate target control).
+
+## 9. Verify and archive outside Git
+
+Require `scientific_status.eligible_for_scientific_conclusions=true` and
+`promotion_decision=unset_pending_scientific_review`. Then create a detached hash inventory
+and archive only in the external area:
+
+```powershell
+New-Item -ItemType Directory -Force $Gate01Archive | Out-Null
+$Gate01ArchiveInputs = @(
+  $Gate01Calibrator, $Gate01Selection, $Gate01ProtocolSpec, $Gate01ProtocolLock,
+  $Gate01ProducerSpec, $Gate01BuildPlan, $Gate01Manifest, $Gate01BuildState,
+  $Gate01Results, $Gate01Report, $Gate01Contract
+)
+$Gate01ArchiveInputs | ForEach-Object {
+  Get-FileHash -Algorithm SHA256 $_
+} | Export-Csv -NoTypeInformation (Join-Path $Gate01Archive "sha256-inventory.csv")
+Copy-Item $Gate01ArchiveInputs -Destination $Gate01Archive
+Copy-Item $Gate01ProducerOutput -Destination $Gate01Archive -Recurse
+Copy-Item $Gate01ProducerState -Destination $Gate01Archive -Recurse
+Copy-Item $Gate01Montages -Destination $Gate01Archive -Recurse
+git status --short
+```
+
+Stop if Git status is not empty. Scientific promotion remains unset until the archived
 private result receives scientific review.

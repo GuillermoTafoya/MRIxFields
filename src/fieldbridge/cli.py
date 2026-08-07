@@ -100,6 +100,11 @@ from fieldbridge.evaluation.stage2_gate01_builder import (
     build_gate01_private_manifest,
     write_gate01_protocol_lock,
 )
+from fieldbridge.evaluation.stage2_gate01_producer import (
+    prepare_gate01_prospective_selection,
+    produce_gate01_private_artifacts,
+    write_gate01_producer_spec,
+)
 from fieldbridge.evaluation.board_score import (
     aggregate_task3_board,
     board_units_from_payload,
@@ -752,6 +757,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hash a sanitized, predeclared Gate-0.1 selection descriptor list.",
     )
     fingerprint_gate01.add_argument("--selection", type=Path, required=True)
+
+    select_gate01 = subparsers.add_parser(
+        "prepare-gate01-private-selection",
+        help=(
+            "Resolve one external prospective traveller to a hash-only frozen "
+            "15-acquisition Gate-0.1 selection."
+        ),
+    )
+    select_gate01.add_argument("--split-json", type=Path, required=True)
+    select_gate01.add_argument("--traveller-subject-id", required=True)
+    select_gate01.add_argument("--out", type=Path, required=True)
+
+    spec_gate01 = subparsers.add_parser(
+        "lock-gate01-producer-spec",
+        help="Hash-seal every external input and inference setting for the private producer.",
+    )
+    for option in (
+        "selection",
+        "split-json",
+        "bank-dir",
+        "stage1-config",
+        "stage1-checkpoint",
+        "sb-v2-config",
+        "sb-v2-checkpoint",
+        "protocol-lock",
+    ):
+        spec_gate01.add_argument(f"--{option}", type=Path, required=True)
+    spec_gate01.add_argument("--solver", choices=("euler", "heun"), required=True)
+    spec_gate01.add_argument("--n-steps", type=int, required=True)
+    spec_gate01.add_argument("--decode-block-size", type=int, nargs=3, required=True)
+    spec_gate01.add_argument("--decode-halo", type=int, nargs=3, required=True)
+    spec_gate01.add_argument(
+        "--decode-precision", choices=("float32", "bfloat16"), required=True
+    )
+    spec_gate01.add_argument("--deterministic-seed", type=int, default=0)
+    spec_gate01.add_argument("--out", type=Path, required=True)
+
+    produce_gate01 = subparsers.add_parser(
+        "produce-gate01-private-artifacts",
+        help=(
+            "Deterministically and resumably infer the complete external 15/60/180 "
+            "Gate-0.1 artifact graph."
+        ),
+    )
+    for option in (
+        "spec",
+        "selection",
+        "split-json",
+        "bank-dir",
+        "stage1-config",
+        "stage1-checkpoint",
+        "sb-v2-config",
+        "sb-v2-checkpoint",
+        "protocol-lock",
+        "output-dir",
+        "state-dir",
+    ):
+        produce_gate01.add_argument(f"--{option}", type=Path, required=True)
+    produce_gate01.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    produce_gate01.add_argument("--resume", action="store_true")
 
     build_gate01 = subparsers.add_parser(
         "build-gate01-private-manifest",
@@ -1591,6 +1656,54 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(selection, list):
             raise SystemExit("Gate 0.1 selection descriptor root must be a list.")
         print(gate01_selection_fingerprint(selection))
+        return 0
+
+    if args.command == "prepare-gate01-private-selection":
+        result = prepare_gate01_prospective_selection(
+            args.split_json, args.traveller_subject_id, args.out
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "lock-gate01-producer-spec":
+        result = write_gate01_producer_spec(
+            selection_path=args.selection,
+            split_path=args.split_json,
+            bank_dir=args.bank_dir,
+            stage1_config_path=args.stage1_config,
+            stage1_checkpoint_path=args.stage1_checkpoint,
+            sb_v2_config_path=args.sb_v2_config,
+            sb_v2_checkpoint_path=args.sb_v2_checkpoint,
+            protocol_lock_path=args.protocol_lock,
+            sampler=TransportSamplerConfig(solver=args.solver, n_steps=args.n_steps),
+            decode=DecodeSpec(
+                block_size=tuple(args.decode_block_size),
+                halo=tuple(args.decode_halo),
+                precision=args.decode_precision,
+            ),
+            deterministic_seed=args.deterministic_seed,
+            out_path=args.out,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "produce-gate01-private-artifacts":
+        result = produce_gate01_private_artifacts(
+            spec_path=args.spec,
+            selection_path=args.selection,
+            split_path=args.split_json,
+            bank_dir=args.bank_dir,
+            stage1_config_path=args.stage1_config,
+            stage1_checkpoint_path=args.stage1_checkpoint,
+            sb_v2_config_path=args.sb_v2_config,
+            sb_v2_checkpoint_path=args.sb_v2_checkpoint,
+            protocol_lock_path=args.protocol_lock,
+            output_dir=args.output_dir,
+            state_dir=args.state_dir,
+            device=args.device,
+            resume=args.resume,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "build-gate01-private-manifest":

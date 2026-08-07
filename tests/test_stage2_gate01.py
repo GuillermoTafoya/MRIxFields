@@ -33,9 +33,29 @@ from fieldbridge.evaluation.stage2_gate01_montage import (
     render_gate01_montages,
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import (
+    GATE01_SCIENTIFIC_MODULES,
     Gate01ProtocolLock,
     frozen_protocol_artifact_provenance,
 )
+
+EVALUATION_COMMIT = "e" * 40
+
+
+def _evaluation_module_hashes() -> dict[str, str]:
+    return {
+        name: f"{index + 1:064x}"
+        for index, name in enumerate(GATE01_SCIENTIFIC_MODULES)
+    }
+
+
+def _evaluation_code_provenance(
+    *, checkout_clean: bool = True, commit: str = EVALUATION_COMMIT
+) -> dict:
+    return {
+        "git_head": commit,
+        "checkout_clean": checkout_clean,
+        "module_sha256": _evaluation_module_hashes(),
+    }
 
 
 def _fit_code_provenance(commit: str) -> dict:
@@ -162,6 +182,8 @@ def _protocol_lock(calibrator, traveller_hash: str, selection_fingerprint: str):
         support_threshold=0.0,
         calibrator_artifact_sha256=calibrator.artifact_sha256,
         calibrator_template_sha256=calibrator.template_sha256,
+        evaluation_git_commit=EVALUATION_COMMIT,
+        evaluation_module_sha256=_evaluation_module_hashes(),
         artifact_provenance=frozen_protocol_artifact_provenance(),
         official_metrics=("nrmse", "ssim", "lpips"),
         montage_specification=fixed_montage_specifications(),
@@ -200,7 +222,7 @@ def _evaluate(
         iter(cases),
         calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
-        code_commit="evaluation-commit",
+        code_commit=EVALUATION_COMMIT,
         evidence_scope={
             "role": "synthetic development evidence",
             "evidence_kind": evidence_kind,
@@ -210,15 +232,7 @@ def _evaluate(
         input_manifest_sha256="a" * 64,
         execution_mode=execution_mode,
         selection_fingerprint_sha256=selection_fingerprint,
-        code_provenance={
-            "git_head": "evaluation-commit",
-            "checkout_clean": checkout_clean,
-            "module_sha256": {
-                "src/fieldbridge/evaluation/stage2_gate01.py": "1" * 64,
-                "src/fieldbridge/evaluation/stage2_gate01_calibration.py": "2" * 64,
-                "src/fieldbridge/evaluation/mrixfields2026_official.py": "3" * 64,
-            },
-        },
+        code_provenance=_evaluation_code_provenance(checkout_clean=checkout_clean),
         protocol_lock=protocol_lock,
         metrics=metrics,
         device="cpu",
@@ -290,6 +304,46 @@ def test_per_pair_deltas_wins_and_wrong_target_diagnostics_are_labeled() -> None
     assert diagnostic["role"].startswith("diagnostic-only")
     assert diagnostic["available_pairs"] == 60
     assert diagnostic["not_rerun"] is True
+    assert set(diagnostic["modes"]) == {
+        "raw",
+        "common_requested_domain_calibration",
+        "condition_native_calibration",
+    }
+    assert "does not isolate target control" in diagnostic["mode_roles"][
+        "condition_native_calibration"
+    ]
+
+
+def test_wrong_target_common_and_condition_native_calibrations_are_distinct() -> None:
+    result = _evaluate()
+    case = _case(CONTRASTS[0], 0.1, 1.5)
+    row = next(
+        item
+        for item in result["pairs"]
+        if item["contrast"] == CONTRASTS[0].value
+        and item["source_field_t"] == 0.1
+        and item["target_field_t"] == 1.5
+    )
+    wrong_row = next(
+        item
+        for item in row["requested_vs_wrong_target"]["wrong_conditions"]
+        if item["conditioned_target_field_t"] == 3.0
+    )
+    prediction = case.wrong_target_sb_v2["3T"]
+    calibrator = _calibrator()
+    common = calibrator.apply(
+        prediction, case.target_domain, support_mask=case.support_mask, mode="histogram"
+    )
+    native = calibrator.apply(
+        prediction, Domain(3.0, CONTRASTS[0]), support_mask=case.support_mask, mode="histogram"
+    )
+    assert wrong_row[
+        "common_requested_domain_calibrated_metrics_against_requested_target"
+    ] == _metric_fn(common, case.target, ("nrmse", "ssim", "lpips"), "cpu")
+    assert wrong_row[
+        "condition_native_calibrated_metrics_against_requested_target"
+    ] == _metric_fn(native, case.target, ("nrmse", "ssim", "lpips"), "cpu")
+    assert not torch.equal(common, native)
 
 
 def test_official_and_diagnostic_roles_are_unambiguous() -> None:
@@ -304,7 +358,7 @@ def test_official_and_diagnostic_roles_are_unambiguous() -> None:
     )
     assert (
         result["scientific_status"]["promotion_decision"]
-        == "unset_pending_private_data_run"
+        == "unset_pending_scientific_review"
     )
     assert result["scientific_status"]["population_or_challenge_claim"] is False
     assert result["scientific_status"]["eligible_for_scientific_conclusions"] is True
@@ -325,6 +379,10 @@ def test_synthetic_or_nonprivate_runs_are_explicitly_ineligible() -> None:
 
     development = _evaluate(execution_mode="development-incomplete")
     assert development["scientific_status"]["eligible_for_scientific_conclusions"] is False
+    assert (
+        development["scientific_status"]["promotion_decision"]
+        == "unset_ineligible_scientific_contract"
+    )
 
 
 def _graph_specs(cases=None):
@@ -451,6 +509,41 @@ def test_protocol_lock_rejects_unfrozen_runtime_contracts() -> None:
         )
 
 
+def test_protocol_lock_independently_pins_clean_commit_and_exact_modules() -> None:
+    cases = _all_cases()
+    lock = _protocol_lock(
+        _calibrator(), cases[0].traveller_identity_sha256, "a" * 64
+    )
+    lock.assert_evaluation_code_provenance(
+        code_commit=EVALUATION_COMMIT,
+        code_provenance=_evaluation_code_provenance(),
+    )
+    other = "f" * 40
+    with pytest.raises(ValueError, match="external protocol lock"):
+        lock.assert_evaluation_code_provenance(
+            code_commit=other,
+            code_provenance=_evaluation_code_provenance(commit=other),
+        )
+    altered = _evaluation_code_provenance()
+    altered["module_sha256"][GATE01_SCIENTIFIC_MODULES[0]] = "f" * 64
+    with pytest.raises(ValueError, match="module SHA-256"):
+        lock.assert_evaluation_code_provenance(
+            code_commit=EVALUATION_COMMIT, code_provenance=altered
+        )
+    missing = _evaluation_code_provenance()
+    missing["module_sha256"].pop(GATE01_SCIENTIFIC_MODULES[0])
+    with pytest.raises(ValueError, match="missing or unexpected"):
+        lock.assert_evaluation_code_provenance(
+            code_commit=EVALUATION_COMMIT, code_provenance=missing
+        )
+    extra = _evaluation_code_provenance()
+    extra["module_sha256"]["unexpected.py"] = "f" * 64
+    with pytest.raises(ValueError, match="missing or unexpected"):
+        lock.assert_evaluation_code_provenance(
+            code_commit=EVALUATION_COMMIT, code_provenance=extra
+        )
+
+
 def test_scientific_mode_rejects_incomplete_duplicate_mixed_and_dirty_inputs() -> None:
     cases = _all_cases()
     with pytest.raises(ValueError, match="exactly 60"):
@@ -507,7 +600,7 @@ def test_raw_pre_mask_background_leakage_is_reported_and_calibration_is_zero() -
         iter(cases),
         calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
-        code_commit="evaluation-commit",
+        code_commit=EVALUATION_COMMIT,
         evidence_scope={
             "role": "synthetic",
             "evidence_kind": "private",
@@ -517,15 +610,7 @@ def test_raw_pre_mask_background_leakage_is_reported_and_calibration_is_zero() -
         input_manifest_sha256="a" * 64,
         execution_mode="development-incomplete",
         selection_fingerprint_sha256=fingerprint,
-        code_provenance={
-            "git_head": "evaluation-commit",
-            "checkout_clean": True,
-            "module_sha256": {
-                "src/fieldbridge/evaluation/stage2_gate01.py": "1" * 64,
-                "src/fieldbridge/evaluation/stage2_gate01_calibration.py": "2" * 64,
-                "src/fieldbridge/evaluation/mrixfields2026_official.py": "3" * 64,
-            },
-        },
+        code_provenance=_evaluation_code_provenance(),
         metrics=("nrmse", "ssim", "lpips"),
         device="cpu",
         metric_fn=_metric_fn,
@@ -599,7 +684,7 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
         stream(),
         calibrator=calibrator,
         artifact_provenance=frozen_artifact_provenance(),
-        code_commit="evaluation-commit",
+        code_commit=EVALUATION_COMMIT,
         evidence_scope={
             "role": "synthetic",
             "evidence_kind": "private",
@@ -609,15 +694,7 @@ def test_evaluator_streams_cases_with_bounded_full_volume_liveness() -> None:
         input_manifest_sha256="a" * 64,
         execution_mode="scientific",
         selection_fingerprint_sha256=selection_fingerprint,
-        code_provenance={
-            "git_head": "evaluation-commit",
-            "checkout_clean": True,
-            "module_sha256": {
-                "src/fieldbridge/evaluation/stage2_gate01.py": "1" * 64,
-                "src/fieldbridge/evaluation/stage2_gate01_calibration.py": "2" * 64,
-                "src/fieldbridge/evaluation/mrixfields2026_official.py": "3" * 64,
-            },
-        },
+        code_provenance=_evaluation_code_provenance(),
         protocol_lock=_protocol_lock(
             calibrator, traveller_hash, selection_fingerprint
         ),
@@ -694,7 +771,9 @@ def test_markdown_and_atomic_outputs_distinguish_development_status(tmp_path) ->
     )
     markdown = render_gate01_markdown(result)
     assert "development evidence only" in markdown
-    assert "unset pending a private-data run" in markdown
+    assert "unset because the scientific contract is ineligible" in markdown
+    assert "Common requested-domain calibration" in markdown
+    assert "does not isolate target control" in markdown
     assert "paired evaluation target" in markdown
 
     written = write_gate01_outputs(

@@ -40,17 +40,15 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     STAGE1_RUN_C_CHECKPOINT_SHA256,
     reject_target_derived_calibration_fields,
 )
-from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
+from fieldbridge.evaluation.stage2_gate01_protocol import (
+    GATE01_SCIENTIFIC_MODULES,
+    Gate01ProtocolLock,
+)
 
 GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v1"
 GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v3"
 GATE01_SCIENTIFIC_CASE_COUNT = 60
 GATE01_EXECUTION_MODES = ("scientific", "development-incomplete")
-GATE01_SCIENTIFIC_MODULES = (
-    "src/fieldbridge/evaluation/stage2_gate01.py",
-    "src/fieldbridge/evaluation/stage2_gate01_calibration.py",
-    "src/fieldbridge/evaluation/mrixfields2026_official.py",
-)
 
 OFFICIAL_METRICS = ("nrmse", "ssim", "lpips")
 LOWER_IS_BETTER = {"nrmse": True, "ssim": False, "lpips": True}
@@ -251,7 +249,10 @@ def evaluate_gate01(
     if execution_mode == "scientific":
         if protocol_lock is None:
             raise ValueError("Scientific Gate 0.1 mode requires an external protocol lock.")
-        _validate_scientific_code_provenance(normalized_code_provenance, code_commit)
+        protocol_lock.assert_evaluation_code_provenance(
+            code_commit=code_commit,
+            code_provenance=normalized_code_provenance,
+        )
         if selection_fingerprint_sha256 is None or not _is_sha256(
             selection_fingerprint_sha256
         ):
@@ -445,6 +446,20 @@ def evaluate_gate01(
     directed_pairs = _directed_pair_reductions(rows, method_names, requested_metrics)
     requested_wrong = _reduce_wrong_target(rows, requested_metrics)
 
+    eligibility_reasons: list[str] = []
+    if execution_mode != "scientific":
+        eligibility_reasons.append("execution_mode_is_not_scientific")
+    if evidence_scope["private_data_run"] is not True:
+        eligibility_reasons.append("private_data_run_is_not_true")
+    if evidence_scope["evidence_kind"] != "private":
+        eligibility_reasons.append("evidence_kind_is_not_private")
+    if protocol_lock is None:
+        eligibility_reasons.append("protocol_lock_not_validated")
+    eligible = not eligibility_reasons
+    promotion_decision = _scientific_promotion_decision(
+        private_data_run=evidence_scope["private_data_run"], eligible=eligible
+    )
+
     contract = {
         "contract_version": GATE01_CONTRACT_VERSION,
         "code_commit": code_commit,
@@ -456,7 +471,7 @@ def evaluate_gate01(
         "protocol_lock": protocol_lock.summary() if protocol_lock is not None else None,
         "scientific_hash_graph": hash_graph,
         "evidence_scope": dict(evidence_scope),
-        "scientific_promotion_decision": "unset_pending_private_data_run",
+        "scientific_promotion_decision": promotion_decision,
         "split_fingerprint": RESPLIT_FINGERPRINT,
         "training_cohort_identity": calibrator.provenance[
             "training_cohort_identity"
@@ -540,22 +555,12 @@ def evaluate_gate01(
         },
     }
 
-    eligibility_reasons: list[str] = []
-    if execution_mode != "scientific":
-        eligibility_reasons.append("execution_mode_is_not_scientific")
-    if evidence_scope["private_data_run"] is not True:
-        eligibility_reasons.append("private_data_run_is_not_true")
-    if evidence_scope["evidence_kind"] != "private":
-        eligibility_reasons.append("evidence_kind_is_not_private")
-    if protocol_lock is None:
-        eligibility_reasons.append("protocol_lock_not_validated")
-    eligible = not eligibility_reasons
-
     return {
         "contract_version": GATE01_CONTRACT_VERSION,
         "evidence_scope": dict(evidence_scope),
         "scientific_status": {
             "execution_mode": execution_mode,
+            "private_data_run": evidence_scope["private_data_run"],
             "selection_contract_complete": execution_mode == "scientific",
             "eligible_for_scientific_conclusions": eligible,
             "ineligibility_reasons": eligibility_reasons,
@@ -564,7 +569,7 @@ def evaluate_gate01(
                 if execution_mode == "scientific"
                 else "development-only incomplete diagnostic"
             ),
-            "promotion_decision": "unset_pending_private_data_run",
+            "promotion_decision": promotion_decision,
             "population_or_challenge_claim": False,
         },
         "central_question": (
@@ -577,9 +582,13 @@ def evaluate_gate01(
                 "formulas_modified": False,
             },
             "diagnostic": {
-                "requested_vs_wrong_target": (
-                    "official metric formulas used for a mechanistic comparison, not "
-                    "an official challenge score"
+                "requested_vs_wrong_target_common_requested_domain_calibration": (
+                    "equal-photometry mechanistic comparison: requested and wrong-conditioned "
+                    "predictions use the same requested-domain template"
+                ),
+                "requested_vs_wrong_target_condition_native_calibration": (
+                    "endpoint diagnostic only: conditioning and photometric template both "
+                    "change, so this does not isolate target control"
                 ),
                 "robust_affine_methods": (
                     "diagnostic-only methods; never eligible for scientific promotion"
@@ -739,6 +748,16 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
             "calibrated SB-v2 minus calibrated identity.",
             "",
             _markdown_central_table(result["central_paired_deltas_and_wins"]["overall"]),
+            "",
+            "## Requested versus wrong-target diagnostics",
+            "",
+            "Common requested-domain calibration is the equal-photometry mechanistic "
+            "comparison: requested and wrong-conditioned predictions use the same "
+            "requested-domain template. Condition-native calibration is a separate "
+            "endpoint diagnostic; it changes both condition and template and does not "
+            "isolate target control.",
+            "",
+            _markdown_wrong_target(result["requested_vs_wrong_target_diagnostic"]),
             "",
             "## Directed-pair matrices and qualitative panels",
             "",
@@ -1182,7 +1201,11 @@ def validate_gate01_scientific_hash_graph(
             source = float(source_domain.field_strength_t)
             target = float(target_domain.field_strength_t)
             arrays = {
-                key: str(_validated_array_reference(item[key], f"graph case {index}.{key}")["sha256"])
+                key: str(
+                    _validated_array_reference(
+                        item[key], f"graph case {index}.{key}"
+                    )["sha256"]
+                )
                 for key in (
                     "source_image",
                     "source_support_mask",
@@ -1406,22 +1429,6 @@ def gate01_code_provenance(repo_root: str | Path | None = None) -> dict[str, Any
             for relative in GATE01_SCIENTIFIC_MODULES
         },
     }
-
-
-def _validate_scientific_code_provenance(
-    provenance: Mapping[str, Any], code_commit: str
-) -> None:
-    if provenance.get("checkout_clean") is not True:
-        raise ValueError("Scientific Gate 0.1 mode requires a clean checkout.")
-    if provenance.get("git_head") != code_commit:
-        raise ValueError("Scientific Gate 0.1 code commit does not match checkout HEAD.")
-    module_hashes = provenance.get("module_sha256")
-    if not isinstance(module_hashes, Mapping) or set(module_hashes) != set(
-        GATE01_SCIENTIFIC_MODULES
-    ):
-        raise ValueError("Scientific Gate 0.1 module/source hashes are incomplete.")
-    if not all(_is_sha256(str(value)) for value in module_hashes.values()):
-        raise ValueError("Scientific Gate 0.1 module/source hash is invalid.")
 
 
 def _background_leakage(
@@ -1721,34 +1728,59 @@ def _wrong_target_diagnostic(
         raw = _validated_metric_result(
             metric_fn(prediction, case.target, metrics, device), metrics, "wrong_target_raw"
         )
-        calibrated_prediction = calibrator.apply(
+        common_requested_prediction = calibrator.apply(
+            prediction,
+            case.target_domain,
+            support_mask=case.support_mask,
+            mode="histogram",
+        )
+        common_requested = _validated_metric_result(
+            metric_fn(common_requested_prediction, case.target, metrics, device),
+            metrics,
+            "wrong_target_common_requested_domain_calibrated",
+        )
+        condition_native_prediction = calibrator.apply(
             prediction,
             wrong_domain,
             support_mask=case.support_mask,
             mode="histogram",
         )
-        calibrated = _validated_metric_result(
-            metric_fn(calibrated_prediction, case.target, metrics, device),
+        condition_native = _validated_metric_result(
+            metric_fn(condition_native_prediction, case.target, metrics, device),
             metrics,
-            "wrong_target_calibrated",
+            "wrong_target_condition_native_calibrated",
         )
         wrong_rows.append(
             {
                 "conditioned_target_field_t": wrong_domain.field_strength_t,
                 "raw_metrics_against_requested_target": raw,
-                "calibrated_metrics_against_requested_target": calibrated,
+                "common_requested_domain_calibrated_metrics_against_requested_target": (
+                    common_requested
+                ),
+                "condition_native_calibrated_metrics_against_requested_target": (
+                    condition_native
+                ),
             }
         )
 
     comparisons: dict[str, Any] = {}
-    for mode, requested in (
-        ("raw", requested_raw_metrics),
-        ("calibrated", requested_calibrated_metrics),
+    for mode, requested, wrong_key in (
+        ("raw", requested_raw_metrics, "raw_metrics_against_requested_target"),
+        (
+            "common_requested_domain_calibration",
+            requested_calibrated_metrics,
+            "common_requested_domain_calibrated_metrics_against_requested_target",
+        ),
+        (
+            "condition_native_calibration",
+            requested_calibrated_metrics,
+            "condition_native_calibrated_metrics_against_requested_target",
+        ),
     ):
         comparisons[mode] = {}
         for metric in metrics:
             wrong_values = [
-                row[f"{mode}_metrics_against_requested_target"][metric]
+                row[wrong_key][metric]
                 for row in wrong_rows
             ]
             wrong_mean = float(sum(wrong_values) / len(wrong_values))
@@ -1763,7 +1795,20 @@ def _wrong_target_diagnostic(
                 "requested_better_than_mean_wrong": improvement > 0,
                 "margin_favoring_requested": improvement,
             }
-    return {"wrong_conditions": wrong_rows, "comparisons": comparisons}
+    return {
+        "wrong_conditions": wrong_rows,
+        "comparisons": comparisons,
+        "interpretation": {
+            "common_requested_domain_calibration": (
+                "equal-photometry mechanistic comparison; conditioning varies while both "
+                "outputs use the same requested-domain photometric template"
+            ),
+            "condition_native_calibration": (
+                "endpoint diagnostic; conditioning and photometric template both vary and "
+                "therefore this endpoint does not isolate target control"
+            ),
+        },
+    }
 
 
 def _reduce_wrong_target(
@@ -1771,12 +1816,25 @@ def _reduce_wrong_target(
 ) -> dict[str, Any]:
     available = [row for row in rows if row["requested_vs_wrong_target"] is not None]
     result: dict[str, Any] = {
-        "role": "diagnostic-only mechanistic target-control evidence",
+        "role": "diagnostic-only requested-versus-wrong conditioning evidence",
         "available_pairs": len(available),
         "not_rerun": True,
         "modes": {},
+        "mode_roles": {
+            "raw": "uncalibrated endpoint diagnostic",
+            "common_requested_domain_calibration": (
+                "equal-photometry mechanistic comparison using one requested-domain template"
+            ),
+            "condition_native_calibration": (
+                "condition-native endpoint diagnostic; does not isolate target control"
+            ),
+        },
     }
-    for mode in ("raw", "calibrated"):
+    for mode in (
+        "raw",
+        "common_requested_domain_calibration",
+        "condition_native_calibration",
+    ):
         result["modes"][mode] = {}
         for metric in metrics:
             entries = [
@@ -1795,6 +1853,14 @@ def _reduce_wrong_target(
                 ),
             }
     return result
+
+
+def _scientific_promotion_decision(*, private_data_run: bool, eligible: bool) -> str:
+    if not private_data_run:
+        return "unset_pending_private_data_run"
+    if eligible:
+        return "unset_pending_scientific_review"
+    return "unset_ineligible_scientific_contract"
 
 
 def _wrong_target_domain(label: str, contrast: Contrast) -> Domain:
@@ -1821,10 +1887,15 @@ def _markdown_scientific_status(status: Mapping[str, Any]) -> str:
         if status["execution_mode"] != "scientific"
         else "This result is "
     )
+    pending = (
+        "**unset pending a private-data run** validated against this contract"
+        if status.get("private_data_run") is not True
+        else "**unset because the scientific contract is ineligible pending correction/review**"
+    )
     return (
         prefix + "explicitly ineligible for scientific conclusions "
-        f"(`{reasons}`). Scientific promotion remains **unset pending a private-data "
-        "run** validated against this contract; no population or challenge claim is made."
+        f"(`{reasons}`). Scientific promotion remains {pending}; no population or "
+        "challenge claim is made."
     )
 
 
@@ -1869,6 +1940,23 @@ def _markdown_background_leakage(block: Mapping[str, Any]) -> str:
             f"{values['background_voxel_count']} | {values['nonzero_fraction']:.6f} | "
             f"{_fmt_optional(values['mean_case_mean_abs'])} | {values['max_abs']:.6f} |"
         )
+    return "\n".join(rows)
+
+
+def _markdown_wrong_target(block: Mapping[str, Any]) -> str:
+    rows = [
+        f"Available directed cases: {block['available_pairs']}",
+        "",
+        "| Mode | Metric | Mean margin favoring requested | Requested-better fraction |",
+        "|---|---|---:|---:|",
+    ]
+    for mode, metrics in block["modes"].items():
+        for metric, values in metrics.items():
+            rows.append(
+                f"| {mode} | {metric} | "
+                f"{_fmt_optional(values['mean_margin_favoring_requested'])} | "
+                f"{_fmt_optional(values['requested_better_fraction'])} |"
+            )
     return "\n".join(rows)
 
 

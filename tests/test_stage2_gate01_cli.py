@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from fieldbridge.cli import main
+from fieldbridge.cli import build_parser, main
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.evaluation.stage2_gate01 import (
     GATE01_INPUT_CONTRACT_VERSION,
@@ -259,12 +259,48 @@ def test_manifest_selection_fingerprint_and_source_support_fail_closed(tmp_path)
 
 def test_gate01_modules_are_importable_from_the_package() -> None:
     from fieldbridge.evaluation import stage2_gate01
+    from fieldbridge.evaluation import stage2_gate01_producer
+    from fieldbridge.evaluation import stage2_gate01_protocol
     from fieldbridge.evaluation import stage2_gate01_calibration
     from fieldbridge.evaluation import stage2_gate01_montage
 
     assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v1")
     assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v3")
     assert stage2_gate01_montage.Gate01MontageCollector
+    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v1")
+    assert stage2_gate01_protocol.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION.endswith("v2")
+
+
+def test_private_producer_cli_entry_point_is_packaged() -> None:
+    args = build_parser().parse_args(
+        [
+            "produce-gate01-private-artifacts",
+            "--spec",
+            "spec.json",
+            "--selection",
+            "selection.json",
+            "--split-json",
+            "split.json",
+            "--bank-dir",
+            "bank",
+            "--stage1-config",
+            "stage1.yaml",
+            "--stage1-checkpoint",
+            "stage1.pt",
+            "--sb-v2-config",
+            "sb.yaml",
+            "--sb-v2-checkpoint",
+            "sb.pt",
+            "--protocol-lock",
+            "lock.json",
+            "--output-dir",
+            "outputs",
+            "--state-dir",
+            "state",
+        ]
+    )
+    assert args.command == "produce-gate01-private-artifacts"
+    assert args.resume is False
 
 
 def test_gate01_selection_fingerprint_cli_uses_sanitized_external_descriptors(

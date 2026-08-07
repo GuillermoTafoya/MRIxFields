@@ -18,6 +18,8 @@ from fieldbridge.evaluation.stage2_gate01 import (
     load_gate01_input_manifest,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     GATE01_CALIBRATOR_SOURCE_MODULES,
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
@@ -165,6 +167,9 @@ def _private_bundle(tmp_path: Path) -> dict[str, object]:
         "traveller_identity_sha256": traveller,
         "selection_fingerprint_sha256": selection,
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "evaluation_split_file_sha256": "2" * 64,
+        "bank_source_split_file_sha256": FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+        "bank_source_split_fingerprint": FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
         "support_threshold": 0.0,
         "calibrator_artifact_sha256": calibrator.artifact_sha256,
         "calibrator_template_sha256": calibrator.template_sha256,
@@ -197,8 +202,7 @@ def _private_bundle(tmp_path: Path) -> dict[str, object]:
         "selection_artifact_sha256": "1" * 64,
         "selection_fingerprint_sha256": selection,
         "traveller_identity_sha256": traveller,
-        "split_file_sha256": "2" * 64,
-        "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": lock.split_provenance,
         "selected_source_acquisitions": source_identities,
         "selected_payload_identity_set_sha256": "3" * 64,
         "selected_payload_count": 15,
@@ -245,6 +249,7 @@ def _private_bundle(tmp_path: Path) -> dict[str, object]:
             "private_data_run": True,
         },
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": lock.split_provenance,
         "artifact_provenance": frozen_artifact_provenance(),
         "source_support_contract": {
             "derivation": "abs(source_image)>threshold",
@@ -282,6 +287,7 @@ def _private_bundle(tmp_path: Path) -> dict[str, object]:
         "contract_version": builder.GATE01_PRIVATE_PRODUCER_STATE_VERSION,
         "producer_spec_artifact_sha256": producer_spec["artifact_sha256"],
         "protocol_lock_artifact_sha256": lock.artifact_sha256,
+        "split_provenance": lock.split_provenance,
         "producer_provenance": {"decode_strategy": "full", "path_used": ["full"]},
         "status": "complete",
         "completed": {
@@ -411,6 +417,38 @@ def test_private_builder_rejects_f28056e_v1_plan_without_producer_provenance(
     plan.pop("producer_receipt")
     bundle["plan_path"].write_text(json.dumps(plan), encoding="utf-8")
     with pytest.raises(ValueError, match="schema mismatch|contract is incompatible"):
+        _build(bundle, resume=False)
+
+
+@pytest.mark.parametrize(
+    ("kind", "legacy_version"),
+    [
+        ("plan", "stage2-gate01-private-build-plan-v2"),
+        ("spec", "stage2-gate01-private-producer-spec-v3"),
+        ("state", "stage2-gate01-private-producer-state-v2"),
+    ],
+)
+def test_private_builder_rejects_immediate_legacy_contracts(
+    tmp_path, kind, legacy_version
+) -> None:
+    bundle = _private_bundle(tmp_path)
+    names = {
+        "plan": ("plan", "plan_path"),
+        "spec": ("producer_spec", "producer_spec_path"),
+        "state": ("producer_state", "producer_state_path"),
+    }
+    payload_key, path_key = names[kind]
+    payload = dict(bundle[payload_key])
+    payload["contract_version"] = legacy_version
+    if kind == "spec":
+        payload.pop("artifact_sha256")
+        payload["artifact_sha256"] = hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        ).hexdigest()
+    bundle[path_key].write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="incompatible"):
         _build(bundle, resume=False)
 
 

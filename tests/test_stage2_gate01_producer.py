@@ -12,7 +12,12 @@ import fieldbridge.evaluation.stage2_gate01_producer as producer
 import fieldbridge.evaluation.stage2_gate01_protocol as protocol
 from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
-from fieldbridge.data.vae_splits import VaeSplits, save_vae_splits, vae_splits_fingerprint
+from fieldbridge.data.vae_splits import (
+    VaeSplits,
+    load_vae_splits,
+    save_vae_splits,
+    vae_splits_fingerprint,
+)
 from fieldbridge.evaluation.stage2_gate01 import fixed_montage_specifications
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
@@ -117,6 +122,41 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
         lambda record: torch.from_numpy(np.load(record.image_path, allow_pickle=False)),
     )
     split_path = save_vae_splits(splits, input_root / "split.json")
+    retrospective_path = input_root / "images" / "retrospective-unused.npy"
+    np.save(
+        retrospective_path,
+        np.ones((1, 1, 4, 4, 4), dtype=np.float32),
+        allow_pickle=False,
+    )
+    retrospective_record = VolumeRecord(
+        case_id="R_SYNTHETIC_UNUSED_T1w_0.1T",
+        image_path=retrospective_path,
+        domain=Domain(0.1, "T1w"),
+        subject_id="SYNTHETIC_UNUSED",
+        split="train",
+        metadata={"prefix": "R"},
+    )
+    bank_records_source = [*records, retrospective_record]
+    bank_splits = VaeSplits(
+        train=tuple(bank_records_source),
+        validation=(),
+        test=(),
+        seed=13,
+        fractions=(1.0, 0.0, 0.0),
+        metadata={"synthetic_bank_source": True},
+    )
+    bank_source_split_path = save_vae_splits(
+        bank_splits, input_root / "bank-source-split.json"
+    )
+    bank_fingerprint = vae_splits_fingerprint(bank_splits)
+    bank_file_sha256 = _file_sha256(bank_source_split_path)
+    for module in (producer, protocol):
+        monkeypatch.setattr(
+            module, "FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT", bank_fingerprint
+        )
+        monkeypatch.setattr(
+            module, "FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256", bank_file_sha256
+        )
     selection_path = input_root / "selection.json"
     selection = producer.prepare_gate01_prospective_selection(
         split_path, "SYNTHETIC_0007", selection_path
@@ -126,6 +166,9 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
         traveller_identity_sha256=selection["traveller_identity_sha256"],
         selection_fingerprint_sha256=selection["selection_fingerprint_sha256"],
         split_fingerprint=synthetic_fingerprint,
+        evaluation_split_file_sha256=_file_sha256(split_path),
+        bank_source_split_file_sha256=bank_file_sha256,
+        bank_source_split_fingerprint=bank_fingerprint,
         support_threshold=0.0,
         calibrator_artifact_sha256="a" * 64,
         calibrator_template_sha256="b" * 64,
@@ -142,14 +185,14 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
     bank = input_root / "latent-bank"
     (bank / "latents").mkdir(parents=True)
     bank_records = []
-    for index, record in enumerate(records):
+    for index, record in enumerate(bank_records_source):
         latent_path = bank / "latents" / f"latent-{index:02d}.pt"
         latent = torch.full((1, 1, 1, 1), float(index))
         latent_payload = {
             "contract_version": "latent-bank-v1",
             "case_id": record.case_id,
             "subject_id": record.subject_id,
-            "split": "validation",
+            "split": "train",
             "domain": record.domain.to_dict(),
             "latent": latent,
             "latent_shape": [1, 1, 1, 1],
@@ -164,7 +207,7 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
             {
                 "case_id": record.case_id,
                 "subject_id": record.subject_id,
-                "split": "validation",
+                "split": "train",
                 "domain": record.domain.to_dict(),
                 "latent_shape": [1, 1, 1, 1],
                 "source_shape": [1, 4, 4, 4],
@@ -211,6 +254,7 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
     spec = producer.write_gate01_producer_spec(
         selection_path=selection_path,
         split_path=split_path,
+        bank_source_split_path=bank_source_split_path,
         bank_dir=bank,
         stage1_config_path=stage1_config,
         stage1_checkpoint_path=stage1_checkpoint,
@@ -229,6 +273,7 @@ def _bundle(tmp_path: Path, monkeypatch) -> dict[str, object]:
         "selection": selection,
         "selection_path": selection_path,
         "split_path": split_path,
+        "bank_source_split_path": bank_source_split_path,
         "lock": lock,
         "lock_path": lock_path,
         "bank": bank,
@@ -255,6 +300,7 @@ def _produce(
         spec_path=bundle["spec_path"],
         selection_path=bundle["selection_path"],
         split_path=bundle["split_path"],
+        bank_source_split_path=bundle["bank_source_split_path"],
         bank_dir=bundle["bank"],
         stage1_config_path=bundle["stage1_config"],
         stage1_checkpoint_path=bundle["stage1_checkpoint"],
@@ -300,6 +346,9 @@ def test_private_producer_clean_build_has_exact_graph_and_no_manual_cases(
     assert len(bundle["spec"]["selected_payload_identity_set_sha256"]) == 64
     assert bundle["spec"]["stage1_config_sha256"] == STAGE1_RUN_C_CONFIG_SHA256
     assert bundle["spec"]["sb_v2_config_sha256"] == SB_V2_CONFIG_SHA256
+    assert bundle["spec"]["split_provenance"]["evaluation"]["membership_fingerprint"] != (
+        bundle["spec"]["split_provenance"]["bank_storage"]["membership_fingerprint"]
+    )
     assert len(backend.stage1_calls) == len(set(backend.stage1_calls)) == 15
     assert len(backend.sb_calls) == len(set(backend.sb_calls)) == 60
     plan = json.loads(Path(result["build_plan"]).read_text(encoding="utf-8"))
@@ -323,6 +372,53 @@ def test_private_producer_clean_build_has_exact_graph_and_no_manual_cases(
             allow_pickle=False,
         )
         assert np.array_equal(mask, np.abs(source) > 0.0)
+
+
+@pytest.mark.parametrize("selected_split", ["train", "test"])
+def test_scientific_selection_rejects_prospective_nonvalidation_travellers(
+    tmp_path, monkeypatch, selected_split
+) -> None:
+    bundle = _bundle(tmp_path, monkeypatch)
+    records = load_vae_splits(bundle["split_path"]).validation
+    nonvalidation = VaeSplits(
+        train=records if selected_split == "train" else (),
+        validation=(),
+        test=records if selected_split == "test" else (),
+        seed=13,
+        fractions=(1.0, 0.0, 0.0),
+        metadata={"synthetic": True},
+    )
+    path = save_vae_splits(nonvalidation, tmp_path / f"{selected_split}-split.json")
+    monkeypatch.setattr(
+        producer, "RESPLIT_FINGERPRINT", vae_splits_fingerprint(nonvalidation)
+    )
+    with pytest.raises(ValueError, match="prospective validation traveller"):
+        producer.prepare_gate01_prospective_selection(
+            path, "SYNTHETIC_0007", tmp_path / f"{selected_split}-selection.json"
+        )
+
+
+def test_latent_manifest_payload_bank_storage_disagreement_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    bundle = _bundle(tmp_path, monkeypatch)
+    manifest_path = Path(bundle["bank"]) / "latent_bank_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # The last record is retrospective and not part of the selected 15. Complete-bank
+    # validation must still reject its disagreement before any selected inference.
+    manifest["records"][-1]["split"] = "validation"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    backend = _SyntheticBackend()
+    with pytest.raises(ValueError, match="manifest/payload/source-split membership"):
+        _produce(
+            bundle,
+            tmp_path / "outputs",
+            tmp_path / "state",
+            backend,
+            resume=False,
+        )
+    assert backend.stage1_calls == []
+    assert backend.sb_calls == []
 
 
 def test_private_producer_interrupted_resume_is_equivalent_without_duplicate_inference(
@@ -464,7 +560,11 @@ def test_private_producer_rejects_selected_source_mutation_before_inference(
     tmp_path, monkeypatch
 ) -> None:
     bundle = _bundle(tmp_path, monkeypatch)
-    image_path = next((Path(bundle["input_root"]) / "images").glob("*.npy"))
+    image_path = next(
+        path
+        for path in (Path(bundle["input_root"]) / "images").glob("*.npy")
+        if "retrospective-unused" not in path.name
+    )
     changed = np.load(image_path, allow_pickle=False)
     changed[..., -1, -1, -1] += 0.125
     np.save(image_path, changed, allow_pickle=False)
@@ -492,7 +592,9 @@ def test_private_producer_rejects_selected_source_mutation_before_inference(
         resume=False,
     )
     resumed_image = next(
-        (Path(resumed_bundle["input_root"]) / "images").glob("*.npy")
+        path
+        for path in (Path(resumed_bundle["input_root"]) / "images").glob("*.npy")
+        if "retrospective-unused" not in path.name
     )
     resumed_changed = np.load(resumed_image, allow_pickle=False)
     resumed_changed[..., 1, 1, 1] += 0.25
@@ -514,7 +616,7 @@ def test_private_producer_rejects_selected_source_mutation_before_inference(
     ("field", "replacement", "message"),
     [
         ("case_id", "wrong-case", "case identity"),
-        ("split", "train", "split identity"),
+        ("split", "validation", "split identity"),
         ("domain", Domain(7.0, "T2w").to_dict(), "domain identity"),
         ("downsample_factor", 2, "downsample factor"),
         ("encode_strategy", "tiled", "not encoded as a full volume"),
@@ -544,7 +646,9 @@ def test_selected_latent_payload_fails_closed_on_stale_provenance(
             payload,
             entry=entry,
             record=record,
-            split_name="validation",
+            bank_record=record,
+            evaluation_split="validation",
+            bank_storage_split="train",
             source_identity=bundle["spec"]["selected_source_acquisitions"][
                 record.domain.label
             ],

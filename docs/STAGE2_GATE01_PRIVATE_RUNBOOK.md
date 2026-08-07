@@ -13,7 +13,8 @@ resolve outside the repository.
 ```powershell
 $Gate01Repo = (Get-Location).Path
 $Gate01External = (Resolve-Path $env:GATE01_EXTERNAL).Path
-$Gate01Split = Join-Path $Gate01External "frozen-resplit.json"
+$Gate01EvaluationSplit = Join-Path $Gate01External "frozen-scientific-resplit.json"
+$Gate01BankSourceSplit = Join-Path $Gate01External "original-split-v3.json"
 $Gate01Bank = Join-Path $Gate01External "full-latent-bank"
 $Gate01Stage1Config = Join-Path $Gate01External "stage1-run-c.yaml"
 $Gate01Stage1Checkpoint = Join-Path $Gate01External "stage1-run-c.pt"
@@ -48,14 +49,14 @@ external artifact into the checkout.
 
 ## 2. Fit the training-derived calibrator
 
-The split fingerprint is frozen at
+The scientific evaluation-resplit fingerprint is frozen at
 `92187cf5f08ba00c446c08151f0658534efffa917569106a73062fdc70bcaf5f`.
 The fit streams retrospective training volumes and retains per-volume quantiles/content
 identities only. It requires all 15 domains, a clean checkout, and support threshold 0.0.
 
 ```powershell
 fieldbridge fit-gate01-target-calibrator `
-  --split-json $Gate01Split `
+  --split-json $Gate01EvaluationSplit `
   --out $Gate01Calibrator `
   --training-cohort-identity $env:GATE01_TRAINING_COHORT_IDENTITY `
   --num-quantiles 256 `
@@ -69,20 +70,23 @@ Record the printed calibrator artifact and template SHA-256 values. Do not hand-
 
 ## 3. Resolve and freeze the 15 acquisitions
 
-This command reads the external frozen split, resolves one prospective traveller, checks
+This command reads the external scientific evaluation resplit, resolves one prospective
+validation traveller, checks
 one acquisition in every one of the 15 domains, and writes only case/traveller hashes.
 It automatically freezes the 60-direction selection fingerprint; the operator does not
 author 60 cases.
 
 ```powershell
 fieldbridge prepare-gate01-private-selection `
-  --split-json $Gate01Split `
+  --split-json $Gate01EvaluationSplit `
   --traveller-subject-id $env:GATE01_TRAVELLER_SUBJECT_ID `
   --out $Gate01Selection
 ```
 
 Verify that the selection contains 15 acquisition identities and no raw case or traveller
-identifier.
+identifier. Scientific selection rejects prospective train and test travellers. Preserve
+the protocol roles: development evidence remains development-only, the locked traveller is
+validation evidence, and the untouched test traveller remains unselected.
 
 ## 4. Independently freeze evaluation code and protocol
 
@@ -135,7 +139,14 @@ Transcribe those reviewed values into the exact module-keyed map in
 runtime evaluator output. The specification contains exactly:
 
 - the hash-only traveller and 60-direction fingerprint from `$Gate01Selection`;
-- the frozen split and support threshold `0.0`;
+- `evaluation_split_file_sha256` plus `split_fingerprint` for the scientific
+  evaluation resplit;
+- `bank_source_split_file_sha256` for the independently supplied original
+  bank-source split, frozen at
+  `f6a19d7a31c4c3bb73edd92088ea078192e88ee4b276309bad81c548ab7f94d5`
+  and `bank_source_split_fingerprint` frozen at
+  `9d50db941d57af3333b10fed7f25262bae7d1e3346dc37b7c38327de50d9e534`;
+- the support threshold `0.0`;
 - calibrator artifact/template SHA-256;
 - `evaluation_git_commit` and the exact 31-entry `evaluation_module_sha256` map above;
 - the frozen Stage-1, latent-bank build, Gate-0, SB-v2, and resplit identities;
@@ -157,7 +168,7 @@ does not hardcode a PR head or predict the future merge commit.
 
 ## 5. Seal the deterministic producer inputs
 
-The command below verifies and pins the selection, split file, every latent-bank record,
+The command below verifies and pins the selection, both split files, every latent-bank record,
 latent statistics/manifest/build commit, both configs/checkpoints, solver, step count,
 full-volume decode path, deterministic seed, and protocol-lock identity. It also loads each
 of the 15 selected source acquisitions once at a time and seals its canonical loaded-array
@@ -170,7 +181,8 @@ frozen configuration file hashes are:
 ```powershell
 fieldbridge lock-gate01-producer-spec `
   --selection $Gate01Selection `
-  --split-json $Gate01Split `
+  --split-json $Gate01EvaluationSplit `
+  --bank-source-split-json $Gate01BankSourceSplit `
   --bank-dir $Gate01Bank `
   --stage1-config $Gate01Stage1Config `
   --stage1-checkpoint $Gate01Stage1Checkpoint `
@@ -187,7 +199,11 @@ fieldbridge lock-gate01-producer-spec `
 ```
 
 Use the reviewed frozen SB-v2 sampler/decode values. A changed config, checkpoint, bank,
-selection, split, lock, solver, step count, or decode value requires a new reviewed spec.
+selection, either split, lock, solver, step count, or decode value requires a new reviewed spec.
+The bank-source split is the split that labeled payload storage when the frozen full bank
+was built; the evaluation resplit governs scientific eligibility. Their labels need not
+match. The complete bank manifest and every payload must agree with the bank-source split,
+while the selected prospective traveller must be validation in the evaluation resplit.
 The emitted decode specification must contain `"strategy": "full"`. The block/halo
 arguments remain required only by the shared decode configuration schema; Gate 0.1 never
 invokes the tiled decoder with them.
@@ -200,7 +216,8 @@ First attempt:
 fieldbridge produce-gate01-private-artifacts `
   --spec $Gate01ProducerSpec `
   --selection $Gate01Selection `
-  --split-json $Gate01Split `
+  --split-json $Gate01EvaluationSplit `
+  --bank-source-split-json $Gate01BankSourceSplit `
   --bank-dir $Gate01Bank `
   --stage1-config $Gate01Stage1Config `
   --stage1-checkpoint $Gate01Stage1Checkpoint `
@@ -221,7 +238,8 @@ verified inference:
 fieldbridge produce-gate01-private-artifacts `
   --spec $Gate01ProducerSpec `
   --selection $Gate01Selection `
-  --split-json $Gate01Split `
+  --split-json $Gate01EvaluationSplit `
+  --bank-source-split-json $Gate01BankSourceSplit `
   --bank-dir $Gate01Bank `
   --stage1-config $Gate01Stage1Config `
   --stage1-checkpoint $Gate01Stage1Checkpoint `
@@ -239,7 +257,8 @@ Verify the command reports 15 acquisitions, 15 Stage-1 inferences, 60 SB-v2 infe
 to the 60 sibling predictions; no extra inference occurs. The producer writes 15 masks as
 `abs(source) > 0.0`, canonical loaded-array hashes, and `$Gate01BuildPlan` atomically.
 It fails before inference unless the bank manifest and all selected latent payloads prove
-full encoding and match the frozen selected case/domain/split, factor 4, Stage-1 checkpoint,
+full encoding and match the frozen bank-source case/domain/storage-split, factor 4,
+Stage-1 checkpoint,
 and bank-build commit. Decoding is one strict full-volume forward per inference: an OOM is
 a hard failure, tiled fallback is prohibited, and the completed producer state/result must
 record `decode_strategy="full"` and `path_used=["full"]`.
@@ -271,10 +290,11 @@ fieldbridge build-gate01-private-manifest `
   --resume
 ```
 
-This second-stage builder performs no inference. It rejects every v1 build plan and
-independently verifies the sealed producer-spec artifact hash, the complete v2 producer
+This second-stage builder performs no inference. It rejects every legacy build plan and
+independently verifies the sealed producer-spec artifact hash, the complete v3 producer
 state, the state's exact build-plan hash, the lock and all configuration/checkpoint/full-bank/
-source-array/selected-payload identities. It requires `decode_strategy="full"` and
+source-array/selected-payload identities, including both sealed split roles. It requires
+`decode_strategy="full"` and
 `path_used=["full"]`, reloads and hashes every array, verifies the exact
 15-node/60-direction/180-sibling graph, calibrator and threshold, then atomically writes
 the scientific manifest. The manifest embeds a verified receipt containing the spec-file,
@@ -319,6 +339,9 @@ and archive only in the external area:
 ```powershell
 $Gate01ResultContract = Get-Content $Gate01Contract -Raw | ConvertFrom-Json
 $Gate01Receipt = $Gate01ResultContract.producer_receipt
+$Gate01Splits = $Gate01ResultContract.split_provenance
+if ($Gate01Splits.evaluation.file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01EvaluationSplit).Hash.ToLowerInvariant()) { throw "Evaluation resplit differs from result contract" }
+if ($Gate01Splits.bank_storage.file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01BankSourceSplit).Hash.ToLowerInvariant()) { throw "Bank-source split differs from result contract" }
 if ($Gate01Receipt.producer_spec_file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01ProducerSpec).Hash.ToLowerInvariant()) { throw "Archived producer spec differs from evaluated receipt" }
 if ($Gate01Receipt.producer_state_file_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01ProducerStateFile).Hash.ToLowerInvariant()) { throw "Archived producer state differs from evaluated receipt" }
 if ($Gate01Receipt.build_plan_sha256 -ne (Get-FileHash -Algorithm SHA256 $Gate01BuildPlan).Hash.ToLowerInvariant()) { throw "Archived build plan differs from evaluated receipt" }
@@ -326,6 +349,7 @@ if ($Gate01Receipt.producer_receipt.decode_strategy -ne "full") { throw "Produce
 if (($Gate01Receipt.producer_receipt.path_used -join ",") -ne "full") { throw "Producer receipt used a non-full path" }
 New-Item -ItemType Directory -Force $Gate01Archive | Out-Null
 $Gate01ArchiveInputs = @(
+  $Gate01EvaluationSplit, $Gate01BankSourceSplit,
   $Gate01Calibrator, $Gate01Selection, $Gate01ProtocolSpec, $Gate01ProtocolLock,
   $Gate01ProducerSpec, $Gate01ProducerStateFile, $Gate01BuildPlan,
   $Gate01Manifest, $Gate01BuildState,

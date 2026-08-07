@@ -12,6 +12,8 @@ from typing import Any
 
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     GATE0_DIAGNOSTIC_COMMIT,
     GATE01_SUPPORT_THRESHOLD,
     RESPLIT_FINGERPRINT,
@@ -20,7 +22,7 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     PosthocTargetCalibrator,
 )
 
-GATE01_PROTOCOL_LOCK_CONTRACT_VERSION = "stage2-gate01-protocol-lock-v2"
+GATE01_PROTOCOL_LOCK_CONTRACT_VERSION = "stage2-gate01-protocol-lock-v3"
 GATE01_PROTOCOL_OFFICIAL_METRICS = ("nrmse", "ssim", "lpips")
 GATE01_SCIENTIFIC_MODULES = (
     "src/fieldbridge/cli.py",
@@ -61,6 +63,9 @@ _LOCK_FIELDS = {
     "traveller_identity_sha256",
     "selection_fingerprint_sha256",
     "split_fingerprint",
+    "evaluation_split_file_sha256",
+    "bank_source_split_file_sha256",
+    "bank_source_split_fingerprint",
     "support_threshold",
     "calibrator_artifact_sha256",
     "calibrator_template_sha256",
@@ -96,6 +101,9 @@ class Gate01ProtocolLock:
     traveller_identity_sha256: str
     selection_fingerprint_sha256: str
     split_fingerprint: str
+    evaluation_split_file_sha256: str
+    bank_source_split_file_sha256: str
+    bank_source_split_fingerprint: str
     support_threshold: float
     calibrator_artifact_sha256: str
     calibrator_template_sha256: str
@@ -109,6 +117,9 @@ class Gate01ProtocolLock:
         for name in (
             "traveller_identity_sha256",
             "selection_fingerprint_sha256",
+            "evaluation_split_file_sha256",
+            "bank_source_split_file_sha256",
+            "bank_source_split_fingerprint",
             "calibrator_artifact_sha256",
             "calibrator_template_sha256",
         ):
@@ -116,6 +127,13 @@ class Gate01ProtocolLock:
                 raise ValueError(f"Gate 0.1 protocol lock {name} must be SHA-256.")
         if self.split_fingerprint != RESPLIT_FINGERPRINT:
             raise ValueError("Gate 0.1 protocol lock has a stale split fingerprint.")
+        if (
+            self.bank_source_split_file_sha256
+            != FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256
+            or self.bank_source_split_fingerprint
+            != FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT
+        ):
+            raise ValueError("Gate 0.1 protocol lock has a stale bank-source split.")
         if not math.isfinite(self.support_threshold) or self.support_threshold != 0.0:
             raise ValueError("Gate 0.1 protocol support threshold is frozen at 0.0.")
         if self.support_threshold != GATE01_SUPPORT_THRESHOLD:
@@ -155,6 +173,9 @@ class Gate01ProtocolLock:
             "traveller_identity_sha256": self.traveller_identity_sha256,
             "selection_fingerprint_sha256": self.selection_fingerprint_sha256,
             "split_fingerprint": self.split_fingerprint,
+            "evaluation_split_file_sha256": self.evaluation_split_file_sha256,
+            "bank_source_split_file_sha256": self.bank_source_split_file_sha256,
+            "bank_source_split_fingerprint": self.bank_source_split_fingerprint,
             "support_threshold": float(self.support_threshold),
             "calibrator_artifact_sha256": self.calibrator_artifact_sha256,
             "calibrator_template_sha256": self.calibrator_template_sha256,
@@ -178,6 +199,7 @@ class Gate01ProtocolLock:
             "traveller_identity_sha256": self.traveller_identity_sha256,
             "selection_fingerprint_sha256": self.selection_fingerprint_sha256,
             "split_fingerprint": self.split_fingerprint,
+            "split_provenance": self.split_provenance,
             "support_threshold": self.support_threshold,
             "calibrator_artifact_sha256": self.calibrator_artifact_sha256,
             "calibrator_template_sha256": self.calibrator_template_sha256,
@@ -213,6 +235,9 @@ class Gate01ProtocolLock:
             traveller_identity_sha256=str(values["traveller_identity_sha256"]),
             selection_fingerprint_sha256=str(values["selection_fingerprint_sha256"]),
             split_fingerprint=str(values["split_fingerprint"]),
+            evaluation_split_file_sha256=str(values["evaluation_split_file_sha256"]),
+            bank_source_split_file_sha256=str(values["bank_source_split_file_sha256"]),
+            bank_source_split_fingerprint=str(values["bank_source_split_fingerprint"]),
             support_threshold=float(values["support_threshold"]),
             calibrator_artifact_sha256=str(values["calibrator_artifact_sha256"]),
             calibrator_template_sha256=str(values["calibrator_template_sha256"]),
@@ -263,6 +288,7 @@ class Gate01ProtocolLock:
         traveller_identity_sha256: str,
         selection_fingerprint_sha256: str,
         split_fingerprint: str,
+        split_provenance: Mapping[str, Any],
         support_threshold: float,
         artifact_provenance: Mapping[str, Any],
     ) -> None:
@@ -282,10 +308,32 @@ class Gate01ProtocolLock:
             raise ValueError(
                 "Gate 0.1 prediction manifest does not match the independent protocol lock."
             )
+        if dict(split_provenance) != self.split_provenance:
+            raise ValueError(
+                "Gate 0.1 prediction manifest split roles do not match the independent "
+                "protocol lock."
+            )
         if dict(artifact_provenance) != dict(self.artifact_provenance):
             raise ValueError(
                 "Gate 0.1 prediction artifacts do not match the independent protocol lock."
             )
+
+    @property
+    def split_provenance(self) -> dict[str, dict[str, str]]:
+        """Return independently frozen evaluation and bank-storage split identities."""
+
+        return {
+            "evaluation": {
+                "role": "scientific_evaluation_resplit",
+                "file_sha256": self.evaluation_split_file_sha256,
+                "membership_fingerprint": self.split_fingerprint,
+            },
+            "bank_storage": {
+                "role": "frozen_latent_bank_source_split",
+                "file_sha256": self.bank_source_split_file_sha256,
+                "membership_fingerprint": self.bank_source_split_fingerprint,
+            },
+        }
 
     def assert_runtime_contract(
         self,

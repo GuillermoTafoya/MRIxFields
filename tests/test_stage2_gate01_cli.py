@@ -18,6 +18,8 @@ from fieldbridge.evaluation.stage2_gate01 import (
     load_gate01_input_manifest,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     GATE01_CALIBRATOR_SOURCE_MODULES,
     RESPLIT_FINGERPRINT,
     TrainingTemplateVolume,
@@ -122,6 +124,18 @@ def _write_manifest(tmp_path, *, forbidden_field: str | None = None):
             "private_data_run": False,
         },
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": {
+            "evaluation": {
+                "role": "scientific_evaluation_resplit",
+                "file_sha256": "1" * 64,
+                "membership_fingerprint": RESPLIT_FINGERPRINT,
+            },
+            "bank_storage": {
+                "role": "frozen_latent_bank_source_split",
+                "file_sha256": FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+                "membership_fingerprint": FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
+            },
+        },
         "artifact_provenance": frozen_artifact_provenance(),
         "source_support_contract": {
             "derivation": "abs(source_image)>threshold",
@@ -155,7 +169,7 @@ def test_gate01_cli_prints_json_and_supports_optional_output_files(
     )
     assert exit_code == 0
     printed = json.loads(capsys.readouterr().out)
-    assert printed["contract_version"] == "stage2-gate01-equal-photometry-v1"
+    assert printed["contract_version"] == "stage2-gate01-equal-photometry-v2"
     assert printed["num_pairs"] == 1
     assert printed["written"] == {}
     verified = printed["contract"]["verified_loaded_array_sha256"][0]["arrays"]
@@ -265,11 +279,11 @@ def test_gate01_modules_are_importable_from_the_package() -> None:
     from fieldbridge.evaluation import stage2_gate01_calibration
     from fieldbridge.evaluation import stage2_gate01_montage
 
-    assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v1")
+    assert stage2_gate01.GATE01_CONTRACT_VERSION.endswith("v2")
     assert stage2_gate01_calibration.GATE01_CALIBRATOR_CONTRACT_VERSION.endswith("v3")
     assert stage2_gate01_montage.Gate01MontageCollector
-    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v3")
-    assert stage2_gate01_protocol.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION.endswith("v2")
+    assert stage2_gate01_producer.GATE01_PRIVATE_PRODUCER_SPEC_VERSION.endswith("v4")
+    assert stage2_gate01_protocol.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION.endswith("v3")
 
 
 def test_private_producer_cli_entry_point_is_packaged() -> None:
@@ -282,6 +296,8 @@ def test_private_producer_cli_entry_point_is_packaged() -> None:
             "selection.json",
             "--split-json",
             "split.json",
+            "--bank-source-split-json",
+            "bank-source-split.json",
             "--bank-dir",
             "bank",
             "--stage1-config",

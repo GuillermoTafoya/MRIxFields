@@ -779,6 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
     for option in (
         "selection",
         "split-json",
+        "bank-source-split-json",
         "bank-dir",
         "stage1-config",
         "stage1-checkpoint",
@@ -808,6 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
         "spec",
         "selection",
         "split-json",
+        "bank-source-split-json",
         "bank-dir",
         "stage1-config",
         "stage1-checkpoint",
@@ -1674,6 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
         result = write_gate01_producer_spec(
             selection_path=args.selection,
             split_path=args.split_json,
+            bank_source_split_path=args.bank_source_split_json,
             bank_dir=args.bank_dir,
             stage1_config_path=args.stage1_config,
             stage1_checkpoint_path=args.stage1_checkpoint,
@@ -1697,6 +1700,7 @@ def main(argv: list[str] | None = None) -> int:
             spec_path=args.spec,
             selection_path=args.selection,
             split_path=args.split_json,
+            bank_source_split_path=args.bank_source_split_json,
             bank_dir=args.bank_dir,
             stage1_config_path=args.stage1_config,
             stage1_checkpoint_path=args.stage1_checkpoint,
@@ -1770,6 +1774,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_scope=input_metadata["evidence_scope"],
             input_manifest_sha256=input_metadata["sha256"],
             producer_receipt=input_metadata["producer_receipt"],
+            split_provenance=input_metadata["split_provenance"],
             support_threshold=input_metadata["support_threshold"],
             execution_mode=input_metadata["execution_mode"],
             selection_fingerprint_sha256=input_metadata[

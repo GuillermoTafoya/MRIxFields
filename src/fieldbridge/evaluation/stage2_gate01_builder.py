@@ -23,6 +23,8 @@ from fieldbridge.evaluation.stage2_gate01 import (
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     RESPLIT_FINGERPRINT,
     SB_V2_CONFIG_SHA256,
     SB_V2_CHECKPOINT_SHA256,
@@ -32,11 +34,11 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import Gate01ProtocolLock
 
-GATE01_PRIVATE_BUILD_PLAN_VERSION = "stage2-gate01-private-build-plan-v2"
-GATE01_PRIVATE_BUILD_STATE_VERSION = "stage2-gate01-private-build-state-v2"
-GATE01_PRIVATE_PRODUCER_SPEC_VERSION = "stage2-gate01-private-producer-spec-v3"
-GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v2"
-GATE01_PRIVATE_PRODUCER_RECEIPT_VERSION = "stage2-gate01-private-producer-receipt-v1"
+GATE01_PRIVATE_BUILD_PLAN_VERSION = "stage2-gate01-private-build-plan-v3"
+GATE01_PRIVATE_BUILD_STATE_VERSION = "stage2-gate01-private-build-state-v3"
+GATE01_PRIVATE_PRODUCER_SPEC_VERSION = "stage2-gate01-private-producer-spec-v4"
+GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v3"
+GATE01_PRIVATE_PRODUCER_RECEIPT_VERSION = "stage2-gate01-private-producer-receipt-v2"
 
 _PLAN_KEYS = {
     "contract_version",
@@ -44,6 +46,7 @@ _PLAN_KEYS = {
     "selection_fingerprint_sha256",
     "evidence_scope",
     "split_fingerprint",
+    "split_provenance",
     "artifact_provenance",
     "source_support_contract",
     "producer_receipt",
@@ -68,8 +71,7 @@ _PRODUCER_SPEC_KEYS = {
     "selection_artifact_sha256",
     "selection_fingerprint_sha256",
     "traveller_identity_sha256",
-    "split_file_sha256",
-    "split_fingerprint",
+    "split_provenance",
     "selected_source_acquisitions",
     "selected_payload_identity_set_sha256",
     "selected_payload_count",
@@ -90,8 +92,7 @@ _PRODUCER_RECEIPT_KEYS = {
     "protocol_lock_artifact_sha256",
     "selection_artifact_sha256",
     "selection_fingerprint_sha256",
-    "split_file_sha256",
-    "split_fingerprint",
+    "split_provenance",
     "selected_source_acquisitions_sha256",
     "selected_payload_identity_set_sha256",
     "selected_payload_count",
@@ -128,8 +129,7 @@ def sealed_gate01_producer_receipt(spec: Mapping[str, Any]) -> dict[str, Any]:
         "selection_fingerprint_sha256": spec.get(
             "selection_fingerprint_sha256"
         ),
-        "split_file_sha256": spec.get("split_file_sha256"),
-        "split_fingerprint": spec.get("split_fingerprint"),
+        "split_provenance": spec.get("split_provenance"),
         "selected_source_acquisitions_sha256": _sha256_json(
             spec.get("selected_source_acquisitions")
         ),
@@ -169,7 +169,6 @@ def _validate_producer_spec(
     if payload["artifact_sha256"] != _sha256_json(body):
         raise ValueError("Gate 0.1 producer-spec artifact hash mismatch.")
     expected = {
-        "split_fingerprint": RESPLIT_FINGERPRINT,
         "stage1_config_sha256": STAGE1_RUN_C_CONFIG_SHA256,
         "stage1_checkpoint_sha256": STAGE1_RUN_C_CHECKPOINT_SHA256,
         "sb_v2_config_sha256": SB_V2_CONFIG_SHA256,
@@ -179,6 +178,7 @@ def _validate_producer_spec(
     }
     if any(payload.get(key) != value for key, value in expected.items()):
         raise ValueError("Gate 0.1 producer specification has stale frozen identities.")
+    _validate_split_provenance(payload.get("split_provenance"), protocol_lock)
     sources = payload["selected_source_acquisitions"]
     if not isinstance(sources, Mapping) or len(sources) != 15:
         raise ValueError("Gate 0.1 producer spec must seal exactly 15 source arrays.")
@@ -251,6 +251,33 @@ def _validate_producer_spec(
     return dict(payload)
 
 
+def _validate_split_provenance(
+    value: Any, protocol_lock: Gate01ProtocolLock
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"evaluation", "bank_storage"}:
+        raise ValueError("Gate 0.1 split provenance must contain both split roles.")
+    expected = protocol_lock.split_provenance
+    if dict(value) != expected:
+        raise ValueError("Gate 0.1 split provenance disagrees with the protocol lock.")
+    evaluation = value["evaluation"]
+    bank = value["bank_storage"]
+    if (
+        not isinstance(evaluation, Mapping)
+        or not isinstance(bank, Mapping)
+    ):
+        raise ValueError("Gate 0.1 split provenance is stale or malformed.")
+    if (
+        set(evaluation) != {"role", "file_sha256", "membership_fingerprint"}
+        or set(bank) != {"role", "file_sha256", "membership_fingerprint"}
+        or evaluation["membership_fingerprint"] != RESPLIT_FINGERPRINT
+        or bank["file_sha256"] != FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256
+        or bank["membership_fingerprint"]
+        != FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT
+    ):
+        raise ValueError("Gate 0.1 split provenance is stale or malformed.")
+    return {str(key): dict(item) for key, item in value.items()}
+
+
 def _validate_producer_state(
     raw: bytes,
     *,
@@ -267,6 +294,7 @@ def _validate_producer_state(
         "producer_spec_artifact_sha256",
         "protocol_lock_artifact_sha256",
         "producer_provenance",
+        "split_provenance",
         "status",
         "completed",
         "pending",
@@ -287,6 +315,7 @@ def _validate_producer_state(
         or state["producer_spec_artifact_sha256"]
         != producer_spec["artifact_sha256"]
         or state["protocol_lock_artifact_sha256"] != protocol_lock.artifact_sha256
+        or state["split_provenance"] != protocol_lock.split_provenance
         or state["producer_provenance"]
         != {"decode_strategy": "full", "path_used": ["full"]}
         or state["counts"]
@@ -313,7 +342,9 @@ def _validate_plan_against_producer(
     if (
         plan.get("selection_fingerprint_sha256")
         != producer_spec["selection_fingerprint_sha256"]
-        or plan.get("split_fingerprint") != producer_spec["split_fingerprint"]
+        or plan.get("split_fingerprint")
+        != producer_spec["split_provenance"]["evaluation"]["membership_fingerprint"]
+        or plan.get("split_provenance") != producer_spec["split_provenance"]
     ):
         raise ValueError("Gate 0.1 producer spec and plan selection/split differ.")
     expected_completed: set[tuple[str, str, bool]] = set()
@@ -502,6 +533,7 @@ def build_gate01_private_manifest(
         ],
         protocol_lock=protocol_lock,
         calibrator=calibrator,
+        split_provenance=producer_spec["split_provenance"],
     )
     cases = plan["cases"]
     if not isinstance(cases, list):
@@ -537,6 +569,7 @@ def build_gate01_private_manifest(
         "selection_fingerprint_sha256": plan["selection_fingerprint_sha256"],
         "evidence_scope": dict(plan["evidence_scope"]),
         "split_fingerprint": plan["split_fingerprint"],
+        "split_provenance": dict(plan["split_provenance"]),
         "artifact_provenance": dict(plan["artifact_provenance"]),
         "source_support_contract": dict(plan["source_support_contract"]),
         "producer_receipt": verified_producer_receipt,
@@ -575,6 +608,7 @@ def build_gate01_private_manifest(
         "case_count": len(built_cases),
         "protocol_lock_artifact_sha256": protocol_lock.artifact_sha256,
         "calibrator_artifact_sha256": calibrator.artifact_sha256,
+        "split_provenance": dict(plan["split_provenance"]),
         "producer_receipt": verified_producer_receipt,
     }
 
@@ -588,6 +622,7 @@ def _initial_or_resumed_state(
     producer_state_file_sha256: str,
     protocol_lock: Gate01ProtocolLock,
     calibrator: PosthocTargetCalibrator,
+    split_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     expected = {
         "contract_version": GATE01_PRIVATE_BUILD_STATE_VERSION,
@@ -596,6 +631,7 @@ def _initial_or_resumed_state(
         "producer_state_file_sha256": producer_state_file_sha256,
         "protocol_lock_artifact_sha256": protocol_lock.artifact_sha256,
         "calibrator_artifact_sha256": calibrator.artifact_sha256,
+        "split_provenance": dict(split_provenance),
     }
     if path.exists():
         if not resume:

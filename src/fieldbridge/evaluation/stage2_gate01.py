@@ -31,6 +31,8 @@ from fieldbridge.evaluation.mrixfields2026_official import (
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     GATE0_DIAGNOSTIC_COMMIT,
     GATE01_CALIBRATION_SEMANTICS,
     GATE01_SUPPORT_THRESHOLD,
@@ -45,10 +47,10 @@ from fieldbridge.evaluation.stage2_gate01_protocol import (
     Gate01ProtocolLock,
 )
 
-GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v1"
-GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v4"
+GATE01_CONTRACT_VERSION = "stage2-gate01-equal-photometry-v2"
+GATE01_INPUT_CONTRACT_VERSION = "stage2-gate01-input-v5"
 GATE01_VERIFIED_PRODUCER_RECEIPT_VERSION = (
-    "stage2-gate01-verified-producer-receipt-v1"
+    "stage2-gate01-verified-producer-receipt-v2"
 )
 GATE01_SCIENTIFIC_CASE_COUNT = 60
 GATE01_EXECUTION_MODES = ("scientific", "development-incomplete")
@@ -213,6 +215,7 @@ def evaluate_gate01(
     evidence_scope: Mapping[str, Any],
     input_manifest_sha256: str,
     producer_receipt: Mapping[str, Any] | None = None,
+    split_provenance: Mapping[str, Any] | None = None,
     support_threshold: float = GATE01_SUPPORT_THRESHOLD,
     execution_mode: str = "development-incomplete",
     selection_fingerprint_sha256: str | None = None,
@@ -282,6 +285,7 @@ def evaluate_gate01(
             traveller_identity_sha256=evidence_scope["traveller_identity_sha256"],
             selection_fingerprint_sha256=str(selection_fingerprint_sha256),
             split_fingerprint=RESPLIT_FINGERPRINT,
+            split_provenance=dict(split_provenance or {}),
             support_threshold=support_threshold,
             artifact_provenance=artifact_provenance,
         )
@@ -494,6 +498,7 @@ def evaluate_gate01(
         "evidence_scope": dict(evidence_scope),
         "scientific_promotion_decision": promotion_decision,
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": dict(split_provenance or {}),
         "training_cohort_identity": calibrator.provenance[
             "training_cohort_identity"
         ],
@@ -716,6 +721,9 @@ def render_gate01_markdown(result: Mapping[str, Any]) -> str:
         "",
         _markdown_producer_receipt(result["contract"].get("producer_receipt")),
         "",
+        "Split roles: "
+        + json.dumps(result["contract"].get("split_provenance", {}), sort_keys=True),
+        "",
         "## Calibration contract",
         "",
         "Both identity and SB-v2 are projected from their own prediction CDF onto the same "
@@ -859,6 +867,7 @@ _ROOT_INPUT_KEYS = {
     "selection_fingerprint_sha256",
     "evidence_scope",
     "split_fingerprint",
+    "split_provenance",
     "artifact_provenance",
     "source_support_contract",
     "producer_receipt",
@@ -919,9 +928,9 @@ def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
         raise ValueError("Gate 0.1 verified producer-receipt contract is incompatible.")
     if (
         value["producer_spec_contract_version"]
-        != "stage2-gate01-private-producer-spec-v3"
+        != "stage2-gate01-private-producer-spec-v4"
         or value["producer_state_contract_version"]
-        != "stage2-gate01-private-producer-state-v2"
+        != "stage2-gate01-private-producer-state-v3"
     ):
         raise ValueError("Gate 0.1 producer spec/state receipt versions are incompatible.")
     for key in (
@@ -941,8 +950,7 @@ def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
         "protocol_lock_artifact_sha256",
         "selection_artifact_sha256",
         "selection_fingerprint_sha256",
-        "split_file_sha256",
-        "split_fingerprint",
+        "split_provenance",
         "selected_source_acquisitions_sha256",
         "selected_payload_identity_set_sha256",
         "selected_payload_count",
@@ -964,7 +972,7 @@ def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
     _assert_exact_keys(receipt, receipt_keys, "Gate 0.1 sealed producer receipt")
     if (
         receipt["contract_version"]
-        != "stage2-gate01-private-producer-receipt-v1"
+        != "stage2-gate01-private-producer-receipt-v2"
         or receipt["producer_spec_artifact_sha256"]
         != value["producer_spec_artifact_sha256"]
         or receipt["decode_strategy"] != "full"
@@ -988,9 +996,11 @@ def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
         "direction_count",
         "sb_v2_inference_count",
         "wrong_target_reference_count",
+        "split_provenance",
     }
     if any(not _is_sha256(str(receipt[key])) for key in sha_keys):
         raise ValueError("Gate 0.1 producer receipt contains an invalid identity digest.")
+    _validated_split_provenance(receipt["split_provenance"])
     bank = receipt["latent_bank"]
     if not isinstance(bank, Mapping) or set(bank) != {
         "artifact_sha256",
@@ -1019,6 +1029,32 @@ def validate_gate01_verified_producer_receipt(value: Any) -> dict[str, Any]:
     return {**dict(value), "producer_receipt": dict(receipt)}
 
 
+def _validated_split_provenance(value: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(value, Mapping) or set(value) != {"evaluation", "bank_storage"}:
+        raise ValueError("Gate 0.1 split provenance must contain both split roles.")
+    expected_fields = {"role", "file_sha256", "membership_fingerprint"}
+    evaluation = value["evaluation"]
+    bank = value["bank_storage"]
+    if (
+        not isinstance(evaluation, Mapping)
+        or not isinstance(bank, Mapping)
+        or set(evaluation) != expected_fields
+        or set(bank) != expected_fields
+        or evaluation["role"] != "scientific_evaluation_resplit"
+        or evaluation["membership_fingerprint"] != RESPLIT_FINGERPRINT
+        or not _is_sha256(str(evaluation["file_sha256"]))
+        or bank["role"] != "frozen_latent_bank_source_split"
+        or bank["file_sha256"] != FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256
+        or bank["membership_fingerprint"]
+        != FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT
+    ):
+        raise ValueError("Gate 0.1 split provenance is stale or malformed.")
+    return {
+        "evaluation": {str(key): str(item) for key, item in evaluation.items()},
+        "bank_storage": {str(key): str(item) for key, item in bank.items()},
+    }
+
+
 def load_gate01_input_manifest(
     path: str | Path,
     *,
@@ -1043,6 +1079,7 @@ def load_gate01_input_manifest(
         raise ValueError("Gate 0.1 input manifest contract is incompatible.")
     if payload["split_fingerprint"] != RESPLIT_FINGERPRINT:
         raise ValueError("Gate 0.1 input manifest has a stale split fingerprint.")
+    split_provenance = _validated_split_provenance(payload["split_provenance"])
     validate_frozen_artifact_provenance(payload["artifact_provenance"])
     evidence_scope = _validated_evidence_scope(payload["evidence_scope"])
     execution_mode = str(payload["execution_mode"])
@@ -1064,7 +1101,7 @@ def load_gate01_input_manifest(
         sealed = producer_receipt["producer_receipt"]
         if (
             sealed["selection_fingerprint_sha256"] != selection_fingerprint
-            or sealed["split_fingerprint"] != payload["split_fingerprint"]
+            or sealed["split_provenance"] != split_provenance
             or (
                 protocol_lock is not None
                 and sealed["protocol_lock_artifact_sha256"]
@@ -1175,6 +1212,7 @@ def load_gate01_input_manifest(
             traveller_identity_sha256=evidence_scope["traveller_identity_sha256"],
             selection_fingerprint_sha256=selection_fingerprint,
             split_fingerprint=str(payload["split_fingerprint"]),
+            split_provenance=split_provenance,
             support_threshold=support_threshold,
             artifact_provenance=payload["artifact_provenance"],
         )
@@ -1196,6 +1234,7 @@ def load_gate01_input_manifest(
         "evidence_scope": dict(evidence_scope),
         "artifact_provenance": dict(payload["artifact_provenance"]),
         "split_fingerprint": str(payload["split_fingerprint"]),
+        "split_provenance": split_provenance,
         "execution_mode": execution_mode,
         "selection_fingerprint_sha256": selection_fingerprint,
         "support_threshold": support_threshold,

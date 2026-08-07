@@ -44,6 +44,8 @@ from fieldbridge.evaluation.stage2_gate01_builder import (
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     FULL_LATENT_BANK_BUILD_COMMIT,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+    FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
     GATE01_SUPPORT_THRESHOLD,
     RESPLIT_FINGERPRINT,
     SB_V2_CONFIG_SHA256,
@@ -60,8 +62,8 @@ from fieldbridge.evaluation.stage2_transport_eval import (
 from fieldbridge.models.factory import build_decoder, build_translator
 from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 
-GATE01_PROSPECTIVE_SELECTION_VERSION = "stage2-gate01-prospective-selection-v1"
-GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v2"
+GATE01_PROSPECTIVE_SELECTION_VERSION = "stage2-gate01-prospective-selection-v2"
+GATE01_PRIVATE_PRODUCER_STATE_VERSION = "stage2-gate01-private-producer-state-v3"
 GATE01_PRODUCER_DECODE_STRATEGY = "full"
 GATE01_VAE_DOWNSAMPLE_FACTOR = 4
 
@@ -78,8 +80,7 @@ _SPEC_KEYS = {
     "selection_artifact_sha256",
     "selection_fingerprint_sha256",
     "traveller_identity_sha256",
-    "split_file_sha256",
-    "split_fingerprint",
+    "split_provenance",
     "selected_source_acquisitions",
     "selected_payload_identity_set_sha256",
     "selected_payload_count",
@@ -134,17 +135,20 @@ def prepare_gate01_prospective_selection(
     matches: list[tuple[str, VolumeRecord]] = []
     for split_name in ("train", "validation", "test"):
         for record in splits.records_for(split_name):
-            prefix = str(record.metadata.get("prefix", str(record.case_id).split("_", 1)[0]))
-            if prefix == "P" and str(record.subject_id) == str(traveller_subject_id):
+            if _is_prospective_record(record) and str(record.subject_id) == str(
+                traveller_subject_id
+            ):
                 matches.append((split_name, record))
     if len(matches) != 15:
         raise ValueError("Gate 0.1 prospective selection must resolve exactly 15 acquisitions.")
     split_names = {name for name, _ in matches}
-    if len(split_names) != 1:
-        raise ValueError("Gate 0.1 traveller acquisitions must belong to one split.")
+    if split_names != {"validation"}:
+        raise ValueError(
+            "Scientific Gate 0.1 selection requires one prospective validation traveller."
+        )
     traveller_hash = _sha256_text(f"P:{traveller_subject_id}")
     records = {record.domain.label: record for _, record in matches}
-    payload = _selection_payload(records, traveller_hash, next(iter(split_names)))
+    payload = _selection_payload(records, traveller_hash, "validation")
     _write_json_atomic(output, payload)
     return payload
 
@@ -172,8 +176,10 @@ def load_gate01_prospective_selection(
     if vae_splits_fingerprint(splits) != RESPLIT_FINGERPRINT:
         raise ValueError("Gate 0.1 selection requires the frozen resplit fingerprint.")
     split_name = str(payload["split_name"])
-    if split_name not in {"train", "validation", "test"}:
-        raise ValueError("Gate 0.1 prospective selection names an unknown split.")
+    if split_name != "validation":
+        raise ValueError(
+            "Scientific Gate 0.1 selection requires the prospective validation split."
+        )
     identities = payload["acquisition_case_identity_sha256"]
     if not isinstance(identities, Mapping) or set(identities) != _all_domain_labels():
         raise ValueError("Gate 0.1 selection must identify all 15 domains exactly once.")
@@ -189,8 +195,7 @@ def load_gate01_prospective_selection(
         record = by_hash.get(str(identity))
         if record is None or record.domain.label != label:
             raise ValueError("Gate 0.1 selection is stale or has a domain/case mismatch.")
-        prefix = str(record.metadata.get("prefix", str(record.case_id).split("_", 1)[0]))
-        if prefix != "P":
+        if not _is_prospective_record(record):
             raise ValueError("Gate 0.1 selection must contain prospective acquisitions only.")
         source_value = Path(record.image_path)
         source_path = assert_gate01_external_path(
@@ -217,6 +222,7 @@ def write_gate01_producer_spec(
     *,
     selection_path: str | Path,
     split_path: str | Path,
+    bank_source_split_path: str | Path,
     bank_dir: str | Path,
     stage1_config_path: str | Path,
     stage1_checkpoint_path: str | Path,
@@ -245,6 +251,7 @@ def write_gate01_producer_spec(
     paths = _external_inputs(
         selection_path,
         split_path,
+        bank_source_split_path,
         bank_dir,
         stage1_config_path,
         stage1_checkpoint_path,
@@ -260,6 +267,12 @@ def write_gate01_producer_spec(
     lock = Gate01ProtocolLock.load(paths["protocol_lock"])
     if lock.split_fingerprint != RESPLIT_FINGERPRINT:
         raise ValueError("Gate 0.1 producer protocol lock has the wrong split fingerprint.")
+    split_provenance, bank_membership = _validated_split_provenance(
+        evaluation_split_path=paths["split"],
+        bank_source_split_path=paths["bank_source_split"],
+        protocol_lock=lock,
+        hash_file=hash_file,
+    )
     if lock.traveller_identity_sha256 != resolved.payload["traveller_identity_sha256"]:
         raise ValueError(
             "Gate 0.1 protocol and prospective selection identify different travellers."
@@ -279,7 +292,9 @@ def write_gate01_producer_spec(
         raise ValueError("Gate 0.1 producer Stage-1 configuration identity is stale.")
     if sb_config_sha != SB_V2_CONFIG_SHA256:
         raise ValueError("Gate 0.1 producer SB-v2 configuration identity is stale.")
-    bank_identity = _latent_bank_identity(paths["bank"], hash_file)
+    bank_identity = _latent_bank_identity(
+        paths["bank"], bank_membership=bank_membership, hash_file=hash_file
+    )
     if bank_identity["build_git_commit"] != FULL_LATENT_BANK_BUILD_COMMIT:
         raise ValueError("Gate 0.1 producer latent-bank build commit is stale.")
     if bank_identity["vae_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256:
@@ -288,7 +303,7 @@ def write_gate01_producer_spec(
     _, selected_payload_identity_set_sha256 = _selected_latent_paths(
         paths["bank"],
         resolved.records,
-        split_name=str(resolved.payload["split_name"]),
+        bank_membership=bank_membership,
         source_identities=source_identities,
         hash_file=hash_file,
     )
@@ -297,8 +312,7 @@ def write_gate01_producer_spec(
         "selection_artifact_sha256": resolved.payload["artifact_sha256"],
         "selection_fingerprint_sha256": resolved.payload["selection_fingerprint_sha256"],
         "traveller_identity_sha256": resolved.payload["traveller_identity_sha256"],
-        "split_file_sha256": hash_file(paths["split"]),
-        "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": split_provenance,
         "selected_source_acquisitions": source_identities,
         "selected_payload_identity_set_sha256": selected_payload_identity_set_sha256,
         "selected_payload_count": 15,
@@ -327,6 +341,7 @@ def produce_gate01_private_artifacts(
     spec_path: str | Path,
     selection_path: str | Path,
     split_path: str | Path,
+    bank_source_split_path: str | Path,
     bank_dir: str | Path,
     stage1_config_path: str | Path,
     stage1_checkpoint_path: str | Path,
@@ -355,6 +370,7 @@ def produce_gate01_private_artifacts(
     paths = _external_inputs(
         selection_path,
         split_path,
+        bank_source_split_path,
         bank_dir,
         stage1_config_path,
         stage1_checkpoint_path,
@@ -371,7 +387,15 @@ def produce_gate01_private_artifacts(
     resolved = load_gate01_prospective_selection(
         paths["selection"], paths["split"], repo_root=repo_root
     )
-    observed = _observed_spec_inputs(paths, resolved, lock, spec, hash_file)
+    split_provenance, bank_membership = _validated_split_provenance(
+        evaluation_split_path=paths["split"],
+        bank_source_split_path=paths["bank_source_split"],
+        protocol_lock=lock,
+        hash_file=hash_file,
+    )
+    observed = _observed_spec_inputs(
+        paths, resolved, lock, spec, split_provenance, bank_membership, hash_file
+    )
     for key, value in observed.items():
         if spec.get(key) != value:
             raise ValueError(f"Gate 0.1 producer input {key} is stale or incompatible.")
@@ -385,7 +409,7 @@ def produce_gate01_private_artifacts(
     latent_paths, selected_payload_identity_set_sha256 = _selected_latent_paths(
         paths["bank"],
         resolved.records,
-        split_name=str(resolved.payload["split_name"]),
+        bank_membership=bank_membership,
         source_identities=spec["selected_source_acquisitions"],
         hash_file=hash_file,
     )
@@ -650,6 +674,7 @@ def produce_gate01_private_artifacts(
             "traveller_identity_sha256": spec["traveller_identity_sha256"],
         },
         "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": dict(spec["split_provenance"]),
         "artifact_provenance": dict(lock.artifact_provenance),
         "source_support_contract": {
             "derivation": "abs(source_image)>threshold",
@@ -674,6 +699,7 @@ def produce_gate01_private_artifacts(
             "wrong_target_reference_count": 180,
             "producer_provenance": dict(state["producer_provenance"]),
             "producer_receipt": producer_receipt,
+            "split_provenance": dict(spec["split_provenance"]),
         }
     )
     _write_json_atomic(state_path, state)
@@ -690,6 +716,7 @@ def produce_gate01_private_artifacts(
         "wrong_target_reference_count": 180,
         "protocol_lock_artifact_sha256": lock.artifact_sha256,
         "producer_spec_artifact_sha256": spec["artifact_sha256"],
+        "split_provenance": dict(spec["split_provenance"]),
         "producer_provenance": dict(state["producer_provenance"]),
         "producer_receipt": producer_receipt,
     }
@@ -821,16 +848,19 @@ def _observed_spec_inputs(
     resolved: ResolvedGate01Selection,
     lock: Gate01ProtocolLock,
     spec: Mapping[str, Any],
+    split_provenance: Mapping[str, Any],
+    bank_membership: Mapping[str, tuple[str, VolumeRecord]],
     hash_file: Callable[[Path], str],
 ) -> dict[str, Any]:
     return {
         "selection_artifact_sha256": resolved.payload["artifact_sha256"],
         "selection_fingerprint_sha256": resolved.payload["selection_fingerprint_sha256"],
         "traveller_identity_sha256": resolved.payload["traveller_identity_sha256"],
-        "split_file_sha256": hash_file(paths["split"]),
-        "split_fingerprint": RESPLIT_FINGERPRINT,
+        "split_provenance": dict(split_provenance),
         "selected_source_acquisitions": _selected_source_identities(resolved.records),
-        "latent_bank": _latent_bank_identity(paths["bank"], hash_file),
+        "latent_bank": _latent_bank_identity(
+            paths["bank"], bank_membership=bank_membership, hash_file=hash_file
+        ),
         "stage1_config_sha256": hash_file(paths["stage1_config"]),
         "stage1_checkpoint_sha256": hash_file(paths["stage1_checkpoint"]),
         "sb_v2_config_sha256": hash_file(paths["sb_v2_config"]),
@@ -846,6 +876,7 @@ def _external_inputs(*values: str | Path, repo_root: str | Path | None) -> dict[
     names = (
         "selection",
         "split",
+        "bank_source_split",
         "bank",
         "stage1_config",
         "stage1_checkpoint",
@@ -859,7 +890,55 @@ def _external_inputs(*values: str | Path, repo_root: str | Path | None) -> dict[
     }
 
 
-def _latent_bank_identity(bank_dir: Path, hash_file: Callable[[Path], str]) -> dict[str, Any]:
+def _validated_split_provenance(
+    *,
+    evaluation_split_path: Path,
+    bank_source_split_path: Path,
+    protocol_lock: Gate01ProtocolLock,
+    hash_file: Callable[[Path], str],
+) -> tuple[dict[str, Any], dict[str, tuple[str, VolumeRecord]]]:
+    evaluation_splits = load_vae_splits(evaluation_split_path)
+    evaluation_fingerprint = vae_splits_fingerprint(evaluation_splits)
+    bank_splits = load_vae_splits(bank_source_split_path)
+    bank_fingerprint = vae_splits_fingerprint(bank_splits)
+    observed = {
+        "evaluation": {
+            "role": "scientific_evaluation_resplit",
+            "file_sha256": hash_file(evaluation_split_path),
+            "membership_fingerprint": evaluation_fingerprint,
+        },
+        "bank_storage": {
+            "role": "frozen_latent_bank_source_split",
+            "file_sha256": hash_file(bank_source_split_path),
+            "membership_fingerprint": bank_fingerprint,
+        },
+    }
+    if evaluation_fingerprint != RESPLIT_FINGERPRINT:
+        raise ValueError("Gate 0.1 evaluation resplit fingerprint is stale.")
+    if (
+        observed["bank_storage"]["file_sha256"]
+        != FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256
+        or bank_fingerprint != FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT
+    ):
+        raise ValueError("Gate 0.1 latent-bank source split identity is stale.")
+    if observed != protocol_lock.split_provenance:
+        raise ValueError("Gate 0.1 split files do not match the external protocol lock.")
+    membership: dict[str, tuple[str, VolumeRecord]] = {}
+    for split_name in ("train", "validation", "test"):
+        for record in bank_splits.records_for(split_name):
+            case_id = str(record.case_id)
+            if case_id in membership:
+                raise ValueError("Gate 0.1 bank-source split contains duplicate case IDs.")
+            membership[case_id] = (split_name, record)
+    return observed, membership
+
+
+def _latent_bank_identity(
+    bank_dir: Path,
+    *,
+    bank_membership: Mapping[str, tuple[str, VolumeRecord]],
+    hash_file: Callable[[Path], str],
+) -> dict[str, Any]:
     manifest_path = bank_dir / "latent_bank_manifest.json"
     stats_path = bank_dir / "latent_stats.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -882,13 +961,40 @@ def _latent_bank_identity(bank_dir: Path, hash_file: Callable[[Path], str]) -> d
         raise ValueError("Gate 0.1 latent-bank statistics provenance is incompatible.")
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
+    seen_cases: set[str] = set()
     for entry in manifest["records"]:
+        if not isinstance(entry, Mapping):
+            raise ValueError("Gate 0.1 latent-bank manifest record is invalid.")
+        case_id = str(entry.get("case_id", ""))
+        expected = bank_membership.get(case_id)
+        if expected is None or case_id in seen_cases:
+            raise ValueError(
+                "Gate 0.1 latent-bank manifest membership differs from its source split."
+            )
+        seen_cases.add(case_id)
+        storage_split, source_record = expected
         relative = str(entry["path"])
         path = (bank_dir / relative).resolve()
-        if not _is_within(path, bank_dir.resolve()) or relative in seen:
+        if (
+            not _is_within(path, bank_dir.resolve())
+            or relative in seen
+            or not path.is_file()
+        ):
             raise ValueError("Gate 0.1 latent bank contains duplicate or escaping paths.")
         seen.add(relative)
+        payload = torch.load(path, map_location="cpu")
+        _validate_bank_membership_payload(
+            payload,
+            entry=entry,
+            record=source_record,
+            bank_storage_split=storage_split,
+        )
         entries.append({"path": relative, "sha256": hash_file(path)})
+        del payload
+    if seen_cases != set(bank_membership):
+        raise ValueError(
+            "Gate 0.1 latent-bank manifest does not cover its complete source split."
+        )
     content = {
         "manifest_sha256": hash_file(manifest_path),
         "stats_sha256": hash_file(stats_path),
@@ -909,7 +1015,7 @@ def _selected_latent_paths(
     bank_dir: Path,
     records: Mapping[str, VolumeRecord],
     *,
-    split_name: str,
+    bank_membership: Mapping[str, tuple[str, VolumeRecord]],
     source_identities: Mapping[str, Any],
     hash_file: Callable[[Path], str],
 ) -> tuple[dict[str, Path], str]:
@@ -932,12 +1038,20 @@ def _selected_latent_paths(
         if found is None or not found[0].is_file():
             raise ValueError("Gate 0.1 selected acquisition is missing from the latent bank.")
         path, entry = found
+        membership = bank_membership.get(str(record.case_id))
+        if membership is None:
+            raise ValueError(
+                "Gate 0.1 selected acquisition is absent from the bank-source split."
+            )
+        bank_storage_split, bank_record = membership
         payload = torch.load(path, map_location="cpu")
         _validate_selected_latent_payload(
             payload,
             entry=entry,
             record=record,
-            split_name=split_name,
+            bank_record=bank_record,
+            evaluation_split="validation",
+            bank_storage_split=bank_storage_split,
             source_identity=source_identities[label],
         )
         result[label] = path
@@ -946,7 +1060,8 @@ def _selected_latent_paths(
                 "domain": label,
                 "case_identity_sha256": _sha256_text(str(record.case_id)),
                 "payload_file_sha256": hash_file(path),
-                "split": split_name,
+                "evaluation_split": "validation",
+                "bank_storage_split": bank_storage_split,
                 "latent_shape": [int(value) for value in payload["latent_shape"]],
                 "source_shape": [int(value) for value in payload["source_shape"]],
                 "downsample_factor": int(payload["downsample_factor"]),
@@ -986,7 +1101,9 @@ def _validate_selected_latent_payload(
     *,
     entry: Mapping[str, Any],
     record: VolumeRecord,
-    split_name: str,
+    bank_record: VolumeRecord,
+    evaluation_split: str,
+    bank_storage_split: str,
     source_identity: Any,
 ) -> None:
     if not isinstance(payload, Mapping) or not isinstance(source_identity, Mapping):
@@ -1008,18 +1125,31 @@ def _validate_selected_latent_payload(
         raise ValueError("Gate 0.1 selected latent payload lacks required provenance.")
     if payload["contract_version"] != LATENT_BANK_CONTRACT_VERSION:
         raise ValueError("Gate 0.1 selected latent payload contract is incompatible.")
-    if str(payload["case_id"]) != str(record.case_id) or str(entry.get("case_id")) != str(
-        record.case_id
+    if evaluation_split != "validation" or not _is_prospective_record(record):
+        raise ValueError(
+            "Scientific Gate 0.1 selected latent requires prospective validation evidence."
+        )
+    if (
+        str(payload["case_id"]) != str(record.case_id)
+        or str(entry.get("case_id")) != str(record.case_id)
+        or str(bank_record.case_id) != str(record.case_id)
     ):
         raise ValueError("Gate 0.1 selected latent case identity is incompatible.")
-    if payload["split"] != split_name or entry.get("split") != split_name:
+    if (
+        payload["split"] != bank_storage_split
+        or entry.get("split") != bank_storage_split
+    ):
         raise ValueError("Gate 0.1 selected latent split identity is incompatible.")
     try:
         payload_domain = Domain.from_dict(payload["domain"])
         entry_domain = Domain.from_dict(entry["domain"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("Gate 0.1 selected latent domain provenance is malformed.") from error
-    if payload_domain != record.domain or entry_domain != record.domain:
+    if (
+        payload_domain != record.domain
+        or entry_domain != record.domain
+        or bank_record.domain != record.domain
+    ):
         raise ValueError("Gate 0.1 selected latent domain identity is incompatible.")
     if int(payload["downsample_factor"]) != GATE01_VAE_DOWNSAMPLE_FACTOR:
         raise ValueError("Gate 0.1 selected latent has the wrong VAE downsample factor.")
@@ -1054,6 +1184,55 @@ def _validate_selected_latent_payload(
         raise ValueError("Gate 0.1 latent manifest/source shape mismatch.")
 
 
+def _validate_bank_membership_payload(
+    payload: Any,
+    *,
+    entry: Mapping[str, Any],
+    record: VolumeRecord,
+    bank_storage_split: str,
+) -> None:
+    """Verify every manifest/payload membership against the original bank-source split."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("Gate 0.1 latent-bank payload is malformed.")
+    required = {
+        "contract_version",
+        "case_id",
+        "split",
+        "domain",
+        "encode_strategy",
+        "vae_checkpoint_sha256",
+        "git_commit",
+    }
+    if not required.issubset(payload):
+        raise ValueError("Gate 0.1 latent-bank payload lacks membership provenance.")
+    if (
+        payload["contract_version"] != LATENT_BANK_CONTRACT_VERSION
+        or str(payload["case_id"]) != str(record.case_id)
+        or str(entry.get("case_id")) != str(record.case_id)
+        or payload["split"] != bank_storage_split
+        or entry.get("split") != bank_storage_split
+    ):
+        raise ValueError(
+            "Gate 0.1 latent-bank manifest/payload/source-split membership disagrees."
+        )
+    try:
+        payload_domain = Domain.from_dict(payload["domain"])
+        entry_domain = Domain.from_dict(entry["domain"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Gate 0.1 latent-bank domain provenance is malformed.") from error
+    if payload_domain != record.domain or entry_domain != record.domain:
+        raise ValueError(
+            "Gate 0.1 latent-bank manifest/payload/source-split domain disagrees."
+        )
+    if (
+        payload["encode_strategy"] != "full"
+        or payload["vae_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256
+        or payload["git_commit"] != FULL_LATENT_BANK_BUILD_COMMIT
+    ):
+        raise ValueError("Gate 0.1 latent-bank payload provenance is incompatible.")
+
+
 def _load_producer_spec(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
@@ -1069,6 +1248,8 @@ def _load_producer_spec(path: Path) -> dict[str, Any]:
         raise ValueError("Gate 0.1 producer specification has the wrong Stage-1 config hash.")
     if payload["sb_v2_config_sha256"] != SB_V2_CONFIG_SHA256:
         raise ValueError("Gate 0.1 producer specification has the wrong SB-v2 config hash.")
+    if not _split_provenance_contract_valid(payload["split_provenance"]):
+        raise ValueError("Gate 0.1 producer specification has stale split provenance.")
     _validate_source_identity_contract(payload["selected_source_acquisitions"])
     if (
         int(payload["selected_payload_count"]) != 15
@@ -1144,6 +1325,7 @@ def _load_or_initialize_state(
         "contract_version": GATE01_PRIVATE_PRODUCER_STATE_VERSION,
         "producer_spec_artifact_sha256": spec["artifact_sha256"],
         "protocol_lock_artifact_sha256": spec["protocol_lock_artifact_sha256"],
+        "split_provenance": dict(spec["split_provenance"]),
         "producer_provenance": {
             "decode_strategy": GATE01_PRODUCER_DECODE_STRATEGY,
             "path_used": [],
@@ -1325,6 +1507,11 @@ def _all_domain_labels() -> set[str]:
     return {Domain(field, contrast).label for contrast in CONTRASTS for field in FIELD_STRENGTHS_T}
 
 
+def _is_prospective_record(record: VolumeRecord) -> bool:
+    prefix = record.metadata.get("prefix") if isinstance(record.metadata, Mapping) else None
+    return str(prefix) == "P" or str(record.case_id).startswith("P_")
+
+
 def _direction_case_id(source_label: str, target_label: str) -> str:
     return f"gate01-{_sha256_text(source_label + '->' + target_label)[:24]}"
 
@@ -1340,6 +1527,32 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _split_provenance_contract_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"evaluation", "bank_storage"}:
+        return False
+    evaluation = value["evaluation"]
+    bank = value["bank_storage"]
+    return (
+        isinstance(evaluation, Mapping)
+        and isinstance(bank, Mapping)
+        and set(evaluation) == {"role", "file_sha256", "membership_fingerprint"}
+        and set(bank) == {"role", "file_sha256", "membership_fingerprint"}
+        and evaluation["role"] == "scientific_evaluation_resplit"
+        and _is_sha256(str(evaluation["file_sha256"]))
+        and evaluation["membership_fingerprint"] == RESPLIT_FINGERPRINT
+        and bank
+        == {
+            "role": "frozen_latent_bank_source_split",
+            "file_sha256": FULL_LATENT_BANK_SOURCE_SPLIT_FILE_SHA256,
+            "membership_fingerprint": FULL_LATENT_BANK_SOURCE_SPLIT_FINGERPRINT,
+        }
+    )
 
 
 def _assert_exact_keys(payload: Mapping[str, Any], expected: set[str], name: str) -> None:

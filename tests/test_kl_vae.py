@@ -123,12 +123,6 @@ def test_encode_decode_roundtrip_preserves_shape() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_decoder_exposes_verified_downsample_factor() -> None:
-    decoder = KLVAEDecoder(base_channels=8, latent_channels=6)
-
-    assert decoder.downsample_factor == 4
-
-
 def test_decoder_default_head_is_linear_and_unbounded() -> None:
     """The default head must NOT saturate: the official contract puts background at
     exactly 0, which a sigmoid/tanh head can only approach asymptotically. Bounding

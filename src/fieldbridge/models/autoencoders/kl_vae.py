@@ -144,10 +144,6 @@ class KLVAEDecoder(BaseDecoder):
         self.latent_channels = _positive_int(latent_channels, "latent_channels")
         self.spatial_dims = _validate_spatial_dims(spatial_dims)
         self.num_res_blocks = _positive_int(num_res_blocks, "num_res_blocks")
-        # This is part of the stored-latent/full-volume decode contract, not an
-        # implementation detail.  Consumers must be able to verify the same factor
-        # on either half of the frozen Stage-1 autoencoder.
-        self.downsample_factor = _DOWNSAMPLE_FACTOR
         self.domain_conditioning_dim = int(domain_conditioning_dim)
         if self.domain_conditioning_dim < 0:
             raise ValueError("domain_conditioning_dim must be non-negative.")

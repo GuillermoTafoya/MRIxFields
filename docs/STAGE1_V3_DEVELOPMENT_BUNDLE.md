@@ -56,6 +56,28 @@ luminance and structure terms are formed. Similarity is documented and checked i
 `[-1, 1]`; loss is finite and nonnegative. It is a training proxy, not the frozen
 Stage-1 audit SSIM3D and not the published Task-3 scikit-image metric.
 
+An initial private-data Arm-A attempt stopped on its first backward pass before
+`optimizer.step`; it produced no scientific result. Synthetic reproduction isolated the
+engineering blocker to differentiation through the projection bound
+`sqrt(var_prediction * var_target)` in exact-zero local target windows. The bound is now
+detached as a forward-only feasibility projection. This preserves its exact numerical
+value and the bounded forward contract while removing the undefined derivative at zero;
+gradients still flow through covariance, luminance, prediction variance, and the
+structure denominator. Always-reported diagnostics with effective weight zero are also
+detached and omitted from the backward sum rather than multiplied by zero.
+
+Before allocating private-data GPU time, run the exact-zero-background Arm-A gradient
+preflight with the checked-in loss composition:
+
+```powershell
+fieldbridge smoke-stage1-gradient --device cuda --precision bf16
+```
+
+The preflight uses synthetic 3D tensors and a reduced-width instance of the same
+encoder/decoder classes. It performs forward, backward, fail-closed gradient clipping,
+and one optimizer step, and reports the number of finite-gradient and updated parameter
+tensors. It never reads a manifest or private image.
+
 The completed audit remains on `stage1-full-volume-metrics-v1`, whose SSIM3D arithmetic
 is frozen explicitly as `stage1_full_volume_ssim3d_v1` at the `be60d75` behavior. The
 source-pinned official Task-3 adapter is documented separately in

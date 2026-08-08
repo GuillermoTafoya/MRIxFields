@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -127,7 +128,13 @@ from fieldbridge.evaluation.stage1_full_volume_audit import (
     write_audit_comparison,
 )
 from fieldbridge.evaluation.stage1_report import run_stage1_eval
-from fieldbridge.data.latent_bank import LatentBankConfig, build_latent_bank, load_volume
+from fieldbridge.data.latent_bank import (
+    LatentBankConfig,
+    build_latent_bank,
+    decode_latent,
+    encode_latent,
+    load_volume,
+)
 from fieldbridge.training.checkpoints import load_checkpoint, resolve_git_commit
 from fieldbridge.training.pseudo_pair_epochs import (
     PSEUDO_PAIR_PIPELINE_VERSION,
@@ -144,6 +151,32 @@ from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage
 from fieldbridge.training.stage2_transport import Stage2TransportConfig, run_stage2_transport_train
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
 from fieldbridge.data.resplit import resplit_file
+from fieldbridge.data.photometry_factorization import (
+    FORBIDDEN_TRAVELLER_IDS,
+    PHOTOMETRY_CLAMPING_RULE,
+    PHOTOMETRY_DUPLICATE_KNOT_RULE,
+    PHOTOMETRY_FACTORIZATION_CONTRACT_VERSION,
+    PHOTOMETRY_FACTORIZATION_CONFIG_VERSION,
+    PHOTOMETRY_FACTORIZATION_SEMANTICS,
+    PHOTOMETRY_INTERPOLATION_RULE,
+    PHOTOMETRY_SUPPORT_POLICY,
+    FrozenPhotometryArtifact,
+    PhotometryFitVolume,
+    assert_variant_a_external_path,
+    capture_photometry_code_provenance,
+    fit_frozen_photometry,
+    reject_target_or_prediction_derived_fields,
+)
+from fieldbridge.evaluation.stage2_photometry_baseline import (
+    BaselineEvaluationCase,
+    ContinuityReference,
+    OfficialQualificationMetrics,
+    QualificationVolume,
+    VariantAQualificationThresholds,
+    evaluate_factorized_identity_case,
+    qualify_variant_a,
+    write_variant_a_result,
+)
 from fieldbridge.evaluation.stage2_transport_eval import (
     DecodeSpec,
     TransportSamplerConfig,
@@ -704,6 +737,95 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --pred-dir/--board-json, add our aggregate under this name to the ranking.",
     )
     board.add_argument("--out", type=Path, default=None, help="Optional JSON output path.")
+
+    fit_stage2_photometry = subparsers.add_parser(
+        "fit-stage2-photometry",
+        help="Fit the fixed Variant-A photometry artifact from retrospective train records only.",
+    )
+    fit_stage2_photometry.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_photometry_factorization_a_v1.yaml"),
+    )
+    fit_stage2_photometry.add_argument("--split-json", type=Path, required=True)
+    fit_stage2_photometry.add_argument("--out", type=Path, required=True)
+    fit_stage2_photometry.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    fit_stage2_photometry.add_argument(
+        "--log-every",
+        type=int,
+        default=0,
+        help="Progress interval; logs to stderr and never changes JSON output.",
+    )
+
+    audit_stage2_photometry = subparsers.add_parser(
+        "audit-stage2-photometry",
+        help=(
+            "Qualify fixed photometry and frozen-VAE compatibility on retrospective "
+            "validation records."
+        ),
+    )
+    audit_stage2_photometry.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_photometry_factorization_a_v1.yaml"),
+    )
+    audit_stage2_photometry.add_argument("--split-json", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--artifact", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--vae-config", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--vae-checkpoint", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--continuity-reference", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--gate01-result", type=Path, required=True)
+    audit_stage2_photometry.add_argument("--out", type=Path, required=True)
+    audit_stage2_photometry.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    audit_stage2_photometry.add_argument(
+        "--precision", choices=("float32", "bfloat16"), default="float32"
+    )
+    audit_stage2_photometry.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Progress interval; logs to stderr and never changes JSON output.",
+    )
+
+    eval_stage2_photometry = subparsers.add_parser(
+        "eval-stage2-photometry-baseline",
+        help=(
+            "Evaluate one fixed-map directed identity case with a hash-verified "
+            "Gate-0.1 continuity reference."
+        ),
+    )
+    eval_stage2_photometry.add_argument("--artifact", type=Path, required=True)
+    eval_stage2_photometry.add_argument(
+        "--source-array", type=Path, required=True, help="External .npy source volume."
+    )
+    eval_stage2_photometry.add_argument(
+        "--target-array",
+        type=Path,
+        required=True,
+        help="External .npy metric target; never used for photometry or support.",
+    )
+    eval_stage2_photometry.add_argument("--source-field", type=float, required=True)
+    eval_stage2_photometry.add_argument(
+        "--source-contrast", choices=("T1w", "T2w", "T2-FLAIR"), required=True
+    )
+    eval_stage2_photometry.add_argument("--target-field", type=float, required=True)
+    eval_stage2_photometry.add_argument(
+        "--target-contrast", choices=("T1w", "T2w", "T2-FLAIR"), required=True
+    )
+    eval_stage2_photometry.add_argument("--case-id", required=True)
+    eval_stage2_photometry.add_argument("--selection-id", required=True)
+    eval_stage2_photometry.add_argument("--continuity-reference", type=Path, required=True)
+    eval_stage2_photometry.add_argument("--gate01-result", type=Path, required=True)
+    eval_stage2_photometry.add_argument("--out", type=Path, required=True)
+    eval_stage2_photometry.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=("nrmse", "ssim", "lpips"),
+        default=("nrmse", "ssim", "lpips"),
+    )
+    eval_stage2_photometry.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
 
     fit_intensity = subparsers.add_parser(
         "fit-intensity-baseline",
@@ -1533,6 +1655,243 @@ def main(argv: list[str] | None = None) -> int:
                 f"final_loss={result.final_loss:.6f} sec_per_step={result.seconds_per_step:.3f} "
                 f"best_val={result.best_val}"
             )
+        return 0
+
+    if args.command == "fit-stage2-photometry":
+        config = _load_variant_a_config(args.config)
+        split_path = assert_variant_a_external_path(args.split_json)
+        output_path = assert_variant_a_external_path(args.out)
+        splits = load_vae_splits(split_path)
+        split_file_sha256 = sha256_file(split_path)
+        membership_fingerprint = vae_splits_fingerprint(splits)
+        recovery_fingerprint = vae_splits_recovery_fingerprint_v3(splits)
+        records = [record for record in splits.train if _variant_a_record_cohort(record) == "R"]
+        if not records:
+            raise ValueError("Variant-A fitting found no retrospective R/train records.")
+        device = _resolve_device(args.device)
+        log_every = _nonnegative_log_every(args.log_every)
+
+        def fit_stream():
+            for index, record in enumerate(records, start=1):
+                if log_every and (index == 1 or index % log_every == 0 or index == len(records)):
+                    print(
+                        f"variant_a_fit record={index}/{len(records)} domain={record.domain.label}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                yield PhotometryFitVolume(
+                    volume=load_volume(record).to(device),
+                    domain=record.domain,
+                    record_identity=str(record.case_id),
+                    subject_identity=record.subject_id,
+                    source_path_identity=str(record.image_path),
+                    source_file_sha256=sha256_file(record.image_path),
+                    split="train",
+                    cohort="R",
+                )
+
+        artifact = fit_frozen_photometry(
+            fit_stream(),
+            source_split_file_sha256=split_file_sha256,
+            source_membership_fingerprint=membership_fingerprint,
+            source_recovery_fingerprint=recovery_fingerprint,
+            code_commit=resolve_git_commit(),
+            code_provenance=capture_photometry_code_provenance(),
+            resolved_config=config,
+            num_quantiles=int(config["photometry"]["num_quantiles"]),
+        )
+        artifact.save(output_path)
+        print(
+            json.dumps(
+                {
+                    "out": str(output_path),
+                    "contract_version": artifact.to_dict()["contract_version"],
+                    "artifact_sha256": artifact.artifact_sha256,
+                    "source_split_file_sha256": split_file_sha256,
+                    "source_membership_fingerprint": membership_fingerprint,
+                    "source_recovery_fingerprint": recovery_fingerprint,
+                    "accepted_records": len(records),
+                    "excluded_prospective_records": sum(
+                        _variant_a_record_cohort(record) == "P" for record in splits.train
+                    ),
+                    "domain_volume_counts": artifact.provenance["domain_volume_counts"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "audit-stage2-photometry":
+        import torch
+
+        config = _load_variant_a_config(args.config)
+        split_path = assert_variant_a_external_path(args.split_json)
+        artifact_path = assert_variant_a_external_path(args.artifact)
+        checkpoint_path = assert_variant_a_external_path(args.vae_checkpoint)
+        continuity_path = assert_variant_a_external_path(args.continuity_reference)
+        gate01_path = assert_variant_a_external_path(args.gate01_result)
+        output_path = assert_variant_a_external_path(args.out)
+        splits = load_vae_splits(split_path)
+        split_file_sha256 = sha256_file(split_path)
+        membership_fingerprint = vae_splits_fingerprint(splits)
+        recovery_fingerprint = vae_splits_recovery_fingerprint_v3(splits)
+        artifact = FrozenPhotometryArtifact.load(
+            artifact_path,
+            expected_split_file_sha256=split_file_sha256,
+            expected_membership_fingerprint=membership_fingerprint,
+            expected_recovery_fingerprint=recovery_fingerprint,
+        )
+        continuity = ContinuityReference.load(
+            continuity_path, source_result_path=gate01_path
+        )
+        records = [
+            record
+            for record in splits.validation
+            if _variant_a_record_cohort(record) == "R"
+        ]
+        if not records:
+            raise ValueError("Variant-A qualification found no retrospective R/validation records.")
+
+        vae_config_path = Path(args.vae_config).resolve()
+        if not vae_config_path.is_file():
+            raise FileNotFoundError(
+                f"Variant-A frozen-VAE config not found: {vae_config_path}"
+            )
+        vae_config = load_yaml_config(vae_config_path)
+        model_config = _model_config(vae_config)
+        encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+        decoder = build_decoder("kl_vae", **_kl_vae_kwargs(model_config, "decoder"))
+        state = load_checkpoint(checkpoint_path)
+        try:
+            encoder.load_state_dict(state["encoder"], strict=True)
+            decoder.load_state_dict(state["decoder"], strict=True)
+        except (KeyError, RuntimeError) as exc:
+            raise ValueError(
+                "Variant-A qualification could not load the frozen VAE checkpoint."
+            ) from exc
+        encoder.requires_grad_(False).eval()
+        decoder.requires_grad_(False).eval()
+        device = _resolve_device(args.device)
+        encoder.to(device)
+        decoder.to(device)
+        precision = str(args.precision)
+
+        def vae_roundtrip(volume, domain):
+            latent, encode_path = encode_latent(
+                encoder,
+                volume.to(device),
+                domain,
+                strategy="full",
+                block_size=(64, 64, 64),
+                halo=(0, 0, 0),
+                precision=precision,
+            )
+            reconstructed, decode_path = decode_latent(
+                decoder,
+                latent,
+                domain,
+                factor=int(getattr(decoder, "downsample_factor")),
+                strategy="full",
+                block_size=(64, 64, 64),
+                halo=(0, 0, 0),
+                precision=precision,
+                clamp=True,
+            )
+            if encode_path != "full" or decode_path != "full":
+                raise ValueError("Variant-A VAE preflight requires exact full encode/decode.")
+            return reconstructed
+
+        log_every = _nonnegative_log_every(args.log_every)
+
+        def progress(index: int, total: int | None, identity: str) -> None:
+            del total
+            if log_every and (index == 1 or index % log_every == 0 or index == len(records)):
+                print(
+                    f"variant_a_qualification record={index}/{len(records)} "
+                    f"identity_sha256={hashlib.sha256(identity.encode('utf-8')).hexdigest()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        def qualification_stream():
+            for record in records:
+                yield QualificationVolume(
+                    volume=load_volume(record).to(device),
+                    domain=record.domain,
+                    record_identity=str(record.case_id),
+                    subject_identity=record.subject_id,
+                    source_path_identity=str(record.image_path),
+                    source_file_sha256=sha256_file(record.image_path),
+                    split="validation",
+                    cohort="R",
+                )
+
+        thresholds = VariantAQualificationThresholds.from_mapping(config)
+        metric_names = tuple(config["evaluation"]["metrics"])
+        result = qualify_variant_a(
+            artifact,
+            qualification_stream(),
+            thresholds=thresholds,
+            resolved_config=config,
+            source_split_file_sha256=split_file_sha256,
+            source_membership_fingerprint=membership_fingerprint,
+            source_recovery_fingerprint=recovery_fingerprint,
+            vae_roundtrip=vae_roundtrip,
+            vae_provenance={
+                "checkpoint_sha256": sha256_file(checkpoint_path),
+                "config_file_sha256": sha256_file(vae_config_path),
+                "encoder_class": type(encoder).__name__,
+                "decoder_class": type(decoder).__name__,
+                "encoder_statistic": "posterior_mean",
+                "encode_strategy": "full",
+                "decode_strategy": "full",
+                "precision": precision,
+                "device_type": device.type,
+            },
+            continuity=continuity,
+            metric_function=OfficialQualificationMetrics(
+                metrics=metric_names, device=device.type
+            ),
+            progress=progress,
+        )
+        write_variant_a_result(output_path, result)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "eval-stage2-photometry-baseline":
+        paths = {
+            "artifact": assert_variant_a_external_path(args.artifact),
+            "source": assert_variant_a_external_path(args.source_array),
+            "target": assert_variant_a_external_path(args.target_array),
+            "continuity": assert_variant_a_external_path(args.continuity_reference),
+            "gate01": assert_variant_a_external_path(args.gate01_result),
+            "out": assert_variant_a_external_path(args.out),
+        }
+        artifact = FrozenPhotometryArtifact.load(paths["artifact"])
+        continuity = ContinuityReference.load(
+            paths["continuity"], source_result_path=paths["gate01"]
+        )
+        source = _load_variant_a_npy(paths["source"])
+        target = _load_variant_a_npy(paths["target"])
+        case = BaselineEvaluationCase(
+            case_identity=str(args.case_id),
+            selection_identity=str(args.selection_id),
+            source=source,
+            target=target,
+            source_domain=Domain(args.source_field, args.source_contrast),
+            target_domain=Domain(args.target_field, args.target_contrast),
+        )
+        result = evaluate_factorized_identity_case(
+            artifact,
+            case,
+            continuity=continuity,
+            metric_function=OfficialQualificationMetrics(
+                metrics=tuple(args.metrics), device=args.device
+            ),
+        )
+        write_variant_a_result(paths["out"], result)
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
     if args.command == "fit-intensity-baseline":
@@ -2366,6 +2725,140 @@ def _load_optional_config(path: Path) -> dict[str, Any]:
     if path.exists():
         return load_yaml_config(path)
     return {}
+
+
+def _load_variant_a_config(path: Path) -> dict[str, Any]:
+    config = load_yaml_config(path)
+    if config.get("contract") != PHOTOMETRY_FACTORIZATION_CONFIG_VERSION:
+        raise ValueError("Variant-A config contract is incompatible.")
+    if config.get("variant") != "A":
+        raise ValueError("Variant-A commands accept variant=A only.")
+    if config.get("scope") != "frozen_photometry_and_factorized_identity_only":
+        raise ValueError("Variant-A config scope is incompatible.")
+    photometry = config.get("photometry")
+    if not isinstance(photometry, Mapping):
+        raise ValueError("Variant-A config requires a photometry mapping.")
+    expected = {
+        "artifact_contract": PHOTOMETRY_FACTORIZATION_CONTRACT_VERSION,
+        "semantics": PHOTOMETRY_FACTORIZATION_SEMANTICS,
+        "num_quantiles": 256,
+        "canonical_scope": "contrast",
+        "contrasts": ["T1w", "T2w", "T2-FLAIR"],
+        "fields_t": [0.1, 1.5, 3.0, 5.0, 7.0],
+        "within_domain_weighting": "equal_per_eligible_volume",
+        "across_fields_weighting": "exactly_equal_0.2",
+        "interpolation": PHOTOMETRY_INTERPOLATION_RULE,
+        "duplicate_knot_rule": PHOTOMETRY_DUPLICATE_KNOT_RULE,
+        "clamping": PHOTOMETRY_CLAMPING_RULE,
+        "support": PHOTOMETRY_SUPPORT_POLICY,
+        "runtime_statistics": "none",
+    }
+    mismatches = {
+        key: {"expected": value, "actual": photometry.get(key)}
+        for key, value in expected.items()
+        if photometry.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Variant-A config changes approved photometry defaults: {mismatches}.")
+    eligibility = config.get("eligibility")
+    if not isinstance(eligibility, Mapping):
+        raise ValueError("Variant-A config requires an eligibility mapping.")
+    if eligibility.get("fit") != {"cohort": "R", "split": "train"}:
+        raise ValueError("Variant-A fit eligibility must be exactly R/train.")
+    if eligibility.get("qualification") != {"cohort": "R", "split": "validation"}:
+        raise ValueError("Variant-A qualification eligibility must be exactly R/validation.")
+    if eligibility.get("prospective_records") != "reject":
+        raise ValueError("Variant-A prospective records must be rejected.")
+    if tuple(eligibility.get("forbidden_travellers", ())) != tuple(
+        sorted(FORBIDDEN_TRAVELLER_IDS)
+    ):
+        raise ValueError("Variant-A must explicitly reject travellers 0006, 0007, and 0009.")
+    thresholds = VariantAQualificationThresholds.from_mapping(config)
+    if thresholds.to_dict() != VariantAQualificationThresholds().to_dict():
+        raise ValueError(
+            "Variant-A v1 qualification thresholds must match the reviewed proposed defaults."
+        )
+    qualification = config.get("qualification")
+    if not isinstance(qualification, Mapping):
+        raise ValueError("Variant-A config requires a qualification mapping.")
+    if qualification.get("threshold_status") != (
+        "versioned_proposed_defaults_requiring_guillermo_simon_signoff"
+    ):
+        raise ValueError("Variant-A threshold status is incompatible.")
+    if qualification.get("failure_classes") != [
+        "photometry_factorization_failure",
+        "canonical_vae_distribution_shift_failure",
+    ]:
+        raise ValueError("Variant-A qualification failure classes are incompatible.")
+    if qualification.get("canonical_latent_bank_authorization") != (
+        "require_all_checks_pass"
+    ):
+        raise ValueError("Variant-A latent-bank authorization gate is incompatible.")
+    if qualification.get("gate01_substitution") != "forbidden":
+        raise ValueError("Variant-A must forbid Gate 0.1 substitution.")
+    if config.get("vae_preflight") != {
+        "encoder_statistic": "posterior_mean",
+        "decode_strategy": "full",
+        "output_clamp": [0.0, 1.0],
+        "comparison": "same_retrospective_validation_record",
+    }:
+        raise ValueError("Variant-A frozen-VAE preflight is incompatible.")
+    reject_target_or_prediction_derived_fields(config)
+    evaluation = config.get("evaluation")
+    if not isinstance(evaluation, Mapping):
+        raise ValueError("Variant-A config requires an evaluation mapping.")
+    if evaluation.get("result_contract") != (
+        "stage2-photometry-dual-baseline-result-v1"
+    ) or evaluation.get("continuity_reference_contract") != (
+        "stage2-photometry-continuity-reference-v1"
+    ):
+        raise ValueError("Variant-A evaluation contracts are incompatible.")
+    methods = evaluation.get("methods")
+    if methods != [
+        "fixed_map_factorized_identity",
+        "gate01_posthoc_calibrated_identity",
+        "raw_identity",
+        "stage1_reconstruction_ceiling",
+    ]:
+        raise ValueError("Variant-A dual-baseline method identities are incompatible.")
+    return config
+
+
+def _variant_a_record_cohort(record: VolumeRecord) -> str:
+    prefix = record.metadata.get("prefix") if isinstance(record.metadata, Mapping) else None
+    if prefix is None:
+        case_id = str(record.case_id)
+        prefix = case_id.split("_", 1)[0] if "_" in case_id else ""
+    cohort = str(prefix).upper()
+    if cohort not in {"R", "P"}:
+        raise ValueError(
+            f"Variant-A record {record.case_id!r} has unknown cohort prefix {prefix!r}."
+        )
+    return cohort
+
+
+def _nonnegative_log_every(value: int) -> int:
+    result = int(value)
+    if result < 0:
+        raise ValueError("--log-every must be non-negative.")
+    return result
+
+
+def _load_variant_a_npy(path: Path) -> "Any":
+    import numpy as np
+    import torch
+
+    if path.suffix.lower() != ".npy":
+        raise ValueError("Variant-A baseline evaluation accepts external .npy arrays only.")
+    try:
+        array = np.load(path, allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Could not load Variant-A array {path}: {exc}") from exc
+    if not np.issubdtype(array.dtype, np.floating):
+        raise ValueError(f"Variant-A array {path} must use a floating dtype.")
+    if array.ndim < 3 or not np.isfinite(array).all():
+        raise ValueError(f"Variant-A array {path} must be a finite full volume.")
+    return torch.from_numpy(np.asarray(array, dtype=np.float32).copy())
 
 
 def _data_patch_size(config: Mapping[str, Any]) -> tuple[int, ...] | None:

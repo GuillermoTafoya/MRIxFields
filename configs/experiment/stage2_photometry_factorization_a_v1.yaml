@@ -1,0 +1,91 @@
+contract: stage2-photometry-variant-a-config-v1
+variant: A
+scope: frozen_photometry_and_factorized_identity_only
+
+photometry:
+  artifact_contract: stage2-photometry-factorization-v1
+  semantics: fixed-domain-to-contrast-canonical-quantile-map-v1
+  num_quantiles: 256
+  canonical_scope: contrast
+  contrasts:
+    - T1w
+    - T2w
+    - T2-FLAIR
+  fields_t:
+    - 0.1
+    - 1.5
+    - 3.0
+    - 5.0
+    - 7.0
+  within_domain_weighting: equal_per_eligible_volume
+  across_fields_weighting: exactly_equal_0.2
+  interpolation: monotone-piecewise-linear-v1
+  duplicate_knot_rule: collapse-equal-source-knots-to-mean-target-v1
+  clamping: sealed-endpoint-clamping-v1
+  support: source-nonzero-mask-exact-zero-output-v1
+  runtime_statistics: none
+
+eligibility:
+  fit:
+    cohort: R
+    split: train
+  qualification:
+    cohort: R
+    split: validation
+  prospective_records: reject
+  forbidden_travellers:
+    - "0006"
+    - "0007"
+    - "0009"
+
+qualification:
+  threshold_status: versioned_proposed_defaults_requiring_guillermo_simon_signoff
+  scaling_factors:
+    - 0.9
+    - 1.1
+  thresholds:
+    monotonic_tolerance_fraction: 1.0e-7
+    roundtrip_macro_nrmse_max: 0.01
+    roundtrip_worst_domain_nrmse_max: 0.02
+    roundtrip_p99_range_fraction_max: 0.03
+    histogram_macro_distance_max: 0.02
+    histogram_worst_field_distance_max: 0.03
+    spearman_min: 0.995
+    contrast_macro_f1_drop_max: 0.02
+    contrast_recall_drop_max: 0.05
+    scaling_histogram_distance_max: 0.03
+    scaling_ssim_min: 0.98
+    vae_nrmse_absolute_increase_max: 0.02
+    vae_nrmse_relative_increase_max: 0.15
+    vae_ssim_decrease_max: 0.01
+    vae_lpips_increase_max: 0.005
+    vae_domain_nrmse_increase_max: 0.03
+    vae_domain_ssim_decrease_max: 0.015
+    vae_domain_lpips_increase_max: 0.008
+  failure_classes:
+    - photometry_factorization_failure
+    - canonical_vae_distribution_shift_failure
+  canonical_latent_bank_authorization: require_all_checks_pass
+  gate01_substitution: forbidden
+
+vae_preflight:
+  encoder_statistic: posterior_mean
+  decode_strategy: full
+  output_clamp:
+    - 0.0
+    - 1.0
+  comparison: same_retrospective_validation_record
+
+evaluation:
+  result_contract: stage2-photometry-dual-baseline-result-v1
+  continuity_reference_contract: stage2-photometry-continuity-reference-v1
+  methods:
+    - fixed_map_factorized_identity
+    - gate01_posthoc_calibrated_identity
+    - raw_identity
+    - stage1_reconstruction_ceiling
+  calibration_semantics_must_remain_separate: true
+  metrics:
+    - nrmse
+    - ssim
+    - lpips

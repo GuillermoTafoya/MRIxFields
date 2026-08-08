@@ -8,14 +8,18 @@ from fieldbridge.models.factory import build_translator
 from fieldbridge.models.translators.flow_transport import FlowMatchingLatentTranslator
 
 
-def _model():
+def _model(**overrides):
+    kwargs = {
+        "latent_channels": 4,
+        "hidden_channels": (8, 16),
+        "bottleneck_channels": 32,
+        "cond_dim": 16,
+        "time_embed_dim": 16,
+        "spatial_dims": 3,
+    }
+    kwargs.update(overrides)
     return FlowMatchingLatentTranslator(
-        latent_channels=4,
-        hidden_channels=(8, 16),
-        bottleneck_channels=32,
-        cond_dim=16,
-        time_embed_dim=16,
-        spatial_dims=3,
+        **kwargs,
     )
 
 
@@ -80,3 +84,69 @@ def test_factory_builds_flow_matching_latent() -> None:
         spatial_dims=3,
     )
     assert isinstance(model, FlowMatchingLatentTranslator)
+
+
+def test_historical_sb_v2_model_configuration_constructs() -> None:
+    model_config = {
+        "latent_channels": 4,
+        "hidden_channels": [64, 128],
+        "bottleneck_channels": 256,
+        "cond_dim": 128,
+        "time_embed_dim": 128,
+        "time_scale": 1000.0,
+        "spatial_dims": 3,
+        "activation": "silu",
+        "skip_mode": "concat",
+        "zero_init_output": True,
+    }
+
+    model = build_translator("flow_matching_latent", **model_config)
+
+    assert isinstance(model, FlowMatchingLatentTranslator)
+    assert model.zero_init_output is True
+
+
+def test_zero_init_output_zeros_exactly_the_initial_output_projection() -> None:
+    model = _model(zero_init_output=True)
+
+    assert torch.count_nonzero(model.output_projection.weight) == 0
+    assert model.output_projection.bias is not None
+    assert torch.count_nonzero(model.output_projection.bias) == 0
+
+
+def test_zero_init_output_false_preserves_default_initialization() -> None:
+    torch.manual_seed(19)
+    default_model = _model()
+    torch.manual_seed(19)
+    explicit_false_model = _model(zero_init_output=False)
+
+    assert default_model.zero_init_output is False
+    assert explicit_false_model.zero_init_output is False
+    for name, default_value in default_model.state_dict().items():
+        assert torch.equal(default_value, explicit_false_model.state_dict()[name])
+    assert torch.count_nonzero(default_model.output_projection.weight) > 0
+
+
+def test_strict_checkpoint_loading_erases_constructor_initialization_difference() -> None:
+    torch.manual_seed(23)
+    trained_model = _model()
+    with torch.no_grad():
+        for index, parameter in enumerate(trained_model.parameters()):
+            parameter.add_(float(index + 1) * 1e-4)
+    trained_state = {
+        name: value.detach().clone() for name, value in trained_model.state_dict().items()
+    }
+
+    initialized_zero = _model(zero_init_output=True).eval()
+    initialized_default = _model(zero_init_output=False).eval()
+    initialized_zero.load_state_dict(trained_state, strict=True)
+    initialized_default.load_state_dict(trained_state, strict=True)
+
+    for name, zero_value in initialized_zero.state_dict().items():
+        assert torch.equal(zero_value, initialized_default.state_dict()[name])
+    z = torch.randn(1, 4, 8, 8, 8)
+    source, target = _domains(1)
+    with torch.no_grad():
+        zero_output = initialized_zero(z, source, target, 0.4)
+        default_output = initialized_default(z, source, target, 0.4)
+    torch.testing.assert_close(zero_output, default_output, rtol=0.0, atol=0.0)

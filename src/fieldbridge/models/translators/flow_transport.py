@@ -53,6 +53,7 @@ class FlowMatchingLatentTranslator(ConditionalUNetFieldTranslator):
         upsample_mode: str = "interpolate",
         skip_mode: str = "concat",
         pad_to_multiple: bool = True,
+        zero_init_output: bool = False,
     ) -> None:
         super().__init__(
             in_channels=latent_channels,
@@ -83,6 +84,11 @@ class FlowMatchingLatentTranslator(ConditionalUNetFieldTranslator):
             nn.SiLU(),
             nn.Linear(self.cond_dim, self.cond_dim),
         )
+        self.zero_init_output = bool(zero_init_output)
+        if self.zero_init_output:
+            nn.init.zeros_(self.output_projection.weight)
+            if self.output_projection.bias is not None:
+                nn.init.zeros_(self.output_projection.bias)
 
     def _time_conditioning(
         self, t: torch.Tensor | float, *, batch_size: int, device: torch.device, dtype: torch.dtype

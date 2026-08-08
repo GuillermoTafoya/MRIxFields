@@ -655,7 +655,9 @@ def test_selected_latent_payload_fails_closed_on_stale_provenance(
         )
 
 
-def test_real_gate01_backend_constructs_with_verified_decoder_factor(tmp_path) -> None:
+def test_real_gate01_backend_accepts_frozen_sb_config_shape_and_decoder_factor(
+    tmp_path,
+) -> None:
     stage_model = {
         "name": "kl_vae",
         "base_channels": 2,
@@ -672,8 +674,12 @@ def test_real_gate01_backend_constructs_with_verified_decoder_factor(tmp_path) -
         "bottleneck_channels": 4,
         "cond_dim": 4,
         "time_embed_dim": 4,
+        "time_scale": 1000.0,
         "spatial_dims": 3,
+        "activation": "silu",
         "use_norm": False,
+        "skip_mode": "concat",
+        "zero_init_output": True,
     }
     stage_config = tmp_path / "stage1.yaml"
     sb_config = tmp_path / "sb.yaml"
@@ -709,6 +715,7 @@ def test_real_gate01_backend_constructs_with_verified_decoder_factor(tmp_path) -
 
     assert backend.factor == 4
     assert backend.decoder.downsample_factor == 4
+    assert backend.translator.zero_init_output is True
     assert backend.decode_paths_used == ()
 
 

@@ -43,6 +43,26 @@ qualification:
   scaling_factors:
     - 0.9
     - 1.1
+  monotonicity_audit:
+    realized_maps:
+      - N_d
+      - P_d
+    dense_grid_points: 4097
+    coverage: sealed_robust_range_plus_endpoints
+  contrast_control:
+    contract: variant-a-photometry-controlled-spatial-features-v1
+    validation: leave_one_canonical_subject_group_out
+    rank_normalization: stable_average_rank_to_minus1_plus1_inside_support
+    low_pass_box_kernel_voxels:
+      - 1
+      - 3
+      - 5
+    gradients: absolute_first_forward_difference_xyz
+    resampling: trilinear_align_corners_false_4x4x4
+  scaling_ssim:
+    implementation: torch_uniform_window_3d_ssim_v1
+    support: identical_source_support
+    data_range: sealed_unperturbed_canonical_volume
   thresholds:
     monotonic_tolerance_fraction: 1.0e-7
     roundtrip_macro_nrmse_max: 0.01
@@ -77,14 +97,37 @@ vae_preflight:
   comparison: same_retrospective_validation_record
 
 evaluation:
-  result_contract: stage2-photometry-dual-baseline-result-v1
-  continuity_reference_contract: stage2-photometry-continuity-reference-v1
+  paired_manifest_contract: stage2-photometry-paired-evaluation-manifest-v1
+  case_shard_contract: stage2-photometry-paired-case-shard-v1
+  result_contract: stage2-photometry-dual-baseline-result-v2
+  continuity_reference_contract: stage2-photometry-continuity-reference-v2
   methods:
     - fixed_map_factorized_identity
     - gate01_posthoc_calibrated_identity
     - raw_identity
     - stage1_reconstruction_ceiling
   calibration_semantics_must_remain_separate: true
+  same_case_methods:
+    - raw_identity
+    - fixed_map_factorized_identity
+    - stage1_reconstruction_ceiling
+  gate01_same_case_reduction: forbidden
+  genuinely_paired_manifest_required: true
+  catastrophic_boundary:
+    method: raw_identity
+    metric: nrmse
+    greater_than: 1.0
+  reductions:
+    per_domain: equal_case
+    per_contrast: equal_domain
+    macro: equal_domain
+  continuity_controls:
+    - spatial_ssim
+    - same_support_intensity_mae_to_source
+    - same_support_gradient_mae_to_source
+    - same_support_edge_mae_to_source
+    - same_support_gradient_mae_to_target
+    - same_support_edge_mae_to_target
   metrics:
     - nrmse
     - ssim

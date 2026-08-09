@@ -164,19 +164,21 @@ from fieldbridge.data.photometry_factorization import (
     PhotometryFitVolume,
     assert_variant_a_external_path,
     capture_photometry_code_provenance,
+    classify_variant_a_cohort,
     fit_frozen_photometry,
     reject_target_or_prediction_derived_fields,
 )
+from fieldbridge.evaluation.mrixfields2026_official import official_task3_runtime_provenance
 from fieldbridge.evaluation.stage2_photometry_baseline import (
-    BaselineEvaluationCase,
     ContinuityReference,
     OfficialQualificationMetrics,
     QualificationVolume,
     VariantAQualificationThresholds,
-    evaluate_factorized_identity_case,
+    build_continuity_reference_from_gate01,
     qualify_variant_a,
     write_variant_a_result,
 )
+from fieldbridge.evaluation.stage2_photometry_protocol import evaluate_paired_variant_a
 from fieldbridge.evaluation.stage2_transport_eval import (
     DecodeSpec,
     TransportSamplerConfig,
@@ -789,43 +791,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Progress interval; logs to stderr and never changes JSON output.",
     )
 
+    build_stage2_continuity = subparsers.add_parser(
+        "build-stage2-photometry-continuity-reference",
+        help="Build a hash-bound continuity reference from one reviewed Gate-0.1 result.",
+    )
+    build_stage2_continuity.add_argument("--gate01-result", type=Path, required=True)
+    build_stage2_continuity.add_argument("--evaluation-id", required=True)
+    build_stage2_continuity.add_argument("--out", type=Path, required=True)
+
     eval_stage2_photometry = subparsers.add_parser(
         "eval-stage2-photometry-baseline",
         help=(
-            "Evaluate one fixed-map directed identity case with a hash-verified "
-            "Gate-0.1 continuity reference."
+            "Evaluate an externally sealed genuinely paired Variant-A manifest with "
+            "resumable atomic case shards."
         ),
     )
     eval_stage2_photometry.add_argument("--artifact", type=Path, required=True)
-    eval_stage2_photometry.add_argument(
-        "--source-array", type=Path, required=True, help="External .npy source volume."
-    )
-    eval_stage2_photometry.add_argument(
-        "--target-array",
-        type=Path,
-        required=True,
-        help="External .npy metric target; never used for photometry or support.",
-    )
-    eval_stage2_photometry.add_argument("--source-field", type=float, required=True)
-    eval_stage2_photometry.add_argument(
-        "--source-contrast", choices=("T1w", "T2w", "T2-FLAIR"), required=True
-    )
-    eval_stage2_photometry.add_argument("--target-field", type=float, required=True)
-    eval_stage2_photometry.add_argument(
-        "--target-contrast", choices=("T1w", "T2w", "T2-FLAIR"), required=True
-    )
-    eval_stage2_photometry.add_argument("--case-id", required=True)
-    eval_stage2_photometry.add_argument("--selection-id", required=True)
+    eval_stage2_photometry.add_argument("--manifest", type=Path, required=True)
     eval_stage2_photometry.add_argument("--continuity-reference", type=Path, required=True)
     eval_stage2_photometry.add_argument("--gate01-result", type=Path, required=True)
-    eval_stage2_photometry.add_argument("--out", type=Path, required=True)
-    eval_stage2_photometry.add_argument(
-        "--metrics",
-        nargs="+",
-        choices=("nrmse", "ssim", "lpips"),
-        default=("nrmse", "ssim", "lpips"),
-    )
+    eval_stage2_photometry.add_argument("--out-dir", type=Path, required=True)
+    eval_stage2_photometry.add_argument("--resume", action="store_true")
     eval_stage2_photometry.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    eval_stage2_photometry.add_argument("--log-every", type=int, default=1)
 
     fit_intensity = subparsers.add_parser(
         "fit-intensity-baseline",
@@ -1684,6 +1672,7 @@ def main(argv: list[str] | None = None) -> int:
                     domain=record.domain,
                     record_identity=str(record.case_id),
                     subject_identity=record.subject_id,
+                    metadata_prefix=_variant_a_record_prefix(record),
                     source_path_identity=str(record.image_path),
                     source_file_sha256=sha256_file(record.image_path),
                     split="train",
@@ -1821,6 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
                     domain=record.domain,
                     record_identity=str(record.case_id),
                     subject_identity=record.subject_id,
+                    metadata_prefix=_variant_a_record_prefix(record),
                     source_path_identity=str(record.image_path),
                     source_file_sha256=sha256_file(record.image_path),
                     split="validation",
@@ -1859,38 +1849,62 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
+    if args.command == "build-stage2-photometry-continuity-reference":
+        gate01_path = assert_variant_a_external_path(args.gate01_result)
+        output_path = assert_variant_a_external_path(args.out)
+        try:
+            gate01_payload = json.loads(gate01_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not load Gate 0.1 result {gate01_path}: {exc}") from exc
+        if not isinstance(gate01_payload, Mapping):
+            raise ValueError("Gate 0.1 result root must be an object.")
+        reference = build_continuity_reference_from_gate01(
+            gate01_payload,
+            source_result_sha256=sha256_file(gate01_path),
+            evaluation_identity=str(args.evaluation_id),
+        )
+        write_variant_a_result(output_path, reference.to_dict())
+        print(json.dumps(reference.to_dict(), indent=2, sort_keys=True))
+        return 0
+
     if args.command == "eval-stage2-photometry-baseline":
         paths = {
             "artifact": assert_variant_a_external_path(args.artifact),
-            "source": assert_variant_a_external_path(args.source_array),
-            "target": assert_variant_a_external_path(args.target_array),
+            "manifest": assert_variant_a_external_path(args.manifest),
             "continuity": assert_variant_a_external_path(args.continuity_reference),
             "gate01": assert_variant_a_external_path(args.gate01_result),
-            "out": assert_variant_a_external_path(args.out),
+            "out": assert_variant_a_external_path(args.out_dir),
         }
         artifact = FrozenPhotometryArtifact.load(paths["artifact"])
         continuity = ContinuityReference.load(
             paths["continuity"], source_result_path=paths["gate01"]
         )
-        source = _load_variant_a_npy(paths["source"])
-        target = _load_variant_a_npy(paths["target"])
-        case = BaselineEvaluationCase(
-            case_identity=str(args.case_id),
-            selection_identity=str(args.selection_id),
-            source=source,
-            target=target,
-            source_domain=Domain(args.source_field, args.source_contrast),
-            target_domain=Domain(args.target_field, args.target_contrast),
-        )
-        result = evaluate_factorized_identity_case(
+        log_every = _nonnegative_log_every(args.log_every)
+
+        def paired_progress(index: int, total: int, identity: str) -> None:
+            if log_every and (index == 1 or index % log_every == 0 or index == total):
+                print(
+                    f"variant_a_paired_eval case={index}/{total} "
+                    f"identity_sha256={hashlib.sha256(identity.encode('utf-8')).hexdigest()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        result = evaluate_paired_variant_a(
             artifact,
-            case,
+            manifest_path=paths["manifest"],
+            output_dir=paths["out"],
             continuity=continuity,
             metric_function=OfficialQualificationMetrics(
-                metrics=tuple(args.metrics), device=args.device
+                metrics=("nrmse", "ssim", "lpips"), device=args.device
             ),
+            metric_runtime_provenance=official_task3_runtime_provenance(
+                metrics=("nrmse", "ssim", "lpips"), device=args.device
+            ),
+            evaluation_code_provenance=capture_photometry_code_provenance(),
+            resume=bool(args.resume),
+            progress=paired_progress,
         )
-        write_variant_a_result(paths["out"], result)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
@@ -2796,6 +2810,27 @@ def _load_variant_a_config(path: Path) -> dict[str, Any]:
         raise ValueError("Variant-A latent-bank authorization gate is incompatible.")
     if qualification.get("gate01_substitution") != "forbidden":
         raise ValueError("Variant-A must forbid Gate 0.1 substitution.")
+    if qualification.get("monotonicity_audit") != {
+        "realized_maps": ["N_d", "P_d"],
+        "dense_grid_points": 4097,
+        "coverage": "sealed_robust_range_plus_endpoints",
+    }:
+        raise ValueError("Variant-A realized-map monotonicity audit is incompatible.")
+    if qualification.get("contrast_control") != {
+        "contract": "variant-a-photometry-controlled-spatial-features-v1",
+        "validation": "leave_one_canonical_subject_group_out",
+        "rank_normalization": "stable_average_rank_to_minus1_plus1_inside_support",
+        "low_pass_box_kernel_voxels": [1, 3, 5],
+        "gradients": "absolute_first_forward_difference_xyz",
+        "resampling": "trilinear_align_corners_false_4x4x4",
+    }:
+        raise ValueError("Variant-A contrast-control definition is incompatible.")
+    if qualification.get("scaling_ssim") != {
+        "implementation": "torch_uniform_window_3d_ssim_v1",
+        "support": "identical_source_support",
+        "data_range": "sealed_unperturbed_canonical_volume",
+    }:
+        raise ValueError("Variant-A scaling-SSIM definition is incompatible.")
     if config.get("vae_preflight") != {
         "encoder_statistic": "posterior_mean",
         "decode_strategy": "full",
@@ -2807,10 +2842,15 @@ def _load_variant_a_config(path: Path) -> dict[str, Any]:
     evaluation = config.get("evaluation")
     if not isinstance(evaluation, Mapping):
         raise ValueError("Variant-A config requires an evaluation mapping.")
-    if evaluation.get("result_contract") != (
-        "stage2-photometry-dual-baseline-result-v1"
-    ) or evaluation.get("continuity_reference_contract") != (
-        "stage2-photometry-continuity-reference-v1"
+    expected_evaluation_contracts = {
+        "paired_manifest_contract": "stage2-photometry-paired-evaluation-manifest-v1",
+        "case_shard_contract": "stage2-photometry-paired-case-shard-v1",
+        "result_contract": "stage2-photometry-dual-baseline-result-v2",
+        "continuity_reference_contract": "stage2-photometry-continuity-reference-v2",
+    }
+    if any(
+        evaluation.get(key) != value
+        for key, value in expected_evaluation_contracts.items()
     ):
         raise ValueError("Variant-A evaluation contracts are incompatible.")
     methods = evaluation.get("methods")
@@ -2821,20 +2861,33 @@ def _load_variant_a_config(path: Path) -> dict[str, Any]:
         "stage1_reconstruction_ceiling",
     ]:
         raise ValueError("Variant-A dual-baseline method identities are incompatible.")
+    if evaluation.get("same_case_methods") != [
+        "raw_identity",
+        "fixed_map_factorized_identity",
+        "stage1_reconstruction_ceiling",
+    ] or evaluation.get("gate01_same_case_reduction") != "forbidden":
+        raise ValueError("Variant-A same-case versus continuity method roles are incompatible.")
+    if evaluation.get("genuinely_paired_manifest_required") is not True:
+        raise ValueError("Variant-A cross-field evaluation requires genuinely paired cases.")
     return config
 
 
 def _variant_a_record_cohort(record: VolumeRecord) -> str:
+    prefix = _variant_a_record_prefix(record)
+    return classify_variant_a_cohort(
+        case_identity=str(record.case_id),
+        metadata_prefix=prefix,
+        supplied_cohort=prefix,
+        subject_identity=record.subject_id,
+        allowed_cohorts=("R", "P"),
+    ).cohort
+
+
+def _variant_a_record_prefix(record: VolumeRecord) -> str:
     prefix = record.metadata.get("prefix") if isinstance(record.metadata, Mapping) else None
-    if prefix is None:
-        case_id = str(record.case_id)
-        prefix = case_id.split("_", 1)[0] if "_" in case_id else ""
-    cohort = str(prefix).upper()
-    if cohort not in {"R", "P"}:
-        raise ValueError(
-            f"Variant-A record {record.case_id!r} has unknown cohort prefix {prefix!r}."
-        )
-    return cohort
+    if prefix is None or not str(prefix).strip():
+        raise ValueError(f"Variant-A record {record.case_id!r} is missing metadata prefix.")
+    return str(prefix).strip().upper()
 
 
 def _nonnegative_log_every(value: int) -> int:
@@ -2842,23 +2895,6 @@ def _nonnegative_log_every(value: int) -> int:
     if result < 0:
         raise ValueError("--log-every must be non-negative.")
     return result
-
-
-def _load_variant_a_npy(path: Path) -> "Any":
-    import numpy as np
-    import torch
-
-    if path.suffix.lower() != ".npy":
-        raise ValueError("Variant-A baseline evaluation accepts external .npy arrays only.")
-    try:
-        array = np.load(path, allow_pickle=False)
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Could not load Variant-A array {path}: {exc}") from exc
-    if not np.issubdtype(array.dtype, np.floating):
-        raise ValueError(f"Variant-A array {path} must use a floating dtype.")
-    if array.ndim < 3 or not np.isfinite(array).all():
-        raise ValueError(f"Variant-A array {path} must be a finite full volume.")
-    return torch.from_numpy(np.asarray(array, dtype=np.float32).copy())
 
 
 def _data_patch_size(config: Mapping[str, Any]) -> tuple[int, ...] | None:

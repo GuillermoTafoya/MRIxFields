@@ -15,6 +15,8 @@ from fieldbridge.data.photometry_factorization import (
     FrozenPhotometryArtifact,
     PhotometryFitVolume,
     all_photometry_domain_labels,
+    canonical_tensor_sha256,
+    classify_variant_a_cohort,
     fit_frozen_photometry,
     interpolate_fixed_grid,
     sha256_json,
@@ -53,6 +55,7 @@ def _fit_items(*, unequal_counts: bool = False) -> list[PhotometryFitVolume]:
                         domain=Domain(field, contrast),
                         record_identity=identity,
                         subject_identity=f"R-{contrast_index}-{field_index}-{offset}",
+                        metadata_prefix="R",
                         source_path_identity=f"external/{identity}.nii.gz",
                         source_file_sha256=sha256_text(f"file-{identity}"),
                     )
@@ -160,6 +163,19 @@ def test_round_trip_uses_fixed_grids_without_runtime_prediction_cdf(monkeypatch)
     assert "prediction" not in inspect.signature(artifact.normalize_source).parameters
 
 
+def test_variant_a5_boundary_repeats_identical_in_memory_tensor_and_support() -> None:
+    artifact = _fit()
+    source = _volume(0.1, 0)
+    first = artifact.normalize_source(source, Domain(0.1, "T1w"))
+    second = artifact.normalize_source(source.clone(), Domain(0.1, "T1w"))
+    assert torch.equal(first.values, second.values)
+    assert torch.equal(first.support_mask, second.support_mask)
+    assert canonical_tensor_sha256(first.values) == canonical_tensor_sha256(second.values)
+    assert canonical_tensor_sha256(first.support_mask) == canonical_tensor_sha256(
+        second.support_mask
+    )
+
+
 def test_fit_rejects_validation_prospective_and_named_travellers() -> None:
     base = _fit_items()
     validation = list(base)
@@ -169,6 +185,7 @@ def test_fit_rejects_validation_prospective_and_named_travellers() -> None:
         domain=item.domain,
         record_identity=item.record_identity,
         subject_identity=item.subject_identity,
+        metadata_prefix=item.metadata_prefix,
         source_path_identity=item.source_path_identity,
         source_file_sha256=item.source_file_sha256,
         split="validation",
@@ -184,6 +201,7 @@ def test_fit_rejects_validation_prospective_and_named_travellers() -> None:
         domain=item.domain,
         record_identity="P_0007_T1w_01",
         subject_identity="0007",
+        metadata_prefix="P",
         source_path_identity=item.source_path_identity,
         source_file_sha256=item.source_file_sha256,
         split="train",
@@ -199,12 +217,13 @@ def test_fit_rejects_validation_prospective_and_named_travellers() -> None:
         domain=item.domain,
         record_identity="P_0010_T1w_01",
         subject_identity="0010",
+        metadata_prefix="P",
         source_path_identity=item.source_path_identity,
         source_file_sha256=item.source_file_sha256,
         split="train",
         cohort="P",
     )
-    with pytest.raises(ValueError, match="cohort R only"):
+    with pytest.raises(ValueError, match="rejects every P record"):
         _fit(items=other_p)
 
 
@@ -217,6 +236,7 @@ def test_fit_explicitly_rejects_every_reserved_traveller(traveller: str) -> None
         domain=item.domain,
         record_identity=f"P_{traveller}_T1w_01",
         subject_identity=traveller,
+        metadata_prefix="P",
         source_path_identity=item.source_path_identity,
         source_file_sha256=item.source_file_sha256,
         split="train",
@@ -224,6 +244,59 @@ def test_fit_explicitly_rejects_every_reserved_traveller(traveller: str) -> None
     )
     with pytest.raises(ValueError, match=f"traveller {traveller}"):
         _fit(items=records)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "metadata_prefix", "cohort", "message"),
+    [
+        ("P_0010_T1w", "R", "R", "identity conflict"),
+        ("R_0010_T1w", "P", "R", "identity conflict"),
+        ("R_0010_T1w", None, "R", "metadata prefix"),
+        ("unknown_0010", "R", "R", "R_ or P_"),
+    ],
+)
+def test_fit_rejects_mislabeled_conflicting_and_missing_cohort_identities(
+    case_id: str, metadata_prefix: str | None, cohort: str, message: str
+) -> None:
+    records = list(_fit_items())
+    item = records[0]
+    records[0] = PhotometryFitVolume(
+        volume=item.volume,
+        domain=item.domain,
+        record_identity=case_id,
+        subject_identity="0010",
+        metadata_prefix=metadata_prefix,
+        source_path_identity=item.source_path_identity,
+        source_file_sha256=item.source_file_sha256,
+        split="train",
+        cohort=cohort,
+    )
+    with pytest.raises(ValueError, match=message):
+        _fit(items=records)
+
+
+def test_artifact_reload_reconciles_identity_namespace_independently() -> None:
+    payload = _fit().to_dict()
+    accepted = payload["provenance"]["accepted_records"]
+    accepted[0]["record_identity"] = "P_0010_T1w"
+    accepted[0]["record_identity_sha256"] = sha256_text("P_0010_T1w")
+    payload["provenance"]["accepted_records_sha256"] = sha256_json(accepted)
+    payload["artifact_sha256"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_sha256"}
+    )
+    with pytest.raises(ValueError, match="identity conflict"):
+        FrozenPhotometryArtifact.from_dict(payload)
+
+
+def test_canonical_cohort_classifier_preserves_retrospective_subject_group() -> None:
+    identity = classify_variant_a_cohort(
+        case_identity="R_0042_T2w",
+        metadata_prefix="R",
+        supplied_cohort="R",
+        subject_identity="0042",
+        allowed_cohorts=("R",),
+    )
+    assert identity.subject_group_identity == "R:0042"
 
 
 def test_artifact_rejects_version_hash_split_content_and_template_mutation() -> None:

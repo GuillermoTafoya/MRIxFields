@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import json
+import re
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -26,9 +29,11 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
     ContinuityReference,
     QualificationVolume,
     VariantAQualificationThresholds,
+    build_continuity_reference_from_gate01,
     evaluate_factorized_identity_case,
     qualify_variant_a,
 )
+from fieldbridge.evaluation.stage2_gate01 import GATE01_CONTRACT_VERSION
 
 
 def _volume(field: float, contrast_index: int, *, offset: float = 0.0) -> torch.Tensor:
@@ -48,6 +53,7 @@ def _artifact():
                     domain=Domain(field, contrast),
                     record_identity=identity,
                     subject_identity=identity,
+                    metadata_prefix="R",
                     source_path_identity=f"external/{identity}.nii.gz",
                     source_file_sha256=sha256_text(identity),
                 )
@@ -83,6 +89,7 @@ def _qualification_volumes() -> list[QualificationVolume]:
                     domain=Domain(field, contrast),
                     record_identity=identity,
                     subject_identity=identity,
+                    metadata_prefix="R",
                     source_path_identity=f"external/{identity}.nii.gz",
                     source_file_sha256=sha256_text(identity),
                 )
@@ -186,7 +193,48 @@ def test_qualification_reports_macro_worst_domain_scaling_and_equal_counts() -> 
     assert result["failure_classification"] == []
     assert result["canonical_latent_bank_authorized"] is True
     assert result["gate01_substitution_forbidden"] is True
-    assert result["interpolation_qualification"]["grid_count"] == 18
+    assert result["interpolation_qualification"]["map_count"] == 30
+    assert result["interpolation_qualification"]["dense_grid_points"] == 4097
+    assert len(result["contrast_preservation_control"]["folds"]) == 15
+    for fold in result["contrast_preservation_control"]["folds"]:
+        assert fold["validation_group_identity"] not in fold["training_group_identities"]
+        assert fold["training_domain_counts"]
+        assert fold["validation_domain_counts"]
+    assert all(
+        item["finite"] and item["nondecreasing_within_tolerance"]
+        for item in result["interpolation_qualification"]["maps"]
+    )
+
+
+def test_qualification_masks_both_vae_paths_and_reports_raw_decoder_leakage() -> None:
+    calls: dict[str, int] = {}
+
+    def leaky_roundtrip(volume: torch.Tensor, domain: Domain) -> torch.Tensor:
+        calls[domain.label] = calls.get(domain.label, 0) + 1
+        result = volume.clone()
+        if calls[domain.label] % 2 == 1:
+            result.reshape(-1)[0] = 0.75
+        return result
+
+    def support_checked_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+        assert prediction.reshape(-1)[0].item() == 0.0
+        assert target.reshape(-1)[0].item() == 0.0
+        return _metrics(prediction, target)
+
+    kwargs = _qualification_kwargs()
+    kwargs["metric_function"] = support_checked_metrics
+    result = qualify_variant_a(
+        _artifact(),
+        _qualification_volumes(),
+        thresholds=_permissive_thresholds(),
+        vae_roundtrip=leaky_roundtrip,
+        **kwargs,
+    )
+    for row in result["records"]:
+        assert row["support"]["dtype"] == "bool"
+        assert row["support"]["voxel_count"] == 63
+        assert len(row["support"]["canonical_byte_sha256"]) == 64
+        assert row["vae"]["raw_pre_mask_decoder_leakage"]["nonzero_voxel_count"] == 1
     assert result["fit_weighting_evidence"]["weighting"]["per_field_weight"] == 0.2
     ceiling = result["stage1_reconstruction_ceiling_continuity"]
     assert ceiling["method_identity"] == STAGE1_CEILING_METHOD
@@ -236,7 +284,7 @@ def test_qualification_classifies_field_specific_canonical_vae_shift() -> None:
 @pytest.mark.parametrize(
     ("cohort", "split", "identity", "subject", "message"),
     [
-        ("P", "validation", "P_0010_T1w", "0010", "cohort R only"),
+        ("P", "validation", "P_0010_T1w", "0010", "rejects every P record"),
         ("P", "validation", "P_0006_T1w", "0006", "traveller 0006"),
         ("P", "validation", "P_0007_T1w", "0007", "traveller 0007"),
         ("P", "validation", "P_0009_T1w", "0009", "traveller 0009"),
@@ -253,10 +301,40 @@ def test_qualification_rejects_nonvalidation_prospective_and_travellers(
         domain=item.domain,
         record_identity=identity,
         subject_identity=subject,
+        metadata_prefix=cohort,
         source_path_identity=item.source_path_identity,
         source_file_sha256=item.source_file_sha256,
         cohort=cohort,
         split=split,
+    )
+    with pytest.raises(ValueError, match=message):
+        qualify_variant_a(
+            _artifact(),
+            records,
+            thresholds=_permissive_thresholds(),
+            vae_roundtrip=lambda volume, domain: volume,
+            **_qualification_kwargs(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("identity", "metadata_prefix", "cohort", "message"),
+    [
+        ("P_0010_T1w", "R", "R", "identity conflict"),
+        ("R_0010_T1w", "P", "R", "identity conflict"),
+        ("R_0010_T1w", None, "R", "metadata prefix"),
+    ],
+)
+def test_qualification_rejects_mislabeled_conflicting_and_missing_prefixes(
+    identity: str, metadata_prefix: str | None, cohort: str, message: str
+) -> None:
+    records = _qualification_volumes()
+    records[0] = replace(
+        records[0],
+        record_identity=identity,
+        subject_identity="0010",
+        metadata_prefix=metadata_prefix,
+        cohort=cohort,
     )
     with pytest.raises(ValueError, match=message):
         qualify_variant_a(
@@ -294,15 +372,10 @@ def test_qualification_rejects_split_hash_and_content_mutation() -> None:
 
 
 def _continuity(source_hash: str) -> ContinuityReference:
-    return ContinuityReference(
-        evaluation_identity="selection-0006-direction",
+    return build_continuity_reference_from_gate01(
+        _gate01_result(),
         source_result_sha256=source_hash,
-        methods={
-            GATE01_POSTHOC_METHOD: {"nrmse": 0.323585, "ssim": 0.899374, "lpips": 0.091186},
-            RAW_IDENTITY_METHOD: {"nrmse": 0.595189, "ssim": 0.875809, "lpips": 0.096859},
-            STAGE1_CEILING_METHOD: {"nrmse": 0.131321, "ssim": 0.965984, "lpips": 0.036060},
-        },
-        provenance={"source_contract": "stage2-gate01-result-v3", "observation": "external"},
+        evaluation_identity="synthetic-paired-direction",
     )
 
 
@@ -319,6 +392,104 @@ def test_continuity_reference_is_source_hash_verified(tmp_path) -> None:
     source.write_text('{"frozen": false}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="source-result SHA-256 mismatch"):
         ContinuityReference.load(reference_path, source_result_path=source)
+
+
+def _gate01_result() -> dict:
+    return {
+        "contract_version": GATE01_CONTRACT_VERSION,
+        "overall": {
+            "methods": {
+                "calibrated_identity": {
+                    "nrmse": 0.323585,
+                    "ssim": 0.899374,
+                    "lpips": 0.091186,
+                },
+                "raw_identity": {
+                    "nrmse": 0.595189,
+                    "ssim": 0.875809,
+                    "lpips": 0.096859,
+                },
+                "stage1_reconstruction_ceiling": {
+                    "nrmse": 0.131321,
+                    "ssim": 0.965984,
+                    "lpips": 0.036060,
+                },
+            }
+        },
+    }
+
+
+def test_continuity_builder_extracts_exact_methods_and_round_trips(tmp_path) -> None:
+    source = tmp_path / "gate01.json"
+    source.write_text(json.dumps(_gate01_result(), sort_keys=True) + "\n", encoding="utf-8")
+    reference = build_continuity_reference_from_gate01(
+        _gate01_result(),
+        source_result_sha256=sha256_file(source),
+        evaluation_identity="paired-selection-v1",
+    )
+    path = write_json_atomic(tmp_path / "continuity.json", reference.to_dict())
+    assert ContinuityReference.load(path, source_result_path=source) == reference
+    assert reference.provenance["source_contract_version"] == GATE01_CONTRACT_VERSION
+
+
+def test_documented_continuity_example_is_byte_exact_and_loadable(tmp_path) -> None:
+    runbook = (
+        Path(__file__).parents[1] / "docs" / "stage2_photometry_variant_a_runbook.md"
+    ).read_text(encoding="utf-8")
+    blocks = re.findall(r"```json\n(.*?)\n```", runbook, flags=re.DOTALL)
+    source_text = next(
+        block
+        for block in blocks
+        if '"contract_version":"stage2-gate01-equal-photometry-v2"' in block
+    )
+    documented_reference = json.loads(
+        next(
+            block
+            for block in blocks
+            if '"contract_version": "stage2-photometry-continuity-reference-v2"'
+            in block
+        )
+    )
+    source = tmp_path / "documented-gate01.json"
+    source.write_text(source_text + "\n", encoding="utf-8", newline="\n")
+    assert sha256_file(source) == documented_reference["source_result_sha256"]
+    built = build_continuity_reference_from_gate01(
+        json.loads(source_text),
+        source_result_sha256=sha256_file(source),
+        evaluation_identity="documented-synthetic-selection",
+    )
+    assert built.to_dict() == documented_reference
+    path = write_json_atomic(tmp_path / "documented-reference.json", documented_reference)
+    assert ContinuityReference.load(path, source_result_path=source) == built
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_continuity_builder_rejects_missing_or_extra_metrics(mutation: str) -> None:
+    payload = _gate01_result()
+    metrics = payload["overall"]["methods"]["raw_identity"]
+    if mutation == "missing":
+        metrics.pop("lpips")
+    else:
+        metrics["psnr"] = 1.0
+    with pytest.raises(ValueError, match="exactly nrmse, ssim, and lpips"):
+        build_continuity_reference_from_gate01(
+            payload,
+            source_result_sha256="f" * 64,
+            evaluation_identity="selection",
+        )
+
+
+def test_continuity_reference_rejects_missing_provenance_and_hash_mutation() -> None:
+    payload = _continuity("f" * 64).to_dict()
+    missing = copy.deepcopy(payload)
+    missing["provenance"] = {}
+    missing["artifact_sha256"] = sha256_text("irrelevant")
+    with pytest.raises(ValueError, match="source provenance"):
+        ContinuityReference.from_dict(missing)
+    mutated = copy.deepcopy(payload)
+    mutated["methods"][RAW_IDENTITY_METHOD]["nrmse"] += 0.01
+    with pytest.raises(ValueError, match="artifact hash mismatch"):
+        ContinuityReference.from_dict(mutated)
 
 
 def test_dual_baseline_result_keeps_all_method_identities_separate() -> None:
@@ -339,9 +510,11 @@ def test_dual_baseline_result_keeps_all_method_identities_separate() -> None:
         continuity=continuity,
         metric_function=_metrics,
     )
-    assert set(result["methods"]) == {FIXED_MAP_METHOD, *CONTINUITY_METHODS}
-    assert result["methods"][GATE01_POSTHOC_METHOD]["metrics"]["nrmse"] == 0.323585
-    assert "prediction-CDF" in result["methods"][GATE01_POSTHOC_METHOD]["semantics"]
+    assert set(result["methods"]) == {FIXED_MAP_METHOD, RAW_IDENTITY_METHOD}
+    assert result["external_continuity_track"]["methods"][GATE01_POSTHOC_METHOD][
+        "nrmse"
+    ] == 0.323585
+    assert result["external_continuity_track"]["included_in_same_case_reductions"] is False
     assert "no runtime prediction CDF" in result["methods"][FIXED_MAP_METHOD]["semantics"]
     assert "must not be averaged" in result["method_identity_invariant"]
 
@@ -371,15 +544,17 @@ def test_evaluation_target_never_changes_fixed_transform() -> None:
             continuity=continuity,
             metric_function=capture,
         )
-    torch.testing.assert_close(captured[0], captured[1], rtol=0.0, atol=0.0)
+    # Each diagnostic evaluates raw then fixed-map; compare only fixed-map predictions.
+    torch.testing.assert_close(captured[1], captured[3], rtol=0.0, atol=0.0)
 
 
-def test_cli_registers_only_the_three_variant_a_commands() -> None:
+def test_cli_registers_only_the_four_variant_a_commands() -> None:
     parser = build_parser()
     help_text = parser.format_help()
     for command in (
         "fit-stage2-photometry",
         "audit-stage2-photometry",
+        "build-stage2-photometry-continuity-reference",
         "eval-stage2-photometry-baseline",
     ):
         assert command in help_text

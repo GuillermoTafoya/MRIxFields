@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,13 +13,16 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Contrast, Domain
 from fieldbridge.data.photometry_factorization import (
     PHOTOMETRY_QUALIFICATION_ELIGIBILITY,
     FrozenPhotometryArtifact,
+    assert_variant_a_external_path,
     canonical_tensor_sha256,
     deterministic_quantiles,
+    interpolate_fixed_grid,
     sha256_file,
     sha256_json,
     sha256_text,
@@ -29,11 +33,16 @@ from fieldbridge.evaluation.mrixfields2026_official import (
     official_task3_nrmse,
     official_task3_ssim,
 )
+from fieldbridge.evaluation.metrics import gradient_mae
+from fieldbridge.evaluation.stage2_gate01 import GATE01_CONTRACT_VERSION
 
 VARIANT_A_QUALIFICATION_CONTRACT_VERSION = "stage2-photometry-variant-a-qualification-v1"
-VARIANT_A_CONTINUITY_REFERENCE_VERSION = "stage2-photometry-continuity-reference-v1"
-VARIANT_A_DUAL_BASELINE_RESULT_VERSION = "stage2-photometry-dual-baseline-result-v1"
+VARIANT_A_CONTINUITY_REFERENCE_VERSION = "stage2-photometry-continuity-reference-v2"
+VARIANT_A_PAIRED_MANIFEST_VERSION = "stage2-photometry-paired-evaluation-manifest-v1"
+VARIANT_A_CASE_SHARD_VERSION = "stage2-photometry-paired-case-shard-v1"
+VARIANT_A_DUAL_BASELINE_RESULT_VERSION = "stage2-photometry-dual-baseline-result-v2"
 VARIANT_A_EVALUATION_SEMANTICS = "separate-fixed-map-and-gate01-posthoc-method-identities-v1"
+OFFICIAL_METRICS = ("nrmse", "ssim", "lpips")
 
 FIXED_MAP_METHOD = "fixed_map_factorized_identity"
 GATE01_POSTHOC_METHOD = "gate01_posthoc_calibrated_identity"
@@ -44,6 +53,11 @@ CONTINUITY_METHODS = (
     RAW_IDENTITY_METHOD,
     STAGE1_CEILING_METHOD,
 )
+CONTINUITY_EXTRACTION_PATHS = {
+    GATE01_POSTHOC_METHOD: "overall.methods.calibrated_identity",
+    RAW_IDENTITY_METHOD: "overall.methods.raw_identity",
+    STAGE1_CEILING_METHOD: "overall.methods.stage1_reconstruction_ceiling",
+}
 
 RoundTrip = Callable[[torch.Tensor, Domain], torch.Tensor]
 MetricFunction = Callable[[torch.Tensor, torch.Tensor], Mapping[str, float]]
@@ -136,6 +150,7 @@ class QualificationVolume:
     domain: Domain
     record_identity: str
     subject_identity: str | None
+    metadata_prefix: str | None
     source_path_identity: str
     source_file_sha256: str
     split: str = "validation"
@@ -150,6 +165,22 @@ class BaselineEvaluationCase:
     target: torch.Tensor
     source_domain: Domain
     target_domain: Domain
+
+
+@dataclass(frozen=True, slots=True)
+class PairedEvaluationCase:
+    """One manifest-verified genuinely paired cross-field case."""
+
+    case_identity: str
+    source: torch.Tensor
+    target: torch.Tensor
+    source_domain: Domain
+    target_domain: Domain
+    subject_group_identity: str
+    source_provenance: Mapping[str, Any]
+    target_provenance: Mapping[str, Any]
+    stage1_reconstruction: torch.Tensor | None = None
+    stage1_provenance: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,8 +203,15 @@ class ContinuityReference:
             )
         for label, metrics in self.methods.items():
             _validate_metric_mapping(metrics, label)
-        if not self.provenance:
-            raise ValueError("Continuity reference requires source provenance.")
+        provenance = dict(self.provenance)
+        if (
+            provenance.get("source_contract_version") != GATE01_CONTRACT_VERSION
+            or provenance.get("source_result_sha256") != self.source_result_sha256
+            or provenance.get("extraction") != CONTINUITY_EXTRACTION_PATHS
+            or provenance.get("semantics")
+            != "external continuity only; not recomputed on Variant-A paired cases"
+        ):
+            raise ValueError("Continuity reference requires complete Gate 0.1 source provenance.")
 
     @property
     def artifact_sha256(self) -> str:
@@ -235,6 +273,49 @@ class ContinuityReference:
         return reference
 
 
+def build_continuity_reference_from_gate01(
+    gate01_result: Mapping[str, Any],
+    *,
+    source_result_sha256: str,
+    evaluation_identity: str,
+) -> ContinuityReference:
+    """Extract three immutable continuity methods from an explicit Gate-0.1 result."""
+
+    _require_sha256(source_result_sha256, "Gate 0.1 source result")
+    if gate01_result.get("contract_version") != GATE01_CONTRACT_VERSION:
+        raise ValueError("Continuity builder requires the reviewed Gate 0.1 result contract.")
+    overall = gate01_result.get("overall")
+    if not isinstance(overall, Mapping) or not isinstance(overall.get("methods"), Mapping):
+        raise ValueError("Gate 0.1 result is missing overall.methods.")
+    source_methods = overall["methods"]
+    source_names = {
+        GATE01_POSTHOC_METHOD: "calibrated_identity",
+        RAW_IDENTITY_METHOD: "raw_identity",
+        STAGE1_CEILING_METHOD: "stage1_reconstruction_ceiling",
+    }
+    methods: dict[str, dict[str, float]] = {}
+    for destination, source in source_names.items():
+        values = source_methods.get(source)
+        if not isinstance(values, Mapping):
+            raise ValueError(f"Gate 0.1 result is missing overall method {source!r}.")
+        normalized = {str(key): float(value) for key, value in values.items()}
+        _validate_metric_mapping(normalized, source)
+        methods[destination] = normalized
+    return ContinuityReference(
+        evaluation_identity=str(evaluation_identity),
+        source_result_sha256=source_result_sha256,
+        methods=methods,
+        provenance={
+            "source_contract_version": GATE01_CONTRACT_VERSION,
+            "source_result_sha256": source_result_sha256,
+            "extraction": dict(CONTINUITY_EXTRACTION_PATHS),
+            "semantics": (
+                "external continuity only; not recomputed on Variant-A paired cases"
+            ),
+        },
+    )
+
+
 def qualify_variant_a(
     artifact: FrozenPhotometryArtifact,
     volumes: Iterable[QualificationVolume],
@@ -271,11 +352,14 @@ def qualify_variant_a(
     raw_features: list[torch.Tensor] = []
     canonical_features: list[torch.Tensor] = []
     contrast_labels: list[str] = []
+    subject_groups: list[str] = []
+    domain_labels: list[str] = []
     identities: set[str] = set()
     for index, item in enumerate(volumes, start=1):
-        validate_qualification_role(
+        identity = validate_qualification_role(
             record_identity=item.record_identity,
             subject_identity=item.subject_identity,
+            metadata_prefix=item.metadata_prefix,
             cohort=item.cohort,
             split=item.split,
         )
@@ -312,14 +396,23 @@ def qualify_variant_a(
         raw_reconstruction = _validate_reconstruction(
             vae_roundtrip(source, item.domain), source, "raw VAE reconstruction"
         )
+        raw_pre_mask_leakage = _background_leakage(
+            raw_reconstruction, canonical.support_mask
+        )
+        raw_reconstruction_masked = _apply_support(
+            raw_reconstruction, canonical.support_mask
+        )
         canonical_decoded = _validate_reconstruction(
             vae_roundtrip(canonical.values, item.domain), source, "canonical VAE reconstruction"
         )
         factorized_reconstruction = artifact.render_target(
             canonical.with_values(canonical_decoded), item.domain
         )
+        factorized_reconstruction = _apply_support(
+            factorized_reconstruction, canonical.support_mask
+        )
         raw_metrics = _finite_metrics(
-            metric_function(raw_reconstruction, source), "raw reconstruction"
+            metric_function(raw_reconstruction_masked, source), "raw reconstruction"
         )
         factorized_metrics = _finite_metrics(
             metric_function(factorized_reconstruction, source), "factorized reconstruction"
@@ -329,11 +422,15 @@ def qualify_variant_a(
         raw_features.append(_contrast_features(source, canonical.support_mask))
         canonical_features.append(_contrast_features(canonical.values, canonical.support_mask))
         contrast_labels.append(item.domain.contrast.value)
+        subject_groups.append(identity.subject_group_identity)
+        domain_labels.append(item.domain.label)
         rows.append(
             {
                 "record_identity": item.record_identity,
                 "record_identity_sha256": sha256_text(item.record_identity),
                 "subject_identity": item.subject_identity,
+                "metadata_prefix": item.metadata_prefix,
+                "subject_group_identity": identity.subject_group_identity,
                 "source_path_identity_sha256": sha256_text(item.source_path_identity),
                 "source_file_sha256": item.source_file_sha256,
                 "canonical_loaded_array_sha256": canonical_tensor_sha256(source),
@@ -341,11 +438,13 @@ def qualify_variant_a(
                 "cohort": item.cohort,
                 "split": item.split,
                 "exact_zero_support": exact_zero,
+                "support": _support_provenance(canonical.support_mask),
                 "direct_roundtrip": direct_metrics,
                 "canonical_histogram_distance": histogram_distance,
                 "spearman": spearman,
                 "scaling_sensitivity": scaling,
                 "vae": {
+                    "raw_pre_mask_decoder_leakage": raw_pre_mask_leakage,
                     "raw_reconstruction": raw_metrics,
                     "factorized_reconstruction": factorized_metrics,
                     "deltas": vae_deltas,
@@ -357,7 +456,11 @@ def qualify_variant_a(
 
     _require_qualification_domains(rows)
     contrast_control = _contrast_preservation_control(
-        raw_features, canonical_features, contrast_labels
+        raw_features,
+        canonical_features,
+        contrast_labels,
+        subject_groups,
+        domain_labels,
     )
     interpolation = _interpolation_qualification(artifact, thresholds)
     aggregate = _aggregate_qualification(
@@ -418,7 +521,7 @@ def evaluate_factorized_identity_case(
     continuity: ContinuityReference,
     metric_function: MetricFunction,
 ) -> dict[str, Any]:
-    """Evaluate one directed fixed-map identity without rerunning Gate 0.1."""
+    """Return a narrow single-case diagnostic; scientific evaluation uses the manifest runner."""
 
     if case.selection_identity != continuity.evaluation_identity:
         raise ValueError("Fixed-map case and continuity evaluation identities do not match.")
@@ -429,27 +532,27 @@ def evaluate_factorized_identity_case(
     source = _validate_volume(case.source, "evaluation source")
     prediction = artifact.factorized_identity(source, case.source_domain, case.target_domain)
     target = _validate_reconstruction(case.target, source, "evaluation target")
+    support = source != 0
+    target = _apply_support(target, support)
+    source = _apply_support(source, support)
+    prediction = _apply_support(prediction, support)
     fixed_metrics = _finite_metrics(metric_function(prediction, target), FIXED_MAP_METHOD)
+    raw_metrics = _finite_metrics(metric_function(source, target), RAW_IDENTITY_METHOD)
     methods: dict[str, Any] = {
+        RAW_IDENTITY_METHOD: {
+            "metrics": raw_metrics,
+            "semantics": "same-case raw source under the exact source support",
+            "prediction_sha256": canonical_tensor_sha256(source),
+        },
         FIXED_MAP_METHOD: {
             "metrics": fixed_metrics,
             "semantics": "fixed P_t(N_s(x_s)); no runtime prediction CDF",
             "prediction_sha256": canonical_tensor_sha256(prediction),
         }
     }
-    for label in CONTINUITY_METHODS:
-        methods[label] = {
-            "metrics": dict(continuity.methods[label]),
-            "semantics": (
-                "unchanged Gate 0.1 posthoc prediction-CDF diagnostic"
-                if label == GATE01_POSTHOC_METHOD
-                else "unmodified frozen continuity reference"
-            ),
-            "continuity_reference_sha256": continuity.artifact_sha256,
-        }
     result: dict[str, Any] = {
-        "contract_version": VARIANT_A_DUAL_BASELINE_RESULT_VERSION,
-        "semantics": VARIANT_A_EVALUATION_SEMANTICS,
+        "contract_version": "stage2-photometry-single-case-diagnostic-v1",
+        "semantics": "development-only; not a protocol-level reduction",
         "case_identity": case.case_identity,
         "selection_identity": case.selection_identity,
         "source_domain": case.source_domain.to_dict(),
@@ -458,6 +561,14 @@ def evaluate_factorized_identity_case(
         "continuity_reference_sha256": continuity.artifact_sha256,
         "continuity_source_result_sha256": continuity.source_result_sha256,
         "methods": methods,
+        "support": _support_provenance(support),
+        "external_continuity_track": {
+            "same_cases_recomputed": False,
+            "included_in_same_case_reductions": False,
+            "methods": {
+                label: dict(continuity.methods[label]) for label in CONTINUITY_METHODS
+            },
+        },
         "method_identity_invariant": (
             "fixed-map and Gate 0.1 posthoc calibrated identities are separate and "
             "must not be averaged, substituted, or described as equivalent"
@@ -480,9 +591,13 @@ class OfficialQualificationMetrics:
         metrics: Sequence[str] = ("nrmse", "ssim", "lpips"),
         device: str = "cuda",
     ) -> None:
-        requested = tuple(dict.fromkeys(str(value) for value in metrics))
-        if set(requested) - {"nrmse", "ssim", "lpips"}:
-            raise ValueError(f"Unsupported qualification metrics: {requested}.")
+        requested = tuple(str(value) for value in metrics)
+        if len(requested) != len(set(requested)):
+            raise ValueError("Official Variant-A metrics may not contain duplicates.")
+        if set(requested) != set(OFFICIAL_METRICS) or len(requested) != len(OFFICIAL_METRICS):
+            raise ValueError(
+                "Scientific Variant-A evaluation requires exactly nrmse, ssim, and lpips."
+            )
         self.metrics = requested
         self.device = device
         self._lpips_network: Any | None = None
@@ -589,6 +704,20 @@ def _aggregate_qualification(
                 )
                 for key in ("nrmse", "ssim", "lpips")
             },
+            "raw_pre_mask_decoder_leakage": {
+                "mean_abs_outside_support": _mean(
+                    item["vae"]["raw_pre_mask_decoder_leakage"][
+                        "mean_abs_outside_support"
+                    ]
+                    for item in items
+                ),
+                "max_abs_outside_support": max(
+                    item["vae"]["raw_pre_mask_decoder_leakage"][
+                        "max_abs_outside_support"
+                    ]
+                    for item in items
+                ),
+            },
         }
     macro = {
         "direct_roundtrip_nrmse": _mean(
@@ -616,6 +745,16 @@ def _aggregate_qualification(
                 for item in per_domain.values()
             )
             for key in ("nrmse", "ssim", "lpips")
+        },
+        "raw_pre_mask_decoder_leakage": {
+            "mean_abs_outside_support": _mean(
+                item["raw_pre_mask_decoder_leakage"]["mean_abs_outside_support"]
+                for item in per_domain.values()
+            ),
+            "max_abs_outside_support": max(
+                item["raw_pre_mask_decoder_leakage"]["max_abs_outside_support"]
+                for item in per_domain.values()
+            ),
         },
     }
     worst = {
@@ -753,40 +892,63 @@ def _interpolation_qualification(
     artifact: FrozenPhotometryArtifact,
     thresholds: VariantAQualificationThresholds,
 ) -> dict[str, Any]:
-    """Measure stored-grid finiteness and tolerance-scaled monotonicity."""
+    """Independently exercise both realized maps after duplicate-knot collapse."""
 
-    grids: list[tuple[str, torch.Tensor]] = []
-    grids.extend(
-        (f"domain:{label}", template.quantiles)
-        for label, template in artifact.domain_templates.items()
-    )
-    grids.extend(
-        (f"canonical:{label}", template.quantiles)
-        for label, template in artifact.canonical_templates.items()
-    )
     rows: list[dict[str, Any]] = []
-    for label, values in sorted(grids):
-        tensor = values.detach().cpu().to(torch.float64)
-        finite = bool(torch.isfinite(tensor).all())
-        value_range = max(float(tensor[-1] - tensor[0]), 1e-12)
-        tolerance = thresholds.monotonic_tolerance_fraction * value_range
-        minimum_increment = float(torch.diff(tensor).min())
-        rows.append(
-            {
-                "grid": label,
-                "finite": finite,
-                "minimum_increment": minimum_increment,
-                "range": value_range,
-                "tolerance": tolerance,
-                "monotonic_within_tolerance": minimum_increment >= -tolerance,
-            }
-        )
+    for label, domain_template in sorted(artifact.domain_templates.items()):
+        field_text, contrast_text = label.split("/", 1)
+        domain = Domain(float(field_text.removesuffix("T")), contrast_text)
+        canonical = artifact.canonical_templates[domain.contrast.value].quantiles
+        for direction, source_grid, target_grid in (
+            ("N_d:domain_to_canonical", domain_template.quantiles, canonical),
+            ("P_d:canonical_to_domain", canonical, domain_template.quantiles),
+        ):
+            low_index = int(torch.argmin((artifact.probabilities - 0.01).abs()))
+            high_index = int(torch.argmin((artifact.probabilities - 0.99).abs()))
+            dense = torch.cat(
+                (
+                    source_grid[:1],
+                    torch.linspace(
+                        float(source_grid[low_index]),
+                        float(source_grid[high_index]),
+                        4097,
+                        dtype=torch.float64,
+                    ),
+                    source_grid[-1:],
+                )
+            )
+            dense = torch.unique_consecutive(dense)
+            realized = interpolate_fixed_grid(dense, source_grid, target_grid)
+            finite = bool(torch.isfinite(realized).all())
+            output_range = max(float(target_grid[-1] - target_grid[0]), 1e-12)
+            tolerance = thresholds.monotonic_tolerance_fraction * output_range
+            minimum_increment = (
+                float(torch.diff(realized).min()) if realized.numel() > 1 else 0.0
+            )
+            rows.append(
+                {
+                    "domain": label,
+                    "direction": direction,
+                    "sample_count": int(dense.numel()),
+                    "input_endpoints": [float(dense[0]), float(dense[-1])],
+                    "robust_input_range": [
+                        float(source_grid[low_index]),
+                        float(source_grid[high_index]),
+                    ],
+                    "finite": finite,
+                    "minimum_increment": minimum_increment,
+                    "output_range": output_range,
+                    "tolerance": tolerance,
+                    "nondecreasing_within_tolerance": minimum_increment >= -tolerance,
+                }
+            )
     return {
         "threshold_fraction": thresholds.monotonic_tolerance_fraction,
-        "grid_count": len(rows),
-        "grids": rows,
+        "dense_grid_points": 4097,
+        "map_count": len(rows),
+        "maps": rows,
         "pass": all(
-            bool(row["finite"]) and bool(row["monotonic_within_tolerance"])
+            bool(row["finite"]) and bool(row["nondecreasing_within_tolerance"])
             for row in rows
         ),
     }
@@ -831,6 +993,10 @@ def _scaling_measurements(
 ) -> list[dict[str, float]]:
     base_quantiles = deterministic_quantiles(unperturbed[support], artifact.probabilities)
     scale = _canonical_robust_range(artifact, domain.contrast)
+    data_range = max(
+        float(unperturbed[support].max() - unperturbed[support].min()),
+        1e-6,
+    )
     rows: list[dict[str, float]] = []
     for factor in thresholds.scaling_factors:
         perturbed_source = (source * factor).clamp(0.0, 1.0)
@@ -842,7 +1008,12 @@ def _scaling_measurements(
             {
                 "factor": float(factor),
                 "histogram_distance": float((quantiles - base_quantiles).abs().mean()) / scale,
-                "ssim": _masked_global_ssim(perturbed.values[support], unperturbed[support]),
+                "ssim": _spatial_ssim_3d(
+                    _apply_support(perturbed.values, support),
+                    _apply_support(unperturbed, support),
+                    support,
+                    data_range=data_range,
+                ),
             }
         )
     return rows
@@ -852,18 +1023,29 @@ def _contrast_preservation_control(
     raw_features: Sequence[torch.Tensor],
     canonical_features: Sequence[torch.Tensor],
     labels: Sequence[str],
+    subject_groups: Sequence[str],
+    domain_labels: Sequence[str],
 ) -> dict[str, Any]:
-    raw = _loo_nearest_centroid(torch.stack(list(raw_features)), labels)
-    canonical = _loo_nearest_centroid(torch.stack(list(canonical_features)), labels)
+    raw = _subject_grouped_nearest_centroid(
+        torch.stack(list(raw_features)), labels, subject_groups, domain_labels
+    )
+    canonical = _subject_grouped_nearest_centroid(
+        torch.stack(list(canonical_features)), labels, subject_groups, domain_labels
+    )
+    if raw["fold_assignments_sha256"] != canonical["fold_assignments_sha256"]:
+        raise AssertionError("Raw and canonical contrast controls used different folds.")
     recalls = {
         contrast.value: raw["recall"][contrast.value] - canonical["recall"][contrast.value]
         for contrast in CONTRASTS
     }
     return {
         "control": (
-            "leave-one-out nearest-centroid on photometry-controlled "
-            "value/gradient quantiles"
+            "leave-one-subject-group-out nearest-centroid on rank-normalized "
+            "spatial low-pass and gradient descriptors"
         ),
+        "feature_specification": _contrast_feature_specification(),
+        "folds": raw["folds"],
+        "fold_assignments_sha256": raw["fold_assignments_sha256"],
         "raw": raw,
         "canonical": canonical,
         "macro_f1_drop": raw["macro_f1"] - canonical["macro_f1"],
@@ -873,47 +1055,151 @@ def _contrast_preservation_control(
 
 
 def _contrast_features(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-    work = values.detach().cpu().to(torch.float64)
-    mask = support.detach().cpu()
+    work, mask = _spatial_tensor_and_mask(values, support)
     selected = work[mask]
-    q = torch.quantile(selected, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], dtype=torch.float64))
-    scale = max(float(q[3] - q[1]), 1e-8)
-    normalized_q = (q - q[2]) / scale
-    gradient_features: list[torch.Tensor] = []
-    for dim in range(max(0, work.ndim - 3), work.ndim):
-        left = mask.narrow(dim, 0, mask.shape[dim] - 1)
-        right = mask.narrow(dim, 1, mask.shape[dim] - 1)
-        valid = left & right
-        gradients = work.diff(dim=dim).abs()[valid] / scale
-        if gradients.numel() == 0:
-            gradient_features.append(torch.zeros(3, dtype=torch.float64))
+    if selected.numel() < 2:
+        raise ValueError("Contrast preservation requires at least two supported voxels.")
+    ranks = _average_ranks(selected)
+    ranked = torch.zeros_like(work)
+    ranked[mask] = (2.0 * ranks / float(selected.numel() - 1)) - 1.0
+    image = ranked[None, None]
+    mask_image = mask.to(torch.float64)[None, None]
+    descriptors: list[torch.Tensor] = []
+    for kernel in (1, 3, 5):
+        if kernel == 1:
+            low_pass = image
         else:
-            gradient_features.append(
-                torch.quantile(gradients, torch.tensor([0.5, 0.75, 0.9], dtype=torch.float64))
+            weights = torch.ones(
+                (1, 1, kernel, kernel, kernel), dtype=image.dtype, device=image.device
             )
-    return torch.cat([normalized_q, *gradient_features])
+            numerator = F.conv3d(
+                image * mask_image,
+                weights,
+                padding=kernel // 2,
+            )
+            denominator = F.conv3d(
+                mask_image,
+                weights,
+                padding=kernel // 2,
+            )
+            low_pass = numerator / denominator.clamp_min(1e-12)
+            low_pass = low_pass * (denominator > 0)
+        descriptors.append(_resample_spatial_descriptor(low_pass))
+    for spatial_dim in range(3):
+        dimension = spatial_dim + 2
+        difference = image.diff(dim=dimension).abs()
+        left = mask_image.narrow(dimension, 0, mask_image.shape[dimension] - 1)
+        right = mask_image.narrow(dimension, 1, mask_image.shape[dimension] - 1)
+        difference = difference * (left * right)
+        padding = [0, 0, 0, 0, 0, 0]
+        padding[2 * (2 - spatial_dim) + 1] = 1
+        descriptors.append(_resample_spatial_descriptor(F.pad(difference, padding)))
+    return torch.cat(descriptors).to(torch.float64)
 
 
-def _loo_nearest_centroid(features: torch.Tensor, labels: Sequence[str]) -> dict[str, Any]:
+def _contrast_feature_specification() -> dict[str, Any]:
+    return {
+        "contract": "variant-a-photometry-controlled-spatial-features-v1",
+        "inside_support_normalization": (
+            "stable average ranks mapped linearly to [-1,1]; exact zero outside support"
+        ),
+        "low_pass_box_kernel_voxels": [1, 3, 5],
+        "low_pass_boundary": (
+            "support-normalized average pooling; zero where support count is zero"
+        ),
+        "gradient": "absolute first forward difference on each of three spatial axes",
+        "spatial_resampling": "trilinear align_corners=false to 4x4x4 per feature map",
+        "folding": "leave-one-canonical-subject-group-out; no group crosses folds",
+    }
+
+
+def _spatial_tensor_and_mask(
+    values: torch.Tensor, support: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    work = values.detach().cpu().to(torch.float64)
+    mask = support.detach().cpu().to(torch.bool)
+    while work.ndim > 3 and work.shape[0] == 1:
+        work = work.squeeze(0)
+        mask = mask.squeeze(0)
+    if work.ndim != 3 or tuple(mask.shape) != tuple(work.shape):
+        raise ValueError("Variant-A spatial controls require one single-channel 3-D volume.")
+    if any(int(size) < 2 for size in work.shape):
+        raise ValueError("Variant-A spatial controls require spatial axes of size >= 2.")
+    return work, mask
+
+
+def _resample_spatial_descriptor(values: torch.Tensor) -> torch.Tensor:
+    return F.interpolate(
+        values,
+        size=(4, 4, 4),
+        mode="trilinear",
+        align_corners=False,
+    ).reshape(-1)
+
+
+def _subject_grouped_nearest_centroid(
+    features: torch.Tensor,
+    labels: Sequence[str],
+    subject_groups: Sequence[str],
+    domain_labels: Sequence[str],
+) -> dict[str, Any]:
     expected = {contrast.value for contrast in CONTRASTS}
     if set(labels) != expected:
         raise ValueError("Contrast preservation requires all three contrasts.")
-    predictions: list[str] = []
-    for index, feature in enumerate(features):
-        distances: list[tuple[float, str]] = []
+    if not (
+        len(features) == len(labels) == len(subject_groups) == len(domain_labels)
+    ):
+        raise ValueError("Contrast feature and identity lengths do not match.")
+    groups = sorted(set(str(value) for value in subject_groups))
+    if len(groups) < 2:
+        raise ValueError("Subject-grouped contrast validation requires at least two groups.")
+    predictions = [""] * len(labels)
+    folds: list[dict[str, Any]] = []
+    for group in groups:
+        validation_indices = [
+            index for index, value in enumerate(subject_groups) if str(value) == group
+        ]
+        training_indices = [
+            index for index, value in enumerate(subject_groups) if str(value) != group
+        ]
+        train_groups = {str(subject_groups[index]) for index in training_indices}
+        if not validation_indices or not training_indices or group in train_groups:
+            raise ValueError("Subject-grouped contrast fold is invalid.")
+        folds.append(
+            {
+                "validation_group_identity": group,
+                "training_group_identities": sorted(train_groups),
+                "training_domain_counts": dict(
+                    sorted(Counter(str(domain_labels[index]) for index in training_indices).items())
+                ),
+                "validation_domain_counts": dict(
+                    sorted(
+                        Counter(str(domain_labels[index]) for index in validation_indices).items()
+                    )
+                ),
+            }
+        )
+        centroids: dict[str, torch.Tensor] = {}
         for label in sorted(expected):
             members = [
-                features[j]
-                for j, value in enumerate(labels)
-                if value == label and j != index
+                features[index]
+                for index in training_indices
+                if labels[index] == label
             ]
             if not members:
                 raise ValueError(
-                    "Contrast preservation requires at least two records per contrast."
+                    f"Subject-grouped fold {group!r} has no training member for {label}."
                 )
-            centroid = torch.stack(members).mean(dim=0)
-            distances.append((float(torch.linalg.vector_norm(feature - centroid)), label))
-        predictions.append(min(distances)[1])
+            centroids[label] = torch.stack(members).mean(dim=0)
+        for index in validation_indices:
+            distances = [
+                (
+                    float(torch.linalg.vector_norm(features[index] - centroid)),
+                    label,
+                )
+                for label, centroid in centroids.items()
+            ]
+            predictions[index] = min(distances)[1]
     recalls: dict[str, float] = {}
     f1_values: list[float] = []
     for label in sorted(expected):
@@ -934,7 +1220,13 @@ def _loo_nearest_centroid(features: torch.Tensor, labels: Sequence[str]) -> dict
         f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
         recalls[label] = recall
         f1_values.append(f1)
-    return {"macro_f1": _mean(f1_values), "recall": recalls}
+    fold_payload = {"groups": groups, "folds": folds}
+    return {
+        "macro_f1": _mean(f1_values),
+        "recall": recalls,
+        "folds": folds,
+        "fold_assignments_sha256": sha256_json(fold_payload),
+    }
 
 
 def _spearman(first: torch.Tensor, second: torch.Tensor) -> float:
@@ -965,20 +1257,35 @@ def _average_ranks(values: torch.Tensor) -> torch.Tensor:
     return ranks
 
 
-def _masked_global_ssim(first: torch.Tensor, second: torch.Tensor) -> float:
-    x = first.detach().cpu().to(torch.float64)
-    y = second.detach().cpu().to(torch.float64)
-    dynamic = max(float(y.max() - y.min()), 1e-6)
-    c1 = (0.01 * dynamic) ** 2
-    c2 = (0.03 * dynamic) ** 2
-    mean_x, mean_y = x.mean(), y.mean()
-    var_x = ((x - mean_x) ** 2).mean()
-    var_y = ((y - mean_y) ** 2).mean()
-    covariance = ((x - mean_x) * (y - mean_y)).mean()
-    value = ((2 * mean_x * mean_y + c1) * (2 * covariance + c2)) / (
-        (mean_x.square() + mean_y.square() + c1) * (var_x + var_y + c2)
-    )
-    return float(value.clamp(-1.0, 1.0))
+def _spatial_ssim_3d(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    data_range: float,
+) -> float:
+    """Uniform-window volumetric SSIM on one sealed support and data range."""
+
+    x, mask = _spatial_tensor_and_mask(first, support)
+    y, second_mask = _spatial_tensor_and_mask(second, support)
+    if not torch.equal(mask, second_mask):
+        raise AssertionError("Scaling SSIM received different source supports.")
+    x5, y5 = x[None, None], y[None, None]
+    kernel = 3
+    mu_x = F.avg_pool3d(x5, kernel, stride=1, padding=1, count_include_pad=False)
+    mu_y = F.avg_pool3d(y5, kernel, stride=1, padding=1, count_include_pad=False)
+    var_x = F.avg_pool3d(x5.square(), kernel, 1, 1, count_include_pad=False) - mu_x.square()
+    var_y = F.avg_pool3d(y5.square(), kernel, 1, 1, count_include_pad=False) - mu_y.square()
+    covariance = F.avg_pool3d(x5 * y5, kernel, 1, 1, count_include_pad=False) - mu_x * mu_y
+    c1 = (0.01 * float(data_range)) ** 2
+    c2 = (0.03 * float(data_range)) ** 2
+    numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * covariance + c2)
+    denominator = (mu_x.square() + mu_y.square() + c1) * (var_x + var_y + c2)
+    values = (numerator / denominator.clamp_min(1e-12))[0, 0]
+    selected = values[mask]
+    if not bool(torch.isfinite(selected).all()):
+        raise ValueError("Scaling 3-D SSIM produced nonfinite values.")
+    return float(selected.mean().clamp(-1.0, 1.0))
 
 
 def _vae_deltas(raw: Mapping[str, float], factorized: Mapping[str, float]) -> dict[str, float]:
@@ -1057,6 +1364,51 @@ def _validate_reconstruction(
     return value
 
 
+def _apply_support(values: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    if support.dtype != torch.bool or tuple(support.shape) != tuple(values.shape):
+        raise ValueError("Variant-A support must be boolean and shape-matched.")
+    masked = torch.zeros_like(values)
+    masked[support] = values[support]
+    return masked
+
+
+def _support_provenance(support: torch.Tensor) -> dict[str, Any]:
+    mask = support.detach().cpu().to(torch.bool).contiguous()
+    canonical = np.ascontiguousarray(mask.numpy(), dtype=np.uint8)
+    header = json.dumps(
+        {"dtype": "bool-uint8", "shape": list(canonical.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(canonical.tobytes(order="C"))
+    return {
+        "shape": list(mask.shape),
+        "dtype": "bool",
+        "voxel_count": int(mask.sum()),
+        "canonical_byte_sha256": digest.hexdigest(),
+        "policy": "source != 0 exactly; derived once from the raw source",
+    }
+
+
+def _background_leakage(values: torch.Tensor, support: torch.Tensor) -> dict[str, float | int]:
+    outside = values.detach()[~support]
+    if outside.numel() == 0:
+        return {
+            "mean_abs_outside_support": 0.0,
+            "max_abs_outside_support": 0.0,
+            "nonzero_voxel_count": 0,
+        }
+    absolute = outside.abs()
+    return {
+        "mean_abs_outside_support": float(absolute.mean().cpu()),
+        "max_abs_outside_support": float(absolute.max().cpu()),
+        "nonzero_voxel_count": int(torch.count_nonzero(outside).cpu()),
+    }
+
+
 def _finite_metrics(values: Mapping[str, float], name: str) -> dict[str, float]:
     result = {str(key): float(value) for key, value in values.items()}
     _validate_metric_mapping(result, name)
@@ -1064,8 +1416,10 @@ def _finite_metrics(values: Mapping[str, float], name: str) -> dict[str, float]:
 
 
 def _validate_metric_mapping(values: Mapping[str, float], name: str) -> None:
-    if not values:
-        raise ValueError(f"Metric mapping {name!r} is empty.")
+    if set(values) != set(OFFICIAL_METRICS) or len(values) != len(OFFICIAL_METRICS):
+        raise ValueError(
+            f"Metric mapping {name!r} must contain exactly nrmse, ssim, and lpips."
+        )
     if any(not math.isfinite(float(value)) for value in values.values()):
         raise ValueError(f"Metric mapping {name!r} contains non-finite values.")
 

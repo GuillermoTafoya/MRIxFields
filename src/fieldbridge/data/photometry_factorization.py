@@ -36,6 +36,7 @@ PHOTOMETRY_DEFAULT_QUANTILES = 256
 PHOTOMETRY_SOURCE_MODULES = (
     "src/fieldbridge/data/photometry_factorization.py",
     "src/fieldbridge/evaluation/stage2_photometry_baseline.py",
+    "src/fieldbridge/evaluation/stage2_photometry_protocol.py",
     "src/fieldbridge/cli.py",
     "src/fieldbridge/data/vae_splits.py",
 )
@@ -76,10 +77,77 @@ class PhotometryFitVolume:
     domain: Domain
     record_identity: str
     subject_identity: str | None
+    metadata_prefix: str | None
     source_path_identity: str
     source_file_sha256: str
     split: str = "train"
     cohort: str = "R"
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCohortIdentity:
+    """Reconciled case namespace used by every Variant-A data boundary."""
+
+    cohort: str
+    case_identity: str
+    subject_identity: str
+    subject_group_identity: str
+
+
+def classify_variant_a_cohort(
+    *,
+    case_identity: str,
+    metadata_prefix: str | None,
+    supplied_cohort: str | None,
+    subject_identity: str | None,
+    allowed_cohorts: Sequence[str] = ("R", "P"),
+) -> CanonicalCohortIdentity:
+    """Derive and reconcile the canonical ``R_``/``P_`` identity namespace.
+
+    The case identifier is authoritative only for deriving the namespace; metadata and
+    the caller-supplied cohort must independently agree.  No boundary may repair,
+    default, or silently reinterpret a missing/conflicting identity.
+    """
+
+    identity = str(case_identity).strip()
+    if not identity:
+        raise ValueError("Variant-A identity requires a nonempty case_id.")
+    if identity.startswith("R_"):
+        case_cohort = "R"
+    elif identity.startswith("P_"):
+        case_cohort = "P"
+    else:
+        raise ValueError("Variant-A case_id must begin with the canonical R_ or P_ prefix.")
+
+    if metadata_prefix is None or not str(metadata_prefix).strip():
+        raise ValueError("Variant-A identity requires metadata prefix R or P.")
+    metadata_cohort = str(metadata_prefix).strip().upper()
+    supplied = "" if supplied_cohort is None else str(supplied_cohort).strip().upper()
+    for name, value in (("metadata prefix", metadata_cohort), ("supplied cohort", supplied)):
+        if value not in {"R", "P"}:
+            raise ValueError(f"Variant-A {name} must be exactly R or P.")
+    if len({case_cohort, metadata_cohort, supplied}) != 1:
+        raise ValueError(
+            "Variant-A cohort identity conflict: "
+            f"case_id={case_cohort}, metadata={metadata_cohort}, supplied={supplied}."
+        )
+
+    subject = "" if subject_identity is None else str(subject_identity).strip()
+    if not subject:
+        raise ValueError("Variant-A identity requires a nonempty subject identity.")
+    allowed = {str(value).strip().upper() for value in allowed_cohorts}
+    if not allowed or not allowed <= {"R", "P"}:
+        raise ValueError("Variant-A allowed cohorts must be a nonempty subset of R/P.")
+    if case_cohort not in allowed:
+        if case_cohort == "P":
+            raise ValueError("Variant-A retrospective operation rejects every P record.")
+        raise ValueError(f"Variant-A operation rejects cohort {case_cohort}.")
+    return CanonicalCohortIdentity(
+        cohort=case_cohort,
+        case_identity=identity,
+        subject_identity=subject,
+        subject_group_identity=f"{case_cohort}:{subject}",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +549,8 @@ def fit_frozen_photometry(
                 "record_identity": item.record_identity,
                 "record_identity_sha256": sha256_text(item.record_identity),
                 "subject_identity": item.subject_identity,
+                "metadata_prefix": item.metadata_prefix,
+                "subject_group_identity": f"R:{item.subject_identity}",
                 "source_path_identity_sha256": sha256_text(item.source_path_identity),
                 "source_file_sha256": item.source_file_sha256,
                 "canonical_loaded_array_sha256": canonical_tensor_sha256(item.volume),
@@ -830,8 +900,15 @@ def _validated_runtime_volume(volume: torch.Tensor, name: str) -> torch.Tensor:
 def _validate_fit_role(item: PhotometryFitVolume) -> None:
     if _is_forbidden_traveller(item.record_identity, item.subject_identity):
         raise ValueError(f"Variant A explicitly rejects traveller {item.subject_identity}.")
-    if item.cohort != "R":
-        raise ValueError("Variant-A fitting accepts retrospective cohort R only.")
+    identity = classify_variant_a_cohort(
+        case_identity=item.record_identity,
+        metadata_prefix=item.metadata_prefix,
+        supplied_cohort=item.cohort,
+        subject_identity=item.subject_identity,
+        allowed_cohorts=("R",),
+    )
+    if _is_forbidden_traveller(identity.case_identity, identity.subject_identity):
+        raise ValueError(f"Variant A explicitly rejects traveller {identity.subject_identity}.")
     if item.split != "train":
         raise ValueError("Variant-A fitting accepts split=train only.")
     if not item.record_identity or not item.source_path_identity:
@@ -839,16 +916,29 @@ def _validate_fit_role(item: PhotometryFitVolume) -> None:
 
 
 def validate_qualification_role(
-    *, record_identity: str, subject_identity: str | None, cohort: str, split: str
-) -> None:
+    *,
+    record_identity: str,
+    subject_identity: str | None,
+    metadata_prefix: str | None,
+    cohort: str,
+    split: str,
+) -> CanonicalCohortIdentity:
     """Fail closed on anything other than retrospective validation records."""
 
     if _is_forbidden_traveller(record_identity, subject_identity):
         raise ValueError(f"Variant A explicitly rejects traveller {subject_identity}.")
-    if cohort != "R":
-        raise ValueError("Variant-A qualification accepts retrospective cohort R only.")
+    identity = classify_variant_a_cohort(
+        case_identity=record_identity,
+        metadata_prefix=metadata_prefix,
+        supplied_cohort=cohort,
+        subject_identity=subject_identity,
+        allowed_cohorts=("R",),
+    )
+    if _is_forbidden_traveller(identity.case_identity, identity.subject_identity):
+        raise ValueError(f"Variant A explicitly rejects traveller {identity.subject_identity}.")
     if split != "validation":
         raise ValueError("Variant-A qualification accepts split=validation only.")
+    return identity
 
 
 def _is_forbidden_traveller(record_identity: str, subject_identity: str | None) -> bool:
@@ -871,10 +961,19 @@ def _validate_accepted_records(provenance: Mapping[str, Any], labels: set[str]) 
         raise ValueError("Photometry artifact contains a malformed accepted record.")
     identities: set[str] = set()
     for item in normalized:
-        if item.get("cohort") != "R" or item.get("split") != "train":
-            raise ValueError("Photometry artifact accepted a non-R/train record.")
         identity = str(item.get("record_identity", ""))
-        if _is_forbidden_traveller(identity, item.get("subject_identity")):
+        reconciled = classify_variant_a_cohort(
+            case_identity=identity,
+            metadata_prefix=item.get("metadata_prefix"),
+            supplied_cohort=item.get("cohort"),
+            subject_identity=item.get("subject_identity"),
+            allowed_cohorts=("R",),
+        )
+        if item.get("split") != "train":
+            raise ValueError("Photometry artifact accepted a non-R/train record.")
+        if item.get("subject_group_identity") != reconciled.subject_group_identity:
+            raise ValueError("Photometry artifact subject-group identity mismatch.")
+        if _is_forbidden_traveller(identity, reconciled.subject_identity):
             raise ValueError("Photometry artifact accepted a reserved traveller identity.")
         if not identity or identity in identities:
             raise ValueError("Photometry artifact has a missing or duplicate record identity.")
@@ -942,6 +1041,7 @@ def _json_safe_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "CanonicalCohortIdentity",
     "FORBIDDEN_TRAVELLER_IDS",
     "PHOTOMETRY_CLAMPING_RULE",
     "PHOTOMETRY_DEFAULT_QUANTILES",
@@ -963,6 +1063,7 @@ __all__ = [
     "assert_variant_a_external_path",
     "canonical_tensor_sha256",
     "capture_photometry_code_provenance",
+    "classify_variant_a_cohort",
     "deterministic_quantiles",
     "fit_frozen_photometry",
     "interpolate_fixed_grid",

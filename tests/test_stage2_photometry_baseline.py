@@ -19,10 +19,14 @@ from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.data.photometry_factorization import (
     PHOTOMETRY_SOURCE_MODULES,
+    FrozenPhotometryArtifact,
     PhotometryFitVolume,
     fit_frozen_photometry,
+    interpolate_fixed_grid,
     sha256_file,
+    sha256_json,
     sha256_text,
+    tensor_sha256,
     write_json_atomic,
 )
 from fieldbridge.evaluation.stage2_photometry_baseline import (
@@ -35,7 +39,6 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
     ContinuityReference,
     QualificationVolume,
     VariantAQualificationThresholds,
-    _sealed_robust_interval,
     build_continuity_reference_from_gate01,
     evaluate_factorized_identity_case,
     qualify_variant_a,
@@ -49,7 +52,7 @@ def _volume(field: float, contrast_index: int, *, offset: float = 0.0) -> torch.
     return torch.cat([torch.zeros(1), values * scale + offset]).reshape(4, 4, 4)
 
 
-def _artifact(*, excluded=()):
+def _artifact(*, excluded=(), num_quantiles: int = 17):
     items = []
     for contrast_index, contrast in enumerate(CONTRASTS):
         for field in FIELD_STRENGTHS_T:
@@ -81,9 +84,56 @@ def _artifact(*, excluded=()):
         code_commit="synthetic-commit",
         code_provenance=provenance,
         resolved_config={"contract": "stage2-photometry-variant-a-config-v1"},
-        num_quantiles=17,
+        num_quantiles=num_quantiles,
         excluded_prospective_records=excluded,
     )
+
+
+def _artifact_from_mutated_payload(payload: dict) -> FrozenPhotometryArtifact:
+    payload.pop("artifact_sha256", None)
+    payload["artifact_sha256"] = sha256_json(payload)
+    return FrozenPhotometryArtifact.from_dict(payload)
+
+
+def _set_template_quantiles(template: dict, quantiles: list[float]) -> None:
+    template["quantiles"] = quantiles
+    template["template_sha256"] = tensor_sha256(
+        torch.tensor(quantiles, dtype=torch.float64)
+    )
+
+
+def _artifact_with_endpoint_policy(*, extreme: bool) -> FrozenPhotometryArtifact:
+    payload = _artifact(num_quantiles=101).to_dict()
+    for template in payload["domain_templates"].values():
+        quantiles = list(template["quantiles"])
+        quantiles[0] = 0.0 if extreme else quantiles[1]
+        quantiles[-1] = 1.0 if extreme else quantiles[-2]
+        _set_template_quantiles(template, quantiles)
+    for template in payload["canonical_templates"].values():
+        quantiles = list(template["quantiles"])
+        quantiles[0] = 0.0 if extreme else quantiles[1]
+        quantiles[-1] = 1.0 if extreme else quantiles[-2]
+        _set_template_quantiles(template, quantiles)
+    return _artifact_from_mutated_payload(payload)
+
+
+def _artifact_with_degenerate_domain(domain: Domain) -> FrozenPhotometryArtifact:
+    payload = _artifact(num_quantiles=101).to_dict()
+    domain_template = payload["domain_templates"][domain.label]
+    _set_template_quantiles(
+        domain_template,
+        [0.25] * len(domain_template["quantiles"]),
+    )
+    canonical = payload["canonical_templates"][domain.contrast.value]
+    field_quantiles = [
+        payload["domain_templates"][label]["quantiles"]
+        for label in canonical["domain_labels"]
+    ]
+    recomputed = [
+        sum(values) / len(values) for values in zip(*field_quantiles)
+    ]
+    _set_template_quantiles(canonical, recomputed)
+    return _artifact_from_mutated_payload(payload)
 
 
 def _qualification_volumes() -> list[QualificationVolume]:
@@ -238,9 +288,15 @@ def test_qualification_reports_macro_worst_domain_scaling_and_equal_counts() -> 
             if item["direction"].startswith("N_d:")
             else artifact.domain_templates[domain.label].quantiles
         )
-        expected_q01, expected_q99, expected_range = _sealed_robust_interval(
-            artifact.probabilities, target_grid, name="both-direction regression"
+        expected_q01, expected_q99 = (
+            float(value)
+            for value in interpolate_fixed_grid(
+                torch.tensor([0.01, 0.99], dtype=torch.float64),
+                artifact.probabilities,
+                target_grid,
+            )
         )
+        expected_range = expected_q99 - expected_q01
         assert item["target_q01"] == pytest.approx(expected_q01)
         assert item["target_q99"] == pytest.approx(expected_q99)
         assert item["robust_target_range"] == pytest.approx(expected_range)
@@ -306,38 +362,160 @@ def test_qualification_seals_validation_p_exclusions() -> None:
     assert result["excluded_prospective_records"] == list(excluded)
 
 
-def test_robust_target_interval_ignores_endpoint_outliers_and_tracks_mutation() -> None:
-    probabilities = torch.tensor(
-        [0.0, 0.005, 0.015, 0.985, 0.995, 1.0], dtype=torch.float64
+def test_qualification_endpoint_outliers_use_only_sealed_q01_q99_tolerance() -> None:
+    outlier_artifact = _artifact_with_endpoint_policy(extreme=True)
+    trimmed_artifact = _artifact_with_endpoint_policy(extreme=False)
+    outlier_result = qualify_variant_a(
+        outlier_artifact,
+        _qualification_volumes(),
+        thresholds=_permissive_thresholds(),
+        vae_roundtrip=lambda volume, domain: volume,
+        **_qualification_kwargs(),
     )
-    sealed = torch.tensor([0.0, 0.2, 0.3, 0.7, 0.8, 1.0], dtype=torch.float64)
-    trimmed = torch.tensor([0.2, 0.2, 0.3, 0.7, 0.8, 0.8], dtype=torch.float64)
-    _, _, sealed_range = _sealed_robust_interval(
-        probabilities, sealed, name="endpoint-outlier regression"
+    trimmed_result = qualify_variant_a(
+        trimmed_artifact,
+        _qualification_volumes(),
+        thresholds=_permissive_thresholds(),
+        vae_roundtrip=lambda volume, domain: volume,
+        **_qualification_kwargs(),
     )
-    _, _, trimmed_range = _sealed_robust_interval(
-        probabilities, trimmed, name="trimmed regression"
-    )
-    assert float(sealed[-1] - sealed[0]) > float(trimmed[-1] - trimmed[0])
-    assert sealed_range == pytest.approx(trimmed_range)
-    assert sealed_range == pytest.approx(0.5)
-    assert 1e-7 * sealed_range == pytest.approx(5e-8)
+    outlier_rows = {
+        (row["domain"], row["direction"]): row
+        for row in outlier_result["interpolation_qualification"]["maps"]
+    }
+    trimmed_rows = {
+        (row["domain"], row["direction"]): row
+        for row in trimmed_result["interpolation_qualification"]["maps"]
+    }
+    assert set(outlier_rows) == set(trimmed_rows)
+    assert {direction.split(":", 1)[0] for _, direction in outlier_rows} == {
+        "N_d",
+        "P_d",
+    }
 
-    mutated = sealed.clone()
-    mutated[4] = 0.9
-    _, _, mutated_range = _sealed_robust_interval(
-        probabilities, mutated, name="interior mutation regression"
-    )
-    assert mutated_range == pytest.approx(0.55)
-
-
-def test_robust_target_interval_rejects_degenerate_range() -> None:
-    with pytest.raises(ValueError, match="must be positive"):
-        _sealed_robust_interval(
-            torch.tensor([0.0, 0.01, 0.99, 1.0], dtype=torch.float64),
-            torch.full((4,), 0.5, dtype=torch.float64),
-            name="degenerate target",
+    query = torch.tensor([0.01, 0.99], dtype=torch.float64)
+    for key, outlier_row in outlier_rows.items():
+        domain_label, direction = key
+        _, contrast = domain_label.split("/", 1)
+        outlier_target = (
+            outlier_artifact.canonical_templates[contrast].quantiles
+            if direction.startswith("N_d:")
+            else outlier_artifact.domain_templates[domain_label].quantiles
         )
+        trimmed_target = (
+            trimmed_artifact.canonical_templates[contrast].quantiles
+            if direction.startswith("N_d:")
+            else trimmed_artifact.domain_templates[domain_label].quantiles
+        )
+        expected = interpolate_fixed_grid(
+            query, outlier_artifact.probabilities, outlier_target
+        )
+        expected_q01, expected_q99 = float(expected[0]), float(expected[1])
+        expected_range = expected_q99 - expected_q01
+        trimmed_row = trimmed_rows[key]
+
+        assert outlier_row["target_q01"] == expected_q01
+        assert outlier_row["target_q99"] == expected_q99
+        assert outlier_row["robust_target_range"] == expected_range
+        assert outlier_row["absolute_tolerance"] == 1e-7 * expected_range
+        assert trimmed_row["target_q01"] == expected_q01
+        assert trimmed_row["target_q99"] == expected_q99
+        assert trimmed_row["robust_target_range"] == expected_range
+        assert trimmed_row["absolute_tolerance"] == outlier_row["absolute_tolerance"]
+
+        outlier_full_range = float(outlier_target[-1] - outlier_target[0])
+        trimmed_full_range = float(trimmed_target[-1] - trimmed_target[0])
+        assert outlier_full_range > trimmed_full_range
+        assert outlier_row["absolute_tolerance"] != 1e-7 * outlier_full_range
+
+
+@pytest.mark.parametrize("direction", ["N_d", "P_d"])
+def test_qualification_classifies_interior_realized_map_decrease(
+    monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    artifact = _artifact_with_endpoint_policy(extreme=True)
+    domain = Domain(0.1, "T1w")
+    domain_grid = artifact.domain_templates[domain.label].quantiles
+    canonical_grid = artifact.canonical_templates[domain.contrast.value].quantiles
+    audited_source = domain_grid if direction == "N_d" else canonical_grid
+    audited_target = canonical_grid if direction == "N_d" else domain_grid
+    mutation_evidence: dict[str, bool] = {"injected": False, "endpoints_unchanged": False}
+
+    def interpolate_with_interior_decrease(
+        values: torch.Tensor,
+        source_grid: torch.Tensor,
+        target_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        # Mutation-test the audit's observed realized map.  The public qualification
+        # entry point, production interpolation qualification, aggregation, and
+        # failure classification remain unpatched.
+        realized = interpolate_fixed_grid(values, source_grid, target_grid)
+        is_selected_dense_audit = (
+            values.numel() > 4097
+            and source_grid.data_ptr() == audited_source.data_ptr()
+            and target_grid.data_ptr() == audited_target.data_ptr()
+        )
+        if not is_selected_dense_audit:
+            return realized
+        mutated = realized.clone()
+        midpoint = mutated.numel() // 2
+        mutated[midpoint] = mutated[midpoint - 1] - 1e-3
+        mutation_evidence["injected"] = True
+        mutation_evidence["endpoints_unchanged"] = bool(
+            mutated[0] == realized[0] and mutated[-1] == realized[-1]
+        )
+        return mutated
+
+    monkeypatch.setattr(
+        "fieldbridge.evaluation.stage2_photometry_baseline.interpolate_fixed_grid",
+        interpolate_with_interior_decrease,
+    )
+    result = qualify_variant_a(
+        artifact,
+        _qualification_volumes(),
+        thresholds=_permissive_thresholds(),
+        vae_roundtrip=lambda volume, domain: volume,
+        **_qualification_kwargs(),
+    )
+    row = next(
+        row
+        for row in result["interpolation_qualification"]["maps"]
+        if row["domain"] == domain.label and row["direction"].startswith(f"{direction}:")
+    )
+    assert mutation_evidence == {"injected": True, "endpoints_unchanged": True}
+    assert row["minimum_increment"] < -row["absolute_tolerance"]
+    assert row["nondecreasing_within_tolerance"] is False
+    assert result["interpolation_qualification"]["pass"] is False
+    assert result["aggregate"]["photometry_checks"][
+        "interpolation_finite_monotonic"
+    ] is False
+    assert "photometry_factorization_failure" in result["failure_classification"]
+    assert result["canonical_latent_bank_authorized"] is False
+
+
+def test_qualification_rejects_degenerate_p_target_robust_range() -> None:
+    domain = Domain(0.1, "T1w")
+    artifact = _artifact_with_degenerate_domain(domain)
+    vae_calls = 0
+
+    def vae_roundtrip(volume: torch.Tensor, ignored_domain: Domain) -> torch.Tensor:
+        nonlocal vae_calls
+        del ignored_domain
+        vae_calls += 1
+        return volume
+
+    with pytest.raises(
+        ValueError,
+        match=r"0\.1T/T1w P_d:canonical_to_domain target robust interval must be positive",
+    ):
+        qualify_variant_a(
+            artifact,
+            _qualification_volumes(),
+            thresholds=_permissive_thresholds(),
+            vae_roundtrip=vae_roundtrip,
+            **_qualification_kwargs(),
+        )
+    assert vae_calls == 2 * len(_qualification_volumes())
 
 
 def test_qualification_masks_both_vae_paths_and_reports_raw_decoder_leakage() -> None:

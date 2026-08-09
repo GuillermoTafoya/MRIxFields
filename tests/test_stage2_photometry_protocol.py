@@ -138,8 +138,8 @@ def _endpoint(
     return {
         "case_id": case_id,
         "subject_id": subject_id,
-        "metadata_prefix": "P",
-        "cohort": "P",
+        "metadata_prefix": "R",
+        "cohort": "R",
         "domain": Domain(field, contrast).to_dict(),
         **_array_spec(path, tensor),
     }
@@ -165,7 +165,7 @@ def _manifest(tmp_path: Path, artifact) -> tuple[Path, dict]:
                 "source": _endpoint(
                     tmp_path / f"source-{index}.npy",
                     source,
-                    case_id=f"P_{subject}_{contrast}_{source_field:g}",
+                    case_id=f"R_{subject}_{contrast}_{source_field:g}",
                     subject_id=subject,
                     field=source_field,
                     contrast=contrast,
@@ -173,7 +173,7 @@ def _manifest(tmp_path: Path, artifact) -> tuple[Path, dict]:
                 "target": _endpoint(
                     tmp_path / f"target-{index}.npy",
                     target,
-                    case_id=f"P_{subject}_{contrast}_{target_field:g}",
+                    case_id=f"R_{subject}_{contrast}_{target_field:g}",
                     subject_id=subject,
                     field=target_field,
                     contrast=contrast,
@@ -193,7 +193,7 @@ def _manifest(tmp_path: Path, artifact) -> tuple[Path, dict]:
             "photometry_artifact_sha256": artifact.artifact_sha256,
             "photometry_config_sha256": artifact.provenance["resolved_config_sha256"],
             "split_provenance": {
-                "role": "synthetic-paired",
+                "role": "synthetic-paired-retrospective",
                 "file_sha256": "e" * 64,
                 "source_membership_fingerprint": "c" * 64,
                 "source_recovery_fingerprint": "d" * 64,
@@ -316,11 +316,37 @@ def test_paired_manifest_rejects_unrelated_subjects_and_conflicting_prefix(tmp_p
         load_paired_evaluation_manifest(path, artifact=artifact)
 
     conflicting = copy.deepcopy(payload)
-    conflicting["cases"][0]["source"]["metadata_prefix"] = "R"
+    conflicting["cases"][0]["source"]["metadata_prefix"] = "P"
     conflicting["split_provenance"].pop("evaluation_membership_fingerprint")
     conflicting = seal_paired_evaluation_manifest(conflicting)
     path.write_text(json.dumps(conflicting, sort_keys=True), encoding="utf-8")
     with pytest.raises(ValueError, match="identity conflict"):
+        load_paired_evaluation_manifest(path, artifact=artifact)
+
+
+@pytest.mark.parametrize(
+    ("metadata_prefix", "cohort", "message"),
+    [
+        ("P", "P", "rejects every P record"),
+        ("P", "R", "identity conflict"),
+        ("R", "P", "identity conflict"),
+        ("R", "R", "identity conflict"),
+    ],
+)
+def test_paired_manifest_v1_rejects_every_p_endpoint_even_if_mislabeled(
+    tmp_path: Path, metadata_prefix: str, cohort: str, message: str
+) -> None:
+    artifact = _artifact()
+    path, payload = _manifest(tmp_path, artifact)
+    prospective = copy.deepcopy(payload)
+    endpoint = prospective["cases"][0]["source"]
+    endpoint["case_id"] = "P_0100_T1w_0.1"
+    endpoint["metadata_prefix"] = metadata_prefix
+    endpoint["cohort"] = cohort
+    prospective["split_provenance"].pop("evaluation_membership_fingerprint")
+    prospective = seal_paired_evaluation_manifest(prospective)
+    path.write_text(json.dumps(prospective, sort_keys=True), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
         load_paired_evaluation_manifest(path, artifact=artifact)
 
 

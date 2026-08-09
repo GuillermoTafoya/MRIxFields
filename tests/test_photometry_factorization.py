@@ -12,6 +12,7 @@ from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.data.photometry_factorization import (
     PHOTOMETRY_DUPLICATE_KNOT_RULE,
     PHOTOMETRY_SOURCE_MODULES,
+    VARIANT_A_PROSPECTIVE_EXCLUSION_REASON,
     FrozenPhotometryArtifact,
     PhotometryFitVolume,
     all_photometry_domain_labels,
@@ -63,7 +64,25 @@ def _fit_items(*, unequal_counts: bool = False) -> list[PhotometryFitVolume]:
     return items
 
 
-def _fit(*, items: list[PhotometryFitVolume] | None = None) -> FrozenPhotometryArtifact:
+def _excluded_record(identity: str = "P_0100_T1w") -> dict:
+    return {
+        "record_identity": identity,
+        "record_identity_sha256": sha256_text(identity),
+        "subject_identity": "0100",
+        "subject_group_identity": "P:0100",
+        "metadata_prefix": "P",
+        "cohort": "P",
+        "split": "train",
+        "source_path_identity_sha256": sha256_text(f"external/{identity}.nii.gz"),
+        "reason": VARIANT_A_PROSPECTIVE_EXCLUSION_REASON,
+    }
+
+
+def _fit(
+    *,
+    items: list[PhotometryFitVolume] | None = None,
+    excluded: tuple[dict, ...] = (),
+) -> FrozenPhotometryArtifact:
     return fit_frozen_photometry(
         _fit_items() if items is None else items,
         source_split_file_sha256="a" * 64,
@@ -73,6 +92,7 @@ def _fit(*, items: list[PhotometryFitVolume] | None = None) -> FrozenPhotometryA
         code_provenance=_code_provenance(),
         resolved_config={"contract": "stage2-photometry-variant-a-config-v1"},
         num_quantiles=17,
+        excluded_prospective_records=excluded,
     )
 
 
@@ -108,7 +128,9 @@ def test_artifact_is_byte_deterministic_and_seals_record_content(tmp_path) -> No
         "all_split_train": True,
         "forbidden_traveller_accepted_count": 0,
         "prospective_accepted_count": 0,
+        "prospective_excluded_count": 0,
     }
+    assert payload["provenance"]["excluded_prospective_records"] == []
     accepted = payload["provenance"]["accepted_records"]
     assert all(item["source_file_sha256"] for item in accepted)
     assert all(item["canonical_loaded_array_sha256"] for item in accepted)
@@ -286,6 +308,27 @@ def test_artifact_reload_reconciles_identity_namespace_independently() -> None:
     )
     with pytest.raises(ValueError, match="identity conflict"):
         FrozenPhotometryArtifact.from_dict(payload)
+
+
+def test_artifact_seals_and_revalidates_prospective_exclusion_evidence() -> None:
+    artifact = _fit(excluded=(_excluded_record(),))
+    provenance = artifact.provenance
+    assert provenance["eligibility_proof"]["prospective_excluded_count"] == 1
+    assert provenance["excluded_prospective_records"][0]["record_identity"] == "P_0100_T1w"
+    assert provenance["excluded_prospective_records_sha256"] == sha256_json(
+        provenance["excluded_prospective_records"]
+    )
+
+    mutated = artifact.to_dict()
+    mutated["provenance"]["excluded_prospective_records"][0]["cohort"] = "R"
+    mutated["provenance"]["excluded_prospective_records_sha256"] = sha256_json(
+        mutated["provenance"]["excluded_prospective_records"]
+    )
+    mutated["artifact_sha256"] = sha256_json(
+        {key: value for key, value in mutated.items() if key != "artifact_sha256"}
+    )
+    with pytest.raises(ValueError, match="identity conflict"):
+        FrozenPhotometryArtifact.from_dict(mutated)
 
 
 def test_canonical_cohort_classifier_preserves_retrospective_subject_group() -> None:

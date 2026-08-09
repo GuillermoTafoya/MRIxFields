@@ -1,8 +1,9 @@
 """Protocol-level paired evaluation for the non-learned Stage-2 Variant-A baseline.
 
-This module never constructs cross-field pairs.  It consumes only an externally sealed
-manifest whose source and target endpoints share one canonical subject group.  Gate 0.1
-metrics remain an external continuity track and never enter same-case reductions.
+This module never constructs cross-field pairs.  Variant-A v1 consumes only an externally
+sealed retrospective manifest whose source and target endpoints share one canonical
+subject group.  A future prospective protocol requires a new contract.  Gate 0.1 metrics
+remain an external continuity track and never enter same-case reductions.
 """
 
 from __future__ import annotations
@@ -43,7 +44,9 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
     PairedEvaluationCase,
 )
 
-PAIRED_EVALUATION_ROLE = "externally-authorized-genuinely-paired-evaluation"
+PAIRED_EVALUATION_ROLE = (
+    "externally-authorized-genuinely-paired-retrospective-evaluation"
+)
 RAW_IDENTITY_CATASTROPHIC_BOUNDARY = 1.0
 _LOWER_BETTER = frozenset({"nrmse", "lpips"})
 _CONTROL_NAMES = (
@@ -341,7 +344,7 @@ def _load_endpoint(
         metadata_prefix=raw.get("metadata_prefix"),
         supplied_cohort=raw.get("cohort"),
         subject_identity=raw.get("subject_id"),
-        allowed_cohorts=("R", "P"),
+        allowed_cohorts=("R",),
     )
     domain_raw = raw.get("domain")
     if not isinstance(domain_raw, Mapping):

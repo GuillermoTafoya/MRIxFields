@@ -41,6 +41,9 @@ PHOTOMETRY_SOURCE_MODULES = (
     "src/fieldbridge/data/vae_splits.py",
 )
 FORBIDDEN_TRAVELLER_IDS = frozenset({"0006", "0007", "0009"})
+VARIANT_A_PROSPECTIVE_EXCLUSION_REASON = (
+    "prospective-cohort-excluded-before-array-load"
+)
 
 _REQUIRED_PROVENANCE_KEYS = {
     "source_split_file_sha256",
@@ -49,6 +52,8 @@ _REQUIRED_PROVENANCE_KEYS = {
     "fit_eligibility_rule",
     "accepted_records",
     "accepted_records_sha256",
+    "excluded_prospective_records",
+    "excluded_prospective_records_sha256",
     "eligibility_proof",
     "domain_volume_counts",
     "weighting",
@@ -514,6 +519,7 @@ def fit_frozen_photometry(
     code_provenance: Mapping[str, Any],
     resolved_config: Mapping[str, Any],
     num_quantiles: int = PHOTOMETRY_DEFAULT_QUANTILES,
+    excluded_prospective_records: Sequence[Mapping[str, Any]] = (),
 ) -> FrozenPhotometryArtifact:
     """Fit fixed domain templates from retrospective training records only."""
 
@@ -594,6 +600,9 @@ def fit_frozen_photometry(
         )
 
     accepted.sort(key=lambda item: (item["domain"], item["record_identity"]))
+    excluded = normalize_variant_a_prospective_exclusions(
+        excluded_prospective_records, expected_split="train"
+    )
     counts = {label: len(values) for label, values in sorted(accumulated.items())}
     config = _json_safe_mapping(resolved_config)
     provenance = {
@@ -603,11 +612,14 @@ def fit_frozen_photometry(
         "fit_eligibility_rule": PHOTOMETRY_FIT_ELIGIBILITY,
         "accepted_records": accepted,
         "accepted_records_sha256": sha256_json(accepted),
+        "excluded_prospective_records": excluded,
+        "excluded_prospective_records_sha256": sha256_json(excluded),
         "eligibility_proof": {
             "accepted_count": len(accepted),
             "all_cohort_R": all(item["cohort"] == "R" for item in accepted),
             "all_split_train": all(item["split"] == "train" for item in accepted),
             "prospective_accepted_count": 0,
+            "prospective_excluded_count": len(excluded),
             "forbidden_traveller_accepted_count": 0,
         },
         "domain_volume_counts": counts,
@@ -998,6 +1010,11 @@ def _validate_accepted_records(provenance: Mapping[str, Any], labels: set[str]) 
     }
     if dict(observed_counts) != expected_counts:
         raise ValueError("Photometry accepted-record membership does not match domain counts.")
+    excluded = normalize_variant_a_prospective_exclusions(
+        provenance["excluded_prospective_records"], expected_split="train"
+    )
+    if sha256_json(excluded) != provenance["excluded_prospective_records_sha256"]:
+        raise ValueError("Photometry excluded-record content hash mismatch.")
     proof = provenance["eligibility_proof"]
     if (
         not isinstance(proof, Mapping)
@@ -1008,9 +1025,65 @@ def _validate_accepted_records(provenance: Mapping[str, Any], labels: set[str]) 
         raise ValueError("Photometry artifact eligibility proof is invalid.")
     if (
         proof.get("prospective_accepted_count") != 0
+        or proof.get("prospective_excluded_count")
+        != len(excluded)
         or proof.get("forbidden_traveller_accepted_count") != 0
     ):
         raise ValueError("Photometry artifact eligibility proof accepted forbidden records.")
+    if identities.intersection(item["record_identity"] for item in excluded):
+        raise ValueError("Photometry artifact records one identity as accepted and excluded.")
+
+
+def normalize_variant_a_prospective_exclusions(
+    records: Sequence[Mapping[str, Any]], *, expected_split: str
+) -> list[dict[str, Any]]:
+    """Validate and deterministically order P records excluded before array loading."""
+
+    if expected_split not in {"train", "validation"}:
+        raise ValueError("Variant-A exclusion evidence requires train or validation split.")
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise ValueError("Variant-A excluded records must be a sequence.")
+    required = {
+        "record_identity",
+        "record_identity_sha256",
+        "subject_identity",
+        "subject_group_identity",
+        "metadata_prefix",
+        "cohort",
+        "split",
+        "source_path_identity_sha256",
+        "reason",
+    }
+    normalized: list[dict[str, Any]] = []
+    identities: set[str] = set()
+    for raw in records:
+        if not isinstance(raw, Mapping) or set(raw) != required:
+            raise ValueError("Variant-A excluded-record schema is incompatible.")
+        item = dict(raw)
+        identity = classify_variant_a_cohort(
+            case_identity=str(item["record_identity"]),
+            metadata_prefix=item["metadata_prefix"],
+            supplied_cohort=item["cohort"],
+            subject_identity=item["subject_identity"],
+            allowed_cohorts=("P",),
+        )
+        if identity.case_identity in identities:
+            raise ValueError("Variant-A exclusion evidence contains a duplicate identity.")
+        identities.add(identity.case_identity)
+        if item["split"] != expected_split:
+            raise ValueError("Variant-A excluded-record split is incompatible.")
+        if item["subject_group_identity"] != identity.subject_group_identity:
+            raise ValueError("Variant-A excluded-record subject grouping is incompatible.")
+        if item["record_identity_sha256"] != sha256_text(identity.case_identity):
+            raise ValueError("Variant-A excluded-record identity hash mismatch.")
+        _validate_sha256(
+            str(item["source_path_identity_sha256"]), "excluded source-path identity"
+        )
+        if item["reason"] != VARIANT_A_PROSPECTIVE_EXCLUSION_REASON:
+            raise ValueError("Variant-A excluded-record reason is incompatible.")
+        normalized.append(item)
+    normalized.sort(key=lambda item: str(item["record_identity"]))
+    return normalized
 
 
 def _validate_code_provenance(provenance: Any, code_commit: str) -> None:
@@ -1059,6 +1132,7 @@ __all__ = [
     "FrozenPhotometryArtifact",
     "PhotometryFitVolume",
     "SourceCanonicalizedVolume",
+    "VARIANT_A_PROSPECTIVE_EXCLUSION_REASON",
     "all_photometry_domain_labels",
     "assert_variant_a_external_path",
     "canonical_tensor_sha256",
@@ -1067,6 +1141,7 @@ __all__ = [
     "deterministic_quantiles",
     "fit_frozen_photometry",
     "interpolate_fixed_grid",
+    "normalize_variant_a_prospective_exclusions",
     "reject_target_or_prediction_derived_fields",
     "sha256_file",
     "sha256_json",

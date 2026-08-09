@@ -23,6 +23,7 @@ from fieldbridge.data.photometry_factorization import (
     canonical_tensor_sha256,
     deterministic_quantiles,
     interpolate_fixed_grid,
+    normalize_variant_a_prospective_exclusions,
     sha256_file,
     sha256_json,
     sha256_text,
@@ -330,6 +331,7 @@ def qualify_variant_a(
     continuity: ContinuityReference,
     metric_function: MetricFunction,
     progress: ProgressFunction | None = None,
+    excluded_prospective_records: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Run all training-independent Variant-A qualification arithmetic."""
 
@@ -347,6 +349,9 @@ def qualify_variant_a(
     vae_payload = _json_safe_mapping(vae_provenance)
     _require_sha256(str(vae_payload.get("checkpoint_sha256", "")), "VAE checkpoint")
     _require_sha256(str(vae_payload.get("config_file_sha256", "")), "VAE config file")
+    excluded = normalize_variant_a_prospective_exclusions(
+        excluded_prospective_records, expected_split="validation"
+    )
 
     rows: list[dict[str, Any]] = []
     raw_features: list[torch.Tensor] = []
@@ -493,10 +498,13 @@ def qualify_variant_a(
         "stage1_reconstruction_ceiling_continuity": stage1_continuity,
         "records": rows,
         "record_count": len(rows),
+        "excluded_prospective_records": excluded,
+        "excluded_prospective_records_sha256": sha256_json(excluded),
         "eligibility_proof": {
             "all_cohort_R": all(row["cohort"] == "R" for row in rows),
             "all_split_validation": all(row["split"] == "validation" for row in rows),
             "prospective_accepted_count": 0,
+            "prospective_excluded_count": len(excluded),
             "forbidden_traveller_accepted_count": 0,
         },
         "fit_weighting_evidence": {
@@ -903,14 +911,21 @@ def _interpolation_qualification(
             ("N_d:domain_to_canonical", domain_template.quantiles, canonical),
             ("P_d:canonical_to_domain", canonical, domain_template.quantiles),
         ):
-            low_index = int(torch.argmin((artifact.probabilities - 0.01).abs()))
-            high_index = int(torch.argmin((artifact.probabilities - 0.99).abs()))
+            input_q01, input_q99, _ = _sealed_robust_interval(
+                artifact.probabilities,
+                source_grid,
+                name=f"{label} {direction} input",
+                require_positive=False,
+            )
+            target_q01, target_q99, robust_target_range = _sealed_robust_interval(
+                artifact.probabilities, target_grid, name=f"{label} {direction} target"
+            )
             dense = torch.cat(
                 (
                     source_grid[:1],
                     torch.linspace(
-                        float(source_grid[low_index]),
-                        float(source_grid[high_index]),
+                        input_q01,
+                        input_q99,
                         4097,
                         dtype=torch.float64,
                     ),
@@ -920,8 +935,7 @@ def _interpolation_qualification(
             dense = torch.unique_consecutive(dense)
             realized = interpolate_fixed_grid(dense, source_grid, target_grid)
             finite = bool(torch.isfinite(realized).all())
-            output_range = max(float(target_grid[-1] - target_grid[0]), 1e-12)
-            tolerance = thresholds.monotonic_tolerance_fraction * output_range
+            tolerance = thresholds.monotonic_tolerance_fraction * robust_target_range
             minimum_increment = (
                 float(torch.diff(realized).min()) if realized.numel() > 1 else 0.0
             )
@@ -932,13 +946,15 @@ def _interpolation_qualification(
                     "sample_count": int(dense.numel()),
                     "input_endpoints": [float(dense[0]), float(dense[-1])],
                     "robust_input_range": [
-                        float(source_grid[low_index]),
-                        float(source_grid[high_index]),
+                        input_q01,
+                        input_q99,
                     ],
+                    "target_q01": target_q01,
+                    "target_q99": target_q99,
+                    "robust_target_range": robust_target_range,
                     "finite": finite,
                     "minimum_increment": minimum_increment,
-                    "output_range": output_range,
-                    "tolerance": tolerance,
+                    "absolute_tolerance": tolerance,
                     "nondecreasing_within_tolerance": minimum_increment >= -tolerance,
                 }
             )
@@ -952,6 +968,26 @@ def _interpolation_qualification(
             for row in rows
         ),
     }
+
+
+def _sealed_robust_interval(
+    probabilities: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    name: str,
+    require_positive: bool = True,
+) -> tuple[float, float, float]:
+    """Interpolate sealed q01/q99 in float64 and optionally require positive range."""
+
+    query = torch.tensor([0.01, 0.99], dtype=torch.float64)
+    interpolated = interpolate_fixed_grid(query, probabilities, values)
+    q01, q99 = float(interpolated[0]), float(interpolated[1])
+    robust_range = q99 - q01
+    if not all(math.isfinite(value) for value in (q01, q99, robust_range)):
+        raise ValueError(f"Variant-A {name} robust interval is non-finite.")
+    if require_positive and robust_range <= 0.0:
+        raise ValueError(f"Variant-A {name} robust interval must be positive.")
+    return q01, q99, robust_range
 
 
 def _direct_roundtrip_metrics(

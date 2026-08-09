@@ -49,6 +49,8 @@ qualification:
       - P_d
     dense_grid_points: 4097
     coverage: sealed_robust_range_plus_endpoints
+    sealed_output_quantiles: deterministic_float64_interpolation_q01_q99
+    tolerance_scale: positive_robust_target_range_q99_minus_q01
   contrast_control:
     contract: variant-a-photometry-controlled-spatial-features-v1
     validation: leave_one_canonical_subject_group_out
@@ -101,6 +103,8 @@ evaluation:
   case_shard_contract: stage2-photometry-paired-case-shard-v1
   result_contract: stage2-photometry-dual-baseline-result-v2
   continuity_reference_contract: stage2-photometry-continuity-reference-v2
+  endpoint_cohort: R
+  prospective_paired_support: forbidden_requires_new_forward_versioned_contract
   methods:
     - fixed_map_factorized_identity
     - gate01_posthoc_calibrated_identity

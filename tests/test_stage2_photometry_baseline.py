@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from fieldbridge.cli import _load_variant_a_config, build_parser
+from fieldbridge.cli import (
+    _load_variant_a_config,
+    _require_variant_a_retrospective_record,
+    _select_variant_a_retrospective_records,
+    build_parser,
+)
+from fieldbridge.data.contracts import VolumeRecord
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.data.photometry_factorization import (
     PHOTOMETRY_SOURCE_MODULES,
@@ -29,6 +35,7 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
     ContinuityReference,
     QualificationVolume,
     VariantAQualificationThresholds,
+    _sealed_robust_interval,
     build_continuity_reference_from_gate01,
     evaluate_factorized_identity_case,
     qualify_variant_a,
@@ -42,7 +49,7 @@ def _volume(field: float, contrast_index: int, *, offset: float = 0.0) -> torch.
     return torch.cat([torch.zeros(1), values * scale + offset]).reshape(4, 4, 4)
 
 
-def _artifact():
+def _artifact(*, excluded=()):
     items = []
     for contrast_index, contrast in enumerate(CONTRASTS):
         for field in FIELD_STRENGTHS_T:
@@ -75,6 +82,7 @@ def _artifact():
         code_provenance=provenance,
         resolved_config={"contract": "stage2-photometry-variant-a-config-v1"},
         num_quantiles=17,
+        excluded_prospective_records=excluded,
     )
 
 
@@ -158,6 +166,10 @@ def test_checked_in_config_exposes_exact_versioned_proposed_thresholds() -> None
     assert thresholds.scaling_factors == (0.9, 1.1)
     assert thresholds.vae_domain_lpips_increase_max == 0.008
     assert config["qualification"]["threshold_status"].startswith("versioned_proposed")
+    assert config["evaluation"]["endpoint_cohort"] == "R"
+    assert config["qualification"]["monotonicity_audit"]["tolerance_scale"] == (
+        "positive_robust_target_range_q99_minus_q01"
+    )
 
 
 def test_variant_a_v1_config_rejects_weakened_thresholds(monkeypatch) -> None:
@@ -171,9 +183,19 @@ def test_variant_a_v1_config_rejects_weakened_thresholds(monkeypatch) -> None:
         _load_variant_a_config(path)
 
 
+def test_variant_a_v1_config_rejects_dormant_prospective_pair_support(monkeypatch) -> None:
+    path = Path("configs/experiment/stage2_photometry_factorization_a_v1.yaml")
+    config = copy.deepcopy(_load_variant_a_config(path))
+    config["evaluation"]["endpoint_cohort"] = "P"
+    monkeypatch.setattr("fieldbridge.cli.load_yaml_config", lambda ignored: config)
+    with pytest.raises(ValueError, match="retrospective-only"):
+        _load_variant_a_config(path)
+
+
 def test_qualification_reports_macro_worst_domain_scaling_and_equal_counts() -> None:
+    artifact = _artifact()
     result = qualify_variant_a(
-        _artifact(),
+        artifact,
         _qualification_volumes(),
         thresholds=_permissive_thresholds(),
         vae_roundtrip=lambda volume, domain: volume,
@@ -204,6 +226,118 @@ def test_qualification_reports_macro_worst_domain_scaling_and_equal_counts() -> 
         item["finite"] and item["nondecreasing_within_tolerance"]
         for item in result["interpolation_qualification"]["maps"]
     )
+    assert {
+        item["direction"].split(":", 1)[0]
+        for item in result["interpolation_qualification"]["maps"]
+    } == {"N_d", "P_d"}
+    for item in result["interpolation_qualification"]["maps"]:
+        field_text, contrast_text = item["domain"].split("/", 1)
+        domain = Domain(float(field_text.removesuffix("T")), contrast_text)
+        target_grid = (
+            artifact.canonical_templates[contrast_text].quantiles
+            if item["direction"].startswith("N_d:")
+            else artifact.domain_templates[domain.label].quantiles
+        )
+        expected_q01, expected_q99, expected_range = _sealed_robust_interval(
+            artifact.probabilities, target_grid, name="both-direction regression"
+        )
+        assert item["target_q01"] == pytest.approx(expected_q01)
+        assert item["target_q99"] == pytest.approx(expected_q99)
+        assert item["robust_target_range"] == pytest.approx(expected_range)
+        assert item["target_q99"] > item["target_q01"]
+        assert item["absolute_tolerance"] == pytest.approx(
+            1e-7 * item["robust_target_range"], rel=0.0, abs=1e-15
+        )
+
+
+def _split_record(case_id: str, prefix: str, subject: str = "0100") -> VolumeRecord:
+    return VolumeRecord(
+        case_id=case_id,
+        image_path=f"external/{case_id}.nii.gz",
+        domain=Domain(0.1, "T1w"),
+        subject_id=subject,
+        metadata={"prefix": prefix},
+    )
+
+
+def test_mixed_split_excludes_labelled_p_before_r_only_conversion_and_seals_it() -> None:
+    retrospective = _split_record("R_0042_T1w", "R", "0042")
+    prospective = _split_record("P_0100_T1w", "P")
+    selected, excluded = _select_variant_a_retrospective_records(
+        (prospective, retrospective), split="train"
+    )
+    assert selected == (retrospective,)
+    assert [item["record_identity"] for item in excluded] == ["P_0100_T1w"]
+    assert excluded[0]["reason"] == "prospective-cohort-excluded-before-array-load"
+    with pytest.raises(ValueError, match="rejects every P record"):
+        _require_variant_a_retrospective_record(prospective)
+
+    artifact = _artifact(excluded=excluded)
+    assert artifact.provenance["excluded_prospective_records"] == list(excluded)
+    assert artifact.provenance["eligibility_proof"]["prospective_excluded_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("case_id", "prefix"),
+    [("P_0100_T1w", "R"), ("R_0042_T1w", "P")],
+)
+def test_mixed_split_raises_on_inconsistent_identity_metadata(
+    case_id: str, prefix: str
+) -> None:
+    with pytest.raises(ValueError, match="identity conflict"):
+        _select_variant_a_retrospective_records(
+            (_split_record(case_id, prefix),), split="validation"
+        )
+
+
+def test_qualification_seals_validation_p_exclusions() -> None:
+    _, excluded = _select_variant_a_retrospective_records(
+        (_split_record("P_0100_T1w", "P"),), split="validation"
+    )
+    result = qualify_variant_a(
+        _artifact(),
+        _qualification_volumes(),
+        thresholds=_permissive_thresholds(),
+        vae_roundtrip=lambda volume, domain: volume,
+        excluded_prospective_records=excluded,
+        **_qualification_kwargs(),
+    )
+    assert result["eligibility_proof"]["prospective_excluded_count"] == 1
+    assert result["excluded_prospective_records"] == list(excluded)
+
+
+def test_robust_target_interval_ignores_endpoint_outliers_and_tracks_mutation() -> None:
+    probabilities = torch.tensor(
+        [0.0, 0.005, 0.015, 0.985, 0.995, 1.0], dtype=torch.float64
+    )
+    sealed = torch.tensor([0.0, 0.2, 0.3, 0.7, 0.8, 1.0], dtype=torch.float64)
+    trimmed = torch.tensor([0.2, 0.2, 0.3, 0.7, 0.8, 0.8], dtype=torch.float64)
+    _, _, sealed_range = _sealed_robust_interval(
+        probabilities, sealed, name="endpoint-outlier regression"
+    )
+    _, _, trimmed_range = _sealed_robust_interval(
+        probabilities, trimmed, name="trimmed regression"
+    )
+    assert float(sealed[-1] - sealed[0]) > float(trimmed[-1] - trimmed[0])
+    assert sealed_range == pytest.approx(trimmed_range)
+    assert sealed_range == pytest.approx(0.5)
+    assert 1e-7 * sealed_range == pytest.approx(5e-8)
+
+    mutated = sealed.clone()
+    mutated[4] = 0.9
+    _, _, mutated_range = _sealed_robust_interval(
+        probabilities, mutated, name="interior mutation regression"
+    )
+    assert mutated_range == pytest.approx(0.55)
+
+
+def test_robust_target_interval_rejects_degenerate_range() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        _sealed_robust_interval(
+            torch.tensor([0.0, 0.01, 0.99, 1.0], dtype=torch.float64),
+            torch.full((4,), 0.5, dtype=torch.float64),
+            name="degenerate target",
+        )
 
 
 def test_qualification_masks_both_vae_paths_and_reports_raw_decoder_leakage() -> None:

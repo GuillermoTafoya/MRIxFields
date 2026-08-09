@@ -160,6 +160,8 @@ from fieldbridge.data.photometry_factorization import (
     PHOTOMETRY_FACTORIZATION_SEMANTICS,
     PHOTOMETRY_INTERPOLATION_RULE,
     PHOTOMETRY_SUPPORT_POLICY,
+    VARIANT_A_PROSPECTIVE_EXCLUSION_REASON,
+    CanonicalCohortIdentity,
     FrozenPhotometryArtifact,
     PhotometryFitVolume,
     assert_variant_a_external_path,
@@ -1653,7 +1655,9 @@ def main(argv: list[str] | None = None) -> int:
         split_file_sha256 = sha256_file(split_path)
         membership_fingerprint = vae_splits_fingerprint(splits)
         recovery_fingerprint = vae_splits_recovery_fingerprint_v3(splits)
-        records = [record for record in splits.train if _variant_a_record_cohort(record) == "R"]
+        records, excluded = _select_variant_a_retrospective_records(
+            splits.train, split="train"
+        )
         if not records:
             raise ValueError("Variant-A fitting found no retrospective R/train records.")
         device = _resolve_device(args.device)
@@ -1661,6 +1665,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def fit_stream():
             for index, record in enumerate(records, start=1):
+                identity = _require_variant_a_retrospective_record(record)
                 if log_every and (index == 1 or index % log_every == 0 or index == len(records)):
                     print(
                         f"variant_a_fit record={index}/{len(records)} domain={record.domain.label}",
@@ -1671,12 +1676,12 @@ def main(argv: list[str] | None = None) -> int:
                     volume=load_volume(record).to(device),
                     domain=record.domain,
                     record_identity=str(record.case_id),
-                    subject_identity=record.subject_id,
+                    subject_identity=identity.subject_identity,
                     metadata_prefix=_variant_a_record_prefix(record),
                     source_path_identity=str(record.image_path),
                     source_file_sha256=sha256_file(record.image_path),
                     split="train",
-                    cohort="R",
+                    cohort=identity.cohort,
                 )
 
         artifact = fit_frozen_photometry(
@@ -1688,6 +1693,7 @@ def main(argv: list[str] | None = None) -> int:
             code_provenance=capture_photometry_code_provenance(),
             resolved_config=config,
             num_quantiles=int(config["photometry"]["num_quantiles"]),
+            excluded_prospective_records=excluded,
         )
         artifact.save(output_path)
         print(
@@ -1700,9 +1706,13 @@ def main(argv: list[str] | None = None) -> int:
                     "source_membership_fingerprint": membership_fingerprint,
                     "source_recovery_fingerprint": recovery_fingerprint,
                     "accepted_records": len(records),
-                    "excluded_prospective_records": sum(
-                        _variant_a_record_cohort(record) == "P" for record in splits.train
-                    ),
+                    "excluded_prospective_records": len(excluded),
+                    "excluded_prospective_record_identities": [
+                        item["record_identity"] for item in excluded
+                    ],
+                    "excluded_prospective_records_sha256": artifact.provenance[
+                        "excluded_prospective_records_sha256"
+                    ],
                     "domain_volume_counts": artifact.provenance["domain_volume_counts"],
                 },
                 indent=2,
@@ -1734,11 +1744,9 @@ def main(argv: list[str] | None = None) -> int:
         continuity = ContinuityReference.load(
             continuity_path, source_result_path=gate01_path
         )
-        records = [
-            record
-            for record in splits.validation
-            if _variant_a_record_cohort(record) == "R"
-        ]
+        records, excluded = _select_variant_a_retrospective_records(
+            splits.validation, split="validation"
+        )
         if not records:
             raise ValueError("Variant-A qualification found no retrospective R/validation records.")
 
@@ -1805,16 +1813,17 @@ def main(argv: list[str] | None = None) -> int:
 
         def qualification_stream():
             for record in records:
+                identity = _require_variant_a_retrospective_record(record)
                 yield QualificationVolume(
                     volume=load_volume(record).to(device),
                     domain=record.domain,
                     record_identity=str(record.case_id),
-                    subject_identity=record.subject_id,
+                    subject_identity=identity.subject_identity,
                     metadata_prefix=_variant_a_record_prefix(record),
                     source_path_identity=str(record.image_path),
                     source_file_sha256=sha256_file(record.image_path),
                     split="validation",
-                    cohort="R",
+                    cohort=identity.cohort,
                 )
 
         thresholds = VariantAQualificationThresholds.from_mapping(config)
@@ -1844,6 +1853,7 @@ def main(argv: list[str] | None = None) -> int:
                 metrics=metric_names, device=device.type
             ),
             progress=progress,
+            excluded_prospective_records=excluded,
         )
         write_variant_a_result(output_path, result)
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -2814,6 +2824,8 @@ def _load_variant_a_config(path: Path) -> dict[str, Any]:
         "realized_maps": ["N_d", "P_d"],
         "dense_grid_points": 4097,
         "coverage": "sealed_robust_range_plus_endpoints",
+        "sealed_output_quantiles": "deterministic_float64_interpolation_q01_q99",
+        "tolerance_scale": "positive_robust_target_range_q99_minus_q01",
     }:
         raise ValueError("Variant-A realized-map monotonicity audit is incompatible.")
     if qualification.get("contrast_control") != {
@@ -2869,10 +2881,16 @@ def _load_variant_a_config(path: Path) -> dict[str, Any]:
         raise ValueError("Variant-A same-case versus continuity method roles are incompatible.")
     if evaluation.get("genuinely_paired_manifest_required") is not True:
         raise ValueError("Variant-A cross-field evaluation requires genuinely paired cases.")
+    if (
+        evaluation.get("endpoint_cohort") != "R"
+        or evaluation.get("prospective_paired_support")
+        != "forbidden_requires_new_forward_versioned_contract"
+    ):
+        raise ValueError("Variant-A v1 paired evaluation must remain retrospective-only.")
     return config
 
 
-def _variant_a_record_cohort(record: VolumeRecord) -> str:
+def _classify_variant_a_split_record(record: VolumeRecord) -> CanonicalCohortIdentity:
     prefix = _variant_a_record_prefix(record)
     return classify_variant_a_cohort(
         case_identity=str(record.case_id),
@@ -2880,7 +2898,57 @@ def _variant_a_record_cohort(record: VolumeRecord) -> str:
         supplied_cohort=prefix,
         subject_identity=record.subject_id,
         allowed_cohorts=("R", "P"),
-    ).cohort
+    )
+
+
+def _require_variant_a_retrospective_record(
+    record: VolumeRecord,
+) -> CanonicalCohortIdentity:
+    """Validate one selected record at the R-only conversion boundary."""
+
+    prefix = _variant_a_record_prefix(record)
+    return classify_variant_a_cohort(
+        case_identity=str(record.case_id),
+        metadata_prefix=prefix,
+        supplied_cohort=prefix,
+        subject_identity=record.subject_id,
+        allowed_cohorts=("R",),
+    )
+
+
+def _select_variant_a_retrospective_records(
+    records: Sequence[VolumeRecord], *, split: str
+) -> tuple[tuple[VolumeRecord, ...], tuple[dict[str, Any], ...]]:
+    """Classify a mixed canonical split and seal every P exclusion without loading it."""
+
+    if split not in {"train", "validation"}:
+        raise ValueError("Variant-A retrospective selection requires train or validation.")
+    selected: list[VolumeRecord] = []
+    excluded: list[dict[str, Any]] = []
+    for record in records:
+        identity = _classify_variant_a_split_record(record)
+        if identity.cohort == "R":
+            selected.append(record)
+            continue
+        excluded.append(
+            {
+                "record_identity": identity.case_identity,
+                "record_identity_sha256": hashlib.sha256(
+                    identity.case_identity.encode("utf-8")
+                ).hexdigest(),
+                "subject_identity": identity.subject_identity,
+                "subject_group_identity": identity.subject_group_identity,
+                "metadata_prefix": _variant_a_record_prefix(record),
+                "cohort": identity.cohort,
+                "split": split,
+                "source_path_identity_sha256": hashlib.sha256(
+                    str(record.image_path).encode("utf-8")
+                ).hexdigest(),
+                "reason": VARIANT_A_PROSPECTIVE_EXCLUSION_REASON,
+            }
+        )
+    excluded.sort(key=lambda item: str(item["record_identity"]))
+    return tuple(selected), tuple(excluded)
 
 
 def _variant_a_record_prefix(record: VolumeRecord) -> str:

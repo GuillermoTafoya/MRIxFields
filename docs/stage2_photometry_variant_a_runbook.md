@@ -49,6 +49,11 @@ prefix, reconciles it with the metadata prefix and supplied cohort, requires a s
 identity, and rejects missing or conflicting identities. Prospective records,
 validation/test records, and travellers 0006, 0007, and 0009 are rejected by the fit
 contract; the three named travellers are not the only rejected `P` identities.
+The canonical split may contain correctly labelled `P` records. The command classifies
+and excludes them before any array or file-content read, and seals their count,
+identities, subject grouping, path-identity hashes, exclusion reason, and exclusion-list
+hash in the artifact. Conflicting or mislabeled identities fail instead of being counted
+as exclusions. The subsequent per-record conversion boundary is independently R-only.
 
 ```powershell
 fieldbridge fit-stage2-photometry `
@@ -81,6 +86,10 @@ Qualification accepts only held-out retrospective `R/validation` records from th
 same fingerprinted split. It rejects `R/train`, all prospective records, and travellers
 0006, 0007, and 0009. The supplied VAE is frozen, loaded strictly, and used with full
 posterior-mean encode and full decode; there is no tiled or automatic fallback.
+Correctly labelled `P` validation records are likewise classified and excluded before
+array loading, with their identities and exclusion-list hash sealed in the qualification
+result. Mislabeled or conflicting records fail closed, and qualification conversion is
+independently R-only.
 
 ```powershell
 fieldbridge audit-stage2-photometry `
@@ -122,7 +131,12 @@ The report includes per-record, per-domain, macro, and worst-domain measurements
 Monotonicity is not inferred from constructor acceptance. The audit evaluates both
 realized `N_d` and `P_d` after duplicate-knot collapse on 4,097 fixed points spanning
 the sealed 1%-99% robust range plus endpoints, and independently reports finiteness and
-the minimum output step under the preregistered tolerance.
+the minimum output step under the preregistered tolerance. For each direction, q01 and
+q99 are obtained from the sealed target probability/value grid using deterministic
+float64 piecewise-linear interpolation. The absolute tolerance is exactly
+`1e-7 * (target_q99 - target_q01)`; endpoint range is never used. The evidence records
+both target quantiles, the positive finite robust target range, and the resulting
+absolute tolerance.
 
 The report also compares the two held-out-retrospective macro reconstructions with the
 hash-verified original Stage-1 ceiling. That comparison is labelled external
@@ -218,12 +232,16 @@ These values are external continuity evidence, not new same-case observations.
 ## 4. Seal and evaluate a paired selection
 
 Variant A cannot create a scientific reference pair by matching unrelated retrospective
-subjects. Evaluation therefore consumes a separately sealed, genuinely paired manifest.
+subjects. The v1 evaluation contract therefore consumes a separately sealed, genuinely
+paired **retrospective-only** manifest.
 Every case must have the same canonical subject-group identity at both endpoints, the
 same contrast, and different fields. The manifest loader applies the same cohort
 classifier used by fitting and qualification and rejects contradictory case prefixes,
-metadata prefixes, cohort labels, or subjects. Its authorization provenance must explain
-why the pairing is permitted. Creating pseudo-pairs by domain alone is forbidden.
+metadata prefixes, cohort labels, P endpoints, or subjects. Its authorization provenance
+must explain why the retrospective pairing is permitted. Creating pseudo-pairs by domain
+alone is forbidden. Variant-A v1 contains no dormant prospective support: any future
+prospective paired evaluation requires a new forward-versioned manifest/result contract
+and explicit scientific authorization.
 
 The `stage2-photometry-paired-evaluation-manifest-v1` manifest seals:
 

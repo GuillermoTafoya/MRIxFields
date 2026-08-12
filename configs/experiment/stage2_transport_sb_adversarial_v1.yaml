@@ -1,0 +1,49 @@
+# Primary Stage-2 experiment: SB matching plus a StarGAN-style latent discriminator.
+# All endpoints come from one frozen latent bank; use CLI overrides for the preregistered
+# ablations in docs/STAGE2_ADVERSARIAL_ABLATIONS.md.
+seed: 13
+model:
+  name: flow_matching_latent
+  latent_channels: 4
+  hidden_channels: [64, 128]
+  bottleneck_channels: 256
+  cond_dim: 128
+  time_embed_dim: 128
+  time_scale: 1000.0
+  spatial_dims: 3
+  activation: silu
+  skip_mode: concat
+  zero_init_output: true
+training:
+  steps: 20000
+  batch_size: 8
+  lr: 0.0002
+  device: auto
+  precision: bf16
+  coupling: ot
+  bridge: schrodinger
+  same_contrast: true
+  field_pairing: cross
+  ot_pool_size: 4
+  sigma: 0.1
+  time_eps: 0.001
+  adversarial_space: latent
+  adversarial_steps: 4
+  discriminator_channels: [32, 64, 128]
+  discriminator_lr: 0.0002
+  loss_weights:
+    flow: 1.0
+    transport_cost: 0.0
+    identity: 0.1
+    cycle: 0.0
+    adversarial: 0.05
+    domain: 0.1
+  checkpoint_dir: outputs/stage2_transport_sb_adversarial_v1/checkpoints
+  checkpoint_every_steps: 2000
+  checkpoint_at_end: true
+  checkpoint_max_bytes: 500000000
+  val_every_steps: 1000
+  val_batches: 8
+  log_every_steps: 50
+  resume_from: null
+  variant: sb_adversarial_latent_v1

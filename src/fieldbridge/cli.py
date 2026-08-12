@@ -517,6 +517,18 @@ def build_parser() -> argparse.ArgumentParser:
     train_transport.add_argument("--seed", type=int, default=None)
     train_transport.add_argument("--coupling", choices=("independent", "ot"), default=None)
     train_transport.add_argument("--bridge", choices=("ot_cfm", "schrodinger"), default=None)
+    train_transport.add_argument("--adversarial-space", choices=("none", "latent", "image"), default=None)
+    train_transport.add_argument("--adversarial-weight", type=float, default=None)
+    train_transport.add_argument("--domain-weight", type=float, default=None)
+    train_transport.add_argument("--identity-weight", type=float, default=None)
+    train_transport.add_argument(
+        "--vae-config", type=Path, default=None,
+        help="Frozen VAE config required by image adversarial training.",
+    )
+    train_transport.add_argument(
+        "--vae-checkpoint", type=Path, default=None,
+        help="Frozen VAE checkpoint required by image adversarial training.",
+    )
     train_transport.add_argument("--resume-from", type=Path, default=None)
     train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
     train_transport.add_argument("--val", action="store_true", help="Enable validation-split flow loss + best checkpoint.")
@@ -1610,6 +1622,10 @@ def main(argv: list[str] | None = None) -> int:
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "training", "coupling", args.coupling)
         _override(config, "training", "bridge", args.bridge)
+        _override(config, "training", "adversarial_space", args.adversarial_space)
+        _override_nested(config, "training", "loss_weights", "adversarial", args.adversarial_weight)
+        _override_nested(config, "training", "loss_weights", "domain", args.domain_weight)
+        _override_nested(config, "training", "loss_weights", "identity", args.identity_weight)
         _override(config, "training", "device", args.device)
         if args.seed is not None:
             config["seed"] = args.seed
@@ -1630,12 +1646,20 @@ def main(argv: list[str] | None = None) -> int:
         val_index = LatentBankIndex(args.bank_dir, "validation") if args.val else None
 
         stage_config = Stage2TransportConfig.from_mapping(config)
+        decoder = None
+        if stage_config.adversarial_space == "image":
+            if args.vae_config is None or args.vae_checkpoint is None:
+                raise ValueError("image adversarial training requires --vae-config and --vae-checkpoint.")
+            vae_config = _model_config(_load_optional_config(args.vae_config))
+            decoder = build_decoder("kl_vae", **_kl_vae_kwargs(vae_config, "decoder"))
+            decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"], strict=True)
         result = run_stage2_transport_train(
             stage_config,
             translator=translator,
             train_index=train_index,
             stats=stats,
             val_index=val_index,
+            decoder=decoder,
         )
         if args.json:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))

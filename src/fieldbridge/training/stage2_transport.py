@@ -33,8 +33,14 @@ from torch.nn import functional as F
 
 from fieldbridge.data.domains import Contrast, Domain
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
+from fieldbridge.models.autoencoders.base import BaseDecoder
+from fieldbridge.models.discriminators import DomainProjectionDiscriminator, domain_labels
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.training.checkpoints import checkpoint_filename, load_checkpoint, save_checkpoint
+from fieldbridge.training.losses import (
+    adversarial_hinge_loss_discriminator,
+    adversarial_hinge_loss_generator,
+)
 from fieldbridge.utils.seeding import seed_everything
 
 Precision = Literal["fp32", "bf16"]
@@ -42,12 +48,15 @@ Device = Literal["auto", "cpu", "cuda"]
 Coupling = Literal["independent", "ot"]
 Bridge = Literal["ot_cfm", "schrodinger"]
 FieldPairing = Literal["cross", "any"]
+AdversarialSpace = Literal["none", "latent", "image"]
 
 DEFAULT_LOSS_WEIGHTS: dict[str, float] = {
     "flow": 1.0,
     "transport_cost": 0.0,
     "identity": 0.0,
     "cycle": 0.0,
+    "adversarial": 0.0,
+    "domain": 0.0,
 }
 
 
@@ -73,6 +82,10 @@ class Stage2TransportConfig:
     ot_pool_size: int = 4
     sigma: float = 0.1  # Schrodinger-bridge volatility (bridge="schrodinger" only)
     time_eps: float = 1e-3  # clamp on t and (1 - t)
+    adversarial_space: AdversarialSpace = "none"
+    adversarial_steps: int = 4
+    discriminator_channels: tuple[int, ...] = (32, 64, 128)
+    discriminator_lr: float = 2e-4
     loss_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_LOSS_WEIGHTS))
     checkpoint_dir: Path | None = None
     checkpoint_every_steps: int = 0
@@ -85,7 +98,7 @@ class Stage2TransportConfig:
     variant: str = "flow_matching_latent"
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "Stage2TransportConfig":
+    def from_mapping(cls, data: Mapping[str, Any]) -> Stage2TransportConfig:
         defaults = cls()
         training = data.get("training", {})
         training = dict(training) if isinstance(training, Mapping) else {}
@@ -111,9 +124,18 @@ class Stage2TransportConfig:
             ot_pool_size=int(pick("ot_pool_size", defaults.ot_pool_size)),
             sigma=float(pick("sigma", defaults.sigma)),
             time_eps=float(pick("time_eps", defaults.time_eps)),
+            adversarial_space=pick("adversarial_space", defaults.adversarial_space),
+            adversarial_steps=int(pick("adversarial_steps", defaults.adversarial_steps)),
+            discriminator_channels=tuple(
+                int(value)
+                for value in pick("discriminator_channels", defaults.discriminator_channels)
+            ),
+            discriminator_lr=float(pick("discriminator_lr", defaults.discriminator_lr)),
             loss_weights=weights,
             checkpoint_dir=Path(checkpoint_dir) if checkpoint_dir else None,
-            checkpoint_every_steps=int(pick("checkpoint_every_steps", defaults.checkpoint_every_steps)),
+            checkpoint_every_steps=int(
+                pick("checkpoint_every_steps", defaults.checkpoint_every_steps)
+            ),
             checkpoint_at_end=bool(pick("checkpoint_at_end", defaults.checkpoint_at_end)),
             checkpoint_max_bytes=int(pick("checkpoint_max_bytes", defaults.checkpoint_max_bytes)),
             val_every_steps=int(pick("val_every_steps", defaults.val_every_steps)),
@@ -138,6 +160,10 @@ class Stage2TransportConfig:
             "ot_pool_size": self.ot_pool_size,
             "sigma": self.sigma,
             "time_eps": self.time_eps,
+            "adversarial_space": self.adversarial_space,
+            "adversarial_steps": self.adversarial_steps,
+            "discriminator_channels": list(self.discriminator_channels),
+            "discriminator_lr": self.discriminator_lr,
             "loss_weights": dict(self.loss_weights),
             "variant": self.variant,
         }
@@ -150,6 +176,7 @@ class Stage2TransportResult:
     val_losses: list[tuple[int, float]] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     best_val: float | None = None
+    discriminator_losses: list[float] = field(default_factory=list)
 
     @property
     def final_loss(self) -> float:
@@ -168,6 +195,7 @@ class Stage2TransportResult:
             "seconds_per_step": self.seconds_per_step,
             "elapsed_seconds": self.elapsed_seconds,
             "best_val": self.best_val,
+            "discriminator_losses": self.discriminator_losses,
         }
 
 
@@ -178,6 +206,7 @@ def run_stage2_transport_train(
     train_index: LatentBankIndex,
     stats: LatentStats,
     val_index: LatentBankIndex | None = None,
+    decoder: BaseDecoder | None = None,
 ) -> Stage2TransportResult:
     cfg = _coerce_config(config)
     _validate_config(cfg)
@@ -185,6 +214,24 @@ def run_stage2_transport_train(
     device = _resolve_device(cfg.device)
     translator = translator.to(device)
     optimizer = torch.optim.Adam(translator.parameters(), lr=cfg.lr)
+    adversarial = cfg.adversarial_space != "none"
+    discriminator = (
+        DomainProjectionDiscriminator(
+            int(train_index.load_latent(0).shape[0]) if cfg.adversarial_space == "latent" else 1,
+            cfg.discriminator_channels,
+        ).to(device)
+        if adversarial
+        else None
+    )
+    discriminator_optimizer = (
+        torch.optim.Adam(discriminator.parameters(), lr=cfg.discriminator_lr)
+        if discriminator is not None
+        else None
+    )
+    if decoder is not None:
+        decoder = decoder.to(device).eval().requires_grad_(False)
+    if cfg.adversarial_space == "image" and decoder is None:
+        raise ValueError("adversarial_space='image' requires a frozen decoder.")
     sampler = torch.Generator().manual_seed(cfg.seed)
     train_pools = _FieldPools.from_index(train_index)
     val_pools = _FieldPools.from_index(val_index) if val_index is not None else None
@@ -197,6 +244,12 @@ def run_stage2_transport_train(
         state = load_checkpoint(cfg.resume_from, map_location=device)
         translator.load_state_dict(state["translator"])
         optimizer.load_state_dict(state["optimizer"])
+        if discriminator is not None:
+            discriminator.load_state_dict(state["discriminator"])
+            assert discriminator_optimizer is not None
+            discriminator_optimizer.load_state_dict(state["discriminator_optimizer"])
+        if "sampler_state" in state:
+            sampler.set_state(state["sampler_state"])
         start_step = int(state.get("step", 0))
         best_val = state.get("best_val")
 
@@ -210,6 +263,7 @@ def run_stage2_transport_train(
         )
 
     losses: list[float] = []
+    discriminator_losses: list[float] = []
     val_losses: list[tuple[int, float]] = []
     last_ckpt_step: int | None = None
     train_start = time.perf_counter()
@@ -218,39 +272,104 @@ def run_stage2_transport_train(
         translator.train()
         optimizer.zero_grad(set_to_none=True)
         with autocast_ctx:
-            total, terms = _transport_loss(translator, train_index, train_pools, stats, cfg, device, sampler)
+            total, terms = _transport_loss(
+                translator, train_index, train_pools, stats, cfg, device, sampler
+            )
+            if discriminator is not None:
+                assert discriminator_optimizer is not None
+                adversarial_loss, discriminator_loss, adversarial_terms = _adversarial_losses(
+                    translator,
+                    discriminator,
+                    discriminator_optimizer,
+                    decoder,
+                    train_index,
+                    train_pools,
+                    stats,
+                    cfg,
+                    device,
+                    sampler,
+                )
+                total = total + adversarial_loss
+                terms.update(adversarial_terms)
+        if discriminator_optimizer is not None:
+            discriminator_losses.append(float(discriminator_loss.detach().cpu()))
         total.backward()
         optimizer.step()
         _sync_if_cuda(device)
         losses.append(float(total.detach().cpu()))
 
         current_step = step + 1
-        if cfg.checkpoint_dir is not None and cfg.checkpoint_every_steps and current_step % cfg.checkpoint_every_steps == 0:
-            _save_checkpoint(cfg, translator, optimizer, current_step, best_val, unique=True)
+        if (
+            cfg.checkpoint_dir is not None
+            and cfg.checkpoint_every_steps
+            and current_step % cfg.checkpoint_every_steps == 0
+        ):
+            _save_checkpoint(
+                cfg,
+                translator,
+                optimizer,
+                current_step,
+                best_val,
+                discriminator,
+                discriminator_optimizer,
+                sampler,
+                unique=True,
+            )
             last_ckpt_step = current_step
 
-        if val_index is not None and cfg.val_every_steps and current_step % cfg.val_every_steps == 0:
+        if (
+            val_index is not None
+            and cfg.val_every_steps
+            and current_step % cfg.val_every_steps == 0
+        ):
+            assert val_pools is not None
             val = _validate(translator, val_index, val_pools, stats, cfg, device)
             val_losses.append((current_step, val))
             if best_val is None or val < best_val:
                 best_val = val
                 if cfg.checkpoint_dir is not None:
-                    _save_checkpoint(cfg, translator, optimizer, current_step, best_val, name="best")
+                    _save_checkpoint(
+                        cfg,
+                        translator,
+                        optimizer,
+                        current_step,
+                        best_val,
+                        discriminator,
+                        discriminator_optimizer,
+                        sampler,
+                        name="best",
+                    )
             if cfg.log_every_steps > 0:
-                _log(f"stage2_transport step={current_step} val_flow={val:.6f} best_val={best_val:.6f}")
+                _log(
+                    f"stage2_transport step={current_step} val_flow={val:.6f} "
+                    f"best_val={best_val:.6f}"
+                )
 
-        if cfg.log_every_steps > 0 and (len(losses) == 1 or current_step % cfg.log_every_steps == 0 or len(losses) == cfg.steps):
+        if cfg.log_every_steps > 0 and (
+            len(losses) == 1 or current_step % cfg.log_every_steps == 0 or len(losses) == cfg.steps
+        ):
             elapsed = time.perf_counter() - train_start
             term_str = " ".join(f"{k}={v:.4f}" for k, v in terms.items())
             _log(
-                f"stage2_transport step={current_step}/{start_step + cfg.steps} loss={losses[-1]:.6f} "
+                f"stage2_transport step={current_step}/{start_step + cfg.steps} "
+                f"loss={losses[-1]:.6f} "
                 f"[{term_str}] step_sec={time.perf_counter() - step_start:.3f} "
                 f"avg_sec_per_step={elapsed / len(losses):.3f}"
             )
 
     final_step = start_step + len(losses)
     if cfg.checkpoint_dir is not None and cfg.checkpoint_at_end and losses:
-        _save_checkpoint(cfg, translator, optimizer, final_step, best_val, name="last")
+        _save_checkpoint(
+            cfg,
+            translator,
+            optimizer,
+            final_step,
+            best_val,
+            discriminator,
+            discriminator_optimizer,
+            sampler,
+            name="last",
+        )
         if last_ckpt_step != final_step and cfg.checkpoint_every_steps == 0:
             pass
     return Stage2TransportResult(
@@ -259,13 +378,90 @@ def run_stage2_transport_train(
         val_losses=val_losses,
         elapsed_seconds=time.perf_counter() - train_start,
         best_val=best_val,
+        discriminator_losses=discriminator_losses,
     )
+
+
+def _adversarial_losses(
+    translator: BaseTranslator,
+    discriminator: DomainProjectionDiscriminator,
+    discriminator_optimizer: torch.optim.Optimizer,
+    decoder: BaseDecoder | None,
+    index: LatentBankIndex,
+    pools: _FieldPools,
+    stats: LatentStats,
+    cfg: Stage2TransportConfig,
+    device: torch.device,
+    sampler: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, sampler)
+    fake = _integrate_transport(translator, z0, dom_s, dom_t, cfg.adversarial_steps)
+    real_view, fake_view = _discriminator_views(z1, fake, dom_t, stats, decoder)
+    real_score, real_domain = discriminator(real_view.detach(), dom_t)
+    fake_score, _ = discriminator(fake_view.detach(), dom_t)
+    labels = domain_labels(dom_t, len(dom_t), device)
+    domain_real = F.cross_entropy(real_domain, labels)
+    discriminator_loss = adversarial_hinge_loss_discriminator(real_score, fake_score)
+    discriminator_loss = discriminator_loss + cfg.loss_weights.get("domain", 0.0) * domain_real
+    discriminator_optimizer.zero_grad(set_to_none=True)
+    discriminator_loss.backward()
+    discriminator_optimizer.step()
+
+    discriminator.requires_grad_(False)
+    generated_score, generated_domain = discriminator(fake_view, dom_t)
+    adversarial = adversarial_hinge_loss_generator(generated_score)
+    domain_fake = F.cross_entropy(generated_domain, labels)
+    discriminator.requires_grad_(True)
+    generator_loss = (
+        cfg.loss_weights.get("adversarial", 0.0) * adversarial
+        + cfg.loss_weights.get("domain", 0.0) * domain_fake
+    )
+    return (
+        generator_loss,
+        discriminator_loss,
+        {
+            "adversarial": float(adversarial.detach().cpu()),
+            "domain_fake": float(domain_fake.detach().cpu()),
+            "domain_real": float(domain_real.detach().cpu()),
+        },
+    )
+
+
+def _integrate_transport(
+    translator: BaseTranslator,
+    z0: torch.Tensor,
+    source: Sequence[Domain],
+    target: Sequence[Domain],
+    steps: int,
+) -> torch.Tensor:
+    """Differentiable Euler endpoint used only by adversarial training."""
+
+    z = z0
+    dt = 1.0 / steps
+    for step in range(steps):
+        time_value = torch.full((z.shape[0],), step * dt, device=z.device)
+        z = z + dt * translator(z, source, target, time_value)
+    return z
+
+
+def _discriminator_views(
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    domains: Sequence[Domain],
+    stats: LatentStats,
+    decoder: BaseDecoder | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if decoder is None:
+        return real, fake
+    real_image = decoder.decode(stats.denormalize(real), domains)
+    fake_image = decoder.decode(stats.denormalize(fake), domains)
+    return real_image, fake_image
 
 
 def _transport_loss(
     translator: BaseTranslator,
     index: LatentBankIndex,
-    pools: "_FieldPools",
+    pools: _FieldPools,
     stats: LatentStats,
     cfg: Stage2TransportConfig,
     device: torch.device,
@@ -364,7 +560,9 @@ def _spatial_pool(z: torch.Tensor, size: int) -> torch.Tensor:
     return tensor
 
 
-def _sample_time(batch_size: int, device: torch.device, sampler: torch.Generator, eps: float) -> torch.Tensor:
+def _sample_time(
+    batch_size: int, device: torch.device, sampler: torch.Generator, eps: float
+) -> torch.Tensor:
     t = torch.rand(batch_size, generator=sampler, device="cpu")
     return t.clamp(eps, 1.0 - eps).to(device)
 
@@ -403,7 +601,7 @@ class _FieldPools:
     pairable_contrasts: tuple[Contrast, ...]
 
     @classmethod
-    def from_index(cls, index: LatentBankIndex) -> "_FieldPools":
+    def from_index(cls, index: LatentBankIndex) -> _FieldPools:
         table: dict[Contrast, dict[float, list[int]]] = {}
         for position, record in enumerate(index.records):
             contrast = Contrast.parse(record.domain.contrast)
@@ -421,10 +619,14 @@ class _FieldPools:
                 "set field_pairing='any' / same_contrast=false."
             )
         if not self.by_contrast_field:
-            raise ValueError("Latent bank has no records to sample contrast-constrained pairs from.")
+            raise ValueError(
+                "Latent bank has no records to sample contrast-constrained pairs from."
+            )
 
 
-def _draw_with_replacement(pool: tuple[int, ...], count: int, sampler: torch.Generator) -> list[int]:
+def _draw_with_replacement(
+    pool: tuple[int, ...], count: int, sampler: torch.Generator
+) -> list[int]:
     picks = torch.randint(0, len(pool), (count,), generator=sampler).tolist()
     return [pool[p] for p in picks]
 
@@ -444,7 +646,9 @@ def _sample_constrained_pair(
     (contrast, field_s, field_t) combinations, training the one shared any-to-any field v_theta.
     """
 
-    contrasts = pools.pairable_contrasts if cfg.field_pairing == "cross" else tuple(pools.by_contrast_field)
+    contrasts = (
+        pools.pairable_contrasts if cfg.field_pairing == "cross" else tuple(pools.by_contrast_field)
+    )
     contrast = contrasts[int(torch.randint(0, len(contrasts), (1,), generator=sampler))]
     fields = sorted(pools.by_contrast_field[contrast])
     if cfg.field_pairing == "cross":
@@ -456,8 +660,12 @@ def _sample_constrained_pair(
     else:
         field_s = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
         field_t = fields[int(torch.randint(0, len(fields), (1,), generator=sampler))]
-    src_idx = _draw_with_replacement(pools.by_contrast_field[contrast][field_s], cfg.batch_size, sampler)
-    tgt_idx = _draw_with_replacement(pools.by_contrast_field[contrast][field_t], cfg.batch_size, sampler)
+    src_idx = _draw_with_replacement(
+        pools.by_contrast_field[contrast][field_s], cfg.batch_size, sampler
+    )
+    tgt_idx = _draw_with_replacement(
+        pools.by_contrast_field[contrast][field_t], cfg.batch_size, sampler
+    )
     z0, dom_s = _load_normalized(index, stats, src_idx, device)
     z1, dom_t = _load_normalized(index, stats, tgt_idx, device)
     return z0, dom_s, z1, dom_t
@@ -477,7 +685,9 @@ def _validate(
     total = 0.0
     for _ in range(max(1, cfg.val_batches)):
         if cfg.same_contrast:
-            z0, dom_s, z1, dom_t = _sample_constrained_pair(index, pools, stats, cfg, device, generator)
+            z0, dom_s, z1, dom_t = _sample_constrained_pair(
+                index, pools, stats, cfg, device, generator
+            )
         else:
             z0, dom_s = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
             z1, dom_t = _sample_normalized_batch(index, stats, cfg.batch_size, device, generator)
@@ -498,6 +708,9 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     best_val: float | None,
+    discriminator: DomainProjectionDiscriminator | None,
+    discriminator_optimizer: torch.optim.Optimizer | None,
+    sampler: torch.Generator,
     *,
     name: str | None = None,
     unique: bool = False,
@@ -508,7 +721,13 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "step": step,
         "best_val": best_val,
+        "sampler_state": sampler.get_state(),
     }
+    if discriminator is not None and discriminator_optimizer is not None:
+        state.update(
+            discriminator=discriminator.state_dict(),
+            discriminator_optimizer=discriminator_optimizer.state_dict(),
+        )
     if unique:
         filename = checkpoint_filename("transport", cfg.variant, step)
         overwrite = False
@@ -538,9 +757,31 @@ def _validate_config(cfg: Stage2TransportConfig) -> None:
         raise ValueError(f"Unknown field_pairing {cfg.field_pairing!r}.")
     if cfg.ot_pool_size < 0:
         raise ValueError("ot_pool_size must be >= 0.")
+    if cfg.adversarial_space not in ("none", "latent", "image"):
+        raise ValueError(f"Unknown adversarial_space {cfg.adversarial_space!r}.")
+    if cfg.adversarial_steps < 1:
+        raise ValueError("adversarial_steps must be >= 1.")
+    if cfg.discriminator_lr <= 0 or not cfg.discriminator_channels:
+        raise ValueError("discriminator_lr and discriminator_channels must be positive.")
+    if any(value < 0 for value in cfg.loss_weights.values()):
+        raise ValueError("loss weights must be non-negative.")
+    if cfg.adversarial_space != "none" and not cfg.same_contrast:
+        raise ValueError("adversarial training requires same_contrast=true.")
+    if cfg.adversarial_space == "none" and any(
+        cfg.loss_weights.get(name, 0.0) > 0.0 for name in ("adversarial", "domain")
+    ):
+        raise ValueError(
+            "adversarial_space must be latent or image when adversarial losses are enabled."
+        )
+    if cfg.adversarial_space != "none" and cfg.loss_weights.get("adversarial", 0.0) <= 0.0:
+        raise ValueError(
+            "adversarial loss weight must be positive when a discriminator is enabled."
+        )
 
 
-def _coerce_config(config: Stage2TransportConfig | Mapping[str, Any] | None) -> Stage2TransportConfig:
+def _coerce_config(
+    config: Stage2TransportConfig | Mapping[str, Any] | None,
+) -> Stage2TransportConfig:
     if config is None:
         return Stage2TransportConfig()
     if isinstance(config, Stage2TransportConfig):

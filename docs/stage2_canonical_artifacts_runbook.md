@@ -9,8 +9,8 @@ R source x_d
   -> frozen Variant-A N_d(x_d)                 [in memory only]
   -> hash canonical tensor and source support
   -> frozen VAE full encode_dist(...)[0]       [same streamed record]
-  -> persist posterior-mean latent + packed conservative latent support + sidecar
-  -> R/train supported-cell statistics
+  -> persist posterior-mean latent + packed local-valid-core support + sidecar
+  -> R/train local-valid-core statistics
   -> R/train structural descriptors
 ```
 
@@ -49,7 +49,7 @@ Run preflight against the exact output location before any long build:
 
 ```powershell
 fieldbridge preflight-photometry-factored-latent-bank `
-  --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
+  --config configs/experiment/stage2_canonical_artifacts_v2.yaml `
   --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
@@ -66,8 +66,8 @@ The JSON report seals or reports:
 - float32 canonical-volume and full Boolean support bytes avoided;
 - predicted latent, packed-support, descriptor, output, and temporary bytes;
 - required free storage and peak streamed working-set estimate;
-- the reviewed encoder support rule, graph hash, receptive field, stride, alignment, and
-  normalization scope; and
+- the reviewed local-valid-core rule, graph hash, receptive field, stride, alignment, and
+  separately sealed GroupNorm dependency provenance; and
 - successful same-directory atomic hard-link publication and no-clobber behavior.
 
 The estimates are conservative planning values, not memory reservations. Preflight reads
@@ -86,7 +86,7 @@ on an unqualified Drive/FUSE mount.
 
 ```powershell
 fieldbridge build-photometry-factored-latent-bank `
-  --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
+  --config configs/experiment/stage2_canonical_artifacts_v2.yaml `
   --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
@@ -100,8 +100,9 @@ fieldbridge build-photometry-factored-latent-bank `
 
 For each R record, the builder loads one source, computes frozen `N_d`, hashes the source,
 canonical tensor, and full source support, immediately performs the frozen full
-`encode_dist(...)[0]`, propagates support through the actual encoder graph, packs that latent
-support, publishes one record, and releases the full tensors. The record payload contains only:
+`encode_dist(...)[0]`, propagates local anatomical validity through the reviewed encoder graph,
+packs that latent support, publishes one record, and releases the full tensors. The record
+payload contains only:
 
 - the stored posterior-mean latent;
 - the packed latent support; and
@@ -109,39 +110,42 @@ support, publishes one record, and releases the full tensors. The record payload
 
 No canonical tensor or full source mask is included in the payload.
 
-The primary v1 config requires `strategy=full` and actual `path_used=full` with float32 encode
+The primary v2 config requires `strategy=full` and actual `path_used=full` with float32 encode
 arithmetic. A full-encode OOM is a hard stop. There is no automatic or explicit tiled fallback;
 any tiled variant requires a new artifact version and separate qualification.
 
-## Encoder-conservative latent support
+## Encoder local-valid-core support
 
-Support is propagated through the complete frozen `KLVAEEncoder` graph:
+`encoder-local-valid-core-support-v1` is the operational support contract. It propagates
+anatomical spatial validity through the frozen `KLVAEEncoder` graph:
 
 - Conv3d invalidity is propagated with each layer's exact kernel, stride, padding, and
   dilation. Constant padding outside the volume is not treated as a source dependency.
 - Residual outputs require both their main and skip dependencies to be supported.
-- Identity normalization is pointwise.
-- GroupNorm has per-sample global spatial statistics. Therefore, when GroupNorm is present,
-  any unsupported source dependency makes every downstream latent cell unsupported.
+- Pointwise activations and identity normalization preserve the local mask.
+- GroupNorm also preserves the local mask. Its global value dependence is recorded separately
+  for every module with module path, type, channels, groups, and epsilon.
 
 The artifact seals the graph operations, graph hash, convolutional receptive-field size,
-radius, output stride, source/latent alignment, GroupNorm count, complete dependency scope,
-support-mask hash, shape, count, and packing rule.
+radius, output stride, source/latent alignment, GroupNorm dependency provenance and hash,
+support-mask hash, shape, count, and packing rule. Local valid-core support describes
+anatomical spatial validity. It does not establish independence from GroupNorm's global
+normalization statistics.
 
-This exposes an important operator boundary: the commonly configured KL-VAE uses GroupNorm,
-while MRI source support normally excludes exact-zero background. Such a combination can
-produce empty conservative latent support and the build will stop. Do not weaken the mask or
-ignore normalization to make the build pass. Resolving that incompatibility requires a
-separately reviewed scientific decision; it is not an operator override and this PR does not
-change Variant A or the frozen VAE.
+The former global-normalization-collapse calculation remains available only as
+`encoder-complete-dependency-support-diagnostic-v1`. It is non-operational and nonblocking;
+for this VAE it may report an empty diagnostic mask. The primary v2 configuration leaves it
+disabled. Enabling it records only a diagnostic summary and never replaces, weakens, or blocks
+the local-valid-core mask. The build itself fails if operational support is empty, nonfinite,
+shape-inconsistent, or the frozen graph contains an unsupported spatial operation.
 
 ## Supported-cell statistics and descriptors
 
-`photometry-factored-latent-statistics-v1` uses only supported cells from persisted R/train
-latents. It uses channel-wise streaming float64 Welford accumulation and records per-channel
-supported counts, total supported value count, and supported spatial-cell count. Empty masks,
-nonfinite values, fewer than two values, and channel variance at or below the sealed `1e-12`
-floor fail closed.
+`photometry-factored-latent-statistics-v2` uses only operational local-valid-core cells from
+persisted R/train latents. It uses channel-wise streaming float64 Welford accumulation and
+records per-channel supported counts, total supported value count, and supported spatial-cell
+count. Empty masks, nonfinite values, fewer than two values, and channel variance at or below
+the sealed `1e-12` floor fail closed.
 
 Descriptors standardize with those masked statistics and force unsupported standardized cells
 to exact zero before hashing or feature calculation. Fixed latent and valid-adjacent absolute
@@ -153,18 +157,19 @@ contains no paired endpoint or target input. It is explicitly sealed as:
 
 ```text
 coupling_authorized: false
-qualification_required: photometry-factored-structural-descriptor-qualification-v1
+qualification_required: photometry-factored-structural-descriptor-qualification-v2
 ```
 
-No trainer may consume it for coupling until a retrospective R/validation qualification with
-subject-group exclusion demonstrates retained instance/anatomical signal and reduced field
-predictability. The artifact makes no learned-disentanglement claim.
+No trainer may consume it for nearest-neighbor coupling until a retrospective R/validation
+qualification with subject-group exclusion tests subject retrieval, field predictability,
+support-volume shortcuts, and descriptor stability. The artifact makes no learned-
+disentanglement claim.
 
 ## 3. Complete audit
 
 ```powershell
 fieldbridge audit-photometry-factored-latent-bank `
-  --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
+  --config configs/experiment/stage2_canonical_artifacts_v2.yaml `
   --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
@@ -182,14 +187,15 @@ statistics, every descriptor, all manifests, and every input/provenance binding.
 
 ## Computational provenance
 
-`stage2-computational-provenance-v1` contains a versioned reviewed dependency map and module
+`stage2-computational-provenance-v2` contains a versioned reviewed dependency map and module
 hash for every production path involved in:
 
 - N_d and support generation;
 - record contracts, source loading, and split classification/fingerprints;
 - VAE construction and encoder forward arithmetic;
 - `encode_latent` and full encoding;
-- support propagation/packing, Welford statistics, and descriptors; and
+- local-valid-core propagation, GroupNorm dependency provenance, optional diagnostic,
+  support packing, Welford statistics, and descriptors; and
 - config, checkpoint, qualification, and CLI loading.
 
 It also seals the dependency-map hash, Git commit/clean-checkout state, Python implementation
@@ -205,10 +211,11 @@ temporaries are removed. Concurrent destination creation never gets overwritten.
 hard links stop without leaving a partial destination.
 
 Without `--resume`, any existing destination fails. With `--resume`, a complete manifest is
-accepted only when the run fingerprint, computational provenance, source identities, and every
-referenced file/content hash match exactly. Compatible complete artifacts are reused byte for
-byte without loading source arrays. Incompatible or partial published manifests fail; there is
-no overwrite, repair, relabel, or fallback path.
+accepted only when the v2 resume/audit contracts, run fingerprint, local-support rule,
+GroupNorm provenance, computational provenance, source identities, and every referenced
+file/content hash match exactly. Compatible complete artifacts are reused byte for byte
+without loading source arrays. Any v1 plan, incompatible artifact, or partial published
+manifest fails; there is no overwrite, repair, relabel, or fallback path.
 
 ## Scientific boundary
 

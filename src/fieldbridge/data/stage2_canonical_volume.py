@@ -41,12 +41,12 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
 )
 
 CANONICAL_VOLUME_CONTRACT_VERSION = "stage2-canonical-volume-v1"
-CANONICAL_ARTIFACT_CONFIG_VERSION = "stage2-canonical-artifacts-config-v1"
+CANONICAL_ARTIFACT_CONFIG_VERSION = "stage2-canonical-artifacts-config-v2"
 CANONICAL_STREAM_SEMANTICS = "ephemeral-N_d-hash-then-immediate-full-encode-v1"
 CANONICAL_VOLUME_SPLITS = ("train", "validation")
 PROSPECTIVE_EXCLUSION_REASON = "prospective-cohort-rejected-before-source-array-load"
-COMPUTATIONAL_PROVENANCE_VERSION = "stage2-computational-provenance-v1"
-DEPENDENCY_MAP_VERSION = "stage2-reviewed-dependency-map-v1"
+COMPUTATIONAL_PROVENANCE_VERSION = "stage2-computational-provenance-v2"
+DEPENDENCY_MAP_VERSION = "stage2-reviewed-dependency-map-v2"
 FILESYSTEM_PREFLIGHT_VERSION = "atomic-hardlink-no-clobber-preflight-v1"
 STORAGE_PREFLIGHT_VERSION = "stage2-streamed-storage-preflight-v1"
 
@@ -83,7 +83,10 @@ REVIEWED_DEPENDENCY_MAP: dict[str, tuple[str, ...]] = {
     ),
     "src/fieldbridge/data/photometry_factored_latent_bank.py": (
         "streamed-build-audit",
-        "support-propagation-packing",
+        "encoder-local-valid-core-support",
+        "groupnorm-global-dependency-provenance",
+        "complete-dependency-diagnostic",
+        "support-packing",
         "masked-statistics",
         "structural-descriptors",
     ),
@@ -126,7 +129,7 @@ class AtomicPublicationUnavailable(RuntimeError):
 
 
 def validate_canonical_artifact_config(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the exact streamed, retrospective-only v1 configuration."""
+    """Validate the exact streamed, retrospective-only v2 configuration."""
 
     config = _json_safe_mapping(data)
     if config.get("contract") != CANONICAL_ARTIFACT_CONFIG_VERSION:
@@ -147,7 +150,7 @@ def validate_canonical_artifact_config(data: Mapping[str, Any]) -> dict[str, Any
         "source": "FrozenPhotometryArtifact.normalize_source",
         "debug_full_volume_artifact": "disabled",
     }:
-        raise ValueError("Canonical stream settings differ from the reviewed v1 contract.")
+        raise ValueError("Canonical stream settings differ from the reviewed v2 plan.")
 
     latent = config.get("latent_bank")
     if not isinstance(latent, Mapping) or set(latent) != {
@@ -157,35 +160,60 @@ def validate_canonical_artifact_config(data: Mapping[str, Any]) -> dict[str, Any
         "path_used_required",
         "store_dtype",
         "precision",
-        "support_propagation",
+        "resume_contract",
+        "audit_contract",
+        "operational_support",
+        "complete_dependency_diagnostic",
         "support_packing",
     }:
         raise ValueError("Photometry-factored latent-bank settings are incomplete.")
-    if latent.get("contract") != "photometry-factored-latent-bank-v1":
+    if latent.get("contract") != "photometry-factored-latent-bank-v2":
         raise ValueError("Photometry-factored latent-bank contract is incompatible.")
     if latent.get("encoder_statistic") != "posterior_mean":
         raise ValueError("The factored bank must use the frozen VAE posterior mean.")
     if latent.get("strategy") != "full" or latent.get("path_used_required") != "full":
-        raise ValueError("Photometry-factored latent-bank v1 requires exact full encoding.")
+        raise ValueError("Photometry-factored latent-bank v2 requires exact full encoding.")
     if latent.get("store_dtype") not in {"float16", "float32"}:
         raise ValueError("Factored-bank store dtype must be float16 or float32.")
     if latent.get("precision") != "float32":
-        raise ValueError("Primary factored-bank v1 requires float32 encoder arithmetic.")
-    if latent.get("support_propagation") != "frozen-encoder-dependency-propagation-v1":
-        raise ValueError("Factored-bank support propagation is incompatible.")
+        raise ValueError("Primary factored-bank v2 requires float32 encoder arithmetic.")
+    if latent.get("resume_contract") != "photometry-factored-latent-bank-resume-v2":
+        raise ValueError("Factored-bank resume contract is incompatible.")
+    if latent.get("audit_contract") != "photometry-factored-latent-bank-audit-v2":
+        raise ValueError("Factored-bank audit contract is incompatible.")
+    if latent.get("operational_support") != {
+        "contract": "encoder-local-valid-core-support-v1",
+        "scope": "anatomical-spatial-validity",
+        "groupnorm_action": "record-global-dependency-without-spatial-mask-collapse",
+        "normalization_statistical_independence_claim": False,
+    }:
+        raise ValueError("Factored-bank operational local-support plan is incompatible.")
+    diagnostic = latent.get("complete_dependency_diagnostic")
+    if (
+        not isinstance(diagnostic, Mapping)
+        or diagnostic.get("contract")
+        != "encoder-complete-dependency-support-diagnostic-v1"
+        or not isinstance(diagnostic.get("enabled"), bool)
+        or diagnostic.get("blocking") is not False
+    ):
+        raise ValueError("Factored-bank complete-dependency diagnostic plan is incompatible.")
     if latent.get("support_packing") != "numpy-packbits-c-order-little-bit-v1":
         raise ValueError("Factored-bank support packing is incompatible.")
 
     if config.get("statistics") != {
-        "contract": "photometry-factored-latent-statistics-v1",
-        "computed_over": {"cohort": "R", "split": "train", "cells": "supported_only"},
+        "contract": "photometry-factored-latent-statistics-v2",
+        "computed_over": {
+            "cohort": "R",
+            "split": "train",
+            "cells": "encoder_local_valid_core_only",
+        },
         "accumulation": "channelwise-masked-welford-float64-v1",
     }:
         raise ValueError("Canonical latent statistics must be masked R/train Welford stats.")
     if config.get("structural_descriptor") != {
-        "contract": "photometry-factored-structural-descriptor-v1",
+        "contract": "photometry-factored-structural-descriptor-v2",
         "computed_over": {"cohort": "R", "split": "train"},
-        "input": "canonical_standardized_supported_latent_only",
+        "input": "canonical_standardized_local_valid_core_latent_only",
         "pool_output_sizes": [1, 2, 4],
         "pooling": "support-normalized-adaptive-average-3d-v1",
         "gradients": "absolute-first-forward-difference-xyz-v1",
@@ -193,10 +221,10 @@ def validate_canonical_artifact_config(data: Mapping[str, Any]) -> dict[str, Any
         "paired_endpoint_or_target_input": "forbidden",
         "coupling_authorized": False,
         "qualification_required": (
-            "photometry-factored-structural-descriptor-qualification-v1"
+            "photometry-factored-structural-descriptor-qualification-v2"
         ),
     }:
-        raise ValueError("Structural-descriptor v1 settings differ from the reviewed contract.")
+        raise ValueError("Structural-descriptor v2 settings differ from the reviewed contract.")
     if config.get("publication") != {
         "atomic": "same-directory-hardlink-publication-v1",
         "no_clobber": True,

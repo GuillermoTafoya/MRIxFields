@@ -1,4 +1,4 @@
-contract: stage2-canonical-artifacts-config-v1
+contract: stage2-canonical-artifacts-config-v2
 scope: retrospective_only_canonical_artifacts
 
 eligibility:
@@ -15,36 +15,46 @@ canonical_stream:
   debug_full_volume_artifact: disabled
 
 latent_bank:
-  contract: photometry-factored-latent-bank-v1
+  contract: photometry-factored-latent-bank-v2
+  resume_contract: photometry-factored-latent-bank-resume-v2
+  audit_contract: photometry-factored-latent-bank-audit-v2
   encoder_statistic: posterior_mean
   strategy: full
   path_used_required: full
   store_dtype: float16
   precision: float32
-  support_propagation: frozen-encoder-dependency-propagation-v1
+  operational_support:
+    contract: encoder-local-valid-core-support-v1
+    scope: anatomical-spatial-validity
+    groupnorm_action: record-global-dependency-without-spatial-mask-collapse
+    normalization_statistical_independence_claim: false
+  complete_dependency_diagnostic:
+    contract: encoder-complete-dependency-support-diagnostic-v1
+    enabled: false
+    blocking: false
   support_packing: numpy-packbits-c-order-little-bit-v1
 
 statistics:
-  contract: photometry-factored-latent-statistics-v1
+  contract: photometry-factored-latent-statistics-v2
   computed_over:
     cohort: R
     split: train
-    cells: supported_only
+    cells: encoder_local_valid_core_only
   accumulation: channelwise-masked-welford-float64-v1
 
 structural_descriptor:
-  contract: photometry-factored-structural-descriptor-v1
+  contract: photometry-factored-structural-descriptor-v2
   computed_over:
     cohort: R
     split: train
-  input: canonical_standardized_supported_latent_only
+  input: canonical_standardized_local_valid_core_latent_only
   pool_output_sizes: [1, 2, 4]
   pooling: support-normalized-adaptive-average-3d-v1
   gradients: absolute-first-forward-difference-xyz-v1
   dtype: float32
   paired_endpoint_or_target_input: forbidden
   coupling_authorized: false
-  qualification_required: photometry-factored-structural-descriptor-qualification-v1
+  qualification_required: photometry-factored-structural-descriptor-qualification-v2
 
 publication:
   atomic: same-directory-hardlink-publication-v1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,16 +17,22 @@ from fieldbridge.data.latent_bank import LATENT_BANK_CONTRACT_VERSION
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex
 from fieldbridge.data.photometry_factored_latent_bank import (
     FACTORED_LATENT_STATS_FILE,
+    COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION,
+    GROUPNORM_DEPENDENCY_PROVENANCE_VERSION,
+    LOCAL_VALID_CORE_SUPPORT_RULE,
+    PHOTOMETRY_FACTORED_AUDIT_VERSION,
     PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION,
     PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
+    PHOTOMETRY_FACTORED_RESUME_VERSION,
     STRUCTURAL_DESCRIPTOR_MANIFEST,
     MaskedChannelWelford,
     PhotometryFactoredLatentBankConfig,
     audit_photometry_factored_latent_bank,
     build_photometry_factored_latent_bank,
-    derive_encoder_support_rule,
+    derive_encoder_local_support_rule,
     pack_support_mask,
-    propagate_encoder_support,
+    propagate_encoder_complete_dependency_diagnostic,
+    propagate_encoder_local_valid_core_support,
     receptive_field_source_bounds,
     standardize_supported_latent,
     structural_descriptor,
@@ -54,7 +61,7 @@ from fieldbridge.evaluation.stage2_photometry_baseline import (
 )
 from fieldbridge.models.autoencoders.kl_vae import KLVAEEncoder
 
-_CONFIG_PATH = Path("configs/experiment/stage2_canonical_artifacts_v1.yaml")
+_CONFIG_PATH = Path("configs/experiment/stage2_canonical_artifacts_v2.yaml")
 _FAKE_SPLIT_SHA = sha256_text("synthetic canonical split file")
 _FAKE_MEMBERSHIP = sha256_text("synthetic membership")
 _FAKE_RECOVERY = sha256_text("synthetic recovery")
@@ -394,17 +401,21 @@ def test_source_content_mutation_invalidates_resume_before_array_load(tmp_path) 
         _build(tmp_path, fixture, _encoder(), resume=True, loader=forbidden_loader)
 
 
-def test_support_propagation_matches_local_receptive_field_boundary_and_impulse() -> None:
-    encoder = _encoder(use_norm=False, num_res_blocks=1)
-    rule = derive_encoder_support_rule(encoder)
-    assert rule["convolutional_receptive_field_size"] == [37, 37, 37]
+@pytest.mark.parametrize(("num_res_blocks", "receptive_field"), [(1, 37), (2, 65)])
+def test_conv_and_residual_valid_core_erosion_is_exact(
+    num_res_blocks: int, receptive_field: int
+) -> None:
+    encoder = _encoder(use_norm=False, num_res_blocks=num_res_blocks)
+    rule = derive_encoder_local_support_rule(encoder)
+    assert rule["contract_version"] == LOCAL_VALID_CORE_SUPPORT_RULE
+    assert rule["scope"] == "anatomical-spatial-validity"
+    assert rule["convolutional_receptive_field_size"] == [receptive_field] * 3
     assert rule["output_stride"] == [4, 4, 4]
-    assert rule["complete_spatial_dependency"] == "convolutional-receptive-field"
 
     for unsupported_index in ((40, 40, 40), (0, 0, 0)):
         source = torch.ones(1, 1, 80, 80, 80, dtype=torch.bool)
         source[(0, 0, *unsupported_index)] = False
-        propagated = propagate_encoder_support(source, encoder)
+        propagated = propagate_encoder_local_valid_core_support(source, encoder)
         for z in range(propagated.shape[0]):
             for y in range(propagated.shape[1]):
                 for x in range(propagated.shape[2]):
@@ -418,14 +429,93 @@ def test_support_propagation_matches_local_receptive_field_boundary_and_impulse(
                     assert bool(propagated[z, y, x]) is (not depends)
 
 
-def test_groupnorm_complete_dependency_is_global_and_fails_empty_support() -> None:
+def test_groupnorm_records_global_dependence_without_collapsing_local_support() -> None:
     encoder = _encoder(use_norm=True, num_res_blocks=1)
-    rule = derive_encoder_support_rule(encoder)
-    assert rule["groupnorm_count"] == 6
-    assert rule["complete_spatial_dependency"] == "full-input-spatial-extent"
-    support = torch.ones(1, 1, 16, 16, 16, dtype=torch.bool)
-    support[..., 8, 8, 8] = False
-    assert not bool(propagate_encoder_support(support, encoder).any())
+    rule = derive_encoder_local_support_rule(encoder)
+    provenance = rule["groupnorm_dependency_provenance"]
+    assert provenance["contract_version"] == GROUPNORM_DEPENDENCY_PROVENANCE_VERSION
+    assert provenance["local_support_mask_action"] == (
+        "record-separately-without-spatial-collapse"
+    )
+    assert len(provenance["modules"]) == 6
+    assert all(
+        set(module) == {"module_path", "type", "channels", "groups", "epsilon"}
+        and module["type"].endswith(".GroupNorm")
+        for module in provenance["modules"]
+    )
+    support = torch.ones(1, 1, 80, 80, 80, dtype=torch.bool)
+    support[..., 40, 40, 40] = False
+    local = propagate_encoder_local_valid_core_support(support, encoder)
+    pointwise_norm_reference = propagate_encoder_local_valid_core_support(
+        support, _encoder(use_norm=False, num_res_blocks=1)
+    )
+    assert bool(local.any())
+    assert torch.equal(local, pointwise_norm_reference)
+    diagnostic = propagate_encoder_complete_dependency_diagnostic(support, encoder)
+    assert not bool(diagnostic.any())
+    assert rule["optional_diagnostic"] == {
+        "contract_version": COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION,
+        "operational": False,
+        "blocking": False,
+    }
+    assert rule["normalization_statistical_independence_claim"] is False
+
+
+def test_empty_complete_dependency_diagnostic_does_not_block_bank(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    fixture.config["latent_bank"]["complete_dependency_diagnostic"]["enabled"] = True
+    for identity, volume in fixture.volumes.items():
+        resized = torch.nn.functional.interpolate(
+            volume, size=(24, 24, 24), mode="trilinear", align_corners=False
+        )
+        resized[..., 0, 0, 0] = 0
+        fixture.volumes[identity] = resized
+    root, manifest = _build(
+        tmp_path, fixture, _encoder(use_norm=True, num_res_blocks=1)
+    )
+    assert manifest["complete_dependency_diagnostic_enabled"] is True
+    assert all(
+        entry["sidecar"]["local_valid_core_support_nonzero_count"] > 0
+        and entry["sidecar"]["complete_dependency_diagnostic"]["empty"] is True
+        and entry["sidecar"]["complete_dependency_diagnostic"]["blocking"] is False
+        for entry in manifest["records"]
+    )
+    assert _audit(root, fixture, _encoder(use_norm=True, num_res_blocks=1))[
+        "all_records_verified"
+    ] is True
+
+
+def test_actual_frozen_klvae_has_nonempty_local_valid_core_support() -> None:
+    model = dict(load_yaml_config(Path("configs/experiment/stage1_vae.yaml"))["model"])
+    assert model.pop("name") == "kl_vae"
+    encoder = KLVAEEncoder(**model).requires_grad_(False).eval()
+    support = torch.zeros(1, 1, 80, 80, 80, dtype=torch.bool)
+    support[..., 4:-4, 4:-4, 4:-4] = True
+    local = propagate_encoder_local_valid_core_support(support, encoder)
+    rule = derive_encoder_local_support_rule(encoder)
+    assert bool(local.any())
+    assert rule["convolutional_receptive_field_size"] == [65, 65, 65]
+    assert len(rule["groupnorm_dependency_provenance"]["modules"]) == 12
+
+
+def test_local_valid_core_support_fails_closed_on_invalid_mask_or_graph() -> None:
+    encoder = _encoder()
+    with pytest.raises(ValueError, match="empty"):
+        propagate_encoder_local_valid_core_support(
+            torch.zeros(1, 1, 16, 16, 16, dtype=torch.bool), encoder
+        )
+    nonfinite = torch.ones(1, 1, 16, 16, 16)
+    nonfinite[..., 0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        propagate_encoder_local_valid_core_support(nonfinite, encoder)
+    with pytest.raises(ValueError, match="requires"):
+        propagate_encoder_local_valid_core_support(
+            torch.ones(16, 16, dtype=torch.bool), encoder
+        )
+    unsupported = _encoder()
+    unsupported.res1[0].act1 = torch.nn.MaxPool3d(2)
+    with pytest.raises(ValueError, match="Unsupported encoder activation"):
+        derive_encoder_local_support_rule(unsupported)
 
 
 def test_packed_support_round_trip_seals_actual_mask() -> None:
@@ -499,11 +589,23 @@ def test_bank_statistics_domains_streaming_and_descriptor_boundary(tmp_path) -> 
     assert manifest["encoding"]["strategy_requested"] == "full"
     assert manifest["encoding"]["path_used_required"] == "full"
     assert manifest["encoding"]["oom_fallback"] == "forbidden-hard-stop"
+    assert manifest["resume_contract_version"] == PHOTOMETRY_FACTORED_RESUME_VERSION
+    assert manifest["audit_contract_version"] == PHOTOMETRY_FACTORED_AUDIT_VERSION
+    assert manifest["operational_support_rule"]["contract_version"] == (
+        LOCAL_VALID_CORE_SUPPORT_RULE
+    )
+    assert manifest["operational_support_rule"][
+        "normalization_statistical_independence_claim"
+    ] is False
+    assert manifest["complete_dependency_diagnostic_enabled"] is False
     assert manifest["storage_preflight"]["full_volume_bytes_avoided"] > 0
     assert manifest["storage_preflight"]["predicted_latent_bytes"] > 0
     assert all(
         entry["sidecar"]["encoding_path"]["path_used"] == "full"
         and entry["sidecar"]["canonical_persisted"] is False
+        and entry["sidecar"]["operational_support_contract"]
+        == LOCAL_VALID_CORE_SUPPORT_RULE
+        and entry["sidecar"]["complete_dependency_diagnostic"] is None
         for entry in manifest["records"]
     )
 
@@ -511,7 +613,7 @@ def test_bank_statistics_domains_streaming_and_descriptor_boundary(tmp_path) -> 
     assert stats["computed_over"] == {
         "cohort": "R",
         "split": "train",
-        "cells": "supported_only",
+        "cells": "encoder_local_valid_core_only",
     }
     assert stats["record_count"] == 15
     assert stats["algorithm"] == "channelwise-masked-welford-float64-v1"
@@ -528,6 +630,14 @@ def test_bank_statistics_domains_streaming_and_descriptor_boundary(tmp_path) -> 
         == PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION
     )
     assert descriptors["learned_disentanglement_claim"] == "forbidden"
+    assert descriptors["qualification_requirements"] == {
+        "retrospective_split": "validation",
+        "subject_group_exclusion": "required",
+        "subject_retrieval": "must-demonstrate-retained-instance-signal",
+        "field_predictability": "must-demonstrate-reduction",
+        "support_volume_shortcuts": "must-test-and-rule-out",
+        "descriptor_stability": "must-demonstrate",
+    }
     assert all(
         entry["sidecar"]["subject_group_identity"].startswith("R:")
         and entry["sidecar"]["coupling_authorized"] is False
@@ -537,6 +647,7 @@ def test_bank_statistics_domains_streaming_and_descriptor_boundary(tmp_path) -> 
     assert report["source_to_N_d_to_E_recomputed"] is True
     assert report["masked_train_statistics_verified"] is True
     assert report["structural_descriptors_verified"] is True
+    assert report["contract_version"] == PHOTOMETRY_FACTORED_AUDIT_VERSION
 
 
 def test_every_dependency_identity_mutation_invalidates_resume_and_audit(tmp_path) -> None:
@@ -568,6 +679,34 @@ def test_every_dependency_identity_mutation_invalidates_resume_and_audit(tmp_pat
         fixture.code_provenance = original
     with pytest.raises(ValueError, match="resume/audit"):
         _audit(root, fixture, _encoder(), code_provenance=runtime_mutation)
+
+
+def test_local_rule_and_groupnorm_provenance_mutations_invalidate_resume_and_audit(
+    tmp_path,
+) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    root, _ = _build(tmp_path, fixture, _encoder(use_norm=True, num_res_blocks=1))
+
+    changed_local_graph = _encoder(use_norm=True, num_res_blocks=2)
+    with pytest.raises(ValueError, match="exact resume"):
+        _build(tmp_path, fixture, changed_local_graph, resume=True)
+    with pytest.raises(ValueError, match="resume/audit"):
+        _audit(root, fixture, changed_local_graph)
+
+    changed_groupnorm = _encoder(use_norm=True, num_res_blocks=1)
+    changed_groupnorm.res1[0].norm1.eps = 2.0e-5
+    changed_rule = derive_encoder_local_support_rule(changed_groupnorm)
+    original_rule = derive_encoder_local_support_rule(_encoder(use_norm=True, num_res_blocks=1))
+    assert changed_rule["convolutional_receptive_field_size"] == original_rule[
+        "convolutional_receptive_field_size"
+    ]
+    assert changed_rule["groupnorm_dependency_provenance_sha256"] != original_rule[
+        "groupnorm_dependency_provenance_sha256"
+    ]
+    with pytest.raises(ValueError, match="exact resume"):
+        _build(tmp_path, fixture, changed_groupnorm, resume=True)
+    with pytest.raises(ValueError, match="resume/audit"):
+        _audit(root, fixture, changed_groupnorm)
 
 
 def test_payload_hash_mutation_fails_complete_audit(tmp_path) -> None:
@@ -676,6 +815,45 @@ def test_primary_config_rejects_tiled_strategy() -> None:
     config["latent_bank"]["strategy"] = "tiled"
     with pytest.raises(ValueError, match="full encoding"):
         PhotometryFactoredLatentBankConfig.from_mapping(config, out_dir="external")
+
+
+def test_v2_config_rejects_old_support_resume_and_audit_plans() -> None:
+    current = load_yaml_config(_CONFIG_PATH)
+    mutations = (
+        ("contract", "stage2-canonical-artifacts-config-v1"),
+        ("latent_bank.contract", "photometry-factored-latent-bank-v1"),
+        (
+            "latent_bank.operational_support.contract",
+            "frozen-encoder-dependency-propagation-v1",
+        ),
+        ("latent_bank.resume_contract", "photometry-factored-latent-bank-resume-v1"),
+        ("latent_bank.audit_contract", "photometry-factored-latent-bank-audit-v1"),
+    )
+    for dotted, value in mutations:
+        mutated = deepcopy(current)
+        target = mutated
+        keys = dotted.split(".")
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = value
+        with pytest.raises(ValueError, match="incompatible"):
+            PhotometryFactoredLatentBankConfig.from_mapping(mutated, out_dir="external")
+
+
+def test_operational_support_contract_disclaims_normalization_statistical_independence() -> None:
+    rule = derive_encoder_local_support_rule(_encoder(use_norm=True))
+    assert rule["scope"] == "anatomical-spatial-validity"
+    assert rule["normalization_statistical_independence_claim"] is False
+    assert "does not establish independence" in rule["scope_statement"]
+    assert rule["optional_diagnostic"]["operational"] is False
+
+    for path in (
+        Path("src/fieldbridge/data/photometry_factored_latent_bank.py"),
+        Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
+        Path("docs/stage2_canonical_artifacts_runbook.md"),
+    ):
+        text = path.read_text(encoding="utf-8").lower()
+        assert "operational_support_claims_normalization_independence: true" not in text
 
 
 def test_existing_latent_bank_v1_reader_behavior_is_unchanged(tmp_path) -> None:

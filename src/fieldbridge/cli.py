@@ -835,7 +835,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_factored_bank.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_canonical_artifacts_v1.yaml"),
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
     )
     preflight_factored_bank.add_argument("--split-json", type=Path, required=True)
     preflight_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)
@@ -854,7 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_factored_bank.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_canonical_artifacts_v1.yaml"),
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
     )
     build_factored_bank.add_argument("--split-json", type=Path, required=True)
     build_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)
@@ -875,7 +875,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit_factored_bank.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_canonical_artifacts_v1.yaml"),
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
     )
     audit_factored_bank.add_argument("--split-json", type=Path, required=True)
     audit_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)

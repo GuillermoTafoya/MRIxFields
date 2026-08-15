@@ -1,6 +1,6 @@
 """Streamed retrospective photometry-factored latent bank.
 
-The primary v1 path computes ``source -> N_d(source) -> E(N_d(source))`` one record at a
+The primary v2 path computes ``source -> N_d(source) -> E(N_d(source))`` one record at a
 time.  It persists only the posterior-mean latent, packed encoder-conservative latent
 support, record sidecar/provenance, masked train statistics, and structural descriptors.
 Full canonical tensors and full-resolution support masks are never published.
@@ -63,21 +63,29 @@ from fieldbridge.data.stage2_canonical_volume import (
 )
 from fieldbridge.training.train_loop import assert_frozen
 
-PHOTOMETRY_FACTORED_LATENT_BANK_VERSION = "photometry-factored-latent-bank-v1"
-PHOTOMETRY_FACTORED_LATENT_STATS_VERSION = "photometry-factored-latent-statistics-v1"
-PHOTOMETRY_FACTORED_DESCRIPTOR_VERSION = "photometry-factored-structural-descriptor-v1"
+PHOTOMETRY_FACTORED_LATENT_BANK_VERSION = "photometry-factored-latent-bank-v2"
+PHOTOMETRY_FACTORED_LATENT_STATS_VERSION = "photometry-factored-latent-statistics-v2"
+PHOTOMETRY_FACTORED_DESCRIPTOR_VERSION = "photometry-factored-structural-descriptor-v2"
 PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION = (
-    "photometry-factored-structural-descriptor-qualification-v1"
+    "photometry-factored-structural-descriptor-qualification-v2"
 )
+PHOTOMETRY_FACTORED_RESUME_VERSION = "photometry-factored-latent-bank-resume-v2"
+PHOTOMETRY_FACTORED_AUDIT_VERSION = "photometry-factored-latent-bank-audit-v2"
 FACTORED_LATENT_BANK_MANIFEST = "photometry_factored_latent_bank_manifest.json"
 FACTORED_LATENT_STATS_FILE = "latent_stats.json"
 STRUCTURAL_DESCRIPTOR_MANIFEST = "structural_descriptor_manifest.json"
-SUPPORT_PROPAGATION_RULE = "frozen-encoder-dependency-propagation-v1"
-SUPPORT_RULE_EVIDENCE_VERSION = "klvae-encoder-support-evidence-v1"
+LOCAL_VALID_CORE_SUPPORT_RULE = "encoder-local-valid-core-support-v1"
+LOCAL_SUPPORT_RULE_EVIDENCE_VERSION = "klvae-encoder-local-support-evidence-v1"
+GROUPNORM_DEPENDENCY_PROVENANCE_VERSION = (
+    "encoder-groupnorm-global-spatial-dependency-provenance-v1"
+)
+COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION = (
+    "encoder-complete-dependency-support-diagnostic-v1"
+)
 SUPPORT_PACKING_RULE = "numpy-packbits-c-order-little-bit-v1"
 MASKED_WELFORD_RULE = "channelwise-masked-welford-float64-v1"
 MIN_SUPPORTED_CHANNEL_VARIANCE = 1.0e-12
-DESCRIPTOR_INPUT = "canonical_standardized_supported_latent_only"
+DESCRIPTOR_INPUT = "canonical_standardized_local_valid_core_latent_only"
 DESCRIPTOR_POOLING = "support-normalized-adaptive-average-3d-v1"
 DESCRIPTOR_GRADIENTS = "absolute-first-forward-difference-xyz-v1"
 
@@ -92,6 +100,7 @@ class PhotometryFactoredLatentBankConfig:
     precision: str = "float32"
     splits: tuple[str, ...] = CANONICAL_VOLUME_SPLITS
     descriptor_pool_sizes: tuple[int, ...] = (1, 2, 4)
+    complete_dependency_diagnostic: bool = False
 
     @classmethod
     def from_mapping(
@@ -109,6 +118,9 @@ class PhotometryFactoredLatentBankConfig:
             descriptor_pool_sizes=tuple(
                 int(value) for value in descriptor["pool_output_sizes"]
             ),
+            complete_dependency_diagnostic=bool(
+                latent["complete_dependency_diagnostic"]["enabled"]
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -119,6 +131,7 @@ class PhotometryFactoredLatentBankConfig:
             "precision": self.precision,
             "splits": list(self.splits),
             "descriptor_pool_sizes": list(self.descriptor_pool_sizes),
+            "complete_dependency_diagnostic": self.complete_dependency_diagnostic,
         }
 
 
@@ -196,24 +209,24 @@ class MaskedChannelWelford:
         }
 
 
-def derive_encoder_support_rule(encoder: Any) -> dict[str, Any]:
-    """Inspect the complete frozen KLVAE encoder graph and seal dependency evidence."""
+def derive_encoder_local_support_rule(encoder: Any) -> dict[str, Any]:
+    """Seal the frozen encoder's local spatial-validity graph and normalization provenance."""
 
     required = ("stem", "res1", "down1", "res2", "down2", "res3", "to_dist")
     if encoder.__class__.__name__ != "KLVAEEncoder" or any(
         not hasattr(encoder, name) for name in required
     ):
         raise ValueError(
-            "Support propagation v1 is qualified only for the frozen KLVAEEncoder graph."
+            "Local-valid-core support v1 is qualified only for the frozen KLVAEEncoder graph."
         )
     if int(getattr(encoder, "spatial_dims", 0)) != 3:
-        raise ValueError("Support propagation v1 requires the frozen 3-D KLVAE encoder.")
+        raise ValueError("Local-valid-core support v1 requires the frozen 3-D KLVAE encoder.")
     factor = downsample_factor(encoder)
     operations: list[dict[str, Any]] = []
     receptive_field = [1, 1, 1]
     stride = [1, 1, 1]
     offset = [0.0, 0.0, 0.0]
-    group_norm_count = 0
+    groupnorm_dependencies: list[dict[str, Any]] = []
 
     def add_conv(name: str, module: nn.Module) -> None:
         nonlocal receptive_field, stride, offset
@@ -233,17 +246,23 @@ def derive_encoder_support_rule(encoder: Any) -> dict[str, Any]:
         operations.append({"name": name, "operator": "conv3d", **spec})
 
     def add_norm(name: str, module: nn.Module) -> None:
-        nonlocal group_norm_count
         if isinstance(module, nn.Identity):
             operations.append({"name": name, "operator": "identity-normalization"})
         elif isinstance(module, nn.GroupNorm):
-            group_norm_count += 1
+            dependency = {
+                "module_path": name,
+                "type": f"{module.__class__.__module__}.{module.__class__.__qualname__}",
+                "channels": int(module.num_channels),
+                "groups": int(module.num_groups),
+                "epsilon": float(module.eps),
+            }
+            groupnorm_dependencies.append(dependency)
             operations.append(
                 {
                     "name": name,
                     "operator": "groupnorm",
-                    "num_groups": int(module.num_groups),
-                    "spatial_dependency": "global-per-sample-channel-group",
+                    "local_support_action": "pass-through",
+                    "global_dependency_provenance": dependency,
                 }
             )
         else:
@@ -253,40 +272,84 @@ def derive_encoder_support_rule(encoder: Any) -> dict[str, Any]:
     for stack_name in ("res1",):
         for index, block in enumerate(getattr(encoder, stack_name)):
             add_norm(f"{stack_name}.{index}.norm1", block.norm1)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act1", block.act1)
             add_conv(f"{stack_name}.{index}.conv1", block.conv1)
             add_norm(f"{stack_name}.{index}.norm2", block.norm2)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act2", block.act2)
             add_conv(f"{stack_name}.{index}.conv2", block.conv2)
             _validate_skip(block.skip, f"{stack_name}.{index}.skip")
+            operations.append(
+                {
+                    "name": f"{stack_name}.{index}.residual_add",
+                    "operator": "pointwise-residual-union",
+                    "required_local_branches": ["main", "skip"],
+                }
+            )
     add_conv("down1", encoder.down1)
     for stack_name in ("res2",):
         for index, block in enumerate(getattr(encoder, stack_name)):
             add_norm(f"{stack_name}.{index}.norm1", block.norm1)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act1", block.act1)
             add_conv(f"{stack_name}.{index}.conv1", block.conv1)
             add_norm(f"{stack_name}.{index}.norm2", block.norm2)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act2", block.act2)
             add_conv(f"{stack_name}.{index}.conv2", block.conv2)
             _validate_skip(block.skip, f"{stack_name}.{index}.skip")
+            operations.append(
+                {
+                    "name": f"{stack_name}.{index}.residual_add",
+                    "operator": "pointwise-residual-union",
+                    "required_local_branches": ["main", "skip"],
+                }
+            )
     add_conv("down2", encoder.down2)
     for stack_name in ("res3",):
         for index, block in enumerate(getattr(encoder, stack_name)):
             add_norm(f"{stack_name}.{index}.norm1", block.norm1)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act1", block.act1)
             add_conv(f"{stack_name}.{index}.conv1", block.conv1)
             add_norm(f"{stack_name}.{index}.norm2", block.norm2)
+            _add_pointwise_activation(operations, f"{stack_name}.{index}.act2", block.act2)
             add_conv(f"{stack_name}.{index}.conv2", block.conv2)
             _validate_skip(block.skip, f"{stack_name}.{index}.skip")
+            operations.append(
+                {
+                    "name": f"{stack_name}.{index}.residual_add",
+                    "operator": "pointwise-residual-union",
+                    "required_local_branches": ["main", "skip"],
+                }
+            )
     add_conv("to_dist", encoder.to_dist)
     if stride != [factor, factor, factor]:
         raise ValueError("Encoder graph stride differs from its sealed downsample factor.")
     if any(abs(value) > 1e-12 for value in offset):
         raise ValueError("Encoder graph alignment is not the reviewed zero-offset alignment.")
     graph = {
-        "evidence_version": SUPPORT_RULE_EVIDENCE_VERSION,
+        "evidence_version": LOCAL_SUPPORT_RULE_EVIDENCE_VERSION,
         "encoder_class": f"{encoder.__class__.__module__}.{encoder.__class__.__qualname__}",
         "spatial_dims": 3,
         "num_res_blocks": int(getattr(encoder, "num_res_blocks")),
         "operations": operations,
     }
+    groupnorm_provenance: dict[str, Any] = {
+        "contract_version": GROUPNORM_DEPENDENCY_PROVENANCE_VERSION,
+        "dependency_scope": "per-sample-spatial-statistics-within-channel-groups",
+        "affects_encoded_values": bool(groupnorm_dependencies),
+        "local_support_mask_action": "record-separately-without-spatial-collapse",
+        "modules": groupnorm_dependencies,
+    }
+    groupnorm_provenance["modules_sha256"] = sha256_json(groupnorm_dependencies)
     rule: dict[str, Any] = {
-        "rule": SUPPORT_PROPAGATION_RULE,
+        "contract_version": LOCAL_VALID_CORE_SUPPORT_RULE,
+        "scope": "anatomical-spatial-validity",
+        "supported_cell_definition": (
+            "every-spatially-local-source-dependency-in-the-frozen-encoder-valid-core-is-supported"
+        ),
+        "normalization_statistical_independence_claim": False,
+        "scope_statement": (
+            "Local valid-core support describes anatomical spatial validity and does not "
+            "establish independence from global normalization statistics."
+        ),
         "graph": graph,
         "graph_sha256": sha256_json(graph),
         "convolutional_receptive_field_size": receptive_field,
@@ -299,42 +362,88 @@ def derive_encoder_support_rule(encoder: Any) -> dict[str, Any]:
             "source_index_offset": [0, 0, 0],
             "outside_volume_padding": "constant-zero-not-a-source-dependency",
         },
-        "groupnorm_count": group_norm_count,
-        "complete_spatial_dependency": (
-            "full-input-spatial-extent" if group_norm_count else "convolutional-receptive-field"
-        ),
-        "supported_cell_definition": (
-            "no-unsupported-source-voxel-in-complete-encoder-dependency-set"
-        ),
+        "groupnorm_dependency_provenance": groupnorm_provenance,
+        "groupnorm_dependency_provenance_sha256": sha256_json(groupnorm_provenance),
+        "optional_diagnostic": {
+            "contract_version": COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION,
+            "operational": False,
+            "blocking": False,
+        },
     }
     rule["rule_sha256"] = sha256_json(rule)
     return rule
 
 
-def propagate_encoder_support(
+def propagate_encoder_local_valid_core_support(
     source_support: torch.Tensor,
     encoder: Any,
     *,
     expected_rule_sha256: str | None = None,
 ) -> torch.Tensor:
-    """Propagate Boolean validity through the actual frozen encoder graph."""
+    """Propagate anatomical spatial validity through every reviewed local encoder edge."""
 
-    rule = derive_encoder_support_rule(encoder)
+    rule = derive_encoder_local_support_rule(encoder)
     if expected_rule_sha256 is not None and rule["rule_sha256"] != expected_rule_sha256:
         raise ValueError("Frozen encoder support-rule identity changed.")
-    support = source_support.detach().cpu().to(torch.bool)
+    support = _validated_source_support(source_support)
     if support.ndim == 3:
         support = support[None, None]
     if support.ndim != 5 or tuple(support.shape[:2]) != (1, 1):
         raise ValueError("Encoder support propagation requires (1,1,X,Y,Z) support.")
     support = _conv_support(support, encoder.stem)
-    support = _res_stack_support(support, encoder.res1)
+    support = _res_stack_support(support, encoder.res1, collapse_groupnorm=False)
     support = _conv_support(support, encoder.down1)
-    support = _res_stack_support(support, encoder.res2)
+    support = _res_stack_support(support, encoder.res2, collapse_groupnorm=False)
     support = _conv_support(support, encoder.down2)
-    support = _res_stack_support(support, encoder.res3)
+    support = _res_stack_support(support, encoder.res3, collapse_groupnorm=False)
     support = _conv_support(support, encoder.to_dist)
-    return support[0, 0].contiguous()
+    result = support[0, 0].contiguous()
+    _validate_local_valid_core_support(result)
+    return result
+
+
+def propagate_encoder_complete_dependency_diagnostic(
+    source_support: torch.Tensor,
+    encoder: Any,
+    *,
+    expected_rule_sha256: str | None = None,
+) -> torch.Tensor:
+    """Run the legacy global-normalization collapse as a nonblocking diagnostic mask."""
+
+    rule = derive_encoder_local_support_rule(encoder)
+    if expected_rule_sha256 is not None and rule["rule_sha256"] != expected_rule_sha256:
+        raise ValueError("Frozen encoder support-rule identity changed.")
+    support = _validated_source_support(source_support)
+    if support.ndim == 3:
+        support = support[None, None]
+    if support.ndim != 5 or tuple(support.shape[:2]) != (1, 1):
+        raise ValueError("Encoder support propagation requires (1,1,X,Y,Z) support.")
+    support = _conv_support(support, encoder.stem)
+    support = _res_stack_support(support, encoder.res1, collapse_groupnorm=True)
+    support = _conv_support(support, encoder.down1)
+    support = _res_stack_support(support, encoder.res2, collapse_groupnorm=True)
+    support = _conv_support(support, encoder.down2)
+    support = _res_stack_support(support, encoder.res3, collapse_groupnorm=True)
+    support = _conv_support(support, encoder.to_dist)
+    result = support[0, 0].contiguous()
+    if result.dtype != torch.bool or result.ndim != 3 or not bool(
+        torch.isfinite(result.to(torch.float32)).all()
+    ):
+        raise ValueError("Complete-dependency diagnostic produced an invalid mask.")
+    return result
+
+
+def _complete_dependency_diagnostic_summary(mask: torch.Tensor) -> dict[str, Any]:
+    return {
+        "contract_version": COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION,
+        "operational": False,
+        "blocking": False,
+        "mask_sha256": storage_tensor_sha256(mask),
+        "shape": list(mask.shape),
+        "dtype": "bool",
+        "nonzero_count": int(mask.sum()),
+        "empty": not bool(mask.any()),
+    }
 
 
 def receptive_field_source_bounds(
@@ -348,8 +457,6 @@ def receptive_field_source_bounds(
     shape = tuple(int(value) for value in source_shape)[-3:]
     if len(index) != 3 or len(shape) != 3:
         raise ValueError("Receptive-field bounds require three spatial dimensions.")
-    if rule.get("complete_spatial_dependency") == "full-input-spatial-extent":
-        return tuple((0, value - 1) for value in shape)  # type: ignore[return-value]
     stride = tuple(int(value) for value in rule["output_stride"])
     radius = tuple(int(value) for value in rule["convolutional_receptive_field_radius"])
     return tuple(
@@ -496,7 +603,9 @@ def preflight_photometry_factored_latent_bank(
         check_publication=True,
     )
     return {
-        "contract_version": "photometry-factored-latent-bank-preflight-v1",
+        "contract_version": "photometry-factored-latent-bank-preflight-v2",
+        "resume_contract_version": PHOTOMETRY_FACTORED_RESUME_VERSION,
+        "audit_contract_version": PHOTOMETRY_FACTORED_AUDIT_VERSION,
         "run_fingerprint": prepared.run_fingerprint,
         "eligibility": {
             "accepted_record_count": len(prepared.eligible),
@@ -504,7 +613,8 @@ def preflight_photometry_factored_latent_bank(
             "prospective_excluded_count": len(prepared.excluded),
             "classification_completed_before_source_array_load": True,
         },
-        "support_rule": prepared.support_rule,
+        "operational_support_rule": prepared.support_rule,
+        "complete_dependency_diagnostic_enabled": config.complete_dependency_diagnostic,
         "storage": prepared.storage_report,
         "filesystem": prepared.filesystem_report,
     }
@@ -607,26 +717,39 @@ def build_photometry_factored_latent_bank(
                 precision=config.precision,
             )
             if path_used != "full":
-                raise ValueError("Factored-bank v1 requires actual path_used=full.")
+                raise ValueError("Factored-bank v2 requires actual path_used=full.")
             stored = latent[0].detach().cpu().to(store_dtype).contiguous()
             if not bool(torch.isfinite(stored).all()):
                 raise ValueError("Posterior-mean latent contains non-finite values.")
-            latent_support = propagate_encoder_support(
+            latent_support = propagate_encoder_local_valid_core_support(
                 source_support,
                 encoder,
                 expected_rule_sha256=prepared.support_rule["rule_sha256"],
             )
             if tuple(latent_support.shape) != tuple(stored.shape[1:]):
-                raise ValueError("Encoder-propagated support does not match latent shape.")
+                raise ValueError("Encoder local-valid-core support does not match latent shape.")
             support_count = int(latent_support.sum())
             if support_count <= 0:
                 raise ValueError(
-                    "Encoder-conservative latent support is empty. The frozen encoder graph "
+                    "Encoder local-valid-core support is empty. The frozen encoder graph "
                     "cannot support masked statistics for this record."
                 )
             packed = pack_support_mask(latent_support)
+            complete_dependency_diagnostic = (
+                _complete_dependency_diagnostic_summary(
+                    propagate_encoder_complete_dependency_diagnostic(
+                        source_support,
+                        encoder,
+                        expected_rule_sha256=prepared.support_rule["rule_sha256"],
+                    )
+                )
+                if config.complete_dependency_diagnostic
+                else None
+            )
             sidecar: dict[str, Any] = {
                 "contract_version": PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
+                "resume_contract_version": PHOTOMETRY_FACTORED_RESUME_VERSION,
+                "audit_contract_version": PHOTOMETRY_FACTORED_AUDIT_VERSION,
                 **source_identity,
                 "source_loaded_array_sha256": source_loaded_sha,
                 "source_dtype": dtype_name(source.dtype),
@@ -652,27 +775,32 @@ def build_photometry_factored_latent_bank(
                     "precision": config.precision,
                 },
                 "downsample_factor": downsample_factor(encoder),
-                "support_propagation_rule": SUPPORT_PROPAGATION_RULE,
-                "support_rule_sha256": prepared.support_rule["rule_sha256"],
-                "receptive_field_evidence": {
+                "operational_support_contract": LOCAL_VALID_CORE_SUPPORT_RULE,
+                "operational_support_scope": "anatomical-spatial-validity",
+                "normalization_statistical_independence_claim": False,
+                "local_support_rule_sha256": prepared.support_rule["rule_sha256"],
+                "local_receptive_field_evidence": {
                     "graph_sha256": prepared.support_rule["graph_sha256"],
                     "convolutional_receptive_field_size": prepared.support_rule[
                         "convolutional_receptive_field_size"
                     ],
                     "output_stride": prepared.support_rule["output_stride"],
                     "alignment": prepared.support_rule["alignment"],
-                    "complete_spatial_dependency": prepared.support_rule[
-                        "complete_spatial_dependency"
-                    ],
                 },
-                "latent_support_mask_sha256": storage_tensor_sha256(latent_support),
-                "support_shape": list(latent_support.shape),
-                "support_dtype": "bool",
-                "support_nonzero_count": support_count,
+                "groupnorm_dependency_provenance_sha256": prepared.support_rule[
+                    "groupnorm_dependency_provenance_sha256"
+                ],
+                "local_valid_core_support_mask_sha256": storage_tensor_sha256(
+                    latent_support
+                ),
+                "local_valid_core_support_shape": list(latent_support.shape),
+                "local_valid_core_support_dtype": "bool",
+                "local_valid_core_support_nonzero_count": support_count,
                 "support_packing_rule": SUPPORT_PACKING_RULE,
                 "packed_support_shape": list(packed.shape),
                 "packed_support_dtype": "uint8",
                 "packed_support_sha256": storage_tensor_sha256(packed),
+                "complete_dependency_diagnostic": complete_dependency_diagnostic,
                 "photometry_artifact_sha256": artifact.artifact_sha256,
                 "photometry_artifact_file_sha256": photometry_artifact_file_sha256,
                 "photometry_resolved_config_sha256": artifact.provenance[
@@ -701,7 +829,7 @@ def build_photometry_factored_latent_bank(
                     "sidecar": sidecar,
                     "sidecar_sha256": sidecar_sha,
                     "latent": stored,
-                    "packed_latent_support": packed,
+                    "packed_local_valid_core_support": packed,
                 },
                 linker=publication_linker,
             )
@@ -746,6 +874,8 @@ def build_photometry_factored_latent_bank(
     )
     manifest: dict[str, Any] = {
         "contract_version": PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
+        "resume_contract_version": PHOTOMETRY_FACTORED_RESUME_VERSION,
+        "audit_contract_version": PHOTOMETRY_FACTORED_AUDIT_VERSION,
         "legacy_contract_mutation": "latent-bank-v1-unchanged",
         "scope": "retrospective-R-only",
         "canonical_stream": {
@@ -781,7 +911,8 @@ def build_photometry_factored_latent_bank(
             "checkpoint_sha256": vae_checkpoint_sha256,
         },
         "computational_provenance": json_safe_mapping(code_provenance),
-        "support_rule": prepared.support_rule,
+        "operational_support_rule": prepared.support_rule,
+        "complete_dependency_diagnostic_enabled": config.complete_dependency_diagnostic,
         "storage_preflight": prepared.storage_report,
         "filesystem_preflight": prepared.filesystem_report,
         "run_fingerprint": prepared.run_fingerprint,
@@ -826,6 +957,10 @@ def load_photometry_factored_latent_bank_manifest(
     manifest = _load_json(Path(root) / FACTORED_LATENT_BANK_MANIFEST)
     if manifest.get("contract_version") != PHOTOMETRY_FACTORED_LATENT_BANK_VERSION:
         raise ValueError("Photometry-factored latent-bank contract mismatch.")
+    if manifest.get("resume_contract_version") != PHOTOMETRY_FACTORED_RESUME_VERSION:
+        raise ValueError("Photometry-factored latent-bank resume contract mismatch.")
+    if manifest.get("audit_contract_version") != PHOTOMETRY_FACTORED_AUDIT_VERSION:
+        raise ValueError("Photometry-factored latent-bank audit contract mismatch.")
     if (
         expected_artifact_sha256 is not None
         and manifest["artifact_sha256"] != expected_artifact_sha256
@@ -850,6 +985,24 @@ def load_photometry_factored_latent_bank_manifest(
         raise ValueError("Factored-bank resolved-config hash mismatch.")
     validate_canonical_artifact_config(manifest["resolved_config"])
     validate_canonical_artifact_code_provenance(manifest["computational_provenance"])
+    support_rule = manifest.get("operational_support_rule")
+    if not isinstance(support_rule, Mapping) or support_rule.get(
+        "contract_version"
+    ) != LOCAL_VALID_CORE_SUPPORT_RULE:
+        raise ValueError("Factored-bank operational support contract is incompatible.")
+    unhashed_support_rule = dict(support_rule)
+    stored_support_rule_sha = unhashed_support_rule.pop("rule_sha256", None)
+    if stored_support_rule_sha != sha256_json(unhashed_support_rule):
+        raise ValueError("Factored-bank local-support rule hash mismatch.")
+    groupnorm = support_rule.get("groupnorm_dependency_provenance")
+    if not isinstance(groupnorm, Mapping) or groupnorm.get(
+        "contract_version"
+    ) != GROUPNORM_DEPENDENCY_PROVENANCE_VERSION:
+        raise ValueError("Factored-bank GroupNorm dependency provenance is incompatible.")
+    if support_rule.get("groupnorm_dependency_provenance_sha256") != sha256_json(
+        groupnorm
+    ):
+        raise ValueError("Factored-bank GroupNorm dependency provenance hash mismatch.")
     records = manifest.get("records")
     if not isinstance(records, list) or not records:
         raise ValueError("Factored-bank manifest has no records.")
@@ -858,6 +1011,19 @@ def load_photometry_factored_latent_bank_manifest(
     ) != sha256_json(records):
         raise ValueError("Factored-bank record-list identity mismatch.")
     _require_factored_bank_roles(records)
+    diagnostic_enabled = manifest.get("complete_dependency_diagnostic_enabled")
+    if not isinstance(diagnostic_enabled, bool):
+        raise ValueError("Factored-bank diagnostic selection is missing.")
+    for entry in records:
+        sidecar = _entry_sidecar(entry)
+        if sidecar.get("local_support_rule_sha256") != stored_support_rule_sha or sidecar.get(
+            "groupnorm_dependency_provenance_sha256"
+        ) != support_rule["groupnorm_dependency_provenance_sha256"]:
+            raise ValueError("Factored-bank record support provenance differs from its manifest.")
+        if (sidecar.get("complete_dependency_diagnostic") is not None) is not diagnostic_enabled:
+            raise ValueError(
+                "Factored-bank record diagnostic selection differs from its manifest."
+            )
     if manifest.get("eligibility_proof", {}).get("prospective_accepted_count") != 0:
         raise ValueError("Factored-bank manifest accepted prospective data.")
     excluded = manifest.get("excluded_prospective_records")
@@ -965,21 +1131,34 @@ def audit_photometry_factored_latent_bank(
         if path_used != "full":
             raise ValueError("Audit VAE encoding did not use the required full path.")
         stored = latent[0].detach().cpu().to(store_dtype).contiguous()
-        support = propagate_encoder_support(
+        support = propagate_encoder_local_valid_core_support(
             source_support,
             encoder,
             expected_rule_sha256=prepared.support_rule["rule_sha256"],
         )
         if storage_tensor_sha256(stored) != sidecar["latent_tensor_sha256"]:
             raise ValueError("Audit posterior-mean latent identity changed.")
-        if storage_tensor_sha256(support) != sidecar["latent_support_mask_sha256"]:
-            raise ValueError("Audit encoder-propagated support identity changed.")
+        if storage_tensor_sha256(support) != sidecar[
+            "local_valid_core_support_mask_sha256"
+        ]:
+            raise ValueError("Audit encoder local-valid-core support identity changed.")
         if storage_tensor_sha256(pack_support_mask(support)) != sidecar[
             "packed_support_sha256"
         ]:
             raise ValueError("Audit packed latent support identity changed.")
         if not torch.equal(stored, loaded["latent"]):
             raise ValueError("Stored posterior-mean latent differs from recomputation.")
+        diagnostic = sidecar.get("complete_dependency_diagnostic")
+        if diagnostic is not None:
+            recomputed_diagnostic = _complete_dependency_diagnostic_summary(
+                propagate_encoder_complete_dependency_diagnostic(
+                    source_support,
+                    encoder,
+                    expected_rule_sha256=prepared.support_rule["rule_sha256"],
+                )
+            )
+            if recomputed_diagnostic != diagnostic:
+                raise ValueError("Complete-dependency diagnostic identity changed.")
         recomputed.append((sidecar, stored, support))
         if progress is not None:
             progress("audit_streamed_factored_latent", index, len(manifest["records"]), identity)
@@ -1009,7 +1188,8 @@ def audit_photometry_factored_latent_bank(
         code_provenance=code_provenance,
     )
     return {
-        "contract_version": PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
+        "contract_version": PHOTOMETRY_FACTORED_AUDIT_VERSION,
+        "artifact_contract_version": PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
         "artifact_sha256": manifest["artifact_sha256"],
         "record_count": len(recomputed),
         "all_records_verified": True,
@@ -1051,7 +1231,7 @@ def _prepare_run(
     if config != expected_config:
         raise ValueError("Factored-bank runtime config differs from the resolved config.")
     if config.strategy != "full":
-        raise ValueError("Factored-bank v1 strategy must remain full.")
+        raise ValueError("Factored-bank v2 strategy must remain full.")
     for name, value in (
         ("source split file", source_split_file_sha256),
         ("photometry artifact file", photometry_artifact_file_sha256),
@@ -1084,7 +1264,7 @@ def _prepare_run(
         source_file_hasher=source_file_hasher,
     )
     source_shapes = resolve_source_shapes(eligible, source_shape_resolver)
-    support_rule = derive_encoder_support_rule(encoder)
+    support_rule = derive_encoder_local_support_rule(encoder)
     factor = downsample_factor(encoder)
     latent_channels = int(getattr(encoder, "latent_channels", 0))
     storage_report = build_storage_preflight_report(
@@ -1113,6 +1293,8 @@ def _prepare_run(
     config_sha = sha256_json(resolved)
     run_identity = {
         "contract_version": PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
+        "resume_contract_version": PHOTOMETRY_FACTORED_RESUME_VERSION,
+        "audit_contract_version": PHOTOMETRY_FACTORED_AUDIT_VERSION,
         "canonical_stream_contract": CANONICAL_VOLUME_CONTRACT_VERSION,
         "canonical_stream_semantics": CANONICAL_STREAM_SEMANTICS,
         "source_split": source_split,
@@ -1129,7 +1311,11 @@ def _prepare_run(
         "computational_provenance_sha256": code_provenance["provenance_sha256"],
         "dependency_map_sha256": code_provenance["dependency_map_sha256"],
         "runtime_sha256": code_provenance["runtime_sha256"],
-        "support_rule_sha256": support_rule["rule_sha256"],
+        "local_support_rule_sha256": support_rule["rule_sha256"],
+        "groupnorm_dependency_provenance_sha256": support_rule[
+            "groupnorm_dependency_provenance_sha256"
+        ],
+        "complete_dependency_diagnostic_enabled": config.complete_dependency_diagnostic,
         "storage_report_sha256": storage_report["report_sha256"],
         "encoding": {
             "strategy": "full",
@@ -1178,7 +1364,8 @@ def _compute_statistics_payload(
             expected_resume_key=sidecar["resume_key"],
         )
         support = unpack_support_mask(
-            payload["packed_latent_support"], sidecar["support_shape"]
+            payload["packed_local_valid_core_support"],
+            sidecar["local_valid_core_support_shape"],
         )
         samples.append((sidecar, payload["latent"], support))
     return _statistics_from_samples(
@@ -1214,14 +1401,27 @@ def _statistics_from_samples(
                 "record_identity_sha256": sidecar["record_identity_sha256"],
                 "source_content_fingerprint": sidecar["source_content_fingerprint"],
                 "latent_tensor_sha256": sidecar["latent_tensor_sha256"],
-                "latent_support_mask_sha256": sidecar["latent_support_mask_sha256"],
-                "supported_cell_count": sidecar["support_nonzero_count"],
+                "local_valid_core_support_mask_sha256": sidecar[
+                    "local_valid_core_support_mask_sha256"
+                ],
+                "local_valid_core_supported_cell_count": sidecar[
+                    "local_valid_core_support_nonzero_count"
+                ],
             }
         )
     records.sort(key=lambda item: item["record_identity"])
     payload: dict[str, Any] = {
         "contract_version": PHOTOMETRY_FACTORED_LATENT_STATS_VERSION,
-        "computed_over": {"cohort": "R", "split": "train", "cells": "supported_only"},
+        "computed_over": {
+            "cohort": "R",
+            "split": "train",
+            "cells": "encoder_local_valid_core_only",
+        },
+        "operational_support_contract": LOCAL_VALID_CORE_SUPPORT_RULE,
+        "local_support_rule_sha256": prepared.support_rule["rule_sha256"],
+        "groupnorm_dependency_provenance_sha256": prepared.support_rule[
+            "groupnorm_dependency_provenance_sha256"
+        ],
         **accumulator.compute(),
         "record_count": len(records),
         "records": records,
@@ -1262,7 +1462,8 @@ def _build_descriptors(
         )
         sidecar = latent_payload["sidecar"]
         support = unpack_support_mask(
-            latent_payload["packed_latent_support"], sidecar["support_shape"]
+            latent_payload["packed_local_valid_core_support"],
+            sidecar["local_valid_core_support_shape"],
         )
         standardized = standardize_supported_latent(
             latent_payload["latent"],
@@ -1300,7 +1501,14 @@ def _build_descriptors(
                 "input": DESCRIPTOR_INPUT,
                 "standardized_supported_latent_sha256": storage_tensor_sha256(standardized),
                 "source_content_fingerprint": sidecar["source_content_fingerprint"],
-                "latent_support_mask_sha256": sidecar["latent_support_mask_sha256"],
+                "operational_support_contract": LOCAL_VALID_CORE_SUPPORT_RULE,
+                "local_valid_core_support_mask_sha256": sidecar[
+                    "local_valid_core_support_mask_sha256"
+                ],
+                "local_support_rule_sha256": prepared.support_rule["rule_sha256"],
+                "groupnorm_dependency_provenance_sha256": prepared.support_rule[
+                    "groupnorm_dependency_provenance_sha256"
+                ],
                 "latent_statistics_sha256": statistics["artifact_sha256"],
                 "bank_run_fingerprint": prepared.run_fingerprint,
                 "resolved_config_sha256": prepared.config_sha256,
@@ -1369,8 +1577,10 @@ def _make_descriptor_manifest(
         "qualification_requirements": {
             "retrospective_split": "validation",
             "subject_group_exclusion": "required",
-            "retained_instance_or_anatomical_signal": "must-demonstrate",
-            "reduced_field_predictability": "must-demonstrate",
+            "subject_retrieval": "must-demonstrate-retained-instance-signal",
+            "field_predictability": "must-demonstrate-reduction",
+            "support_volume_shortcuts": "must-test-and-rule-out",
+            "descriptor_stability": "must-demonstrate",
         },
         "descriptor_config": descriptor_config,
         "descriptor_config_sha256": sha256_json(descriptor_config),
@@ -1442,7 +1652,9 @@ def _descriptor_config(config: PhotometryFactoredLatentBankConfig) -> dict[str, 
         "gradients": DESCRIPTOR_GRADIENTS,
         "feature_order": ["latent", "gradient_x", "gradient_y", "gradient_z"],
         "scale_order": list(config.descriptor_pool_sizes),
-        "support": "actual-frozen-encoder-dependency-propagation",
+        "support": LOCAL_VALID_CORE_SUPPORT_RULE,
+        "support_scope": "anatomical-spatial-validity",
+        "normalization_statistical_independence_claim": False,
         "unsupported_standardized_values": "forced-exact-zero-before-hash-and-features",
         "dtype": "float32",
     }
@@ -1478,12 +1690,22 @@ def _load_latent_record(
         raise ValueError("Factored latent subject-group identity mismatch.")
     if sidecar.get("split") not in CANONICAL_VOLUME_SPLITS:
         raise ValueError("Factored latent record has a forbidden split role.")
+    if sidecar.get("resume_contract_version") != PHOTOMETRY_FACTORED_RESUME_VERSION or sidecar.get(
+        "audit_contract_version"
+    ) != PHOTOMETRY_FACTORED_AUDIT_VERSION:
+        raise ValueError("Factored latent record resume/audit contract mismatch.")
+    if sidecar.get("operational_support_contract") != LOCAL_VALID_CORE_SUPPORT_RULE:
+        raise ValueError("Factored latent record operational support contract mismatch.")
+    if sidecar.get("operational_support_scope") != "anatomical-spatial-validity" or sidecar.get(
+        "normalization_statistical_independence_claim"
+    ) is not False:
+        raise ValueError("Factored latent record local-support scope is incompatible.")
     if sidecar.get("canonical_persisted") is not False:
         raise ValueError("Factored latent sidecar claims a persisted canonical tensor.")
     if sidecar.get("encoding_path", {}).get("path_used") != "full":
         raise ValueError("Factored latent record did not use full encoding.")
     latent = result.get("latent")
-    packed = result.get("packed_latent_support")
+    packed = result.get("packed_local_valid_core_support")
     if not isinstance(latent, torch.Tensor) or not isinstance(packed, torch.Tensor):
         raise ValueError("Factored latent record tensors are missing.")
     if latent.ndim != 4 or latent.dtype not in {torch.float16, torch.float32}:
@@ -1496,15 +1718,31 @@ def _load_latent_record(
         "packed_support_sha256"
     ):
         raise ValueError("Factored latent packed-support hash mismatch.")
-    support = unpack_support_mask(packed, sidecar.get("support_shape", ()))
+    support = unpack_support_mask(
+        packed, sidecar.get("local_valid_core_support_shape", ())
+    )
     if tuple(support.shape) != tuple(latent.shape[1:]):
         raise ValueError("Factored latent support shape mismatch.")
     if int(support.sum()) <= 0 or int(support.sum()) != int(
-        sidecar.get("support_nonzero_count", -1)
+        sidecar.get("local_valid_core_support_nonzero_count", -1)
     ):
         raise ValueError("Factored latent support count is empty or inconsistent.")
-    if storage_tensor_sha256(support) != sidecar.get("latent_support_mask_sha256"):
-        raise ValueError("Factored latent support-mask hash mismatch.")
+    if storage_tensor_sha256(support) != sidecar.get(
+        "local_valid_core_support_mask_sha256"
+    ):
+        raise ValueError("Factored latent local-valid-core support-mask hash mismatch.")
+    diagnostic = sidecar.get("complete_dependency_diagnostic")
+    if diagnostic is not None:
+        if not isinstance(diagnostic, Mapping) or diagnostic.get("contract_version") != (
+            COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION
+        ) or diagnostic.get("operational") is not False or diagnostic.get("blocking") is not False:
+            raise ValueError("Factored latent diagnostic contract is incompatible.")
+        if diagnostic.get("shape") != list(support.shape) or diagnostic.get("dtype") != "bool":
+            raise ValueError("Factored latent diagnostic shape/dtype is inconsistent.")
+        require_sha256(str(diagnostic.get("mask_sha256", "")), "diagnostic mask")
+        count = int(diagnostic.get("nonzero_count", -1))
+        if count < 0 or diagnostic.get("empty") is not (count == 0):
+            raise ValueError("Factored latent diagnostic count is inconsistent.")
     if sidecar.get("source_content_fingerprint") != _source_content_fingerprint(sidecar):
         raise ValueError("Factored latent source-content fingerprint mismatch.")
     return result
@@ -1577,7 +1815,7 @@ def _source_content_fingerprint(sidecar: Mapping[str, Any]) -> str:
                 "canonical_tensor_sha256",
                 "source_support_tensor_sha256",
                 "latent_tensor_sha256",
-                "latent_support_mask_sha256",
+                "local_valid_core_support_mask_sha256",
                 "packed_support_sha256",
             )
         }
@@ -1595,10 +1833,16 @@ def _validate_manifest_against_run(
         raise ValueError("Factored-bank resolved configuration changed.")
     if manifest.get("source_split") != prepared.source_split:
         raise ValueError("Factored-bank source-split identity changed.")
-    if manifest.get("support_rule", {}).get("rule_sha256") != prepared.support_rule[
+    if manifest.get("operational_support_rule", {}).get(
+        "rule_sha256"
+    ) != prepared.support_rule[
         "rule_sha256"
     ]:
-        raise ValueError("Factored-bank encoder support-rule identity changed.")
+        raise ValueError("Factored-bank encoder local-support-rule identity changed.")
+    if manifest.get("complete_dependency_diagnostic_enabled") is not prepared.resolved[
+        "latent_bank"
+    ]["complete_dependency_diagnostic"]["enabled"]:
+        raise ValueError("Factored-bank diagnostic selection changed.")
     if manifest.get("storage_preflight", {}).get("report_sha256") != prepared.storage_report[
         "report_sha256"
     ]:
@@ -1689,24 +1933,77 @@ def _conv_support(support: torch.Tensor, module: nn.Module) -> torch.Tensor:
     return propagated == 0
 
 
-def _res_stack_support(support: torch.Tensor, stack: nn.Module) -> torch.Tensor:
+def _res_stack_support(
+    support: torch.Tensor,
+    stack: nn.Module,
+    *,
+    collapse_groupnorm: bool,
+) -> torch.Tensor:
     result = support
     for block in stack:
-        main = _norm_support(result, block.norm1)
+        main = _norm_support(
+            result, block.norm1, collapse_groupnorm=collapse_groupnorm
+        )
         main = _conv_support(main, block.conv1)
-        main = _norm_support(main, block.norm2)
+        main = _norm_support(
+            main, block.norm2, collapse_groupnorm=collapse_groupnorm
+        )
         main = _conv_support(main, block.conv2)
         skip = result if isinstance(block.skip, nn.Identity) else _conv_support(result, block.skip)
         result = main & skip
     return result
 
 
-def _norm_support(support: torch.Tensor, module: nn.Module) -> torch.Tensor:
+def _norm_support(
+    support: torch.Tensor,
+    module: nn.Module,
+    *,
+    collapse_groupnorm: bool,
+) -> torch.Tensor:
     if isinstance(module, nn.Identity):
         return support
     if isinstance(module, nn.GroupNorm):
-        return torch.full_like(support, bool(support.all()))
+        if collapse_groupnorm:
+            return torch.full_like(support, bool(support.all()))
+        return support
     raise ValueError("Unsupported normalization in frozen encoder support propagation.")
+
+
+def _validated_source_support(source_support: torch.Tensor) -> torch.Tensor:
+    if not isinstance(source_support, torch.Tensor):
+        raise TypeError("Encoder source support must be a tensor.")
+    work = source_support.detach().cpu()
+    if work.dtype == torch.bool:
+        return work.contiguous()
+    if work.is_floating_point() and not bool(torch.isfinite(work).all()):
+        raise ValueError("Encoder source support contains non-finite values.")
+    if not bool(((work == 0) | (work == 1)).all()):
+        raise ValueError("Encoder source support must contain only Boolean values.")
+    return work.to(torch.bool).contiguous()
+
+
+def _validate_local_valid_core_support(support: torch.Tensor) -> None:
+    if support.dtype != torch.bool or support.ndim != 3:
+        raise ValueError("Encoder local-valid-core support shape/dtype is inconsistent.")
+    if not bool(torch.isfinite(support.to(torch.float32)).all()):
+        raise ValueError("Encoder local-valid-core support is non-finite.")
+    if int(support.sum()) <= 0:
+        raise ValueError("Encoder local-valid-core support is empty.")
+
+
+def _add_pointwise_activation(
+    operations: list[dict[str, Any]], name: str, module: nn.Module
+) -> None:
+    supported = (nn.ReLU, nn.LeakyReLU, nn.GELU, nn.SiLU, nn.Sigmoid, nn.Tanh)
+    if not isinstance(module, supported):
+        raise ValueError(f"Unsupported encoder activation in support graph: {name}.")
+    operations.append(
+        {
+            "name": name,
+            "operator": "pointwise-activation",
+            "type": f"{module.__class__.__module__}.{module.__class__.__qualname__}",
+        }
+    )
 
 
 def _conv_spec(module: nn.Module, name: str) -> dict[str, list[int]]:
@@ -1771,26 +2068,31 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 __all__ = [
     "DESCRIPTOR_INPUT",
+    "COMPLETE_DEPENDENCY_SUPPORT_DIAGNOSTIC_VERSION",
     "FACTORED_LATENT_BANK_MANIFEST",
     "FACTORED_LATENT_STATS_FILE",
     "MASKED_WELFORD_RULE",
     "MIN_SUPPORTED_CHANNEL_VARIANCE",
     "MaskedChannelWelford",
+    "GROUPNORM_DEPENDENCY_PROVENANCE_VERSION",
+    "LOCAL_VALID_CORE_SUPPORT_RULE",
+    "PHOTOMETRY_FACTORED_AUDIT_VERSION",
     "PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION",
     "PHOTOMETRY_FACTORED_DESCRIPTOR_VERSION",
     "PHOTOMETRY_FACTORED_LATENT_BANK_VERSION",
     "PHOTOMETRY_FACTORED_LATENT_STATS_VERSION",
+    "PHOTOMETRY_FACTORED_RESUME_VERSION",
     "PhotometryFactoredLatentBankConfig",
     "STRUCTURAL_DESCRIPTOR_MANIFEST",
     "SUPPORT_PACKING_RULE",
-    "SUPPORT_PROPAGATION_RULE",
     "audit_photometry_factored_latent_bank",
     "build_photometry_factored_latent_bank",
-    "derive_encoder_support_rule",
+    "derive_encoder_local_support_rule",
     "load_photometry_factored_latent_bank_manifest",
     "pack_support_mask",
     "preflight_photometry_factored_latent_bank",
-    "propagate_encoder_support",
+    "propagate_encoder_complete_dependency_diagnostic",
+    "propagate_encoder_local_valid_core_support",
     "receptive_field_source_bounds",
     "standardize_supported_latent",
     "structural_descriptor",

@@ -871,12 +871,13 @@ def test_cli_keeps_variant_a_commands_and_separates_canonical_artifact_extension
     ):
         assert command in help_text
     for command in (
-        "build-stage2-canonical-volumes",
-        "audit-stage2-canonical-volumes",
+        "preflight-photometry-factored-latent-bank",
         "build-photometry-factored-latent-bank",
         "audit-photometry-factored-latent-bank",
     ):
         assert command in help_text
+    assert "build-stage2-canonical-volumes" not in help_text
+    assert "audit-stage2-canonical-volumes" not in help_text
     assert "train-stage2-field-graph" not in help_text
 
 

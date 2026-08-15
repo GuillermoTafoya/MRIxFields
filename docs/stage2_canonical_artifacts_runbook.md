@@ -1,174 +1,217 @@
-# Stage-2 canonical artifacts: engineering PR 1 runbook
+# Stage-2 streamed canonical artifacts: engineering PR 1 runbook
 
 ## Scope
 
-This runbook covers only the external artifact path authorized after Variant A:
+This runbook covers the retrospective-only external artifact path:
 
 ```text
-retrospective source x_d
-  -> frozen Variant-A N_d
-  -> stage2-canonical-volume-v1
-  -> frozen VAE posterior mean E
-  -> photometry-factored-latent-bank-v1
-  -> R/train-only channel statistics
-  -> R/train-only structural descriptors
+R source x_d
+  -> frozen Variant-A N_d(x_d)                 [in memory only]
+  -> hash canonical tensor and source support
+  -> frozen VAE full encode_dist(...)[0]       [same streamed record]
+  -> persist posterior-mean latent + packed conservative latent support + sidecar
+  -> R/train supported-cell statistics
+  -> R/train structural descriptors
 ```
 
-It does not implement or run a translator, trainer, critic, anatomy loss, graph loss,
-adversarial loss, notebook, prospective evaluation, or long job. It does not modify or
-relabel `latent-bank-v1`.
+The primary config never persists full float32 canonical volumes or full Boolean source
+masks. `stage2-canonical-volume-v1` is an ephemeral, hash-sealed computation boundary. No
+debug full-volume artifact mode is enabled or exposed by the primary commands.
+
+This PR does not implement or run a translator, trainer, critic, anatomy loss, graph loss,
+adversarial loss, notebook, prospective evaluation, or long job. It does not modify Variant-A
+arithmetic and does not mutate, alias, or relabel `latent-bank-v1`.
 
 All split files, source arrays, photometry/qualification artifacts, checkpoints, output
-records, manifests, statistics, and descriptors are external to the repository. The
-checked-in config and a reviewed frozen-VAE architecture config may be inside the checkout.
+records, manifests, statistics, and descriptors are external to the repository.
 
-## Preconditions
+## Required inputs
 
 The operator must supply:
 
-- the original canonical VAE split JSON with valid membership and v3 recovery fingerprints;
+- the original canonical VAE split JSON with valid file, membership, and v3 recovery
+  fingerprints;
 - the exact frozen `stage2-photometry-factorization-v1` artifact;
 - the exact passing `stage2-photometry-variant-a-qualification-v1` result with
   `canonical_latent_bank_authorized: true`;
-- the exact frozen VAE config and checkpoint named by that qualification result; and
-- external output directories that do not already contain incompatible artifacts.
+- the exact frozen VAE architecture config and checkpoint named by that qualification; and
+- a local output filesystem that passes atomic hard-link/no-clobber and capacity preflight.
 
-The split is classified completely before a source array is loaded. Only canonical `R_`
-identities with matching metadata prefix, cohort, subject identity, and `train` or
-`validation` role are accepted. Every correctly labelled `P_` identity is excluded and
-sealed before array loading; conflicting or missing identities fail closed. This applies to
-all prospective identities, not only travellers 0006, 0007, and 0009.
+The complete split is classified before source files are hashed, headers are inspected, or
+arrays are loaded. Only canonical `R_` identities with matching prefix/cohort/subject metadata
+and frozen `train` or `validation` roles are accepted. Every `P` identity is excluded; there is
+no special-case list and no operator override. Both accepted splits must contain all 15
+contrast/field domains.
 
-Both accepted splits must contain all 15 contrast/field domains. Statistics and structural
-descriptors use only `R/train`; `R/validation` latents remain non-training records and are
-never added to either derived artifact.
+## 1. Preflight the streamed build
 
-## 1. Build canonical volumes
+Run preflight against the exact output location before any long build:
 
 ```powershell
-fieldbridge build-stage2-canonical-volumes `
+fieldbridge preflight-photometry-factored-latent-bank `
   --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
   --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
-  --out-dir <EXTERNAL_CANONICAL_DIRECTORY> `
-  --resume `
-  --device cpu `
-  --log-every 10
+  --vae-config <FROZEN_VAE_CONFIG> `
+  --vae-checkpoint <EXTERNAL_FROZEN_VAE_CHECKPOINT> `
+  --out-dir <LOCAL_SCRATCH_FACTORED_BANK_DIRECTORY> `
+  --device cuda
 ```
 
-Each `stage2-canonical-volume-v1` record stores the float32 tensor returned by
-`FrozenPhotometryArtifact.normalize_source` and its exact boolean source support. Its
-manifest seals:
+The JSON report seals or reports:
 
-- original split-file, membership, and recovery identities;
-- photometry artifact, artifact-file, and resolved-config hashes;
-- Variant-A qualification artifact/file identity and frozen-VAE provenance;
-- Git commit, clean-checkout evidence, and source-module hashes;
-- record, canonical subject-group, cohort, split, domain, and source-path identities;
-- source-file, loaded-source-array, canonical-tensor, support, record-payload, and record-file
-  hashes;
-- source/canonical/support shape and dtype, support count, normalization path, and support
-  policy; and
-- deterministic run and per-record resume keys.
+- accepted/excluded record counts and proof that classification preceded array loading;
+- source shapes obtained from NIfTI headers, record count, and total source voxels;
+- float32 canonical-volume and full Boolean support bytes avoided;
+- predicted latent, packed-support, descriptor, output, and temporary bytes;
+- required free storage and peak streamed working-set estimate;
+- the reviewed encoder support rule, graph hash, receptive field, stride, alignment, and
+  normalization scope; and
+- successful same-directory atomic hard-link publication and no-clobber behavior.
 
-No target tensor, paired endpoint, target statistic, or runtime prediction CDF is accepted.
+The estimates are conservative planning values, not memory reservations. Preflight reads
+source identities, file bytes for hashes, and NIfTI headers; it does not load voxel arrays and
+does not run N_d or VAE inference.
 
-## 2. Audit canonical volumes
+### Google Drive, FUSE, and unsupported filesystems
 
-```powershell
-fieldbridge audit-stage2-canonical-volumes `
-  --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
-  --split-json <EXTERNAL_SPLIT_JSON> `
-  --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
-  --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
-  --canonical-dir <EXTERNAL_CANONICAL_DIRECTORY> `
-  --device cpu `
-  --log-every 10
-```
+Publication deliberately has no rename/overwrite fallback. If the target returns `ENOTSUP`,
+`EPERM`, or otherwise cannot prove hard-link no-clobber semantics, preflight stops before any
+record is processed. Build on a compatible local scratch filesystem, audit the completed local
+artifact, and only then perform a separate hash-verified archival copy. Do not build directly
+on an unqualified Drive/FUSE mount.
 
-The audit revalidates current source-file bytes, reloads each accepted source only after the
-complete cohort/role preflight, reruns `N_d`, and requires exact saved tensor and support
-identities. A source-content change, manifest edit, record edit, config change, split change,
-or authorization change fails closed.
-
-## 3. Build the photometry-factored bank
+## 2. Build the streamed bank
 
 ```powershell
 fieldbridge build-photometry-factored-latent-bank `
   --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
-  --canonical-dir <EXTERNAL_CANONICAL_DIRECTORY> `
+  --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
   --vae-config <FROZEN_VAE_CONFIG> `
   --vae-checkpoint <EXTERNAL_FROZEN_VAE_CHECKPOINT> `
-  --out-dir <EXTERNAL_FACTORED_BANK_DIRECTORY> `
+  --out-dir <LOCAL_SCRATCH_FACTORED_BANK_DIRECTORY> `
   --resume `
   --device cuda `
   --log-every 10
 ```
 
-The encoder is loaded strictly and frozen. Each record uses only
-`encode_dist(canonical, domain)[0]`: the posterior mean, never a posterior sample. The
-requested full/tiled encoding path, actual path, precision, downsample factor, latent shape,
-stored dtype, VAE hashes, photometry hashes, source/canonical identities, and code provenance
-are sealed.
+For each R record, the builder loads one source, computes frozen `N_d`, hashes the source,
+canonical tensor, and full source support, immediately performs the frozen full
+`encode_dist(...)[0]`, propagates support through the actual encoder graph, packs that latent
+support, publishes one record, and releases the full tensors. The record payload contains only:
 
-Each latent also carries a packed conservative source-support mask. A latent cell is marked
-supported only when every source voxel in its exact VAE downsample block was supported. The
-boolean mask is flattened in C order and packed with little-bit-order `numpy.packbits`; shape,
-count, byte tensor identity, downsample rule, and packing rule are sealed.
+- the stored posterior-mean latent;
+- the packed latent support; and
+- a hash-bound metadata/provenance sidecar.
 
-`photometry-factored-latent-statistics-v1` computes per-channel mean and standard deviation
-from stored `R/train` latents only. Its record/content list and artifact hash are inputs to
-the descriptor contract.
+No canonical tensor or full source mask is included in the payload.
 
-`photometry-factored-structural-descriptor-v1` is also `R/train` only. For each standardized
-canonical latent it computes, in fixed order:
+The primary v1 config requires `strategy=full` and actual `path_used=full` with float32 encode
+arithmetic. A full-encode OOM is a hard stop. There is no automatic or explicit tiled fallback;
+any tiled variant requires a new artifact version and separate qualification.
 
-1. support-normalized latent pooling;
-2. support-valid absolute first differences along x, y, and z; and
-3. support-normalized adaptive 3-D pooling at output sizes 1, 2, and 4.
+## Encoder-conservative latent support
 
-The descriptor retains canonical subject identity for later same-subject exclusion. It seals
-the complete record/source/canonical/latent/support content fingerprint, latent-statistics
-artifact hash, descriptor-config hash, standardized-latent identity, descriptor tensor
-identity, shape, and dtype. It contains no paired endpoint or target input.
+Support is propagated through the complete frozen `KLVAEEncoder` graph:
 
-## 4. Audit the bank
+- Conv3d invalidity is propagated with each layer's exact kernel, stride, padding, and
+  dilation. Constant padding outside the volume is not treated as a source dependency.
+- Residual outputs require both their main and skip dependencies to be supported.
+- Identity normalization is pointwise.
+- GroupNorm has per-sample global spatial statistics. Therefore, when GroupNorm is present,
+  any unsupported source dependency makes every downstream latent cell unsupported.
+
+The artifact seals the graph operations, graph hash, convolutional receptive-field size,
+radius, output stride, source/latent alignment, GroupNorm count, complete dependency scope,
+support-mask hash, shape, count, and packing rule.
+
+This exposes an important operator boundary: the commonly configured KL-VAE uses GroupNorm,
+while MRI source support normally excludes exact-zero background. Such a combination can
+produce empty conservative latent support and the build will stop. Do not weaken the mask or
+ignore normalization to make the build pass. Resolving that incompatibility requires a
+separately reviewed scientific decision; it is not an operator override and this PR does not
+change Variant A or the frozen VAE.
+
+## Supported-cell statistics and descriptors
+
+`photometry-factored-latent-statistics-v1` uses only supported cells from persisted R/train
+latents. It uses channel-wise streaming float64 Welford accumulation and records per-channel
+supported counts, total supported value count, and supported spatial-cell count. Empty masks,
+nonfinite values, fewer than two values, and channel variance at or below the sealed `1e-12`
+floor fail closed.
+
+Descriptors standardize with those masked statistics and force unsupported standardized cells
+to exact zero before hashing or feature calculation. Fixed latent and valid-adjacent absolute
+gradient features are support-normalized and adaptively pooled at sizes 1, 2, and 4. Arbitrary
+finite values outside support cannot change either statistics or descriptors.
+
+The descriptor artifact retains subject-group identity for later same-subject exclusion and
+contains no paired endpoint or target input. It is explicitly sealed as:
+
+```text
+coupling_authorized: false
+qualification_required: photometry-factored-structural-descriptor-qualification-v1
+```
+
+No trainer may consume it for coupling until a retrospective R/validation qualification with
+subject-group exclusion demonstrates retained instance/anatomical signal and reduced field
+predictability. The artifact makes no learned-disentanglement claim.
+
+## 3. Complete audit
 
 ```powershell
 fieldbridge audit-photometry-factored-latent-bank `
   --config configs/experiment/stage2_canonical_artifacts_v1.yaml `
-  --canonical-dir <EXTERNAL_CANONICAL_DIRECTORY> `
+  --split-json <EXTERNAL_SPLIT_JSON> `
   --photometry-artifact <EXTERNAL_PHOTOMETRY_JSON> `
   --qualification <EXTERNAL_VARIANT_A_QUALIFICATION_JSON> `
   --vae-config <FROZEN_VAE_CONFIG> `
   --vae-checkpoint <EXTERNAL_FROZEN_VAE_CHECKPOINT> `
-  --bank-dir <EXTERNAL_FACTORED_BANK_DIRECTORY> `
+  --bank-dir <LOCAL_SCRATCH_FACTORED_BANK_DIRECTORY> `
   --device cuda `
   --log-every 10
 ```
 
-The audit re-encodes every canonical tensor with the exact frozen encoder, verifies every
-stored latent and packed support mask, recomputes train-only statistics, and recomputes all
-train-only descriptors. It writes nothing.
+Audit writes nothing. After the same complete R-only preflight, it verifies current source-file
+identities and recomputes every source through `source -> N_d -> full E`. It verifies canonical
+and source-support hashes, posterior-mean latent bytes, propagated and packed support, masked
+statistics, every descriptor, all manifests, and every input/provenance binding.
 
-## Atomic resume and no-clobber rules
+## Computational provenance
 
-Every record and JSON manifest is published atomically from a same-directory temporary file.
-Publication uses an atomic no-clobber link; an existing destination is never replaced.
-Interrupted temporary files are removed.
+`stage2-computational-provenance-v1` contains a versioned reviewed dependency map and module
+hash for every production path involved in:
 
-Without `--resume`, any existing destination fails. With `--resume`, every existing record,
-derived artifact, and final manifest must match its deterministic input/resume identity and
-all internal tensor/content hashes. Compatible files are reused byte-for-byte. Incompatible
-files fail; there is no overwrite, repair, relabel, or partial acceptance path.
+- N_d and support generation;
+- record contracts, source loading, and split classification/fingerprints;
+- VAE construction and encoder forward arithmetic;
+- `encode_latent` and full encoding;
+- support propagation/packing, Welford statistics, and descriptors; and
+- config, checkpoint, qualification, and CLI loading.
 
-## Scientific and operator boundary
+It also seals the dependency-map hash, Git commit/clean-checkout state, Python implementation
+and version, PyTorch and NumPy versions, CUDA build/availability, cuDNN version, and selected
+device name/index/capability. A change to any required module identity, map, or runtime identity
+invalidates resume and audit.
 
-These artifacts authorize no model training by themselves. The missing later decisions remain
-outside this PR: trainer/objective contract, coupling policy, checkpoint/history contract,
-anatomy scales, graph-loss order, promotion thresholds, prospective roles, compute budget, and
-competition-permitted final-fit manifest. No `P` identity may be added to this v1 bank by an
-operator override; any future prospective ablation requires a new forward-versioned contract.
+## Atomic resume and no-clobber
+
+Every record and JSON manifest is written to a unique same-directory temporary file, flushed,
+and published using a hard link that fails if the destination already exists. Interrupted
+temporaries are removed. Concurrent destination creation never gets overwritten. Unsupported
+hard links stop without leaving a partial destination.
+
+Without `--resume`, any existing destination fails. With `--resume`, a complete manifest is
+accepted only when the run fingerprint, computational provenance, source identities, and every
+referenced file/content hash match exactly. Compatible complete artifacts are reused byte for
+byte without loading source arrays. Incompatible or partial published manifests fail; there is
+no overwrite, repair, relabel, or fallback path.
+
+## Scientific boundary
+
+These artifacts authorize no model training or coupling. Remaining trainer/objective,
+coupling, checkpoint/history, anatomy scale, graph-loss, promotion, prospective, compute, and
+final-fit decisions remain outside this PR. No private or prospective execution is authorized.

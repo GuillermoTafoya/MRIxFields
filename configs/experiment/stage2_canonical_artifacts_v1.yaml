@@ -6,37 +6,54 @@ eligibility:
   splits: [train, validation]
   prospective_records: exclude_before_array_load
 
-canonical_volume:
+canonical_stream:
   contract: stage2-canonical-volume-v1
-  semantics: frozen-N_d-source-canonical-volume-v1
-  store_dtype: float32
+  semantics: ephemeral-N_d-hash-then-immediate-full-encode-v1
+  persistence: hashes-and-provenance-only
   support: source-nonzero-mask-exact-zero-output-v1
   source: FrozenPhotometryArtifact.normalize_source
+  debug_full_volume_artifact: disabled
 
 latent_bank:
   contract: photometry-factored-latent-bank-v1
   encoder_statistic: posterior_mean
-  strategy: tiled
+  strategy: full
+  path_used_required: full
   store_dtype: float16
   precision: float32
-  block_size: [128, 128, 128]
-  halo: [32, 32, 32]
-  support_downsample: all-source-voxels-supported-per-latent-cell-v1
+  support_propagation: frozen-encoder-dependency-propagation-v1
+  support_packing: numpy-packbits-c-order-little-bit-v1
 
 statistics:
   contract: photometry-factored-latent-statistics-v1
   computed_over:
     cohort: R
     split: train
+    cells: supported_only
+  accumulation: channelwise-masked-welford-float64-v1
 
 structural_descriptor:
   contract: photometry-factored-structural-descriptor-v1
   computed_over:
     cohort: R
     split: train
-  input: canonical_standardized_latent_only
+  input: canonical_standardized_supported_latent_only
   pool_output_sizes: [1, 2, 4]
   pooling: support-normalized-adaptive-average-3d-v1
   gradients: absolute-first-forward-difference-xyz-v1
   dtype: float32
   paired_endpoint_or_target_input: forbidden
+  coupling_authorized: false
+  qualification_required: photometry-factored-structural-descriptor-qualification-v1
+
+publication:
+  atomic: same-directory-hardlink-publication-v1
+  no_clobber: true
+  filesystem_preflight: atomic-hardlink-no-clobber-preflight-v1
+  unsupported_filesystem_action: stop-and-stage-on-local-scratch
+
+storage_preflight:
+  contract: stage2-streamed-storage-preflight-v1
+  shape_source: header-or-injected-resolver-without-array-load-v1
+  per_record_sidecar_estimate_bytes: 16384
+  fixed_artifact_overhead_bytes: 1048576

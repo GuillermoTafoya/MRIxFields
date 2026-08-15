@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import torch
-from torch import nn
-from torch.nn import functional as F
 
 from fieldbridge.config import load_yaml_config
 from fieldbridge.data.contracts import VolumeRecord
@@ -15,16 +15,19 @@ from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Domain
 from fieldbridge.data.latent_bank import LATENT_BANK_CONTRACT_VERSION
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex
 from fieldbridge.data.photometry_factored_latent_bank import (
-    FACTORED_LATENT_BANK_MANIFEST,
     FACTORED_LATENT_STATS_FILE,
-    PHOTOMETRY_FACTORED_DESCRIPTOR_VERSION,
+    PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION,
     PHOTOMETRY_FACTORED_LATENT_BANK_VERSION,
     STRUCTURAL_DESCRIPTOR_MANIFEST,
+    MaskedChannelWelford,
     PhotometryFactoredLatentBankConfig,
     audit_photometry_factored_latent_bank,
     build_photometry_factored_latent_bank,
-    downsample_source_support,
+    derive_encoder_support_rule,
     pack_support_mask,
+    propagate_encoder_support,
+    receptive_field_source_bounds,
+    standardize_supported_latent,
     structural_descriptor,
     unpack_support_mask,
 )
@@ -38,15 +41,18 @@ from fieldbridge.data.photometry_factorization import (
     sha256_text,
 )
 from fieldbridge.data.stage2_canonical_volume import (
-    CANONICAL_VOLUME_SOURCE_MODULES,
-    CanonicalVolumeBuildConfig,
-    audit_canonical_volume_artifact,
-    build_canonical_volume_artifact,
-    load_canonical_volume_manifest,
+    AtomicPublicationUnavailable,
+    COMPUTATIONAL_PROVENANCE_VERSION,
+    DEPENDENCY_MAP_VERSION,
+    REVIEWED_DEPENDENCY_MAP,
+    atomic_torch_save_no_clobber,
+    preflight_atomic_no_clobber_filesystem,
+    storage_tensor_sha256,
 )
 from fieldbridge.evaluation.stage2_photometry_baseline import (
     VARIANT_A_QUALIFICATION_CONTRACT_VERSION,
 )
+from fieldbridge.models.autoencoders.kl_vae import KLVAEEncoder
 
 _CONFIG_PATH = Path("configs/experiment/stage2_canonical_artifacts_v1.yaml")
 _FAKE_SPLIT_SHA = sha256_text("synthetic canonical split file")
@@ -56,24 +62,6 @@ _VAE_CONFIG_SHA = sha256_text("synthetic frozen VAE config")
 _VAE_CHECKPOINT_SHA = sha256_text("synthetic frozen VAE checkpoint")
 _PHOTOMETRY_FILE_SHA = sha256_text("synthetic photometry artifact file")
 _QUALIFICATION_FILE_SHA = sha256_text("synthetic qualification file")
-
-
-class _FrozenPosteriorMeanEncoder(nn.Module):
-    downsample_factor = 2
-    latent_channels = 2
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls = 0
-
-    def encode_dist(
-        self, volume: torch.Tensor, domain: Domain
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.calls += 1
-        pooled = F.avg_pool3d(volume, kernel_size=2, stride=2)
-        field_scaled = pooled * float(domain.field_strength_t / 7.0)
-        mean = torch.cat((pooled, field_scaled), dim=1)
-        return mean, torch.zeros_like(mean)
 
 
 @dataclass
@@ -88,13 +76,36 @@ class _Fixture:
 
 
 def _code_provenance() -> dict:
-    return {
+    dependency_map = {
+        path: list(responsibilities)
+        for path, responsibilities in sorted(REVIEWED_DEPENDENCY_MAP.items())
+    }
+    runtime = {
+        "python_version": "3.synthetic",
+        "python_implementation": "CPython",
+        "platform": "synthetic-platform",
+        "torch_version": "synthetic-torch",
+        "numpy_version": "synthetic-numpy",
+        "cuda_compiled_version": None,
+        "cuda_available": False,
+        "cudnn_version": None,
+        "device": {"type": "cpu", "index": None, "name": None, "capability": None},
+    }
+    payload = {
+        "contract_version": COMPUTATIONAL_PROVENANCE_VERSION,
         "git_head": "synthetic-commit",
         "checkout_clean": True,
-        "module_sha256": {
-            path: sha256_text(path) for path in CANONICAL_VOLUME_SOURCE_MODULES
-        },
+        "dependency_map_version": DEPENDENCY_MAP_VERSION,
+        "dependency_map": dependency_map,
+        "dependency_map_sha256": sha256_json(
+            {"version": DEPENDENCY_MAP_VERSION, "modules": dependency_map}
+        ),
+        "module_sha256": {path: sha256_text(path) for path in dependency_map},
+        "runtime": runtime,
+        "runtime_sha256": sha256_json(runtime),
     }
+    payload["provenance_sha256"] = sha256_json(payload)
+    return payload
 
 
 def _photometry_code_provenance() -> dict:
@@ -105,23 +116,35 @@ def _photometry_code_provenance() -> dict:
     }
 
 
+def _encoder(*, use_norm: bool = False, num_res_blocks: int = 1) -> KLVAEEncoder:
+    torch.manual_seed(1234)
+    encoder = KLVAEEncoder(
+        in_channels=1,
+        base_channels=2,
+        latent_channels=2,
+        spatial_dims=3,
+        activation="silu",
+        use_norm=use_norm,
+        num_res_blocks=num_res_blocks,
+    )
+    return encoder.requires_grad_(False).eval()
+
+
 def _volume(domain: Domain, split_index: int) -> torch.Tensor:
-    values = torch.linspace(0.1, 0.9, 8 * 8 * 8, dtype=torch.float32).reshape(
-        1, 1, 8, 8, 8
+    values = torch.linspace(0.05, 0.85, 16**3, dtype=torch.float32).reshape(
+        1, 1, 16, 16, 16
     )
-    values = (values + 0.005 * domain.contrast_index + 0.001 * split_index).clamp_max(
-        1.0
-    )
-    values[..., :2, :, :] = 0.0
-    return values
+    return (
+        values
+        + 0.004 * domain.contrast_index
+        + 0.002 * FIELD_STRENGTHS_T.index(domain.field_strength_t)
+        + 0.001 * split_index
+    ).clamp_max(0.99)
 
 
 def _make_fixture(tmp_path: Path, *, include_prospective: bool = True) -> _Fixture:
     config = load_yaml_config(_CONFIG_PATH)
-    records_by_split: dict[str, list[VolumeRecord]] = {
-        "train": [],
-        "validation": [],
-    }
+    records_by_split: dict[str, list[VolumeRecord]] = {"train": [], "validation": []}
     volumes: dict[str, torch.Tensor] = {}
     fit: list[PhotometryFitVolume] = []
     for split_index, split in enumerate(("train", "validation")):
@@ -131,7 +154,7 @@ def _make_fixture(tmp_path: Path, *, include_prospective: bool = True) -> _Fixtu
                 case_id = f"R_{split}_{contrast.value}_{field:g}T"
                 source_path = tmp_path / "sources" / f"{case_id}.bin"
                 source_path.parent.mkdir(parents=True, exist_ok=True)
-                source_path.write_bytes(f"{case_id}-content".encode("utf-8"))
+                source_path.write_bytes(f"{case_id}-content".encode())
                 record = VolumeRecord(
                     case_id=case_id,
                     image_path=source_path,
@@ -211,60 +234,65 @@ def _make_fixture(tmp_path: Path, *, include_prospective: bool = True) -> _Fixtu
     )
 
 
-def _build_canonical(
+def _common(fixture: _Fixture, encoder: KLVAEEncoder) -> dict:
+    return {
+        "encoder": encoder,
+        "artifact": fixture.artifact,
+        "qualification": fixture.qualification,
+        "records_by_split": fixture.records_by_split,
+        "resolved_config": fixture.config,
+        "source_split_file_sha256": _FAKE_SPLIT_SHA,
+        "source_membership_fingerprint": _FAKE_MEMBERSHIP,
+        "source_recovery_fingerprint": _FAKE_RECOVERY,
+        "photometry_artifact_file_sha256": _PHOTOMETRY_FILE_SHA,
+        "qualification_file_sha256": _QUALIFICATION_FILE_SHA,
+        "vae_config_sha256": _VAE_CONFIG_SHA,
+        "vae_checkpoint_sha256": _VAE_CHECKPOINT_SHA,
+        "code_provenance": fixture.code_provenance,
+        "source_shape_resolver": lambda record: fixture.volumes[str(record.image_path)].shape,
+        "device": torch.device("cpu"),
+    }
+
+
+def _build(
     tmp_path: Path,
     fixture: _Fixture,
+    encoder: KLVAEEncoder,
     *,
     resume: bool = False,
     loader=None,
-) -> tuple[Path, dict]:
-    out_dir = tmp_path / "canonical"
-    volume_loader = loader or (lambda record: fixture.volumes[str(record.image_path)].clone())
-    manifest = build_canonical_volume_artifact(
-        artifact=fixture.artifact,
-        qualification=fixture.qualification,
-        records_by_split=fixture.records_by_split,
-        config=CanonicalVolumeBuildConfig.from_mapping(fixture.config, out_dir=out_dir),
-        resolved_config=fixture.config,
-        source_split_file_sha256=_FAKE_SPLIT_SHA,
-        source_membership_fingerprint=_FAKE_MEMBERSHIP,
-        source_recovery_fingerprint=_FAKE_RECOVERY,
-        photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-        qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-        code_provenance=fixture.code_provenance,
-        volume_loader=volume_loader,
-        resume=resume,
-    )
-    return out_dir, manifest
-
-
-def _build_bank(
-    tmp_path: Path,
-    fixture: _Fixture,
-    canonical_dir: Path,
-    encoder: _FrozenPosteriorMeanEncoder,
-    *,
-    resume: bool = False,
+    source_file_hasher=sha256_file,
 ) -> tuple[Path, dict]:
     out_dir = tmp_path / "bank"
     manifest = build_photometry_factored_latent_bank(
-        encoder=encoder,
-        artifact=fixture.artifact,
-        qualification=fixture.qualification,
-        canonical_dir=canonical_dir,
+        **_common(fixture, encoder),
         config=PhotometryFactoredLatentBankConfig.from_mapping(
             fixture.config, out_dir=out_dir
         ),
-        resolved_config=fixture.config,
-        photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-        qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-        vae_config_sha256=_VAE_CONFIG_SHA,
-        vae_checkpoint_sha256=_VAE_CHECKPOINT_SHA,
-        code_provenance=fixture.code_provenance,
-        device=torch.device("cpu"),
+        volume_loader=loader
+        or (lambda record: fixture.volumes[str(record.image_path)].clone()),
+        source_file_hasher=source_file_hasher,
         resume=resume,
     )
     return out_dir, manifest
+
+
+def _audit(
+    root: Path,
+    fixture: _Fixture,
+    encoder: KLVAEEncoder,
+    *,
+    code_provenance: dict | None = None,
+    loader=None,
+) -> dict:
+    common = _common(fixture, encoder)
+    common["code_provenance"] = code_provenance or fixture.code_provenance
+    return audit_photometry_factored_latent_bank(
+        **common,
+        root=root,
+        volume_loader=loader
+        or (lambda record: fixture.volumes[str(record.image_path)].clone()),
+    )
 
 
 def _artifact_bytes(root: Path) -> dict[str, bytes]:
@@ -275,7 +303,15 @@ def _artifact_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
-def test_canonical_builder_excludes_every_p_identity_before_array_load(tmp_path) -> None:
+def _mutated_provenance(original: dict, module: str) -> dict:
+    value = json.loads(json.dumps(original))
+    value["module_sha256"][module] = sha256_text(f"mutated:{module}")
+    value.pop("provenance_sha256")
+    value["provenance_sha256"] = sha256_json(value)
+    return value
+
+
+def test_streamed_builder_rejects_every_p_before_hash_shape_or_array_load(tmp_path) -> None:
     fixture = _make_fixture(tmp_path)
     loaded: list[str] = []
 
@@ -284,220 +320,362 @@ def test_canonical_builder_excludes_every_p_identity_before_array_load(tmp_path)
         assert str(record.image_path) != fixture.p_path
         return fixture.volumes[str(record.image_path)].clone()
 
-    _, manifest = _build_canonical(tmp_path, fixture, loader=loader)
+    def hasher(path: str | Path) -> str:
+        assert str(path) != fixture.p_path
+        return sha256_file(path)
+
+    _, manifest = _build(
+        tmp_path, fixture, _encoder(), loader=loader, source_file_hasher=hasher
+    )
     assert len(loaded) == 30
     assert manifest["record_count"] == 30
     assert manifest["eligibility_proof"]["prospective_accepted_count"] == 0
     assert [item["record_identity"] for item in manifest["excluded_prospective_records"]] == [
         "P_1234_T1w_01T"
     ]
-    assert all(item["cohort"] == "R" for item in manifest["records"])
+    assert manifest["canonical_stream"]["full_canonical_tensor_persisted"] is False
+    assert not list((tmp_path / "bank").rglob("*canonical*"))
 
 
-def test_canonical_and_bank_exact_resume_are_no_clobber(tmp_path) -> None:
-    fixture = _make_fixture(tmp_path)
-    canonical_dir, _ = _build_canonical(tmp_path, fixture)
-    canonical_before = _artifact_bytes(canonical_dir)
+def test_streamed_exact_resume_is_byte_exact_and_does_not_load_arrays(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    root, _ = _build(tmp_path, fixture, _encoder())
+    before = _artifact_bytes(root)
 
     def forbidden_loader(record: VolumeRecord) -> torch.Tensor:
-        raise AssertionError(f"exact resume loaded source array {record.case_id}")
+        raise AssertionError(f"exact resume loaded {record.case_id}")
 
-    _build_canonical(tmp_path, fixture, resume=True, loader=forbidden_loader)
-    assert _artifact_bytes(canonical_dir) == canonical_before
+    _build(tmp_path, fixture, _encoder(), resume=True, loader=forbidden_loader)
+    assert _artifact_bytes(root) == before
     with pytest.raises(FileExistsError, match="overwrite"):
-        _build_canonical(tmp_path, fixture, resume=False)
+        _build(tmp_path, fixture, _encoder(), resume=False)
 
-    encoder = _FrozenPosteriorMeanEncoder()
-    bank_dir, _ = _build_bank(tmp_path, fixture, canonical_dir, encoder)
-    assert encoder.calls == 30
-    bank_before = _artifact_bytes(bank_dir)
-    resumed_encoder = _FrozenPosteriorMeanEncoder()
-    _build_bank(tmp_path, fixture, canonical_dir, resumed_encoder, resume=True)
-    assert resumed_encoder.calls == 0
-    assert _artifact_bytes(bank_dir) == bank_before
-    with pytest.raises(FileExistsError, match="overwrite"):
-        _build_bank(
-            tmp_path,
-            fixture,
-            canonical_dir,
-            _FrozenPosteriorMeanEncoder(),
-            resume=False,
-        )
+
+def test_interrupted_partial_build_resumes_without_reencoding_published_record(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    calls = 0
+
+    def interrupted_loader(record: VolumeRecord) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("synthetic interruption")
+        return fixture.volumes[str(record.image_path)].clone()
+
+    with pytest.raises(RuntimeError, match="interruption"):
+        _build(tmp_path, fixture, _encoder(), loader=interrupted_loader)
+    published = list((tmp_path / "bank" / "latents").rglob("*.pt"))
+    assert len(published) == 1
+    first_bytes = published[0].read_bytes()
+    resumed_loads: list[str] = []
+
+    def resumed_loader(record: VolumeRecord) -> torch.Tensor:
+        resumed_loads.append(record.case_id)
+        return fixture.volumes[str(record.image_path)].clone()
+
+    root, manifest = _build(
+        tmp_path, fixture, _encoder(), resume=True, loader=resumed_loader
+    )
+    assert manifest["record_count"] == 30
+    assert len(resumed_loads) == 29
+    assert published[0].read_bytes() == first_bytes
+    assert not list(root.rglob("*.tmp"))
 
 
 def test_source_content_mutation_invalidates_resume_before_array_load(tmp_path) -> None:
     fixture = _make_fixture(tmp_path, include_prospective=False)
-    _build_canonical(tmp_path, fixture)
-    mutated = fixture.records_by_split["train"][0].image_path
-    Path(mutated).write_bytes(b"mutated-source-content")
+    _build(tmp_path, fixture, _encoder())
+    Path(fixture.records_by_split["train"][0].image_path).write_bytes(b"mutated")
 
     def forbidden_loader(record: VolumeRecord) -> torch.Tensor:
-        raise AssertionError(f"mutation preflight loaded source array {record.case_id}")
+        raise AssertionError(f"mutation preflight loaded {record.case_id}")
 
     with pytest.raises(ValueError, match="exact resume"):
-        _build_canonical(tmp_path, fixture, resume=True, loader=forbidden_loader)
+        _build(tmp_path, fixture, _encoder(), resume=True, loader=forbidden_loader)
 
 
-def test_support_mask_round_trip_is_conservative_and_packed() -> None:
-    support = torch.ones(1, 1, 8, 8, 8, dtype=torch.bool)
-    support[..., 0, 0, 0] = False
-    support[..., 4:6, 4:6, 4:6] = False
-    downsampled = downsample_source_support(support, factor=2)
-    assert downsampled.shape == (4, 4, 4)
-    assert not downsampled[0, 0, 0]
-    assert not downsampled[2, 2, 2]
-    assert int(downsampled.sum()) == 62
-    packed = pack_support_mask(downsampled)
+def test_support_propagation_matches_local_receptive_field_boundary_and_impulse() -> None:
+    encoder = _encoder(use_norm=False, num_res_blocks=1)
+    rule = derive_encoder_support_rule(encoder)
+    assert rule["convolutional_receptive_field_size"] == [37, 37, 37]
+    assert rule["output_stride"] == [4, 4, 4]
+    assert rule["complete_spatial_dependency"] == "convolutional-receptive-field"
+
+    for unsupported_index in ((40, 40, 40), (0, 0, 0)):
+        source = torch.ones(1, 1, 80, 80, 80, dtype=torch.bool)
+        source[(0, 0, *unsupported_index)] = False
+        propagated = propagate_encoder_support(source, encoder)
+        for z in range(propagated.shape[0]):
+            for y in range(propagated.shape[1]):
+                for x in range(propagated.shape[2]):
+                    bounds = receptive_field_source_bounds(
+                        rule, (z, y, x), source.shape[-3:]
+                    )
+                    depends = all(
+                        bounds[axis][0] <= unsupported_index[axis] <= bounds[axis][1]
+                        for axis in range(3)
+                    )
+                    assert bool(propagated[z, y, x]) is (not depends)
+
+
+def test_groupnorm_complete_dependency_is_global_and_fails_empty_support() -> None:
+    encoder = _encoder(use_norm=True, num_res_blocks=1)
+    rule = derive_encoder_support_rule(encoder)
+    assert rule["groupnorm_count"] == 6
+    assert rule["complete_spatial_dependency"] == "full-input-spatial-extent"
+    support = torch.ones(1, 1, 16, 16, 16, dtype=torch.bool)
+    support[..., 8, 8, 8] = False
+    assert not bool(propagate_encoder_support(support, encoder).any())
+
+
+def test_packed_support_round_trip_seals_actual_mask() -> None:
+    support = torch.ones(5, 4, 3, dtype=torch.bool)
+    support[0, 0, 0] = False
+    support[-1, -1, -1] = False
+    packed = pack_support_mask(support)
     assert packed.dtype == torch.uint8
-    assert packed.numel() == 8
-    assert torch.equal(unpack_support_mask(packed, downsampled.shape), downsampled)
+    assert packed.numel() == math.ceil(support.numel() / 8)
+    restored = unpack_support_mask(packed, support.shape)
+    assert torch.equal(restored, support)
+    assert storage_tensor_sha256(restored) == storage_tensor_sha256(support)
 
 
-def test_bank_stats_descriptors_and_all_domains_have_strict_roles(tmp_path) -> None:
-    fixture = _make_fixture(tmp_path)
-    canonical_dir, canonical_manifest = _build_canonical(tmp_path, fixture)
-    bank_dir, bank = _build_bank(
-        tmp_path, fixture, canonical_dir, _FrozenPosteriorMeanEncoder()
+def test_masked_welford_and_descriptor_ignore_arbitrary_unsupported_values() -> None:
+    support = torch.zeros(4, 4, 4, dtype=torch.bool)
+    support[1:3, 1:3, 1:3] = True
+    first = torch.arange(2 * 4**3, dtype=torch.float32).reshape(2, 4, 4, 4)
+    second = first * 1.5 + 3
+    changed_first = first.clone()
+    changed_second = second.clone()
+    changed_first[:, ~support] = 1.0e20
+    changed_second[:, ~support] = -1.0e20
+    left = MaskedChannelWelford(2)
+    right = MaskedChannelWelford(2)
+    for original, changed in ((first, changed_first), (second, changed_second)):
+        left.update(original, support)
+        right.update(changed, support)
+    left_stats = left.compute()
+    assert right.compute() == left_stats
+    standardized_left = standardize_supported_latent(
+        first, support, left_stats["per_channel_mean"], left_stats["per_channel_std"]
     )
+    standardized_right = standardize_supported_latent(
+        changed_first,
+        support,
+        left_stats["per_channel_mean"],
+        left_stats["per_channel_std"],
+    )
+    assert torch.equal(standardized_left, standardized_right)
+    assert torch.equal(
+        structural_descriptor(standardized_left, support),
+        structural_descriptor(standardized_right, support),
+    )
+
+
+def test_masked_statistics_reject_empty_nonfinite_and_degenerate_values() -> None:
+    accumulator = MaskedChannelWelford(1)
+    with pytest.raises(ValueError, match="empty"):
+        accumulator.update(torch.ones(1, 2, 2, 2), torch.zeros(2, 2, 2, dtype=torch.bool))
+    bad = torch.ones(1, 2, 2, 2)
+    bad[0, 0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        accumulator.update(bad, torch.ones(2, 2, 2, dtype=torch.bool))
+    degenerate = MaskedChannelWelford(1)
+    degenerate.update(torch.ones(1, 2, 2, 2), torch.ones(2, 2, 2, dtype=torch.bool))
+    with pytest.raises(ValueError, match="degenerate"):
+        degenerate.compute()
+
+
+def test_bank_statistics_domains_streaming_and_descriptor_boundary(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path)
+    root, manifest = _build(tmp_path, fixture, _encoder())
     expected_domains = {
         Domain(field, contrast).label
         for contrast in CONTRASTS
         for field in FIELD_STRENGTHS_T
     }
-    assert set(canonical_manifest["domain_counts"]["train"]) == expected_domains
-    assert set(canonical_manifest["domain_counts"]["validation"]) == expected_domains
-    assert set(bank["domain_counts"]["train"]) == expected_domains
-    assert set(bank["domain_counts"]["validation"]) == expected_domains
-    assert bank["contract_version"] == PHOTOMETRY_FACTORED_LATENT_BANK_VERSION
-    assert bank["legacy_contract_mutation"] == "latent-bank-v1-unchanged"
-
-    stats = json.loads((bank_dir / FACTORED_LATENT_STATS_FILE).read_text(encoding="utf-8"))
-    assert stats["computed_over"] == {"cohort": "R", "split": "train"}
-    assert stats["record_count"] == 15
-    assert {item["record_identity"] for item in stats["records"]} == {
-        item["record_identity"] for item in bank["records"] if item["split"] == "train"
-    }
-    descriptors = json.loads(
-        (bank_dir / STRUCTURAL_DESCRIPTOR_MANIFEST).read_text(encoding="utf-8")
-    )
-    assert descriptors["contract_version"] == PHOTOMETRY_FACTORED_DESCRIPTOR_VERSION
-    assert descriptors["computed_over"] == {"cohort": "R", "split": "train"}
-    assert descriptors["record_count"] == 15
-    assert all(item["subject_group_identity"].startswith("R:") for item in descriptors["records"])
-    assert all(item["paired_endpoint_or_target_input"] == "none" for item in descriptors["records"])
-    assert all(item["split"] == "train" for item in descriptors["records"])
-
-    first = torch.load(
-        bank_dir / descriptors["records"][0]["path"],
-        map_location="cpu",
-        weights_only=False,
-    )
-    assert first["descriptor"].ndim == 1
-    assert first["descriptor"].dtype == torch.float32
-    assert first["input"] == "canonical_standardized_latent_only"
+    assert set(manifest["domain_counts"]["train"]) == expected_domains
+    assert set(manifest["domain_counts"]["validation"]) == expected_domains
+    assert manifest["encoding"]["strategy_requested"] == "full"
+    assert manifest["encoding"]["path_used_required"] == "full"
+    assert manifest["encoding"]["oom_fallback"] == "forbidden-hard-stop"
+    assert manifest["storage_preflight"]["full_volume_bytes_avoided"] > 0
+    assert manifest["storage_preflight"]["predicted_latent_bytes"] > 0
     assert all(
-        not ({"target", "target_domain", "paired_endpoint"} & set(item))
-        for item in descriptors["records"]
+        entry["sidecar"]["encoding_path"]["path_used"] == "full"
+        and entry["sidecar"]["canonical_persisted"] is False
+        for entry in manifest["records"]
     )
 
-    report = audit_photometry_factored_latent_bank(
-        root=bank_dir,
-        canonical_dir=canonical_dir,
-        encoder=_FrozenPosteriorMeanEncoder(),
-        artifact=fixture.artifact,
-        qualification=fixture.qualification,
-        resolved_config=fixture.config,
-        photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-        qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-        vae_config_sha256=_VAE_CONFIG_SHA,
-        vae_checkpoint_sha256=_VAE_CHECKPOINT_SHA,
-        device=torch.device("cpu"),
+    stats = json.loads((root / FACTORED_LATENT_STATS_FILE).read_text())
+    assert stats["computed_over"] == {
+        "cohort": "R",
+        "split": "train",
+        "cells": "supported_only",
+    }
+    assert stats["record_count"] == 15
+    assert stats["algorithm"] == "channelwise-masked-welford-float64-v1"
+    assert stats["minimum_channel_variance"] == 1.0e-12
+    assert len(stats["per_channel_supported_count"]) == 2
+    assert stats["total_supported_value_count"] == sum(
+        stats["per_channel_supported_count"]
     )
-    assert report["train_statistics_verified"] is True
+    descriptors = json.loads((root / STRUCTURAL_DESCRIPTOR_MANIFEST).read_text())
+    assert descriptors["record_count"] == 15
+    assert descriptors["coupling_authorized"] is False
+    assert (
+        descriptors["qualification_required"]
+        == PHOTOMETRY_FACTORED_DESCRIPTOR_QUALIFICATION_VERSION
+    )
+    assert descriptors["learned_disentanglement_claim"] == "forbidden"
+    assert all(
+        entry["sidecar"]["subject_group_identity"].startswith("R:")
+        and entry["sidecar"]["coupling_authorized"] is False
+        for entry in descriptors["records"]
+    )
+    report = _audit(root, fixture, _encoder())
+    assert report["source_to_N_d_to_E_recomputed"] is True
+    assert report["masked_train_statistics_verified"] is True
     assert report["structural_descriptors_verified"] is True
 
 
-def test_manifest_and_payload_hash_mutation_fail_closed(tmp_path) -> None:
-    fixture = _make_fixture(tmp_path)
-    canonical_dir, _ = _build_canonical(tmp_path, fixture)
-    manifest_path = canonical_dir / "canonical_volume_manifest.json"
-    original = json.loads(manifest_path.read_text(encoding="utf-8"))
-    mutated = json.loads(json.dumps(original))
-    mutated["records"][0]["canonical_dtype"] = "float16"
-    manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
-    with pytest.raises(ValueError, match="content hash"):
-        load_canonical_volume_manifest(canonical_dir)
-    manifest_path.write_text(
-        json.dumps(original, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+def test_every_dependency_identity_mutation_invalidates_resume_and_audit(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    root, _ = _build(tmp_path, fixture, _encoder())
+    for module in REVIEWED_DEPENDENCY_MAP:
+        mutated = _mutated_provenance(fixture.code_provenance, module)
+        original = fixture.code_provenance
+        fixture.code_provenance = mutated
+        try:
+            with pytest.raises(ValueError, match="exact resume"):
+                _build(tmp_path, fixture, _encoder(), resume=True)
+        finally:
+            fixture.code_provenance = original
+        with pytest.raises(ValueError, match="resume/audit"):
+            _audit(root, fixture, _encoder(), code_provenance=mutated)
 
-    bank_dir, bank = _build_bank(
-        tmp_path, fixture, canonical_dir, _FrozenPosteriorMeanEncoder()
-    )
-    record_path = bank_dir / bank["records"][0]["path"]
-    payload = torch.load(record_path, map_location="cpu", weights_only=False)
+    runtime_mutation = json.loads(json.dumps(fixture.code_provenance))
+    runtime_mutation["runtime"]["python_version"] = "changed-runtime"
+    runtime_mutation["runtime_sha256"] = sha256_json(runtime_mutation["runtime"])
+    runtime_mutation.pop("provenance_sha256")
+    runtime_mutation["provenance_sha256"] = sha256_json(runtime_mutation)
+    original = fixture.code_provenance
+    fixture.code_provenance = runtime_mutation
+    try:
+        with pytest.raises(ValueError, match="exact resume"):
+            _build(tmp_path, fixture, _encoder(), resume=True)
+    finally:
+        fixture.code_provenance = original
+    with pytest.raises(ValueError, match="resume/audit"):
+        _audit(root, fixture, _encoder(), code_provenance=runtime_mutation)
+
+
+def test_payload_hash_mutation_fails_complete_audit(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    root, manifest = _build(tmp_path, fixture, _encoder())
+    path = root / manifest["records"][0]["path"]
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     payload["latent"] = payload["latent"] + 1
-    torch.save(payload, record_path)
+    torch.save(payload, path)
     with pytest.raises(ValueError, match="file hash"):
-        audit_photometry_factored_latent_bank(
-            root=bank_dir,
-            canonical_dir=canonical_dir,
-            encoder=_FrozenPosteriorMeanEncoder(),
-            artifact=fixture.artifact,
-            qualification=fixture.qualification,
-            resolved_config=fixture.config,
-            photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-            qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-            vae_config_sha256=_VAE_CONFIG_SHA,
-            vae_checkpoint_sha256=_VAE_CHECKPOINT_SHA,
-            device=torch.device("cpu"),
-        )
+        _audit(root, fixture, _encoder())
 
 
-def test_canonical_audit_recomputes_source_and_rejects_qualification_mutation(
-    tmp_path: Path,
+@pytest.mark.parametrize("error_number", [errno.ENOTSUP, errno.EPERM])
+def test_filesystem_preflight_rejects_unsupported_hardlinks_before_processing(
+    tmp_path, error_number
 ) -> None:
-    fixture = _make_fixture(tmp_path)
-    canonical_dir, _ = _build_canonical(tmp_path, fixture)
-    report = audit_canonical_volume_artifact(
-        root=canonical_dir,
-        artifact=fixture.artifact,
-        qualification=fixture.qualification,
-        records_by_split=fixture.records_by_split,
-        source_split_file_sha256=_FAKE_SPLIT_SHA,
-        source_membership_fingerprint=_FAKE_MEMBERSHIP,
-        source_recovery_fingerprint=_FAKE_RECOVERY,
-        photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-        qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-        volume_loader=lambda record: fixture.volumes[str(record.image_path)].clone(),
-    )
-    assert report["source_content_verified"] is True
-    mutated = json.loads(json.dumps(fixture.qualification))
-    mutated["canonical_latent_bank_authorized"] = False
-    with pytest.raises(ValueError, match="result hash"):
-        audit_canonical_volume_artifact(
-            root=canonical_dir,
-            artifact=fixture.artifact,
-            qualification=mutated,
-            records_by_split=fixture.records_by_split,
-            source_split_file_sha256=_FAKE_SPLIT_SHA,
-            source_membership_fingerprint=_FAKE_MEMBERSHIP,
-            source_recovery_fingerprint=_FAKE_RECOVERY,
-            photometry_artifact_file_sha256=_PHOTOMETRY_FILE_SHA,
-            qualification_file_sha256=_QUALIFICATION_FILE_SHA,
-            volume_loader=lambda record: fixture.volumes[str(record.image_path)].clone(),
+    def unsupported(source, destination) -> None:
+        raise OSError(error_number, "unsupported")
+
+    with pytest.raises(AtomicPublicationUnavailable, match="local scratch"):
+        preflight_atomic_no_clobber_filesystem(
+            tmp_path / "output", required_free_bytes=0, linker=unsupported
         )
+    assert not list((tmp_path / "output").glob(".fieldbridge-atomic-probe*"))
 
 
-def test_structural_descriptor_is_deterministic_and_uses_standardized_latents() -> None:
-    latent = torch.arange(2 * 4 * 4 * 4, dtype=torch.float32).reshape(2, 4, 4, 4)
-    support = torch.ones(4, 4, 4, dtype=torch.bool)
-    support[0] = False
-    first = structural_descriptor(latent, support)
-    second = structural_descriptor(latent.clone(), support.clone())
-    assert torch.equal(first, second)
-    assert first.shape == (2 * (1 + 8 + 64) * 4,)
-    assert torch.isfinite(first).all()
+def test_build_filesystem_failure_occurs_before_any_source_array_load(tmp_path) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+
+    def unsupported(source, destination) -> None:
+        raise OSError(errno.ENOTSUP, "unsupported")
+
+    def forbidden_loader(record: VolumeRecord) -> torch.Tensor:
+        raise AssertionError(f"filesystem preflight loaded {record.case_id}")
+
+    out_dir = tmp_path / "bank"
+    with pytest.raises(AtomicPublicationUnavailable, match="local scratch"):
+        build_photometry_factored_latent_bank(
+            **_common(fixture, _encoder()),
+            config=PhotometryFactoredLatentBankConfig.from_mapping(
+                fixture.config, out_dir=out_dir
+            ),
+            volume_loader=forbidden_loader,
+            publication_linker=unsupported,
+        )
+    assert not list(out_dir.rglob("*.pt"))
+    assert not list(out_dir.glob(".fieldbridge-atomic-probe*"))
+
+
+def test_atomic_publication_handles_concurrent_destination_and_cleans_temporary(tmp_path) -> None:
+    destination = tmp_path / "record.pt"
+
+    def concurrent(source, target) -> None:
+        Path(target).write_bytes(b"concurrent-writer")
+        raise FileExistsError(errno.EEXIST, "exists")
+
+    with pytest.raises(FileExistsError, match="overwrite"):
+        atomic_torch_save_no_clobber(destination, {"value": torch.ones(1)}, linker=concurrent)
+    assert destination.read_bytes() == b"concurrent-writer"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_atomic_publication_interruption_and_enotsup_leave_no_partial_destination(
+    tmp_path, monkeypatch
+) -> None:
+    destination = tmp_path / "record.pt"
+    original_save = torch.save
+
+    def interrupted(payload, path) -> None:
+        Path(path).write_bytes(b"partial")
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(torch, "save", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        atomic_torch_save_no_clobber(destination, {"value": torch.ones(1)})
+    assert not destination.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+    monkeypatch.setattr(torch, "save", original_save)
+
+    def unsupported(source, target) -> None:
+        raise OSError(errno.ENOTSUP, "unsupported")
+
+    with pytest.raises(AtomicPublicationUnavailable):
+        atomic_torch_save_no_clobber(destination, {"value": torch.ones(1)}, linker=unsupported)
+    assert not destination.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_full_encode_oom_is_hard_stop_without_tiled_fallback(tmp_path, monkeypatch) -> None:
+    fixture = _make_fixture(tmp_path, include_prospective=False)
+    encoder = _encoder()
+
+    def oom(volume, domain):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(encoder, "encode_dist", oom)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _build(tmp_path, fixture, encoder)
+    assert not list((tmp_path / "bank").rglob("*.pt"))
+    assert not (tmp_path / "bank" / "photometry_factored_latent_bank_manifest.json").exists()
+
+
+def test_primary_config_rejects_tiled_strategy() -> None:
+    config = load_yaml_config(_CONFIG_PATH)
+    config["latent_bank"]["strategy"] = "tiled"
+    with pytest.raises(ValueError, match="full encoding"):
+        PhotometryFactoredLatentBankConfig.from_mapping(config, out_dir="external")
 
 
 def test_existing_latent_bank_v1_reader_behavior_is_unchanged(tmp_path) -> None:
@@ -517,17 +695,18 @@ def test_existing_latent_bank_v1_reader_behavior_is_unchanged(tmp_path) -> None:
     index = LatentBankIndex(tmp_path / "legacy", "train")
     assert len(index) == 1
     assert torch.equal(index.load_latent(0), payload["latent"])
-    assert not (tmp_path / "legacy" / FACTORED_LATENT_BANK_MANIFEST).exists()
 
 
-def test_new_artifact_commands_are_exposed_in_help() -> None:
+def test_streamed_artifact_commands_are_exposed_without_canonical_persistence_commands() -> None:
     from fieldbridge.cli import build_parser
 
     help_text = build_parser().format_help()
     for command in (
-        "build-stage2-canonical-volumes",
-        "audit-stage2-canonical-volumes",
+        "preflight-photometry-factored-latent-bank",
         "build-photometry-factored-latent-bank",
         "audit-photometry-factored-latent-bank",
     ):
         assert command in help_text
+    assert "build-stage2-canonical-volumes" not in help_text
+    assert "audit-stage2-canonical-volumes" not in help_text
+    assert "train-stage2-field-graph" not in help_text

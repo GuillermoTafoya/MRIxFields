@@ -1,0 +1,42 @@
+contract: stage2-canonical-artifacts-config-v1
+scope: retrospective_only_canonical_artifacts
+
+eligibility:
+  cohort: R
+  splits: [train, validation]
+  prospective_records: exclude_before_array_load
+
+canonical_volume:
+  contract: stage2-canonical-volume-v1
+  semantics: frozen-N_d-source-canonical-volume-v1
+  store_dtype: float32
+  support: source-nonzero-mask-exact-zero-output-v1
+  source: FrozenPhotometryArtifact.normalize_source
+
+latent_bank:
+  contract: photometry-factored-latent-bank-v1
+  encoder_statistic: posterior_mean
+  strategy: tiled
+  store_dtype: float16
+  precision: float32
+  block_size: [128, 128, 128]
+  halo: [32, 32, 32]
+  support_downsample: all-source-voxels-supported-per-latent-cell-v1
+
+statistics:
+  contract: photometry-factored-latent-statistics-v1
+  computed_over:
+    cohort: R
+    split: train
+
+structural_descriptor:
+  contract: photometry-factored-structural-descriptor-v1
+  computed_over:
+    cohort: R
+    split: train
+  input: canonical_standardized_latent_only
+  pool_output_sizes: [1, 2, 4]
+  pooling: support-normalized-adaptive-average-3d-v1
+  gradients: absolute-first-forward-difference-xyz-v1
+  dtype: float32
+  paired_endpoint_or_target_input: forbidden

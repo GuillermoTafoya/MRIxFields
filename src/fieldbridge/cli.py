@@ -44,7 +44,7 @@ from fieldbridge.data.patch_bank import (
 from fieldbridge.data.manifests import audit_manifest, load_manifest
 from fieldbridge.data.preprocessing import SlicePreprocessingSpec, from_model_range, selected_slice_indices
 from fieldbridge.data.sampling import domain_oversampling_weights, field_balanced_weights
-from fieldbridge.data.sources import nifti_image_loader
+from fieldbridge.data.sources import nifti_image_loader, nifti_image_shape
 from fieldbridge.data.transforms import StratifiedCropConfig, assert_official_unit_range
 from fieldbridge.data.volume_splits import (
     audit_volume_splits,
@@ -150,6 +150,12 @@ from fieldbridge.training.stage1_vae import (
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
 from fieldbridge.training.stage2_transport import Stage2TransportConfig, run_stage2_transport_train
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
+from fieldbridge.data.photometry_factored_latent_bank import (
+    PhotometryFactoredLatentBankConfig,
+    audit_photometry_factored_latent_bank,
+    build_photometry_factored_latent_bank,
+    preflight_photometry_factored_latent_bank,
+)
 from fieldbridge.data.resplit import resplit_file
 from fieldbridge.data.photometry_factorization import (
     FORBIDDEN_TRAVELLER_IDS,
@@ -169,6 +175,11 @@ from fieldbridge.data.photometry_factorization import (
     classify_variant_a_cohort,
     fit_frozen_photometry,
     reject_target_or_prediction_derived_fields,
+)
+from fieldbridge.data.stage2_canonical_volume import (
+    capture_canonical_artifact_code_provenance,
+    load_variant_a_qualification,
+    validate_canonical_artifact_config,
 )
 from fieldbridge.evaluation.mrixfields2026_official import official_task3_runtime_provenance
 from fieldbridge.evaluation.stage2_photometry_baseline import (
@@ -816,6 +827,66 @@ def build_parser() -> argparse.ArgumentParser:
     eval_stage2_photometry.add_argument("--resume", action="store_true")
     eval_stage2_photometry.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     eval_stage2_photometry.add_argument("--log-every", type=int, default=1)
+
+    preflight_factored_bank = subparsers.add_parser(
+        "preflight-photometry-factored-latent-bank",
+        help="Verify streamed storage, filesystem, cohort, VAE, and support contracts.",
+    )
+    preflight_factored_bank.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
+    )
+    preflight_factored_bank.add_argument("--split-json", type=Path, required=True)
+    preflight_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)
+    preflight_factored_bank.add_argument("--qualification", type=Path, required=True)
+    preflight_factored_bank.add_argument("--vae-config", type=Path, required=True)
+    preflight_factored_bank.add_argument("--vae-checkpoint", type=Path, required=True)
+    preflight_factored_bank.add_argument("--out-dir", type=Path, required=True)
+    preflight_factored_bank.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+
+    build_factored_bank = subparsers.add_parser(
+        "build-photometry-factored-latent-bank",
+        help="Build E(N_d(x_d)) posterior-mean latents, train stats, and descriptors.",
+    )
+    build_factored_bank.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
+    )
+    build_factored_bank.add_argument("--split-json", type=Path, required=True)
+    build_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)
+    build_factored_bank.add_argument("--qualification", type=Path, required=True)
+    build_factored_bank.add_argument("--vae-config", type=Path, required=True)
+    build_factored_bank.add_argument("--vae-checkpoint", type=Path, required=True)
+    build_factored_bank.add_argument("--out-dir", type=Path, required=True)
+    build_factored_bank.add_argument("--resume", action="store_true")
+    build_factored_bank.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    build_factored_bank.add_argument("--log-every", type=int, default=1)
+
+    audit_factored_bank = subparsers.add_parser(
+        "audit-photometry-factored-latent-bank",
+        help="Re-encode and audit a factored latent bank, support, stats, and descriptors.",
+    )
+    audit_factored_bank.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_canonical_artifacts_v2.yaml"),
+    )
+    audit_factored_bank.add_argument("--split-json", type=Path, required=True)
+    audit_factored_bank.add_argument("--photometry-artifact", type=Path, required=True)
+    audit_factored_bank.add_argument("--qualification", type=Path, required=True)
+    audit_factored_bank.add_argument("--vae-config", type=Path, required=True)
+    audit_factored_bank.add_argument("--vae-checkpoint", type=Path, required=True)
+    audit_factored_bank.add_argument("--bank-dir", type=Path, required=True)
+    audit_factored_bank.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    audit_factored_bank.add_argument("--log-every", type=int, default=1)
 
     fit_intensity = subparsers.add_parser(
         "fit-intensity-baseline",
@@ -1857,6 +1928,129 @@ def main(argv: list[str] | None = None) -> int:
         )
         write_variant_a_result(output_path, result)
         print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    if args.command in {
+        "preflight-photometry-factored-latent-bank",
+        "build-photometry-factored-latent-bank",
+        "audit-photometry-factored-latent-bank",
+    }:
+        config = validate_canonical_artifact_config(load_yaml_config(args.config))
+        split_path = assert_variant_a_external_path(args.split_json)
+        photometry_path = assert_variant_a_external_path(args.photometry_artifact)
+        qualification_path = assert_variant_a_external_path(args.qualification)
+        checkpoint_path = assert_variant_a_external_path(args.vae_checkpoint)
+        bank_arg = (
+            args.bank_dir
+            if args.command == "audit-photometry-factored-latent-bank"
+            else args.out_dir
+        )
+        bank_dir = assert_variant_a_external_path(bank_arg)
+        vae_config_path = Path(args.vae_config).resolve()
+        if not vae_config_path.is_file():
+            raise FileNotFoundError(f"Frozen-VAE config not found: {vae_config_path}")
+        splits = load_vae_splits(split_path)
+        split_file_sha256 = sha256_file(split_path)
+        membership_fingerprint = vae_splits_fingerprint(splits)
+        recovery_fingerprint = vae_splits_recovery_fingerprint_v3(splits)
+        artifact = FrozenPhotometryArtifact.load(
+            photometry_path,
+            expected_split_file_sha256=split_file_sha256,
+            expected_membership_fingerprint=membership_fingerprint,
+            expected_recovery_fingerprint=recovery_fingerprint,
+        )
+        vae_config_sha256 = sha256_file(vae_config_path)
+        vae_checkpoint_sha256 = sha256_file(checkpoint_path)
+        qualification = load_variant_a_qualification(
+            qualification_path,
+            artifact=artifact,
+            source_split_file_sha256=split_file_sha256,
+            source_membership_fingerprint=membership_fingerprint,
+            source_recovery_fingerprint=recovery_fingerprint,
+            vae_config_sha256=vae_config_sha256,
+            vae_checkpoint_sha256=vae_checkpoint_sha256,
+        )
+        vae_config = load_yaml_config(vae_config_path)
+        model_config = _model_config(vae_config)
+        encoder = build_encoder("kl_vae", **_kl_vae_kwargs(model_config, "encoder"))
+        state = load_checkpoint(checkpoint_path)
+        try:
+            encoder.load_state_dict(state["encoder"], strict=True)
+        except (KeyError, RuntimeError) as exc:
+            raise ValueError("Could not load the frozen VAE encoder checkpoint.") from exc
+        encoder.requires_grad_(False).eval()
+        device = _resolve_device(args.device)
+        log_every = _nonnegative_log_every(getattr(args, "log_every", 0))
+
+        def bank_progress(stage: str, index: int, total: int, identity: str) -> None:
+            if log_every and (index == 1 or index % log_every == 0 or index == total):
+                print(
+                    f"{stage} record={index}/{total} "
+                    f"identity_sha256={hashlib.sha256(identity.encode('utf-8')).hexdigest()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        common = {
+            "encoder": encoder,
+            "artifact": artifact,
+            "qualification": qualification,
+            "records_by_split": {
+                "train": splits.train,
+                "validation": splits.validation,
+            },
+            "resolved_config": config,
+            "source_split_file_sha256": split_file_sha256,
+            "source_membership_fingerprint": membership_fingerprint,
+            "source_recovery_fingerprint": recovery_fingerprint,
+            "photometry_artifact_file_sha256": sha256_file(photometry_path),
+            "qualification_file_sha256": sha256_file(qualification_path),
+            "vae_config_sha256": vae_config_sha256,
+            "vae_checkpoint_sha256": vae_checkpoint_sha256,
+            "code_provenance": capture_canonical_artifact_code_provenance(device=device),
+            "source_shape_resolver": lambda record: nifti_image_shape(
+                record.image_path, record
+            ),
+            "device": device,
+        }
+        if args.command == "preflight-photometry-factored-latent-bank":
+            result = preflight_photometry_factored_latent_bank(
+                **common,
+                config=PhotometryFactoredLatentBankConfig.from_mapping(
+                    config, out_dir=bank_dir
+                ),
+            )
+        elif args.command == "build-photometry-factored-latent-bank":
+            result = build_photometry_factored_latent_bank(
+                **common,
+                config=PhotometryFactoredLatentBankConfig.from_mapping(
+                    config, out_dir=bank_dir
+                ),
+                volume_loader=load_volume,
+                resume=bool(args.resume),
+                progress=bank_progress,
+            )
+        else:
+            result = audit_photometry_factored_latent_bank(
+                **common,
+                root=bank_dir,
+                volume_loader=load_volume,
+                progress=bank_progress,
+            )
+        output = (
+            {
+                "contract_version": result["contract_version"],
+                "artifact_sha256": result["artifact_sha256"],
+                "record_count": result["record_count"],
+                "domain_counts": result["domain_counts"],
+                "latent_statistics": result["latent_statistics"],
+                "structural_descriptors": result["structural_descriptors"],
+                "out_dir": str(bank_dir),
+            }
+            if args.command == "build-photometry-factored-latent-bank"
+            else result
+        )
+        print(json.dumps(output, indent=2, sort_keys=True))
         return 0
 
     if args.command == "build-stage2-photometry-continuity-reference":

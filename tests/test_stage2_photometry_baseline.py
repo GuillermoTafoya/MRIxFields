@@ -860,7 +860,7 @@ def test_evaluation_target_never_changes_fixed_transform() -> None:
     torch.testing.assert_close(captured[1], captured[3], rtol=0.0, atol=0.0)
 
 
-def test_cli_registers_only_the_four_variant_a_commands() -> None:
+def test_cli_keeps_variant_a_commands_and_separates_canonical_artifact_extension() -> None:
     parser = build_parser()
     help_text = parser.format_help()
     for command in (
@@ -870,7 +870,14 @@ def test_cli_registers_only_the_four_variant_a_commands() -> None:
         "eval-stage2-photometry-baseline",
     ):
         assert command in help_text
-    assert "build-photometry-factored-latent-bank" not in help_text
+    for command in (
+        "preflight-photometry-factored-latent-bank",
+        "build-photometry-factored-latent-bank",
+        "audit-photometry-factored-latent-bank",
+    ):
+        assert command in help_text
+    assert "build-stage2-canonical-volumes" not in help_text
+    assert "audit-stage2-canonical-volumes" not in help_text
     assert "train-stage2-field-graph" not in help_text
 
 

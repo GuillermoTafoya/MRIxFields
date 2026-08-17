@@ -118,6 +118,23 @@ def nifti_image_loader(path: Path, record: VolumeRecord) -> torch.Tensor:
     return volume.unsqueeze(0)
 
 
+def nifti_image_shape(path: Path, record: VolumeRecord) -> tuple[int, int, int, int, int]:
+    """Read only a NIfTI header and return the streamed model shape ``(1,1,X,Y,Z)``."""
+
+    del record
+    try:
+        import nibabel as nib
+    except ImportError as exc:  # pragma: no cover - optional real-data dependency
+        raise ImportError(
+            "nifti_image_shape requires nibabel: pip install -e \".[nifti]\"."
+        ) from exc
+    image = nib.load(str(path))
+    shape = tuple(int(value) for value in image.shape)
+    if len(shape) != 3 or any(value <= 0 for value in shape):
+        raise ValueError(f"Expected a positive 3-D NIfTI shape, got {shape}: {path}")
+    return (1, 1, *shape)
+
+
 _DEFAULT_PRIORITY_DIRS: tuple[str, ...] = (
     "Validating_prospective",
     "Training_prospective",

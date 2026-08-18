@@ -4,14 +4,16 @@ import json
 
 import pytest
 import torch
+from torch import nn
 
 from fieldbridge.data.domains import Contrast, Domain
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
+from fieldbridge.models.autoencoders.base import BaseDecoder
 from fieldbridge.models.translators.flow_transport import FlowMatchingLatentTranslator
 from fieldbridge.training.stage2_transport import (
     Stage2TransportConfig,
-    _FieldPools,
     _bridge_sample,
+    _FieldPools,
     _ot_assignment,
     _sample_constrained_pair,
     run_stage2_transport_train,
@@ -36,17 +38,33 @@ def _make_bank(tmp_path, subjects_per_cell=3):
                     case_id = f"{split}_{contrast.name}_{field}_{s}"
                     path = split_dir / f"{case_id}.pt"
                     torch.save(
-                        {"case_id": case_id, "subject_id": f"{contrast.name}_{s}", "split": split,
-                         "domain": domain.to_dict(), "latent": latent}, path
+                        {
+                            "case_id": case_id,
+                            "subject_id": f"{contrast.name}_{s}",
+                            "split": split,
+                            "domain": domain.to_dict(),
+                            "latent": latent,
+                        },
+                        path,
                     )
                     records.append(
-                        {"case_id": case_id, "subject_id": f"{contrast.name}_{s}", "split": split,
-                         "domain": domain.to_dict(), "latent_shape": [C, X, X, X],
-                         "source_shape": [1, X * 4, X * 4, X * 4], "path": f"{split}/{case_id}.pt"}
+                        {
+                            "case_id": case_id,
+                            "subject_id": f"{contrast.name}_{s}",
+                            "split": split,
+                            "domain": domain.to_dict(),
+                            "latent_shape": [C, X, X, X],
+                            "source_shape": [1, X * 4, X * 4, X * 4],
+                            "path": f"{split}/{case_id}.pt",
+                        }
                     )
-    (tmp_path / "latent_bank_manifest.json").write_text(json.dumps({"records": records}), encoding="utf-8")
+    (tmp_path / "latent_bank_manifest.json").write_text(
+        json.dumps({"records": records}), encoding="utf-8"
+    )
     (tmp_path / "latent_stats.json").write_text(
-        json.dumps({"per_channel_mean": [0.0] * C, "per_channel_std": [1.0] * C, "computed_over": "train"}),
+        json.dumps(
+            {"per_channel_mean": [0.0] * C, "per_channel_std": [1.0] * C, "computed_over": "train"}
+        ),
         encoding="utf-8",
     )
     return tmp_path
@@ -54,8 +72,12 @@ def _make_bank(tmp_path, subjects_per_cell=3):
 
 def _model():
     return FlowMatchingLatentTranslator(
-        latent_channels=C, hidden_channels=(8, 16), bottleneck_channels=16,
-        cond_dim=16, time_embed_dim=16, spatial_dims=3,
+        latent_channels=C,
+        hidden_channels=(8, 16),
+        bottleneck_channels=16,
+        cond_dim=16,
+        time_embed_dim=16,
+        spatial_dims=3,
     )
 
 
@@ -84,7 +106,9 @@ def test_same_contrast_coupling_shares_contrast_and_crosses_field(tmp_path) -> N
     cfg = Stage2TransportConfig(batch_size=4, same_contrast=True, field_pairing="cross")
     gen = torch.Generator().manual_seed(0)
     for _ in range(25):
-        _, dom_s, _, dom_t = _sample_constrained_pair(index, pools, stats, cfg, torch.device("cpu"), gen)
+        _, dom_s, _, dom_t = _sample_constrained_pair(
+            index, pools, stats, cfg, torch.device("cpu"), gen
+        )
         s_contrast = {Contrast.parse(d.contrast) for d in dom_s}
         t_contrast = {Contrast.parse(d.contrast) for d in dom_t}
         assert s_contrast == t_contrast and len(s_contrast) == 1  # one shared contrast per batch
@@ -131,8 +155,15 @@ def test_transport_training_runs_and_checkpoints(tmp_path) -> None:
     stats = LatentStats.from_json(bank / "latent_stats.json")
     ckpt_dir = tmp_path / "ckpt"
     cfg = Stage2TransportConfig(
-        steps=12, batch_size=4, precision="fp32", coupling="ot", bridge="ot_cfm",
-        checkpoint_dir=ckpt_dir, checkpoint_at_end=True, val_every_steps=6, val_batches=2,
+        steps=12,
+        batch_size=4,
+        precision="fp32",
+        coupling="ot",
+        bridge="ot_cfm",
+        checkpoint_dir=ckpt_dir,
+        checkpoint_at_end=True,
+        val_every_steps=6,
+        val_batches=2,
         variant="fm_test",
     )
     result = run_stage2_transport_train(
@@ -150,19 +181,68 @@ def test_transport_training_resumes(tmp_path) -> None:
     train_index = LatentBankIndex(bank, "train")
     stats = LatentStats.from_json(bank / "latent_stats.json")
     ckpt_dir = tmp_path / "ckpt"
-    base = dict(precision="fp32", coupling="independent", bridge="ot_cfm",
-                checkpoint_dir=ckpt_dir, variant="fm_test")
+    base = dict(
+        precision="fp32",
+        coupling="independent",
+        bridge="ot_cfm",
+        checkpoint_dir=ckpt_dir,
+        variant="fm_test",
+    )
     run_stage2_transport_train(
         Stage2TransportConfig(steps=6, batch_size=4, **base),
-        translator=_model(), train_index=train_index, stats=stats,
+        translator=_model(),
+        train_index=train_index,
+        stats=stats,
     )
     resumed = run_stage2_transport_train(
         Stage2TransportConfig(
             steps=4, batch_size=4, resume_from=ckpt_dir / "transport_fm_test_last.pt", **base
         ),
-        translator=_model(), train_index=train_index, stats=stats,
+        translator=_model(),
+        train_index=train_index,
+        stats=stats,
     )
     assert resumed.steps == 4
+
+
+@pytest.mark.parametrize("space", ["latent", "image"])
+def test_adversarial_transport_training_runs_and_checkpoints(tmp_path, space: str) -> None:
+    bank = _make_bank(tmp_path)
+    index = LatentBankIndex(bank, "train")
+    stats = LatentStats.from_json(bank / "latent_stats.json")
+    checkpoint_dir = tmp_path / "checkpoints"
+    decoder = _TinyDecoder() if space == "image" else None
+    result = run_stage2_transport_train(
+        Stage2TransportConfig(
+            steps=1,
+            batch_size=2,
+            precision="fp32",
+            adversarial_space=space,
+            adversarial_steps=1,
+            discriminator_channels=(4,),
+            loss_weights={"flow": 1.0, "adversarial": 0.05, "domain": 0.1},
+            checkpoint_dir=checkpoint_dir,
+            variant=f"sb_adv_{space}_test",
+        ),
+        translator=_model(),
+        train_index=index,
+        stats=stats,
+        decoder=decoder,
+    )
+    checkpoint = torch.load(
+        checkpoint_dir / f"transport_sb_adv_{space}_test_last.pt", map_location="cpu"
+    )
+    assert len(result.discriminator_losses) == 1
+    assert {"discriminator", "discriminator_optimizer", "sampler_state"} <= checkpoint.keys()
+
+
+class _TinyDecoder(BaseDecoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv3d(C, 1, 1)
+
+    def decode(self, z: torch.Tensor, domain) -> torch.Tensor:
+        return torch.sigmoid(self.projection(z))
 
 
 def test_cycle_weight_is_guarded(tmp_path) -> None:
@@ -170,7 +250,9 @@ def test_cycle_weight_is_guarded(tmp_path) -> None:
     train_index = LatentBankIndex(bank, "train")
     stats = LatentStats.from_json(bank / "latent_stats.json")
     cfg = Stage2TransportConfig(
-        steps=1, batch_size=2, precision="fp32",
+        steps=1,
+        batch_size=2,
+        precision="fp32",
         loss_weights={"flow": 1.0, "transport_cost": 0.0, "identity": 0.0, "cycle": 1.0},
     )
     with pytest.raises(NotImplementedError, match="cycle loss"):

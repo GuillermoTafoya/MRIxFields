@@ -1,0 +1,67 @@
+contract: stage2-unified-retrospective-full-model-config-v1
+scope: retrospective_R_only
+input_contract: photometry-factored-latent-bank-v2
+descriptor_coupling: forbidden_unauthorized
+
+model:
+  name: flow_matching_latent
+  latent_channels: 4
+  hidden_channels: [64, 128]
+  bottleneck_channels: 256
+  cond_dim: 128
+  time_embed_dim: 128
+  spatial_dims: 3
+  activation: silu
+  use_norm: true
+  upsample_mode: interpolate
+  skip_mode: concat
+  pad_to_multiple: true
+  zero_init_output: false
+
+training:
+  variant: full
+  steps: 100000
+  batch_size: 2
+  seed: 13
+  device: auto
+  precision: bf16
+  bridge: schrodinger
+  sigma: 0.1
+  time_eps: 0.001
+  integration_steps: 4
+  integration_solver: heun
+  lr_generator: 0.0002
+  lr_critic: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  scheduler_t_max: 100000
+  loss_weights:
+    sb: 1.0
+    identity: 0.1
+    anatomy: 0.02
+    graph: 0.01
+    adversarial: 0.05
+    domain: 0.1
+  critic:
+    space: latent
+    channels: [32, 64, 128]
+    image_space_available_as_separate_ablation: true
+  anatomy:
+    pool_scales: [1, 2, 4]
+    support_erosion: 1
+    raw_high_frequency_equality: forbidden
+  sanity:
+    steps: 20
+    max_aux_to_flow_ratio: 1.0
+    failure: hard_stop_before_long_run
+  checkpoint:
+    every_steps: 1000
+    max_bytes: 1500000000
+
+ablation_order:
+  - full
+  - no_graph
+  - no_anatomy_graph
+  - no_adversarial_domain
+  - sb_identity_only
+  - sb_only

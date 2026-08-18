@@ -150,6 +150,13 @@ from fieldbridge.training.stage1_vae import (
 from fieldbridge.training.stage2_diffuser import Stage2DiffuserConfig, run_stage2_diffuser_train
 from fieldbridge.training.stage2_transport import Stage2TransportConfig, run_stage2_transport_train
 from fieldbridge.data.latent_bank_dataset import LatentBankIndex, LatentStats
+from fieldbridge.data.photometry_factored_bank_dataset import (
+    FactoredLatentStats,
+    PhotometryFactoredLatentBankIndex,
+)
+from fieldbridge.training.stage2_unified import UnifiedStage2Config, run_stage2_unified_train
+from fieldbridge.evaluation.stage2_unified import evaluate_stage2_unified
+from fieldbridge.utils.seeding import seed_everything
 from fieldbridge.data.photometry_factored_latent_bank import (
     PhotometryFactoredLatentBankConfig,
     audit_photometry_factored_latent_bank,
@@ -532,6 +539,49 @@ def build_parser() -> argparse.ArgumentParser:
     train_transport.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
     train_transport.add_argument("--val", action="store_true", help="Enable validation-split flow loss + best checkpoint.")
     train_transport.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+    train_unified = subparsers.add_parser(
+        "train-stage2-unified",
+        help="Train/resume the complete R-only unified model on factored bank-v2.",
+    )
+    train_unified.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v1.yaml"),
+    )
+    train_unified.add_argument("--bank-dir", type=Path, required=True)
+    train_unified.add_argument("--vae-config", type=Path, required=True)
+    train_unified.add_argument("--vae-checkpoint", type=Path, required=True)
+    train_unified.add_argument("--checkpoint-dir", type=Path, required=True)
+    train_unified.add_argument("--history-jsonl", type=Path, required=True)
+    train_unified.add_argument("--resume-from", type=Path, default=None)
+    train_unified.add_argument("--steps", type=int, default=None)
+    train_unified.add_argument("--batch-size", type=int, default=None)
+    train_unified.add_argument("--sanity-steps", type=int, default=None)
+    train_unified.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
+
+    eval_unified = subparsers.add_parser(
+        "eval-stage2-unified",
+        help="Run complete retrospective R/validation controls, metrics, and montages.",
+    )
+    eval_unified.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v1.yaml"),
+    )
+    eval_unified.add_argument("--bank-dir", type=Path, required=True)
+    eval_unified.add_argument("--checkpoint", type=Path, required=True)
+    eval_unified.add_argument("--vae-config", type=Path, required=True)
+    eval_unified.add_argument("--vae-checkpoint", type=Path, required=True)
+    eval_unified.add_argument("--photometry-artifact", type=Path, required=True)
+    eval_unified.add_argument("--paired-manifest", type=Path, required=True)
+    eval_unified.add_argument("--baseline-predictions", type=Path, required=True)
+    eval_unified.add_argument("--sb-only-checkpoint", type=Path, default=None)
+    eval_unified.add_argument("--out", type=Path, required=True)
+    eval_unified.add_argument("--integration-steps", type=int, default=20)
+    eval_unified.add_argument("--solver", choices=("euler", "heun"), default="heun")
+    eval_unified.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    eval_unified.add_argument("--resume", action="store_true")
 
     eval_transport = subparsers.add_parser(
         "eval-stage2-transport",
@@ -1716,6 +1766,109 @@ def main(argv: list[str] | None = None) -> int:
                 f"final_loss={result.final_loss:.6f} sec_per_step={result.seconds_per_step:.3f} "
                 f"best_val={result.best_val}"
             )
+        return 0
+
+    if args.command == "train-stage2-unified":
+        config = _load_optional_config(args.config)
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v1":
+            raise ValueError("Unified training config contract mismatch.")
+        _override(config, "training", "steps", args.steps)
+        _override(config, "training", "batch_size", args.batch_size)
+        _override(config, "training", "device", args.device)
+        if args.sanity_steps is not None:
+            training = config.setdefault("training", {})
+            sanity = training.setdefault("sanity", {})
+            sanity["steps"] = args.sanity_steps
+        training = config.setdefault("training", {})
+        checkpoint_config = training.setdefault("checkpoint", {})
+        checkpoint_config["dir"] = str(args.checkpoint_dir)
+        training["history_jsonl"] = str(args.history_jsonl)
+        if args.resume_from is not None:
+            training["resume_from"] = str(args.resume_from)
+
+        stage_config = UnifiedStage2Config.from_mapping(config)
+        seed_everything(stage_config.seed)
+        train_index = PhotometryFactoredLatentBankIndex(args.bank_dir, "train")
+        _assert_bank_vae_inputs(
+            train_index.manifest, args.vae_config, args.vae_checkpoint
+        )
+        stats = FactoredLatentStats.from_bank(args.bank_dir)
+        model_config = _model_config(config)
+        translator = build_translator(
+            str(model_config.get("name", "flow_matching_latent")),
+            **{key: value for key, value in model_config.items() if key != "name"},
+        )
+        vae_config = _load_optional_config(args.vae_config)
+        vae_model_config = _model_config(vae_config)
+        decoder = build_decoder(
+            "kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder")
+        )
+        decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"], strict=True)
+        decoder.requires_grad_(False)
+        result = run_stage2_unified_train(
+            stage_config,
+            translator=translator,
+            decoder=decoder,
+            train_index=train_index,
+            stats=stats,
+        )
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "eval-stage2-unified":
+        config = _load_optional_config(args.config)
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v1":
+            raise ValueError("Unified evaluation config contract mismatch.")
+        validation_index = PhotometryFactoredLatentBankIndex(
+            args.bank_dir, "validation"
+        )
+        _assert_bank_vae_inputs(
+            validation_index.manifest, args.vae_config, args.vae_checkpoint
+        )
+        stats = FactoredLatentStats.from_bank(args.bank_dir)
+        model_config = _model_config(config)
+
+        def make_translator(checkpoint_path: Path):
+            model = build_translator(
+                str(model_config.get("name", "flow_matching_latent")),
+                **{key: value for key, value in model_config.items() if key != "name"},
+            )
+            state = load_checkpoint(checkpoint_path)
+            if state.get("contract_version") != "stage2-unified-exact-resume-v1":
+                raise ValueError("Unified evaluation checkpoint contract mismatch.")
+            model.load_state_dict(state["translator"], strict=True)
+            return model
+
+        translator = make_translator(args.checkpoint)
+        sb_only = (
+            make_translator(args.sb_only_checkpoint)
+            if args.sb_only_checkpoint is not None
+            else None
+        )
+        vae_config = _load_optional_config(args.vae_config)
+        vae_model_config = _model_config(vae_config)
+        decoder = build_decoder(
+            "kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder")
+        )
+        decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"], strict=True)
+        decoder.requires_grad_(False)
+        artifact = FrozenPhotometryArtifact.load(args.photometry_artifact)
+        result = evaluate_stage2_unified(
+            translator=translator,
+            decoder=decoder,
+            artifact=artifact,
+            bank=validation_index,
+            stats=stats,
+            paired_manifest_path=args.paired_manifest,
+            baseline_predictions_path=args.baseline_predictions,
+            output_dir=args.out,
+            sb_only_translator=sb_only,
+            device=args.device,
+            integration_steps=args.integration_steps,
+            solver=args.solver,
+            resume=args.resume,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
         return 0
 
     if args.command == "fit-stage2-photometry":
@@ -3464,6 +3617,20 @@ def _model_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("Config section 'model' must be a mapping.")
     return dict(value)
+
+
+def _assert_bank_vae_inputs(
+    manifest: Mapping[str, Any], vae_config_path: Path, vae_checkpoint_path: Path
+) -> None:
+    """Bind training/evaluation to the frozen VAE used to build bank-v2."""
+
+    vae = manifest.get("vae")
+    if not isinstance(vae, Mapping):
+        raise ValueError("Factored-bank VAE provenance is missing.")
+    if sha256_file(vae_config_path) != vae.get("config_sha256"):
+        raise ValueError("Frozen VAE config differs from the factored bank.")
+    if sha256_file(vae_checkpoint_path) != vae.get("checkpoint_sha256"):
+        raise ValueError("Frozen VAE checkpoint differs from the factored bank.")
 
 
 def _component_config(

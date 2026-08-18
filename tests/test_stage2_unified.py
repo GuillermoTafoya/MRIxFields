@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 import fieldbridge.data.photometry_factored_bank_dataset as factored_reader
+import fieldbridge.training.stage2_unified as unified
 from fieldbridge.data.domains import Contrast, Domain, FIELD_STRENGTHS_T
 from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentRecord,
@@ -65,17 +66,27 @@ class TinyDecoder(nn.Module):
         return torch.sigmoid(self.projection(z))
 
 
+class DecoderSpy(TinyDecoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[torch.Tensor] = []
+
+    def decode(self, z, domains):
+        self.calls.append(z.detach().clone())
+        return super().decode(z, domains)
+
+
 class SyntheticFactoredIndex:
-    split = "train"
     artifact_sha256 = "a" * 64
 
-    def __init__(self) -> None:
+    def __init__(self, split: str = "train") -> None:
+        self.split = split
         self.records = []
         self._latents = []
         self._supports = []
         for contrast in Contrast:
             for field in FIELD_STRENGTHS_T:
-                for subject in ("s1", "s2"):
+                for subject in (("s1", "s2") if split == "train" else ("v1", "v2")):
                     domain = Domain(field, contrast)
                     identity = f"R_{contrast.value}_{field:g}_{subject}"
                     self.records.append(
@@ -83,10 +94,10 @@ class SyntheticFactoredIndex:
                             case_id=identity,
                             subject_group_id=subject,
                             domain=domain,
-                            split="train",
+                            split=split,
                             path=Path(f"{identity}.pt"),
                             resume_key="r" * 64,
-                            sidecar={"cohort": "R", "split": "train"},
+                            sidecar={"cohort": "R", "split": split},
                         )
                     )
                     generator = torch.Generator().manual_seed(len(self.records))
@@ -112,6 +123,15 @@ def _stats() -> FactoredLatentStats:
     )
 
 
+def _nontrivial_stats() -> FactoredLatentStats:
+    return FactoredLatentStats(
+        mean=torch.tensor([2.0, -1.0, 0.5, 3.0]),
+        std=torch.tensor([0.5, 2.0, 1.5, 4.0]),
+        supported_count=torch.full((4,), 100, dtype=torch.int64),
+        artifact_sha256="c" * 64,
+    )
+
+
 def _config(tmp_path: Path, **overrides) -> UnifiedStage2Config:
     value = UnifiedStage2Config(
         steps=1,
@@ -126,7 +146,8 @@ def _config(tmp_path: Path, **overrides) -> UnifiedStage2Config:
         checkpoint_every_steps=1,
         checkpoint_max_bytes=20_000_000,
         history_jsonl=tmp_path / "history.jsonl",
-        sanity_steps=0,
+        pilot_steps=0,
+        validation_every_steps=1,
         loss_weights=dict(DEFAULT_UNIFIED_WEIGHTS),
     )
     return replace(value, **overrides)
@@ -185,6 +206,175 @@ def test_stats_force_unsupported_cells_to_zero() -> None:
     assert torch.equal(normalized[:, 0], torch.zeros_like(normalized[:, 0]))
 
 
+def test_image_critic_decoder_receives_denormalized_latent_with_nontrivial_stats() -> None:
+    stats = _nontrivial_stats()
+    decoder = DecoderSpy().requires_grad_(False)
+    latent = torch.randn(2, 4, 3, 3, 3)
+    support = torch.ones(2, 1, 3, 3, 3, dtype=torch.bool)
+    domains = [Domain(0.1, Contrast.T1W), Domain(3.0, Contrast.T1W)]
+    view = unified._critic_view(latent, support, domains, decoder, stats, "image")
+    assert torch.equal(decoder.calls[0], stats.denormalize(latent))
+    assert view.shape[1] == 2
+
+
+def test_real_fake_critic_views_have_identical_support_and_mask_only_score() -> None:
+    stats = _nontrivial_stats()
+    support = torch.zeros(1, 1, 4, 4, 4, dtype=torch.bool)
+    support[:, :, 1:3, 1:3, 1:3] = True
+    real = torch.randn(1, 4, 4, 4, 4)
+    fake = torch.randn(1, 4, 4, 4, 4)
+    domains = [Domain(3.0, Contrast.T2W)]
+    decoder = DecoderSpy().requires_grad_(False)
+    real_view = unified._critic_view(real, support, domains, decoder, stats, "latent")
+    fake_view = unified._critic_view(fake, support, domains, decoder, stats, "latent")
+    assert torch.equal(real_view[:, -1:], fake_view[:, -1:])
+    real_outside = real_view[:, :-1].masked_select(~support.expand_as(real))
+    fake_outside = fake_view[:, :-1].masked_select(~support.expand_as(fake))
+    assert torch.equal(real_outside, torch.zeros_like(real_outside))
+    assert torch.equal(fake_outside, torch.zeros_like(fake_outside))
+    mask_only_real = real_view[:, -1:].mean(dim=(1, 2, 3, 4))
+    mask_only_fake = fake_view[:, -1:].mean(dim=(1, 2, 3, 4))
+    assert torch.equal(mask_only_real, mask_only_fake)
+
+
+def test_every_generator_term_has_finite_nonzero_gradient_and_decoder_stays_frozen(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(41)
+    translator = TinyTranslator()
+    decoder = DecoderSpy().requires_grad_(False)
+    decoder_before = {name: value.clone() for name, value in decoder.state_dict().items()}
+    critic = DomainProjectionDiscriminator(5, (4,))
+    stats = _nontrivial_stats()
+    source = torch.randn(1, 4, 5, 5, 5)
+    target = torch.randn(1, 4, 5, 5, 5) + 0.75
+    support = torch.ones(1, 1, 5, 5, 5, dtype=torch.bool)
+    source_domain = Domain(0.1, Contrast.T1W)
+    target_domain = Domain(3.0, Contrast.T1W)
+    record = FactoredLatentRecord(
+        case_id="R_fixture",
+        subject_group_id="R:fixture",
+        domain=source_domain,
+        split="train",
+        path=tmp_path / "unused.pt",
+        resume_key="d" * 64,
+        sidecar={"cohort": "R", "split": "train"},
+    )
+    batch = unified._TrainingBatch(
+        source,
+        support,
+        [source_domain],
+        target,
+        support.clone(),
+        [target_domain],
+        [record],
+        [replace(record, case_id="R_target", domain=target_domain)],
+    )
+    cfg = _config(tmp_path, checkpoint_dir=None, history_jsonl=None)
+    expected_generated = integrate_transport(
+        translator,
+        source,
+        [source_domain],
+        [target_domain],
+        steps=cfg.integration_steps,
+        solver=cfg.integration_solver,
+    ).detach()
+    generator_optimizer = torch.optim.AdamW(translator.parameters(), lr=1.0e-4)
+    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=1.0e-4)
+    row = unified._train_step(
+        cfg,
+        translator,
+        critic,
+        decoder,
+        generator_optimizer,
+        critic_optimizer,
+        torch.amp.GradScaler("cuda", enabled=False),
+        batch,
+        torch.Generator().manual_seed(17),
+        stats,
+        qualify_term_gradients=True,
+    )
+    for term in DEFAULT_UNIFIED_WEIGHTS:
+        assert torch.isfinite(torch.tensor(row[f"raw/{term}"]))
+        assert row[f"gradient/term_{term}"] > 0.0
+        disabled = dict(DEFAULT_UNIFIED_WEIGHTS)
+        disabled[term] = 0.0
+        norms = unified.generator_term_gradient_norms(
+            {name: (translator.conv.weight * (position + 1)).sum() for position, name in enumerate(DEFAULT_UNIFIED_WEIGHTS)},
+            translator,
+            disabled,
+        )
+        assert norms[term] == 0.0
+    assert torch.equal(decoder.calls[0], stats.denormalize(source))
+    assert torch.allclose(decoder.calls[1], stats.denormalize(expected_generated))
+    assert all(parameter.grad is None for parameter in decoder.parameters())
+    for name, value in decoder_before.items():
+        assert torch.equal(value, decoder.state_dict()[name])
+
+
+def test_graph_loss_backpropagates_through_direct_and_composed_paths() -> None:
+    torch.manual_seed(43)
+    translator = TinyTranslator()
+    latent = torch.randn(1, 4, 4, 4, 4)
+    support = torch.ones(1, 1, 4, 4, 4, dtype=torch.bool)
+    loss, direct, composed = graph_consistency_loss(
+        translator,
+        latent,
+        [Domain(0.1, Contrast.T1W)],
+        [Domain(3.0, Contrast.T1W)],
+        [Domain(7.0, Contrast.T1W)],
+        support,
+        steps=1,
+        solver="euler",
+    )
+    direct.retain_grad()
+    composed.retain_grad()
+    loss.backward()
+    assert direct.grad is not None and float(direct.grad.abs().sum()) > 0
+    assert composed.grad is not None and float(composed.grad.abs().sum()) > 0
+    assert translator.conv.weight.grad is not None
+    assert float(translator.conv.weight.grad.abs().sum()) > 0
+
+
+def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: Path) -> None:
+    cfg = _config(
+        tmp_path,
+        pilot_steps=2,
+        pilot_smoothing_window=2,
+        gpu_hourly_cost_usd=2.5,
+    )
+    rows = []
+    for step in range(2):
+        row = {
+            "weighted/generator_total": 2.0 - step * 0.1,
+            "weighted/aux_to_flow_ratio": 0.25,
+            "gradient/generator_norm": 1.0,
+            "gradient/critic_norm": 1.0,
+            "critic/score_saturation_fraction": 0.0,
+            "critic/real_score_mean": 0.5,
+            "critic/fake_score_mean": -0.5,
+            "critic/score_separation": 1.0,
+            "critic/real_domain_accuracy": 0.5,
+            "critic/generated_domain_accuracy": 0.25,
+            "step_seconds": 2.0,
+            "peak_cuda_bytes": 1234,
+        }
+        for branch in ("real", "fake"):
+            for quantile in ("p05", "p50", "p95"):
+                row[f"critic/{branch}_score_{quantile}"] = 0.1
+        for term, weight in cfg.loss_weights.items():
+            row[f"raw/{term}"] = 1.0
+            row[f"weighted/{term}"] = weight
+            row[f"gradient/term_{term}"] = 0.5
+        rows.append(row)
+    report = unified._pilot_report(rows, cfg)
+    assert report["status"] == "pass"
+    assert set(report["term_gradient_norms"]) == set(DEFAULT_UNIFIED_WEIGHTS)
+    assert report["critic"]["real_score_distribution"]["p50"] == 0.1
+    assert report["runtime"]["projected_seconds"] == 200_000.0
+    assert report["runtime"]["projected_cost_usd"] == pytest.approx(138.8888889)
+
+
 def test_prospective_manifest_is_rejected_before_payload_load(monkeypatch, tmp_path: Path) -> None:
     manifest = {
         "artifact_sha256": "a" * 64,
@@ -223,7 +413,8 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
     translator = TinyTranslator()
     cfg = _config(tmp_path)
     result = run_stage2_unified_train(
-        cfg, translator=translator, decoder=decoder, train_index=index, stats=_stats()
+        cfg, translator=translator, decoder=decoder, train_index=index,
+        validation_index=SyntheticFactoredIndex("validation"), stats=_stats()
     )
     assert result.completed_steps == 1
     checkpoint = Path(result.checkpoint)
@@ -232,6 +423,9 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
     assert state["critic"]
     assert state["generator_scheduler"] and state["critic_scheduler"]
     assert state["sampler_rng"].numel() > 0
+    assert state["validation_selection"]["paired_targets_used"] is False
+    assert state["validation_selection"]["best_step"] == 1
+    assert (cfg.checkpoint_dir / "stage2_unified_full_selection_step000000001.json").is_file()
     assert before.keys() == decoder.state_dict().keys()
     for key, value in before.items():
         assert torch.equal(value, decoder.state_dict()[key])
@@ -241,6 +435,7 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
             translator=TinyTranslator(),
             decoder=TinyDecoder().requires_grad_(False),
             train_index=index,
+            validation_index=SyntheticFactoredIndex("validation"),
             stats=_stats(),
         )
     restored = TinyTranslator()
@@ -252,14 +447,17 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
         translator=restored,
         decoder=resume_decoder,
         train_index=index,
+        validation_index=SyntheticFactoredIndex("validation"),
         stats=_stats(),
     )
     assert resumed.completed_steps == 1
     for key, value in state["translator"].items():
         assert torch.equal(value, restored.state_dict()[key])
     rows = [json.loads(line) for line in (tmp_path / "history.jsonl").read_text().splitlines()]
-    assert len(rows) == 1
-    assert all(name in rows[0] for name in ("raw/sb", "raw/identity", "raw/anatomy", "raw/graph", "raw/adversarial", "raw/domain"))
+    step_rows = [row for row in rows if "raw/sb" in row]
+    assert len(step_rows) == 1
+    assert all(name in step_rows[0] for name in ("raw/sb", "raw/identity", "raw/anatomy", "raw/graph", "raw/adversarial", "raw/domain"))
+    assert any(row.get("event") == "unpaired_validation" for row in rows)
 
 
 def test_oom_is_hard_stop_and_diagnostic_is_preserved(tmp_path: Path) -> None:
@@ -269,6 +467,7 @@ def test_oom_is_hard_stop_and_diagnostic_is_preserved(tmp_path: Path) -> None:
             translator=OOMTranslator(),
             decoder=TinyDecoder().requires_grad_(False),
             train_index=SyntheticFactoredIndex(),
+            validation_index=SyntheticFactoredIndex("validation"),
             stats=_stats(),
         )
     row = json.loads((tmp_path / "history.jsonl").read_text().strip())
@@ -284,9 +483,14 @@ def test_sb_only_backward_ablation_disables_every_auxiliary_path(tmp_path: Path)
         translator=TinyTranslator(),
         decoder=TinyDecoder().requires_grad_(False),
         train_index=SyntheticFactoredIndex(),
+        validation_index=SyntheticFactoredIndex("validation"),
         stats=_stats(),
     )
-    row = json.loads((tmp_path / "history.jsonl").read_text().strip())
+    row = next(
+        json.loads(line)
+        for line in (tmp_path / "history.jsonl").read_text().splitlines()
+        if "raw/sb" in line
+    )
     assert row["graph_path"] == "disabled"
     assert row["gradient/critic_norm"] == 0.0
     assert row["critic/total"] == 0.0
@@ -301,7 +505,8 @@ def test_interrupted_resume_reproduces_uninterrupted_next_step(tmp_path: Path) -
     cfg = _config(tmp_path / "uninterrupted", steps=2)
     uninterrupted = TinyTranslator()
     run_stage2_unified_train(
-        cfg, translator=uninterrupted, decoder=decoder, train_index=index, stats=_stats()
+        cfg, translator=uninterrupted, decoder=decoder, train_index=index,
+        validation_index=SyntheticFactoredIndex("validation"), stats=_stats()
     )
     step1 = cfg.checkpoint_dir / "stage2_unified_full_step000000001.pt"
     step2 = cfg.checkpoint_dir / "stage2_unified_full_step000000002.pt"
@@ -319,6 +524,7 @@ def test_interrupted_resume_reproduces_uninterrupted_next_step(tmp_path: Path) -
         translator=resumed_model,
         decoder=decoder,
         train_index=index,
+        validation_index=SyntheticFactoredIndex("validation"),
         stats=_stats(),
     )
     actual = load_checkpoint(Path(resumed_result.checkpoint))

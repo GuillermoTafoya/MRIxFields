@@ -1,4 +1,4 @@
-contract: stage2-unified-retrospective-full-model-config-v1
+contract: stage2-unified-retrospective-full-model-config-v2
 scope: retrospective_R_only
 input_contract: photometry-factored-latent-bank-v2
 descriptor_coupling: forbidden_unauthorized
@@ -46,14 +46,30 @@ training:
     space: latent
     channels: [32, 64, 128]
     image_space_available_as_separate_ablation: true
+    spectral_normalization: false
+    lazy_r1: false
+    stability_decision: evidence_required_before_enabling
   anatomy:
     pool_scales: [1, 2, 4]
     support_erosion: 1
     raw_high_frequency_equality: forbidden
-  sanity:
-    steps: 20
+  pilot:
+    steps: 200
+    smoothing_window: 20
     max_aux_to_flow_ratio: 1.0
+    min_term_gradient_norm: 1.0e-12
+    max_smoothed_loss_growth: 10.0
+    score_saturation_threshold: 20.0
+    max_saturation_fraction: 0.95
+    projected_steps: 100000
+    gpu_hourly_cost_usd: null
     failure: hard_stop_before_long_run
+  validation:
+    every_steps: 1000
+    complete_inventory: true
+    inventory: complete_R_validation
+    paired_endpoint_assumption: false
+    selection_rule: val_sb+0.1*val_identity+0.01*val_graph+0.1*(1-generated_domain_accuracy)
   checkpoint:
     every_steps: 1000
     max_bytes: 1500000000

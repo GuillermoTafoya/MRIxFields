@@ -29,7 +29,7 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentStats,
     PhotometryFactoredLatentBankIndex,
 )
-from fieldbridge.data.photometry_factorization import sha256_json
+from fieldbridge.data.photometry_factorization import sha256_json, write_json_atomic
 from fieldbridge.data.stage2_canonical_volume import storage_tensor_sha256
 from fieldbridge.models.discriminators import (
     DomainProjectionDiscriminator,
@@ -47,9 +47,10 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.train_loop import assert_frozen
 from fieldbridge.utils.seeding import seed_everything
 
-UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v1"
-UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v1"
-UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v1"
+UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v2"
+UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v2"
+UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v2"
+UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v1"
 
 CriticSpace = Literal["latent", "image"]
 Precision = Literal["fp32", "bf16"]
@@ -81,6 +82,8 @@ class UnifiedStage2Config:
     integration_solver: Solver = "heun"
     critic_space: CriticSpace = "latent"
     critic_channels: tuple[int, ...] = (32, 64, 128)
+    critic_spectral_normalization: bool = False
+    critic_lazy_r1: bool = False
     anatomy_pool_scales: tuple[int, ...] = (1, 2, 4)
     anatomy_support_erosion: int = 1
     loss_weights: dict[str, float] = field(
@@ -95,8 +98,17 @@ class UnifiedStage2Config:
     checkpoint_max_bytes: int = 1_500_000_000
     history_jsonl: Path | None = None
     resume_from: Path | None = None
-    sanity_steps: int = 0
-    sanity_max_aux_to_flow_ratio: float = 1.0
+    pilot_steps: int = 200
+    pilot_smoothing_window: int = 20
+    pilot_max_aux_to_flow_ratio: float = 1.0
+    pilot_min_term_gradient_norm: float = 1.0e-12
+    pilot_max_smoothed_loss_growth: float = 10.0
+    pilot_score_saturation_threshold: float = 20.0
+    pilot_max_saturation_fraction: float = 0.95
+    projected_steps: int = 100_000
+    gpu_hourly_cost_usd: float | None = None
+    validation_every_steps: int = 1000
+    validation_complete_inventory: bool = True
     variant: str = "full"
 
     @classmethod
@@ -113,8 +125,12 @@ class UnifiedStage2Config:
         anatomy = anatomy if isinstance(anatomy, Mapping) else {}
         checkpoint = training.get("checkpoint", {})
         checkpoint = checkpoint if isinstance(checkpoint, Mapping) else {}
-        sanity = training.get("sanity", {})
-        sanity = sanity if isinstance(sanity, Mapping) else {}
+        if "sanity" in training:
+            raise ValueError("The v1 sanity block is obsolete; use the v2 pilot contract.")
+        pilot = training.get("pilot", {})
+        pilot = pilot if isinstance(pilot, Mapping) else {}
+        validation = training.get("validation", {})
+        validation = validation if isinstance(validation, Mapping) else {}
         value = cls(
             steps=int(training.get("steps", defaults.steps)),
             batch_size=int(training.get("batch_size", defaults.batch_size)),
@@ -129,6 +145,10 @@ class UnifiedStage2Config:
             integration_solver=str(training.get("integration_solver", defaults.integration_solver)),  # type: ignore[arg-type]
             critic_space=str(critic.get("space", defaults.critic_space)),  # type: ignore[arg-type]
             critic_channels=tuple(int(v) for v in critic.get("channels", defaults.critic_channels)),
+            critic_spectral_normalization=bool(
+                critic.get("spectral_normalization", defaults.critic_spectral_normalization)
+            ),
+            critic_lazy_r1=bool(critic.get("lazy_r1", defaults.critic_lazy_r1)),
             anatomy_pool_scales=tuple(
                 int(v) for v in anatomy.get("pool_scales", defaults.anatomy_pool_scales)
             ),
@@ -153,9 +173,36 @@ class UnifiedStage2Config:
                 Path(training["history_jsonl"]) if training.get("history_jsonl") else None
             ),
             resume_from=(Path(training["resume_from"]) if training.get("resume_from") else None),
-            sanity_steps=int(sanity.get("steps", defaults.sanity_steps)),
-            sanity_max_aux_to_flow_ratio=float(
-                sanity.get("max_aux_to_flow_ratio", defaults.sanity_max_aux_to_flow_ratio)
+            pilot_steps=int(pilot.get("steps", defaults.pilot_steps)),
+            pilot_smoothing_window=int(
+                pilot.get("smoothing_window", defaults.pilot_smoothing_window)
+            ),
+            pilot_max_aux_to_flow_ratio=float(
+                pilot.get("max_aux_to_flow_ratio", defaults.pilot_max_aux_to_flow_ratio)
+            ),
+            pilot_min_term_gradient_norm=float(
+                pilot.get("min_term_gradient_norm", defaults.pilot_min_term_gradient_norm)
+            ),
+            pilot_max_smoothed_loss_growth=float(
+                pilot.get("max_smoothed_loss_growth", defaults.pilot_max_smoothed_loss_growth)
+            ),
+            pilot_score_saturation_threshold=float(
+                pilot.get("score_saturation_threshold", defaults.pilot_score_saturation_threshold)
+            ),
+            pilot_max_saturation_fraction=float(
+                pilot.get("max_saturation_fraction", defaults.pilot_max_saturation_fraction)
+            ),
+            projected_steps=int(pilot.get("projected_steps", defaults.projected_steps)),
+            gpu_hourly_cost_usd=(
+                float(pilot["gpu_hourly_cost_usd"])
+                if pilot.get("gpu_hourly_cost_usd") is not None
+                else None
+            ),
+            validation_every_steps=int(
+                validation.get("every_steps", defaults.validation_every_steps)
+            ),
+            validation_complete_inventory=bool(
+                validation.get("complete_inventory", defaults.validation_complete_inventory)
             ),
             variant=str(training.get("variant", defaults.variant)),
         )
@@ -178,6 +225,8 @@ class UnifiedStage2Config:
             "integration_solver": self.integration_solver,
             "critic_space": self.critic_space,
             "critic_channels": list(self.critic_channels),
+            "critic_spectral_normalization": self.critic_spectral_normalization,
+            "critic_lazy_r1": self.critic_lazy_r1,
             "anatomy_pool_scales": list(self.anatomy_pool_scales),
             "anatomy_support_erosion": self.anatomy_support_erosion,
             "loss_weights": dict(self.loss_weights),
@@ -185,8 +234,17 @@ class UnifiedStage2Config:
             "precision": self.precision,
             "grad_clip_norm": self.grad_clip_norm,
             "scheduler_t_max": self.scheduler_t_max,
-            "sanity_steps": self.sanity_steps,
-            "sanity_max_aux_to_flow_ratio": self.sanity_max_aux_to_flow_ratio,
+            "pilot_steps": self.pilot_steps,
+            "pilot_smoothing_window": self.pilot_smoothing_window,
+            "pilot_max_aux_to_flow_ratio": self.pilot_max_aux_to_flow_ratio,
+            "pilot_min_term_gradient_norm": self.pilot_min_term_gradient_norm,
+            "pilot_max_smoothed_loss_growth": self.pilot_max_smoothed_loss_growth,
+            "pilot_score_saturation_threshold": self.pilot_score_saturation_threshold,
+            "pilot_max_saturation_fraction": self.pilot_max_saturation_fraction,
+            "projected_steps": self.projected_steps,
+            "gpu_hourly_cost_usd": self.gpu_hourly_cost_usd,
+            "validation_every_steps": self.validation_every_steps,
+            "validation_complete_inventory": self.validation_complete_inventory,
             "variant": self.variant,
         }
 
@@ -196,7 +254,8 @@ class UnifiedStage2Result:
     completed_steps: int
     checkpoint: str | None
     history_jsonl: str
-    sanity_report: dict[str, Any]
+    pilot_report: dict[str, Any]
+    selection: dict[str, Any]
     run_fingerprint: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -205,7 +264,8 @@ class UnifiedStage2Result:
             "completed_steps": self.completed_steps,
             "checkpoint": self.checkpoint,
             "history_jsonl": self.history_jsonl,
-            "sanity_report": self.sanity_report,
+            "pilot_report": self.pilot_report,
+            "selection": self.selection,
             "run_fingerprint": self.run_fingerprint,
         }
 
@@ -329,6 +389,7 @@ def run_stage2_unified_train(
     translator: BaseTranslator,
     decoder: nn.Module,
     train_index: PhotometryFactoredLatentBankIndex,
+    validation_index: PhotometryFactoredLatentBankIndex,
     stats: FactoredLatentStats,
     critic: DomainProjectionDiscriminator | None = None,
 ) -> UnifiedStage2Result:
@@ -336,6 +397,13 @@ def run_stage2_unified_train(
     validate_unified_config(cfg)
     if train_index.split != "train":
         raise ValueError("Unified model fitting is restricted to R/train.")
+    if validation_index.split != "validation":
+        raise ValueError("Unified model selection requires the complete R/validation bank.")
+    train_subjects = {item.subject_group_id for item in train_index.records}
+    validation_subjects = {item.subject_group_id for item in validation_index.records}
+    overlap = sorted(train_subjects & validation_subjects)
+    if overlap:
+        raise ValueError(f"R/train and R/validation subject groups overlap: {overlap[:3]}.")
     seed_everything(cfg.seed)
     device = _resolve_device(cfg.device)
     translator = translator.to(device)
@@ -364,6 +432,8 @@ def run_stage2_unified_train(
     sampler = torch.Generator().manual_seed(cfg.seed)
     pools = _DomainPools.from_index(train_index)
     pools.require_all_domains()
+    validation_pools = _DomainPools.from_index(validation_index)
+    validation_pools.require_all_domains()
     history_path = cfg.history_jsonl or (
         (cfg.checkpoint_dir or Path.cwd()) / "stage2_unified_history.jsonl"
     )
@@ -372,6 +442,10 @@ def run_stage2_unified_train(
         "contract_version": UNIFIED_STAGE2_CONTRACT,
         "config": cfg.to_dict(),
         "bank_artifact_sha256": train_index.artifact_sha256,
+        "validation_bank_artifact_sha256": validation_index.artifact_sha256,
+        "validation_inventory_sha256": sha256_json(
+            [item.resume_key for item in validation_index.records]
+        ),
         "latent_statistics_sha256": stats.artifact_sha256,
         "bank_vae_provenance": dict(getattr(train_index, "manifest", {}).get("vae", {})),
         "frozen_decoder_state_sha256": _module_state_sha256(decoder),
@@ -380,8 +454,20 @@ def run_stage2_unified_train(
     run_fingerprint = sha256_json(run_identity)
     cursor = 0
     history_generation = 0
+    selection: dict[str, Any] = {
+        "contract_version": UNIFIED_SELECTION_CONTRACT,
+        "rule": "min(val_sb+0.1*val_identity+0.01*val_graph+0.1*(1-generated_domain_accuracy))",
+        "paired_targets_used": False,
+        "complete_r_validation_inventory": True,
+        "latest_step": None,
+        "latest_checkpoint": None,
+        "best_step": None,
+        "best_checkpoint": None,
+        "best_score": None,
+    }
+    pilot_report: dict[str, Any] = {"status": "not_requested", "steps": 0}
     if cfg.resume_from is not None:
-        cursor = _restore_exact(
+        cursor, restored_selection, pilot_report = _restore_exact(
             cfg.resume_from,
             translator=translator,
             critic=critic,
@@ -394,6 +480,7 @@ def run_stage2_unified_train(
             expected_run_fingerprint=run_fingerprint,
             history_path=history_path,
         )
+        selection.update(restored_selection)
         history_generation = _prepare_history_resume(
             history_path, cursor=cursor, run_fingerprint=run_fingerprint
         )
@@ -402,7 +489,7 @@ def run_stage2_unified_train(
     elif history_path.exists() and history_path.stat().st_size:
         raise FileExistsError("Non-empty history exists but no exact-resume checkpoint was supplied.")
 
-    sanity_rows: list[dict[str, float]] = []
+    pilot_rows: list[dict[str, Any]] = []
     last_checkpoint: Path | None = cfg.resume_from
     start = time.perf_counter()
     for step in range(cursor, cfg.steps):
@@ -419,6 +506,8 @@ def run_stage2_unified_train(
                 scaler,
                 batch,
                 sampler,
+                stats,
+                qualify_term_gradients=step < cfg.pilot_steps,
             )
         except torch.OutOfMemoryError:
             if device.type == "cuda":
@@ -456,15 +545,68 @@ def run_stage2_unified_train(
         )
         _append_jsonl(history_path, row)
         print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
-        if step < cfg.sanity_steps:
-            sanity_rows.append(
+        if step < cfg.pilot_steps:
+            pilot_rows.append(dict(row))
+        if cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps:
+            pilot_report = _pilot_report(pilot_rows, cfg)
+            _append_jsonl(
+                history_path,
                 {
-                    "flow": float(row["weighted/sb"]),
-                    "aux": float(row["weighted/auxiliary_total"]),
-                }
+                    "contract_version": UNIFIED_HISTORY_CONTRACT,
+                    "event": "full_objective_pilot",
+                    "step": step + 1,
+                    "pilot": pilot_report,
+                    "run_fingerprint": run_fingerprint,
+                    "history_generation": history_generation,
+                },
             )
+            if pilot_report["status"] != "pass":
+                raise RuntimeError(
+                    "Unified Stage-2 full-objective pilot failed: "
+                    + ", ".join(pilot_report["failures"])
+                )
+        validation_due = (
+            (step + 1) % cfg.validation_every_steps == 0
+            or step + 1 == cfg.steps
+            or (cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps)
+        )
+        if validation_due:
+            validation = _evaluate_unpaired_validation(
+                cfg,
+                translator,
+                critic,
+                decoder,
+                validation_index,
+                validation_pools,
+                stats,
+                device,
+                step=step + 1,
+            )
+            _append_jsonl(
+                history_path,
+                {
+                    "contract_version": UNIFIED_HISTORY_CONTRACT,
+                    "event": "unpaired_validation",
+                    "step": step + 1,
+                    "validation": validation,
+                    "run_fingerprint": run_fingerprint,
+                    "history_generation": history_generation,
+                },
+            )
+            selection["latest_step"] = step + 1
+            current_score = float(validation["selection_score"])
+            if selection["best_score"] is None or current_score < float(selection["best_score"]):
+                selection["best_score"] = current_score
+                selection["best_step"] = step + 1
         if cfg.checkpoint_dir is not None and cfg.checkpoint_every_steps > 0:
-            if (step + 1) % cfg.checkpoint_every_steps == 0:
+            if (step + 1) % cfg.checkpoint_every_steps == 0 or validation_due:
+                checkpoint_identity = str(
+                    cfg.checkpoint_dir
+                    / f"stage2_unified_{cfg.variant}_step{step + 1:09d}.pt"
+                )
+                selection["latest_checkpoint"] = checkpoint_identity
+                if selection["best_step"] == step + 1:
+                    selection["best_checkpoint"] = checkpoint_identity
                 last_checkpoint = _save_exact_checkpoint(
                     cfg,
                     step + 1,
@@ -478,16 +620,28 @@ def run_stage2_unified_train(
                     sampler,
                     run_fingerprint,
                     history_path,
+                    selection,
+                    pilot_report,
                 )
-    sanity = _sanity_report(sanity_rows, cfg.sanity_max_aux_to_flow_ratio)
-    if sanity["status"] == "fail":
-        raise RuntimeError(
-            "Unified Stage-2 sanity failed: weighted auxiliary objectives dominate flow."
-        )
+                if validation_due:
+                    receipt = dict(selection)
+                    receipt["selection_sha256"] = sha256_json(receipt)
+                    write_json_atomic(
+                        cfg.checkpoint_dir
+                        / f"stage2_unified_{cfg.variant}_selection_step{step + 1:09d}.json",
+                        receipt,
+                        refuse_existing=True,
+                    )
     if cfg.checkpoint_dir is not None and cfg.steps > cursor and (
         last_checkpoint is None
         or not last_checkpoint.name.endswith(f"step{cfg.steps:09d}.pt")
     ):
+        checkpoint_identity = str(
+            cfg.checkpoint_dir / f"stage2_unified_{cfg.variant}_step{cfg.steps:09d}.pt"
+        )
+        selection["latest_checkpoint"] = checkpoint_identity
+        if selection["best_step"] == cfg.steps:
+            selection["best_checkpoint"] = checkpoint_identity
         last_checkpoint = _save_exact_checkpoint(
             cfg,
             cfg.steps,
@@ -501,12 +655,22 @@ def run_stage2_unified_train(
             sampler,
             run_fingerprint,
             history_path,
+            selection,
+            pilot_report,
         )
+    if cfg.pilot_steps > 0 and cfg.steps < cfg.pilot_steps:
+        pilot_report = {
+            "status": "incomplete",
+            "steps": len(pilot_rows),
+            "required_steps": cfg.pilot_steps,
+            "failures": ["configured run ended before the full-objective pilot completed"],
+        }
     return UnifiedStage2Result(
         completed_steps=cfg.steps,
         checkpoint=str(last_checkpoint) if last_checkpoint else None,
         history_jsonl=str(history_path),
-        sanity_report=sanity,
+        pilot_report=pilot_report,
+        selection=selection,
         run_fingerprint=run_fingerprint,
     )
 
@@ -533,6 +697,9 @@ def _train_step(
     scaler: torch.amp.GradScaler,
     batch: _TrainingBatch,
     sampler: torch.Generator,
+    stats: FactoredLatentStats,
+    *,
+    qualify_term_gradients: bool,
 ) -> dict[str, Any]:
     translator.train()
     critic.train()
@@ -564,11 +731,13 @@ def _train_step(
                 steps=cfg.integration_steps,
                 solver=cfg.integration_solver,
             )
+        # Both branches use the identical frozen intersection.  In particular, the
+        # appended support channel cannot reveal whether a sample is real or generated.
         real_view = _critic_view(
-            batch.target, batch.target_support, batch.target_domains, decoder, cfg.critic_space
+            batch.target, support, batch.target_domains, decoder, stats, cfg.critic_space
         )
         fake_view = _critic_view(
-            fake_detached, support, batch.target_domains, decoder, cfg.critic_space
+            fake_detached, support, batch.target_domains, decoder, stats, cfg.critic_space
         )
         with autocast:
             real_score, real_domain_logits = critic(real_view, batch.target_domains)
@@ -650,8 +819,12 @@ def _train_step(
         anatomy_parts = {"low_mid": zero, "edge": zero, "gradient": zero, "total": zero}
         if cfg.loss_weights["anatomy"] > 0:
             assert generated is not None
-            source_image = _decode(decoder, batch.source, batch.source_domains)
-            generated_image = _decode(decoder, generated, batch.target_domains)
+            source_image = _decode(
+                decoder, stats.denormalize(batch.source), batch.source_domains
+            )
+            generated_image = _decode(
+                decoder, stats.denormalize(generated), batch.target_domains
+            )
             anatomy_parts = anatomy_preservation_components(
                 source_image,
                 generated_image,
@@ -664,7 +837,7 @@ def _train_step(
         if critic_active:
             assert generated is not None
             generated_view = _critic_view(
-                generated, support, batch.target_domains, decoder, cfg.critic_space
+                generated, support, batch.target_domains, decoder, stats, cfg.critic_space
             )
             fake_score_for_generator, fake_domain_logits = critic(
                 generated_view, batch.target_domains
@@ -688,6 +861,11 @@ def _train_step(
         }
         weighted = {name: cfg.loss_weights[name] * value for name, value in raw_terms.items()}
         generator_total = sum(weighted.values())
+        term_gradient_norms = (
+            generator_term_gradient_norms(raw_terms, translator, cfg.loss_weights)
+            if qualify_term_gradients
+            else {name: None for name in raw_terms}
+        )
     if not bool(torch.isfinite(generator_total)):
         raise FloatingPointError("Unified generator loss is non-finite.")
     scaler.scale(generator_total).backward()
@@ -703,6 +881,7 @@ def _train_step(
     row: dict[str, Any] = {
         **{f"raw/{key}": float(value.detach().float().cpu()) for key, value in raw_terms.items()},
         **{f"weighted/{key}": float(value.detach().float().cpu()) for key, value in weighted.items()},
+        "weighted/generator_total": float(generator_total.detach().float().cpu()),
         "weighted/auxiliary_total": float(weighted_aux.detach().float().cpu()),
         "weighted/aux_to_flow_ratio": float(
             (weighted_aux / weighted["sb"].abs().clamp_min(1e-12)).detach().float().cpu()
@@ -716,8 +895,76 @@ def _train_step(
         "critic/adversarial": float(critic_adv.detach().float().cpu()),
         "critic/domain": float(critic_domain.detach().float().cpu()),
         "critic/updated": critic_active,
+        "critic/real_score_mean": (
+            float(real_score.detach().float().mean().cpu()) if critic_active else 0.0
+        ),
+        "critic/real_score_std": (
+            float(real_score.detach().float().std(unbiased=False).cpu()) if critic_active else 0.0
+        ),
+        "critic/fake_score_mean": (
+            float(fake_score.detach().float().mean().cpu()) if critic_active else 0.0
+        ),
+        "critic/fake_score_std": (
+            float(fake_score.detach().float().std(unbiased=False).cpu()) if critic_active else 0.0
+        ),
+        **{
+            f"critic/real_score_{name}": value
+            for name, value in _score_quantiles(real_score if critic_active else None).items()
+        },
+        **{
+            f"critic/fake_score_{name}": value
+            for name, value in _score_quantiles(fake_score if critic_active else None).items()
+        },
+        "critic/score_separation": (
+            float((real_score.mean() - fake_score.mean()).detach().float().cpu())
+            if critic_active
+            else 0.0
+        ),
+        "critic/score_saturation_fraction": (
+            float(
+                torch.cat((real_score, fake_score))
+                .detach()
+                .abs()
+                .ge(cfg.pilot_score_saturation_threshold)
+                .float()
+                .mean()
+                .cpu()
+            )
+            if critic_active
+            else 0.0
+        ),
+        "critic/real_domain_accuracy": (
+            float(
+                real_domain_logits.detach()
+                .argmax(1)
+                .eq(domain_labels(batch.target_domains, len(batch.target_domains), batch.source.device))
+                .float()
+                .mean()
+                .cpu()
+            )
+            if critic_active
+            else 0.0
+        ),
+        "critic/generated_domain_accuracy": (
+            float(
+                fake_domain_logits.detach()
+                .argmax(1)
+                .eq(domain_labels(batch.target_domains, len(batch.target_domains), batch.source.device))
+                .float()
+                .mean()
+                .cpu()
+            )
+            if critic_active
+            else 0.0
+        ),
         "gradient/generator_norm": generator_grad,
         "gradient/critic_norm": critic_grad,
+        **{
+            f"gradient/term_{name}": value
+            for name, value in term_gradient_norms.items()
+        },
+        "critic/support_identical_real_fake": True,
+        "critic/support_cell_count": int(support.sum().detach().cpu()),
         "transition": f"{batch.source_domains[0].label}->{batch.target_domains[0].label}",
         "graph_path": (
             f"{batch.source_domains[0].label}->{intermediate[0].label}"
@@ -739,18 +986,71 @@ def _decode(decoder: nn.Module, latent: torch.Tensor, domains: Sequence[Domain])
     return decoder(latent)  # type: ignore[no-any-return]
 
 
+def _score_quantiles(score: torch.Tensor | None) -> dict[str, float]:
+    if score is None:
+        return {"p05": 0.0, "p50": 0.0, "p95": 0.0}
+    values = score.detach().float().reshape(-1)
+    quantiles = torch.quantile(values, torch.tensor([0.05, 0.5, 0.95], device=values.device))
+    return {
+        "p05": float(quantiles[0].cpu()),
+        "p50": float(quantiles[1].cpu()),
+        "p95": float(quantiles[2].cpu()),
+    }
+
+
 def _critic_view(
     latent: torch.Tensor,
     support: torch.Tensor,
     domains: Sequence[Domain],
     decoder: nn.Module,
+    stats: FactoredLatentStats,
     space: CriticSpace,
 ) -> torch.Tensor:
     if space == "latent":
         return supported_critic_input(latent, support)
-    image = _decode(decoder, latent, domains)
+    image = _decode(decoder, stats.denormalize(latent), domains)
     image_support = F.interpolate(support.float(), size=image.shape[2:], mode="nearest") > 0.5
     return supported_critic_input(image, image_support)
+
+
+def generator_term_gradient_norms(
+    raw_terms: Mapping[str, torch.Tensor],
+    translator: nn.Module,
+    weights: Mapping[str, float],
+) -> dict[str, float]:
+    """Measure each enabled objective's translator gradient on the intact graph.
+
+    The raw term, rather than the sum, is differentiated so a configured weight cannot
+    hide a disconnected objective.  Disabled objectives are sealed as exactly zero.
+    """
+
+    parameters = tuple(value for value in translator.parameters() if value.requires_grad)
+    if not parameters:
+        raise ValueError("Translator has no trainable parameters for gradient qualification.")
+    result: dict[str, float] = {}
+    for name in DEFAULT_UNIFIED_WEIGHTS:
+        weight = float(weights[name])
+        if weight == 0.0:
+            result[name] = 0.0
+            continue
+        term = raw_terms[name]
+        if not bool(torch.isfinite(term)):
+            raise FloatingPointError(f"Generator term {name!r} is non-finite.")
+        gradients = torch.autograd.grad(
+            term,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        squared = term.new_zeros(())
+        for gradient in gradients:
+            if gradient is not None:
+                squared = squared + gradient.float().square().sum()
+        norm = float(squared.sqrt().detach().cpu())
+        if not np.isfinite(norm):
+            raise FloatingPointError(f"Generator term {name!r} has a non-finite gradient.")
+        result[name] = norm
+    return result
 
 
 def _bridge_sample(
@@ -892,6 +1192,144 @@ def _intermediate_domains(
     return result
 
 
+@torch.inference_mode()
+def _evaluate_unpaired_validation(
+    cfg: UnifiedStage2Config,
+    translator: BaseTranslator,
+    critic: DomainProjectionDiscriminator,
+    decoder: nn.Module,
+    index: PhotometryFactoredLatentBankIndex,
+    pools: _DomainPools,
+    stats: FactoredLatentStats,
+    device: torch.device,
+    *,
+    step: int,
+) -> dict[str, Any]:
+    """Evaluate every R/validation source against deterministic independent targets.
+
+    Targets share contrast but are from a different subject group.  They provide
+    distribution/flow diagnostics only and are never represented as paired endpoints.
+    """
+
+    translator.eval()
+    critic.eval()
+    sampler = torch.Generator().manual_seed(cfg.seed + step * 1_000_003)
+    rows: list[dict[str, float]] = []
+    for source_index, source_record in enumerate(index.records):
+        target_field = _next_field(source_record.domain.field_strength_t)
+        candidates = [
+            value
+            for value in pools.table[Contrast.parse(source_record.domain.contrast)][target_field]
+            if index.records[value].subject_group_id != source_record.subject_group_id
+        ]
+        if not candidates:
+            raise ValueError(
+                "Complete R/validation diagnostics have no subject-excluded target."
+            )
+        target_index = candidates[
+            int(sha256_json([source_record.case_id, step])[:8], 16) % len(candidates)
+        ]
+        source, source_support, source_domains, _ = index.load_batch([source_index])
+        target, target_support, target_domains, _ = index.load_batch([target_index])
+        source = stats.normalize(source.to(device), source_support.to(device))
+        target = stats.normalize(target.to(device), target_support.to(device))
+        source_support = source_support.to(device)
+        target_support = target_support.to(device)
+        support = source_support & target_support
+        if not bool(support.any()):
+            raise ValueError("R/validation source/target support intersection is empty.")
+        time_values = _rand((1,), sampler, device).clamp(cfg.time_eps, 1.0 - cfg.time_eps)
+        z_t, flow_target = _bridge_sample(source, target, time_values, cfg, sampler)
+        predicted_velocity = translator(z_t, source_domains, target_domains, time_values)
+        sb = _masked_mse(predicted_velocity, flow_target, support)
+        identity_generated = integrate_transport(
+            translator,
+            source,
+            source_domains,
+            source_domains,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+        )
+        identity = masked_l1_loss(identity_generated, source, source_support)
+        intermediate = [
+            Domain(
+                next(
+                    field
+                    for field in FIELD_STRENGTHS_T
+                    if field
+                    not in {
+                        source_domains[0].field_strength_t,
+                        target_domains[0].field_strength_t,
+                    }
+                ),
+                source_domains[0].contrast,
+            )
+        ]
+        graph, generated, _ = graph_consistency_loss(
+            translator,
+            source,
+            source_domains,
+            intermediate,
+            target_domains,
+            support,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+        )
+        anatomy = anatomy_preservation_components(
+            _decode(decoder, stats.denormalize(source), source_domains),
+            _decode(decoder, stats.denormalize(generated), target_domains),
+            source_support,
+            pool_scales=cfg.anatomy_pool_scales,
+            support_erosion=cfg.anatomy_support_erosion,
+        )["total"]
+        real_view = _critic_view(target, support, target_domains, decoder, stats, cfg.critic_space)
+        fake_view = _critic_view(generated, support, target_domains, decoder, stats, cfg.critic_space)
+        real_score, real_logits = critic(real_view, target_domains)
+        fake_score, fake_logits = critic(fake_view, target_domains)
+        labels = domain_labels(target_domains, 1, device)
+        rows.append(
+            {
+                "sb": float(sb.float().cpu()),
+                "identity": float(identity.float().cpu()),
+                "graph": float(graph.float().cpu()),
+                "anatomy": float(anatomy.float().cpu()),
+                "real_score": float(real_score.float().mean().cpu()),
+                "generated_score": float(fake_score.float().mean().cpu()),
+                "real_domain_correct": float(real_logits.argmax(1).eq(labels).float().cpu()),
+                "generated_domain_correct": float(fake_logits.argmax(1).eq(labels).float().cpu()),
+            }
+        )
+    means = {
+        key: float(np.mean([row[key] for row in rows]))
+        for key in rows[0]
+    }
+    selection_score = (
+        means["sb"]
+        + 0.1 * means["identity"]
+        + 0.01 * means["graph"]
+        + 0.1 * (1.0 - means["generated_domain_correct"])
+    )
+    if not np.isfinite(selection_score):
+        raise FloatingPointError("Unpaired R/validation selection score is non-finite.")
+    return {
+        "contract_version": UNIFIED_SELECTION_CONTRACT,
+        "step": step,
+        "inventory_record_count": len(index.records),
+        "inventory_sha256": sha256_json([item.resume_key for item in index.records]),
+        "complete_inventory_used": True,
+        "paired_endpoint_assumption": False,
+        "subject_group_exclusion": True,
+        "means": means,
+        "selection_score": selection_score,
+        "selection_rule": "val_sb+0.1*val_identity+0.01*val_graph+0.1*(1-generated_domain_accuracy)",
+    }
+
+
+def _next_field(value: float) -> float:
+    position = FIELD_STRENGTHS_T.index(value)
+    return FIELD_STRENGTHS_T[(position + 1) % len(FIELD_STRENGTHS_T)]
+
+
 def _save_exact_checkpoint(
     cfg: UnifiedStage2Config,
     cursor: int,
@@ -905,6 +1343,8 @@ def _save_exact_checkpoint(
     sampler: torch.Generator,
     run_fingerprint: str,
     history_path: Path,
+    selection: Mapping[str, Any],
+    pilot_report: Mapping[str, Any],
 ) -> Path:
     assert cfg.checkpoint_dir is not None
     path = cfg.checkpoint_dir / f"stage2_unified_{cfg.variant}_step{cursor:09d}.pt"
@@ -927,6 +1367,8 @@ def _save_exact_checkpoint(
         "numpy_rng": _numpy_rng_state(),
         "history_prefix_bytes": len(history_bytes),
         "history_prefix_sha256": hashlib.sha256(history_bytes).hexdigest(),
+        "validation_selection": dict(selection),
+        "pilot_report": dict(pilot_report),
     }
     return save_checkpoint(
         path,
@@ -951,7 +1393,7 @@ def _restore_exact(
     sampler: torch.Generator,
     expected_run_fingerprint: str,
     history_path: Path,
-) -> int:
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
     state = load_checkpoint(path)
     if state.get("contract_version") != UNIFIED_RESUME_CONTRACT:
         raise ValueError("Unified checkpoint exact-resume contract mismatch.")
@@ -990,7 +1432,15 @@ def _restore_exact(
     cursor = int(state["training_cursor"])
     if cursor < 0:
         raise ValueError("Unified checkpoint has an invalid training cursor.")
-    return cursor
+    selection = state.get("validation_selection")
+    if not isinstance(selection, Mapping) or selection.get(
+        "contract_version"
+    ) != UNIFIED_SELECTION_CONTRACT:
+        raise ValueError("Unified checkpoint validation-selection contract mismatch.")
+    pilot_report = state.get("pilot_report")
+    if not isinstance(pilot_report, Mapping):
+        raise ValueError("Unified checkpoint pilot-report contract mismatch.")
+    return cursor, dict(selection), dict(pilot_report)
 
 
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
@@ -1049,17 +1499,143 @@ def _module_state_sha256(module: nn.Module) -> str:
     )
 
 
-def _sanity_report(rows: Sequence[Mapping[str, float]], threshold: float) -> dict[str, Any]:
+def _pilot_report(
+    rows: Sequence[Mapping[str, Any]], cfg: UnifiedStage2Config
+) -> dict[str, Any]:
     if not rows:
-        return {"status": "not_requested", "steps": 0, "max_aux_to_flow_ratio": None}
-    ratios = [item["aux"] / max(abs(item["flow"]), 1e-12) for item in rows]
-    maximum = max(ratios)
+        return {"status": "not_requested", "steps": 0, "failures": []}
+    numeric_keys = [
+        "weighted/generator_total",
+        "weighted/aux_to_flow_ratio",
+        "gradient/generator_norm",
+        "gradient/critic_norm",
+        "critic/score_saturation_fraction",
+        "critic/real_score_mean",
+        "critic/fake_score_mean",
+        "critic/real_domain_accuracy",
+        "critic/generated_domain_accuracy",
+        "step_seconds",
+    ]
+    for branch in ("real", "fake"):
+        numeric_keys.extend(f"critic/{branch}_score_{name}" for name in ("p05", "p50", "p95"))
+    for term in DEFAULT_UNIFIED_WEIGHTS:
+        numeric_keys.extend((f"raw/{term}", f"weighted/{term}", f"gradient/term_{term}"))
+    failures: list[str] = []
+    for key in numeric_keys:
+        values = [float(row[key]) for row in rows]
+        if not all(np.isfinite(value) for value in values):
+            failures.append(f"nonfinite:{key}")
+    gradient_summary: dict[str, Any] = {}
+    for term, weight in cfg.loss_weights.items():
+        values = [float(row[f"gradient/term_{term}"]) for row in rows]
+        gradient_summary[term] = {
+            "enabled": weight > 0,
+            "mean": float(np.mean(values)),
+            "minimum": float(np.min(values)),
+            "maximum": float(np.max(values)),
+        }
+        if weight > 0 and max(values) <= cfg.pilot_min_term_gradient_norm:
+            failures.append(f"missing_translator_gradient:{term}")
+        if weight == 0 and any(value != 0.0 for value in values):
+            failures.append(f"disabled_term_gradient_nonzero:{term}")
+        if weight == 0 and any(float(row[f"weighted/{term}"]) != 0.0 for row in rows):
+            failures.append(f"disabled_term_contribution_nonzero:{term}")
+    ratios = [float(row["weighted/aux_to_flow_ratio"]) for row in rows]
+    if max(ratios) > cfg.pilot_max_aux_to_flow_ratio:
+        failures.append("auxiliary_objectives_dominate_flow")
+    saturation = [float(row["critic/score_saturation_fraction"]) for row in rows]
+    if max(saturation) > cfg.pilot_max_saturation_fraction:
+        failures.append("critic_saturation")
+    if cfg.loss_weights["adversarial"] > 0 or cfg.loss_weights["domain"] > 0:
+        if max(float(row["gradient/critic_norm"]) for row in rows) <= 0:
+            failures.append("missing_critic_gradient")
+    window = min(cfg.pilot_smoothing_window, len(rows))
+    losses = [float(row["weighted/generator_total"]) for row in rows]
+    first_smoothed = float(np.mean(losses[:window]))
+    last_smoothed = float(np.mean(losses[-window:]))
+    if abs(last_smoothed) > max(abs(first_smoothed), 1.0e-12) * cfg.pilot_max_smoothed_loss_growth:
+        failures.append("uncontrolled_smoothed_loss_growth")
+    step_seconds = [float(row["step_seconds"]) for row in rows]
+    mean_step_seconds = float(np.mean(step_seconds))
+    projected_seconds = mean_step_seconds * cfg.projected_steps
+    projected_cost = (
+        projected_seconds / 3600.0 * cfg.gpu_hourly_cost_usd
+        if cfg.gpu_hourly_cost_usd is not None
+        else None
+    )
     return {
-        "status": "pass" if maximum <= threshold else "fail",
+        "status": "pass" if not failures else "fail",
+        "failures": sorted(set(failures)),
         "steps": len(rows),
-        "max_aux_to_flow_ratio": maximum,
-        "threshold": threshold,
-        "weighted_terms_only": True,
+        "full_objective": all(cfg.loss_weights[name] > 0 for name in DEFAULT_UNIFIED_WEIGHTS),
+        "loss_behavior": {
+            "first": losses[0],
+            "last": losses[-1],
+            "first_smoothed": first_smoothed,
+            "last_smoothed": last_smoothed,
+            "smoothing_window": window,
+        },
+        "raw_term_means": {
+            term: float(np.mean([float(row[f"raw/{term}"]) for row in rows]))
+            for term in DEFAULT_UNIFIED_WEIGHTS
+        },
+        "weighted_term_means": {
+            term: float(np.mean([float(row[f"weighted/{term}"]) for row in rows]))
+            for term in DEFAULT_UNIFIED_WEIGHTS
+        },
+        "term_gradient_norms": gradient_summary,
+        "generator_gradient_norm_mean": float(
+            np.mean([float(row["gradient/generator_norm"]) for row in rows])
+        ),
+        "critic_gradient_norm_mean": float(
+            np.mean([float(row["gradient/critic_norm"]) for row in rows])
+        ),
+        "aux_to_flow_ratio": {"maximum": max(ratios), "mean": float(np.mean(ratios))},
+        "critic": {
+            "real_score_mean": float(np.mean([float(row["critic/real_score_mean"]) for row in rows])),
+            "fake_score_mean": float(np.mean([float(row["critic/fake_score_mean"]) for row in rows])),
+            "real_score_distribution": {
+                name: float(
+                    np.mean([float(row[f"critic/real_score_{name}"]) for row in rows])
+                )
+                for name in ("p05", "p50", "p95")
+            },
+            "fake_score_distribution": {
+                name: float(
+                    np.mean([float(row[f"critic/fake_score_{name}"]) for row in rows])
+                )
+                for name in ("p05", "p50", "p95")
+            },
+            "score_separation_mean": float(
+                np.mean([float(row["critic/score_separation"]) for row in rows])
+            ),
+            "saturation_fraction_max": max(saturation),
+            "real_domain_accuracy": float(
+                np.mean([float(row["critic/real_domain_accuracy"]) for row in rows])
+            ),
+            "generated_domain_accuracy": float(
+                np.mean([float(row["critic/generated_domain_accuracy"]) for row in rows])
+            ),
+        },
+        "runtime": {
+            "mean_step_seconds": mean_step_seconds,
+            "examples_per_second": cfg.batch_size / max(mean_step_seconds, 1.0e-12),
+            "peak_cuda_bytes": max(int(row["peak_cuda_bytes"]) for row in rows),
+            "projected_steps": cfg.projected_steps,
+            "projected_seconds": projected_seconds,
+            "projected_hours": projected_seconds / 3600.0,
+            "gpu_hourly_cost_usd": cfg.gpu_hourly_cost_usd,
+            "projected_cost_usd": projected_cost,
+            "cost_status": "measured_rate" if projected_cost is not None else "operator_rate_required",
+        },
+        "hard_stop_conditions": [
+            "nonfinite",
+            "missing_gradient",
+            "critic_saturation",
+            "auxiliary_dominance",
+            "uncontrolled_loss_growth",
+            "oom",
+        ],
     }
 
 
@@ -1094,6 +1670,11 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         raise ValueError("integration_solver must be euler or heun.")
     if cfg.critic_space not in {"latent", "image"}:
         raise ValueError("critic.space must be latent or image.")
+    if cfg.critic_spectral_normalization or cfg.critic_lazy_r1:
+        raise ValueError(
+            "Spectral normalization/lazy R1 are evidence-gated ablations and are not "
+            "enabled by the primary v2 contract."
+        )
     if cfg.precision not in {"fp32", "bf16"}:
         raise ValueError("precision must be fp32 or bf16.")
     if set(cfg.loss_weights) != set(DEFAULT_UNIFIED_WEIGHTS):
@@ -1102,19 +1683,33 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         raise ValueError("Unified loss weights must be finite and non-negative.")
     if cfg.loss_weights["sb"] <= 0:
         raise ValueError("The SB objective must remain active.")
-    if not 0.0 < cfg.sanity_max_aux_to_flow_ratio:
-        raise ValueError("Sanity auxiliary/flow threshold must be positive.")
+    if cfg.pilot_steps < 0 or cfg.pilot_smoothing_window < 1:
+        raise ValueError("Pilot steps must be non-negative and its smoothing window positive.")
+    if not 0.0 < cfg.pilot_max_aux_to_flow_ratio:
+        raise ValueError("Pilot auxiliary/flow threshold must be positive.")
+    if cfg.pilot_min_term_gradient_norm < 0 or cfg.pilot_max_smoothed_loss_growth <= 0:
+        raise ValueError("Pilot gradient/growth thresholds are invalid.")
+    if cfg.pilot_score_saturation_threshold <= 0 or not 0 <= cfg.pilot_max_saturation_fraction <= 1:
+        raise ValueError("Pilot critic-saturation thresholds are invalid.")
+    if cfg.projected_steps < 1 or (
+        cfg.gpu_hourly_cost_usd is not None and cfg.gpu_hourly_cost_usd < 0
+    ):
+        raise ValueError("Pilot projection steps/cost are invalid.")
+    if cfg.validation_every_steps < 1 or not cfg.validation_complete_inventory:
+        raise ValueError("Validation must use the complete R/validation inventory.")
 
 
 __all__ = [
     "DEFAULT_UNIFIED_WEIGHTS",
     "UNIFIED_HISTORY_CONTRACT",
     "UNIFIED_RESUME_CONTRACT",
+    "UNIFIED_SELECTION_CONTRACT",
     "UNIFIED_STAGE2_CONTRACT",
     "UnifiedStage2Config",
     "UnifiedStage2Result",
     "anatomy_preservation_components",
     "graph_consistency_loss",
+    "generator_term_gradient_norms",
     "integrate_transport",
     "run_stage2_unified_train",
     "validate_unified_config",

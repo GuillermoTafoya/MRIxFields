@@ -39,24 +39,33 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
         "preflight-photometry-factored-latent-bank",
         "build-photometry-factored-latent-bank",
         "audit-photometry-factored-latent-bank",
+        "preflight-stage2-factored-domain-separability",
+        "audit-stage2-retrospective-pair-feasibility",
         "train-stage2-unified",
         "eval-stage2-unified",
     ]
     positions = [source.index(value) for value in required]
     assert positions == sorted(positions)
-    assert source.count("RUN_LONG_FULL_AND_BACKWARD_ABLATIONS = False") == 1
+    assert source.count("AUTHORIZE_LONG_FULL_MODEL = False") == 1
+    assert source.count("AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False") == 1
+    assert "RUN_LONG_FULL_AND_BACKWARD_ABLATIONS" not in source
+    assert "--steps', '200', '--pilot-steps', '200'" in source
+    assert "No ablation is launched by this flag" in source
+    assert "Complete paired R/validation manifest with Stage-1 ceilings" not in source
     assert "AUTHORIZE_FIT_AFTER" not in source
     assert "AUTHORIZE_QUALIFICATION_AFTER" not in source
     assert "descriptor_coupling': False" in source
     assert "Path outside reviewed Windows root" in source
     assert "classification_before_array_load" in source
+    assert "StarGAN_control_claim': False" in source
+    assert "learned_disentanglement_claim': False" in source
 
 
 def test_full_config_uses_reviewed_initial_weights() -> None:
     import yaml
 
     payload = yaml.safe_load(
-        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v1.yaml").read_text()
+        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v2.yaml").read_text()
     )
     config = UnifiedStage2Config.from_mapping(payload)
     assert config.loss_weights == {
@@ -68,6 +77,14 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         "domain": 0.1,
     }
     assert config.critic_space == "latent"
+    assert config.pilot_steps == 200
+    assert config.validation_complete_inventory is True
+    assert config.critic_spectral_normalization is False
+    assert config.critic_lazy_r1 is False
+    with pytest.raises(ValueError, match="obsolete"):
+        UnifiedStage2Config.from_mapping(
+            {"training": {"sanity": {"steps": 20}, "loss_weights": config.loss_weights}}
+        )
 
 
 def test_baseline_manifest_rejects_p_before_array_open(monkeypatch, tmp_path: Path) -> None:

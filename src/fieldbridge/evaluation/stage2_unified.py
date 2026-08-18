@@ -43,7 +43,7 @@ from fieldbridge.training.stage2_unified import (
     integrate_transport,
 )
 
-UNIFIED_EVALUATION_CONTRACT = "stage2-unified-retrospective-evaluation-v1"
+UNIFIED_EVALUATION_CONTRACT = "stage2-unified-retrospective-evaluation-v2"
 BASELINE_PREDICTIONS_CONTRACT = "stage2-unified-retrospective-baseline-predictions-v1"
 
 
@@ -59,6 +59,7 @@ def evaluate_stage2_unified(
     baseline_predictions_path: str | Path,
     output_dir: str | Path,
     sb_only_translator: BaseTranslator | None = None,
+    ablation_translators: Mapping[str, BaseTranslator] | None = None,
     device: str | torch.device = "cuda",
     integration_steps: int = 20,
     solver: str = "heun",
@@ -80,6 +81,11 @@ def evaluate_stage2_unified(
     decoder = decoder.to(device_obj).eval()
     if sb_only_translator is not None:
         sb_only_translator = sb_only_translator.to(device_obj).eval()
+    ablation_translators = dict(ablation_translators or {})
+    for name, model in ablation_translators.items():
+        if not name or name in {"full", "sb_only"}:
+            raise ValueError("Ablation translator names must be nonempty and unambiguous.")
+        ablation_translators[name] = model.to(device_obj).eval()
     root = Path(output_dir)
     final_path = root / "result.json"
     existing_result: dict[str, Any] | None = None
@@ -100,7 +106,7 @@ def evaluate_stage2_unified(
     shard_dir = root / "case_shards"
     shard_dir.mkdir(exist_ok=True)
     run_contract: dict[str, Any] = {
-        "contract_version": "stage2-unified-retrospective-evaluation-run-v1",
+        "contract_version": "stage2-unified-retrospective-evaluation-run-v2",
         "paired_manifest_sha256": manifest["manifest_sha256"],
         "bank_artifact_sha256": bank.artifact_sha256,
         "latent_statistics_sha256": stats.artifact_sha256,
@@ -110,6 +116,10 @@ def evaluate_stage2_unified(
         "sb_only_translator_state_sha256": (
             _module_state_sha256(sb_only_translator) if sb_only_translator is not None else None
         ),
+        "ablation_translator_state_sha256": {
+            name: _module_state_sha256(model)
+            for name, model in sorted(ablation_translators.items())
+        },
         "frozen_decoder_state_sha256": _module_state_sha256(decoder),
         "integration": {"steps": integration_steps, "solver": solver},
         "case_identities": sorted(case.case_identity for case in cases),
@@ -192,6 +202,21 @@ def evaluate_stage2_unified(
             methods["photometry_factored_sb_only"] = artifact.render_target(
                 canonical_context.with_values(sb_canonical), case.target_domain
             )
+        for name, ablation_model in sorted(ablation_translators.items()):
+            ablation_z = integrate_transport(
+                ablation_model,
+                z,
+                [case.source_domain],
+                [case.target_domain],
+                steps=integration_steps,
+                solver=solver,  # type: ignore[arg-type]
+            )
+            ablation_canonical = _decode(
+                decoder, stats.denormalize(ablation_z), [case.target_domain]
+            )[0].cpu()
+            methods[f"ablation_{name}"] = artifact.render_target(
+                canonical_context.with_values(ablation_canonical), case.target_domain
+            )
         method_metrics = {
             name: dict(metrics(prediction, case.target))
             for name, prediction in methods.items()
@@ -213,17 +238,29 @@ def evaluate_stage2_unified(
             decoded_canonical[None].to(device_obj),
             support_batch,
         )
-        intermediate = _fixed_intermediate(case.source_domain, case.target_domain)
-        graph, direct, composed = graph_consistency_loss(
-            translator,
-            z,
-            [case.source_domain],
-            [intermediate],
-            [case.target_domain],
-            support_batch,
-            steps=integration_steps,
-            solver=solver,  # type: ignore[arg-type]
-        )
+        graph_paths = []
+        for intermediate in _all_intermediates(case.source_domain, case.target_domain):
+            graph, direct, composed = graph_consistency_loss(
+                translator,
+                z,
+                [case.source_domain],
+                [intermediate],
+                [case.target_domain],
+                support_batch,
+                steps=integration_steps,
+                solver=solver,  # type: ignore[arg-type]
+            )
+            graph_paths.append(
+                {
+                    "path": (
+                        f"{case.source_domain.label}->{intermediate.label}->"
+                        f"{case.target_domain.label}"
+                    ),
+                    "intermediate_domain": intermediate.label,
+                    "direct_vs_composed_l1": float(graph.cpu()),
+                    "direct_vs_composed_mse": float(F.mse_loss(direct, composed).cpu()),
+                }
+            )
         requested = method_metrics["full_unified_model"]["nrmse"]
         wrong = _wrong_target_controls(
             translator,
@@ -239,7 +276,10 @@ def evaluate_stage2_unified(
         )
         support_image = canonical_context.support_mask
         outside = ~support_image
-        background = (
+        raw_decoder_background = (
+            float(decoded_canonical[outside].abs().mean()) if bool(outside.any()) else 0.0
+        )
+        rendered_background = (
             float(full_prediction[outside].abs().mean()) if bool(outside.any()) else 0.0
         )
         montage_path = montage_dir / f"{sha256_text(case.case_identity)}.png"
@@ -248,6 +288,8 @@ def evaluate_stage2_unified(
             "case_identity": case.case_identity,
             "subject_group_identity": case.subject_group_identity,
             "contrast": case.source_domain.contrast.value,
+            "source_domain": case.source_domain.label,
+            "target_domain": case.target_domain.label,
             "directed_field_pair": (
                 f"{case.source_domain.field_strength_t:g}T->"
                 f"{case.target_domain.field_strength_t:g}T"
@@ -264,21 +306,26 @@ def evaluate_stage2_unified(
                 "requested_nrmse": requested,
                 "wrong_targets": wrong,
                 "requested_better_than_every_wrong_target": all(
-                    requested < item["nrmse"] for item in wrong
+                    requested < item["requested_render_nrmse"] for item in wrong
                 ),
+                "mechanistic_rendering": "all conditions rendered through requested target map",
+                "condition_native_rendering_role": "separately_labelled_diagnostic_only",
             },
             "graph_consistency": {
-                "path": (
-                    f"{case.source_domain.label}->{intermediate.label}->"
-                    f"{case.target_domain.label}"
+                "all_valid_intermediate_fields": True,
+                "paths": graph_paths,
+                "mean_direct_vs_composed_l1": float(
+                    np.mean([item["direct_vs_composed_l1"] for item in graph_paths])
                 ),
-                "direct_vs_composed_l1": float(graph.cpu()),
-                "direct_vs_composed_mse": float(F.mse_loss(direct, composed).cpu()),
+                "max_direct_vs_composed_l1": float(
+                    np.max([item["direct_vs_composed_l1"] for item in graph_paths])
+                ),
             },
             "anatomy_preservation": {
                 key: float(value.cpu()) for key, value in anatomy.items()
             },
-            "background_leakage_mae": background,
+            "raw_pre_mask_decoder_background_leakage_mae": raw_decoder_background,
+            "rendered_post_mask_background_leakage_mae": rendered_background,
             "source_provenance": dict(case.source_provenance),
             "target_provenance": dict(case.target_provenance),
             "montage": {
@@ -288,7 +335,7 @@ def evaluate_stage2_unified(
         }
         rows.append(row)
         shard = {
-            "contract_version": "stage2-unified-retrospective-case-shard-v1",
+            "contract_version": "stage2-unified-retrospective-case-shard-v2",
             "run_contract_sha256": run_contract["run_contract_sha256"],
             "case": row,
         }
@@ -317,6 +364,9 @@ def evaluate_stage2_unified(
         "baseline_predictions": baseline_identity,
         "run_contract_sha256": run_contract["run_contract_sha256"],
         "methods": sorted(rows[0]["methods"]),
+        "trained_ablation_methods_evaluated": sorted(
+            f"ablation_{name}" for name in ablation_translators
+        ),
         "case_count": len(rows),
         "cases": rows,
         "reductions": _reductions(rows),
@@ -327,6 +377,8 @@ def evaluate_stage2_unified(
                 "target",
                 "raw_identity",
                 "gate01_calibrated_identity",
+                "original_sb_v2",
+                *( ["photometry_factored_sb_only"] if sb_only_translator is not None else [] ),
                 "full_unified_model",
                 "stage1_reconstruction_ceiling",
                 "absolute_full_error",
@@ -458,24 +510,42 @@ def _wrong_target_controls(
         wrong_canonical = _decode(
             decoder, stats.denormalize(wrong_z), [wrong_domain]
         )[0].cpu()
-        wrong_prediction = artifact.render_target(
+        # Mechanistic condition control: rendering is held fixed at the requested
+        # target, so only the translator condition changes.
+        requested_render_prediction = artifact.render_target(
+            canonical_context.with_values(wrong_canonical), case.target_domain
+        )
+        native_render_prediction = artifact.render_target(
             canonical_context.with_values(wrong_canonical), wrong_domain
         )
         target = case.target.detach().cpu().double().numpy()
-        prediction = wrong_prediction.detach().cpu().double().numpy()
         denominator = float(np.sqrt(np.mean(target**2)))
-        nrmse = float(np.sqrt(np.mean((prediction - target) ** 2)) / max(denominator, 1e-12))
-        rows.append({"domain": wrong_domain.label, "nrmse": nrmse})
+        requested_prediction = requested_render_prediction.detach().cpu().double().numpy()
+        native_prediction = native_render_prediction.detach().cpu().double().numpy()
+        rows.append(
+            {
+                "conditioned_domain": wrong_domain.label,
+                "requested_render_domain": case.target_domain.label,
+                "requested_render_nrmse": float(
+                    np.sqrt(np.mean((requested_prediction - target) ** 2))
+                    / max(denominator, 1e-12)
+                ),
+                "condition_native_render_domain": wrong_domain.label,
+                "condition_native_render_nrmse": float(
+                    np.sqrt(np.mean((native_prediction - target) ** 2))
+                    / max(denominator, 1e-12)
+                ),
+            }
+        )
     return rows
 
 
-def _fixed_intermediate(source: Domain, target: Domain) -> Domain:
-    candidates = [
-        value
+def _all_intermediates(source: Domain, target: Domain) -> list[Domain]:
+    return [
+        Domain(value, source.contrast)
         for value in FIELD_STRENGTHS_T
         if value not in {source.field_strength_t, target.field_strength_t}
     ]
-    return Domain(candidates[len(candidates) // 2], source.contrast)
 
 
 def _decode(decoder: torch.nn.Module, latent: torch.Tensor, domains: Sequence[Domain]) -> torch.Tensor:
@@ -493,6 +563,8 @@ def _require_ceiling(case: PairedEvaluationCase) -> torch.Tensor:
 def _reductions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     dimensions = {
         "overall": lambda row: "all",
+        "per_source_domain": lambda row: str(row["source_domain"]),
+        "per_target_domain": lambda row: str(row["target_domain"]),
         "per_contrast": lambda row: str(row["contrast"]),
         "per_directed_field_pair": lambda row: str(row["directed_field_pair"]),
         "ordinary_vs_catastrophic": lambda row: str(row["raw_identity_stratum"]),
@@ -535,8 +607,13 @@ def _reductions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                         ]
                     )
                 ),
-                "graph_direct_vs_composed_l1": float(
-                    np.mean([item["graph_consistency"]["direct_vs_composed_l1"] for item in items])
+                "graph_mean_direct_vs_composed_l1": float(
+                    np.mean(
+                        [
+                            item["graph_consistency"]["mean_direct_vs_composed_l1"]
+                            for item in items
+                        ]
+                    )
                 ),
                 "anatomy_preservation": {
                     metric: float(
@@ -544,8 +621,13 @@ def _reductions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                     )
                     for metric in ("low_mid", "edge", "gradient", "total")
                 },
-                "background_leakage_mae": float(
-                    np.mean([item["background_leakage_mae"] for item in items])
+                "raw_pre_mask_decoder_background_leakage_mae": float(
+                    np.mean(
+                        [
+                            item["raw_pre_mask_decoder_background_leakage_mae"]
+                            for item in items
+                        ]
+                    )
                 ),
             }
     return output
@@ -564,6 +646,12 @@ def _render_montage(
         ("target", case.target),
         ("raw", methods["raw_identity"]),
         ("calibrated", methods["gate01_calibrated_identity"]),
+        ("SB-v2", methods["original_sb_v2"]),
+        *(
+            [("factored SB", methods["photometry_factored_sb_only"])]
+            if "photometry_factored_sb_only" in methods
+            else []
+        ),
         ("full", methods["full_unified_model"]),
         ("ceiling", methods["stage1_reconstruction_ceiling"]),
         ("|full-target|", (methods["full_unified_model"] - case.target).abs()),

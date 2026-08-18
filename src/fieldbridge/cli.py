@@ -156,6 +156,12 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
 )
 from fieldbridge.training.stage2_unified import UnifiedStage2Config, run_stage2_unified_train
 from fieldbridge.evaluation.stage2_unified import evaluate_stage2_unified
+from fieldbridge.evaluation.stage2_unified_preflight import (
+    audit_retrospective_paired_feasibility,
+    build_baseline_prediction_manifest,
+    build_retrospective_paired_manifest,
+    quantify_factored_domain_separability,
+)
 from fieldbridge.utils.seeding import seed_everything
 from fieldbridge.data.photometry_factored_latent_bank import (
     PhotometryFactoredLatentBankConfig,
@@ -547,7 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v1.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v2.yaml"),
     )
     train_unified.add_argument("--bank-dir", type=Path, required=True)
     train_unified.add_argument("--vae-config", type=Path, required=True)
@@ -557,8 +563,40 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument("--resume-from", type=Path, default=None)
     train_unified.add_argument("--steps", type=int, default=None)
     train_unified.add_argument("--batch-size", type=int, default=None)
-    train_unified.add_argument("--sanity-steps", type=int, default=None)
+    train_unified.add_argument("--pilot-steps", type=int, default=None)
     train_unified.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
+
+    domain_preflight = subparsers.add_parser(
+        "preflight-stage2-factored-domain-separability",
+        help="Measure residual 15-domain predictability on subject-disjoint factored latents.",
+    )
+    domain_preflight.add_argument("--bank-dir", type=Path, required=True)
+    domain_preflight.add_argument("--out", type=Path, required=True)
+
+    pair_feasibility = subparsers.add_parser(
+        "audit-stage2-retrospective-pair-feasibility",
+        help="Seal complete same-subject/same-contrast R/validation cross-field feasibility.",
+    )
+    pair_feasibility.add_argument("--split-json", type=Path, required=True)
+    pair_feasibility.add_argument("--out", type=Path, required=True)
+
+    pair_builder = subparsers.add_parser(
+        "build-stage2-retrospective-paired-manifest",
+        help="Build the complete paired R/validation manifest after feasibility succeeds.",
+    )
+    pair_builder.add_argument("--feasibility", type=Path, required=True)
+    pair_builder.add_argument("--materialized-arrays", type=Path, required=True)
+    pair_builder.add_argument("--photometry-artifact", type=Path, required=True)
+    pair_builder.add_argument("--authorization-reference", required=True)
+    pair_builder.add_argument("--out", type=Path, required=True)
+
+    baseline_builder = subparsers.add_parser(
+        "build-stage2-unified-baseline-manifest",
+        help="Seal complete existing Gate-0.1/SB-v2 baseline predictions.",
+    )
+    baseline_builder.add_argument("--paired-manifest", type=Path, required=True)
+    baseline_builder.add_argument("--source-artifact", type=Path, required=True)
+    baseline_builder.add_argument("--out", type=Path, required=True)
 
     eval_unified = subparsers.add_parser(
         "eval-stage2-unified",
@@ -567,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v1.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v2.yaml"),
     )
     eval_unified.add_argument("--bank-dir", type=Path, required=True)
     eval_unified.add_argument("--checkpoint", type=Path, required=True)
@@ -577,6 +615,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument("--paired-manifest", type=Path, required=True)
     eval_unified.add_argument("--baseline-predictions", type=Path, required=True)
     eval_unified.add_argument("--sb-only-checkpoint", type=Path, default=None)
+    eval_unified.add_argument(
+        "--ablation-checkpoint",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="Repeat for every additionally trained ablation; each is evaluated.",
+    )
     eval_unified.add_argument("--out", type=Path, required=True)
     eval_unified.add_argument("--integration-steps", type=int, default=20)
     eval_unified.add_argument("--solver", choices=("euler", "heun"), default="heun")
@@ -1768,17 +1813,53 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "preflight-stage2-factored-domain-separability":
+        train_index = PhotometryFactoredLatentBankIndex(args.bank_dir, "train")
+        validation_index = PhotometryFactoredLatentBankIndex(args.bank_dir, "validation")
+        stats = FactoredLatentStats.from_bank(args.bank_dir)
+        result = quantify_factored_domain_separability(
+            train_index, validation_index, stats, output_path=args.out
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "audit-stage2-retrospective-pair-feasibility":
+        result = audit_retrospective_paired_feasibility(
+            args.split_json, output_path=args.out, hash_source_files=True
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "build-stage2-retrospective-paired-manifest":
+        artifact = FrozenPhotometryArtifact.load(args.photometry_artifact)
+        result = build_retrospective_paired_manifest(
+            args.feasibility,
+            args.materialized_arrays,
+            artifact,
+            output_path=args.out,
+            authorization_reference=args.authorization_reference,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "build-stage2-unified-baseline-manifest":
+        result = build_baseline_prediction_manifest(
+            args.paired_manifest, args.source_artifact, output_path=args.out
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
     if args.command == "train-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v1":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v2":
             raise ValueError("Unified training config contract mismatch.")
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
         _override(config, "training", "device", args.device)
-        if args.sanity_steps is not None:
+        if args.pilot_steps is not None:
             training = config.setdefault("training", {})
-            sanity = training.setdefault("sanity", {})
-            sanity["steps"] = args.sanity_steps
+            pilot = training.setdefault("pilot", {})
+            pilot["steps"] = args.pilot_steps
         training = config.setdefault("training", {})
         checkpoint_config = training.setdefault("checkpoint", {})
         checkpoint_config["dir"] = str(args.checkpoint_dir)
@@ -1789,6 +1870,7 @@ def main(argv: list[str] | None = None) -> int:
         stage_config = UnifiedStage2Config.from_mapping(config)
         seed_everything(stage_config.seed)
         train_index = PhotometryFactoredLatentBankIndex(args.bank_dir, "train")
+        validation_index = PhotometryFactoredLatentBankIndex(args.bank_dir, "validation")
         _assert_bank_vae_inputs(
             train_index.manifest, args.vae_config, args.vae_checkpoint
         )
@@ -1810,6 +1892,7 @@ def main(argv: list[str] | None = None) -> int:
             translator=translator,
             decoder=decoder,
             train_index=train_index,
+            validation_index=validation_index,
             stats=stats,
         )
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True, allow_nan=False))
@@ -1817,7 +1900,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v1":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v2":
             raise ValueError("Unified evaluation config contract mismatch.")
         validation_index = PhotometryFactoredLatentBankIndex(
             args.bank_dir, "validation"
@@ -1834,7 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
                 **{key: value for key, value in model_config.items() if key != "name"},
             )
             state = load_checkpoint(checkpoint_path)
-            if state.get("contract_version") != "stage2-unified-exact-resume-v1":
+            if state.get("contract_version") != "stage2-unified-exact-resume-v2":
                 raise ValueError("Unified evaluation checkpoint contract mismatch.")
             model.load_state_dict(state["translator"], strict=True)
             return model
@@ -1845,6 +1928,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.sb_only_checkpoint is not None
             else None
         )
+        ablations = {}
+        for raw in args.ablation_checkpoint:
+            name, separator, checkpoint_value = str(raw).partition("=")
+            if not separator or not name or not checkpoint_value or name in ablations:
+                raise ValueError("--ablation-checkpoint requires unique NAME=PATH values.")
+            ablations[name] = make_translator(Path(checkpoint_value))
         vae_config = _load_optional_config(args.vae_config)
         vae_model_config = _model_config(vae_config)
         decoder = build_decoder(
@@ -1863,6 +1952,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_predictions_path=args.baseline_predictions,
             output_dir=args.out,
             sb_only_translator=sb_only,
+            ablation_translators=ablations,
             device=args.device,
             integration_steps=args.integration_steps,
             solver=args.solver,

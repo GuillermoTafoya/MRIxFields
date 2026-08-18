@@ -21,10 +21,13 @@ This document records the qualification of current `origin/main` at
 | Does not carry canonical local-valid-core support | Validates packed support and uses supported cells for flow, identity, critic, anatomy, and graph terms |
 | Partial resume (model/optimizer/sampler only) | Exact resume seals generator, critic, both optimizers/schedulers, scaler, Python/NumPy/Torch/CUDA RNG, sampler, cursor, config, bank, stats, and code identity |
 | No anatomy or graph objectives | Adds source-supported low/mid-frequency anatomy/edge/gradient terms and differentiable direct-vs-composed field paths |
-| Raw/image critic assumptions can exploit padding | Primary latent critic receives masked values plus the support channel |
+| Raw/image critic assumptions can exploit padding | Real and generated critic views use the identical frozen source-intersection-target support; masked values and the appended support channel follow one construction |
 | No R-only bank contract | Manifest/sidecars are classified before tensor load; only R/train fits and R/validation evaluates; all P identities fail closed |
-| No auxiliary-dominance check | Short sanity phase records weighted auxiliary/flow ratios and hard-stops if the configured ceiling is exceeded |
-| No term-level diagnostics | Append-only JSONL records raw and weighted terms, graph paths, transitions, gradients, throughput, time, memory, and OOM hard stops |
+| Normalized latents passed directly to frozen decoder | Every anatomy, image-critic, validation, and evaluation decode receives `stats.denormalize(latent)`; the VAE remains frozen |
+| No auxiliary-dominance check | The default 200-step full-objective pilot gates finite terms, per-term gradients, smoothed behavior, critic saturation, auxiliary/flow ratios, OOM, runtime, and projected 100k cost |
+| No term-level diagnostics | Append-only JSONL records raw/weighted terms, per-term translator gradients, critic distributions/domain accuracies, graph paths, transitions, throughput, time, memory, and OOM hard stops |
+| Training-loss-only checkpointing | Complete unpaired R/validation distribution diagnostics drive a sealed deterministic latest/best selection rule without paired endpoint assumptions |
+| Unspecified paired and baseline manifests | Metadata-only feasibility seals every genuine R/validation edge; deterministic builders consume complete materialized arrays/Stage-1 ceilings and existing Gate-0.1/SB-v2 artifacts, or fail with exact instructions |
 
 ## Scientific boundary
 
@@ -44,7 +47,10 @@ independence.
 ## Remaining external operator inputs
 
 The repository contains no private data or model artifacts. A run therefore supplies the
-sealed split, retrospective root, frozen Variant-A artifact/qualification, frozen VAE config
-and checkpoint, paired R/validation manifest with Stage-1 ceiling arrays, and a hash-sealed
-per-case continuity manifest containing Gate 0.1 calibrated-identity and original-SB-v2
-predictions. These are paths and identities only; no endpoint or prospective data is committed.
+sealed split, retrospective root, frozen Variant-A artifact/qualification, and frozen VAE config
+and checkpoint. The notebook first audits whether genuine R/validation pairs exist. Only when
+they do, the operator additionally supplies a complete materialized R/validation array export
+with Stage-1 ceilings and a sealed source index over existing Gate 0.1 calibrated-identity and
+original-SB-v2 predictions. Production commands build the final manifests; no operator-curated
+paired subset is accepted. These are paths and identities only; no endpoint or prospective data
+is committed.

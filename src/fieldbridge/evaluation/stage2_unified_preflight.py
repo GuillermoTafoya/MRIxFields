@@ -45,7 +45,10 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
 from fieldbridge.evaluation.stage2_unified import BASELINE_PREDICTIONS_CONTRACT
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     GATE01_P0006_EVALUATION_PROTOCOL,
+    P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+    P0006_EVIDENCE_LIMITATION,
     P0006_IDENTITY_SHA256,
+    P0009_CONFIRMATION_STATUS,
 )
 
 DOMAIN_SEPARABILITY_CONTRACT = "stage2-factored-latent-domain-separability-v1"
@@ -56,7 +59,7 @@ MATERIALIZED_VALIDATION_PRODUCER_CONTRACT = (
 )
 BASELINE_SOURCE_CONTRACT = "stage2-existing-gate01-sbv2-baseline-source-v2"
 BASELINE_SOURCE_PRODUCER_CONTRACT = "stage2-gate01-sbv2-baseline-export-producer-v1"
-LONG_RUN_EVALUATION_READINESS_CONTRACT = "stage2-long-run-evaluation-readiness-v2"
+LONG_RUN_EVALUATION_READINESS_CONTRACT = "stage2-long-run-evaluation-readiness-v3"
 
 
 def quantify_factored_domain_separability(
@@ -437,7 +440,7 @@ def import_retrospective_paired_evaluation_archive(
     destination.mkdir(parents=True, exist_ok=True)
     paired_path = destination / "stage2_complete_R_validation_paired_manifest.json"
     baselines_path = destination / "stage2_complete_gate01_sbv2_baselines.json"
-    readiness_path = destination / "stage2_long_run_evaluation_readiness_v2.json"
+    readiness_path = destination / "stage2_long_run_evaluation_readiness_v3.json"
     if paired_path.exists():
         paired = _load_self_hashed(paired_path, "manifest_sha256")
         provenance = paired.get("provenance", {})
@@ -531,8 +534,9 @@ def seal_long_run_evaluation_readiness(
         )
         if (
             protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL
-            or protocol.get("data_role")
-            != "held-out_P0006_final_evaluation_only_not_training_or_selection"
+            or protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+            or protocol.get("evidence_interpretation") != P0006_EVIDENCE_LIMITATION
+            or protocol.get("population_or_generalization_claims_authorized") is not False
             or protocol.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256
             or protocol.get("acquisition_count") != 15
             or protocol.get("directed_pair_count") != 60
@@ -541,6 +545,8 @@ def seal_long_run_evaluation_readiness(
             or protocol.get("training_or_model_selection_use") is not False
             or protocol.get("factored_bank", {}).get("P_record_count") != 0
             or protocol.get("frozen_unpaired_validation", {}).get("P_endpoint_count") != 0
+            or protocol.get("P0009_confirmation_status") != P0009_CONFIRMATION_STATUS
+            or protocol.get("P0009_executed") is not False
         ):
             raise ValueError(
                 "Long training is blocked: P:0006 evaluation-only protocol is incomplete."
@@ -548,7 +554,9 @@ def seal_long_run_evaluation_readiness(
         result: dict[str, Any] = {
             "contract_version": LONG_RUN_EVALUATION_READINESS_CONTRACT,
             "long_run_authorized_by_evaluation_path": True,
-            "evaluation_role": "sealed_held_out_P0006_final_evaluation_only",
+            "evaluation_role": P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+            "evidence_interpretation": P0006_EVIDENCE_LIMITATION,
+            "population_or_generalization_claims_authorized": False,
             "prospective_protocol_used": True,
             "prospective_training_or_model_selection_use": False,
             "reviewed_prospective_protocol_available": True,
@@ -562,6 +570,8 @@ def seal_long_run_evaluation_readiness(
             ],
             "factored_bank_P_record_count": 0,
             "unpaired_validation_P_endpoint_count": 0,
+            "P0009_confirmation_status": P0009_CONFIRMATION_STATUS,
+            "P0009_executed": False,
         }
         result["readiness_sha256"] = sha256_json(result)
         write_json_atomic(output_path, result, refuse_existing=True)

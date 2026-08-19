@@ -1,7 +1,14 @@
-contract: stage2-unified-retrospective-full-model-config-v4
+contract: stage2-unified-retrospective-full-model-config-v5
 scope: retrospective_R_only
 input_contract: photometry-factored-latent-bank-v2
 descriptor_coupling: forbidden_unauthorized
+
+development_validation_evidence:
+  P0006_data_role: development_validation_P0006_evaluation_only
+  interpretation: development/model assessment only
+  population_or_generalization_claims_authorized: false
+  P0009_status: frozen_and_unused_for_possible_later_confirmation
+  P0009_execution: forbidden
 
 model:
   name: flow_matching_latent
@@ -54,6 +61,7 @@ training:
     support_erosion: 1
     raw_high_frequency_equality: forbidden
   pilot:
+    runtime_projection_contract: stage2-unified-pilot-training-plus-validation-runtime-projection-v1
     steps: 200
     smoothing_window: 20
     max_aux_to_flow_ratio: 1.0
@@ -62,6 +70,8 @@ training:
     score_saturation_threshold: 20.0
     max_saturation_fraction: 0.95
     projected_steps: 100000
+    projection_scope: training_plus_complete_validation
+    terminal_validation_count: exactly_once
     gpu_hourly_cost_usd: null
     failure: hard_stop_before_long_run
   validation:

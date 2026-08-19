@@ -41,6 +41,9 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
     load_paired_evaluation_manifest,
 )
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+    P0006_EVIDENCE_LIMITATION,
+    P0009_CONFIRMATION_STATUS,
     load_gate01_p0006_evaluation_protocol,
 )
 from fieldbridge.models.translators.base import BaseTranslator
@@ -50,7 +53,7 @@ from fieldbridge.training.stage2_unified import (
     integrate_transport,
 )
 
-UNIFIED_EVALUATION_CONTRACT = "stage2-unified-selected-best-evaluation-v3"
+UNIFIED_EVALUATION_CONTRACT = "stage2-unified-selected-best-evaluation-v4"
 BASELINE_PREDICTIONS_CONTRACT = "stage2-unified-retrospective-baseline-predictions-v1"
 
 
@@ -74,7 +77,7 @@ def evaluate_stage2_unified(
     solver: str = "heun",
     resume: bool = False,
 ) -> dict[str, Any]:
-    """Score sealed genuine-R pairs or the held-out P:0006 evaluation-only graph."""
+    """Score genuine-R pairs or P:0006 development-validation evidence."""
 
     if bank.split != "validation":
         raise ValueError("Unified evaluation is restricted to the complete R/validation bank.")
@@ -86,7 +89,7 @@ def evaluate_stage2_unified(
         manifest, cases, baselines = load_gate01_p0006_evaluation_protocol(
             p0006_evaluation_protocol_path
         )
-        evaluation_role = "held_out_P0006_final_evaluation_only"
+        evaluation_role = P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
         evaluation_identity_sha256 = str(manifest["protocol_sha256"])
         baseline_identity = {
             "contract_version": manifest["contract_version"],
@@ -123,12 +126,12 @@ def evaluate_stage2_unified(
             raise ValueError("Ablation translator names must be nonempty and unambiguous.")
         ablation_translators[name] = model.to(device_obj).eval()
     root = Path(output_dir)
-    final_path = root / "result.json"
+    result_path = root / "result.json"
     existing_result: dict[str, Any] | None = None
-    if final_path.exists():
+    if result_path.exists():
         if not resume:
             raise FileExistsError("Unified evaluation result exists; pass resume to verify it.")
-        result = json.loads(final_path.read_text(encoding="utf-8"))
+        result = json.loads(result_path.read_text(encoding="utf-8"))
         stored = result.pop("result_sha256", None)
         if stored != sha256_json(result):
             raise ValueError("Unified evaluation result hash mismatch.")
@@ -142,8 +145,13 @@ def evaluate_stage2_unified(
     shard_dir = root / "case_shards"
     shard_dir.mkdir(exist_ok=True)
     run_contract: dict[str, Any] = {
-        "contract_version": "stage2-unified-selected-best-evaluation-run-v3",
+        "contract_version": "stage2-unified-selected-best-evaluation-run-v4",
         "evaluation_role": evaluation_role,
+        "evidence_interpretation": (
+            P0006_EVIDENCE_LIMITATION
+            if evaluation_role == P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+            else "complete genuine paired R/validation development evidence"
+        ),
         "evaluation_protocol_sha256": evaluation_identity_sha256,
         "bank_artifact_sha256": bank.artifact_sha256,
         "latent_statistics_sha256": stats.artifact_sha256,
@@ -173,7 +181,7 @@ def evaluate_stage2_unified(
         write_json_atomic(contract_path, run_contract, refuse_existing=True)
     if existing_result is not None:
         if existing_result.get("run_contract_sha256") != run_contract["run_contract_sha256"]:
-            raise ValueError("Unified final result belongs to a different run contract.")
+            raise ValueError("Unified result belongs to a different run contract.")
         return existing_result
     metrics = OfficialQualificationMetrics(device=str(device_obj))
     by_case = {record.case_id: index for index, record in enumerate(bank.records)}
@@ -205,7 +213,7 @@ def evaluate_stage2_unified(
             raise ValueError("Unified evaluation source support is not a 3-D full volume.")
         image_support_batch = canonical_support[None, None].to(device_obj)
         source_id = str(case.source_provenance["case_id"])
-        if evaluation_role == "held_out_P0006_final_evaluation_only":
+        if evaluation_role == P0006_DEVELOPMENT_VALIDATION_DATA_ROLE:
             assert encoder is not None
             canonical = canonical_context.values
             if canonical.ndim == 3:
@@ -435,8 +443,16 @@ def evaluate_stage2_unified(
     result: dict[str, Any] = {
         "contract_version": UNIFIED_EVALUATION_CONTRACT,
         "scope": evaluation_role,
+        "evidence_interpretation": (
+            P0006_EVIDENCE_LIMITATION
+            if evaluation_role == P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+            else "complete genuine paired R/validation development evidence"
+        ),
+        "population_or_generalization_claims_authorized": False,
+        "P0009_confirmation_status": P0009_CONFIRMATION_STATUS,
+        "P0009_executed": False,
         "prospective_records_loaded": (
-            len(rows) if evaluation_role == "held_out_P0006_final_evaluation_only" else 0
+            len(rows) if evaluation_role == P0006_DEVELOPMENT_VALIDATION_DATA_ROLE else 0
         ),
         "training_or_model_selection_prospective_records": 0,
         "evaluation_protocol_sha256": evaluation_identity_sha256,
@@ -470,7 +486,7 @@ def evaluate_stage2_unified(
         "learned_disentanglement_claim": "none",
     }
     result["result_sha256"] = sha256_json(result)
-    write_json_atomic(final_path, result, refuse_existing=True)
+    write_json_atomic(result_path, result, refuse_existing=True)
     _write_markdown(root / "report.md", result)
     return result
 

@@ -1,8 +1,9 @@
-"""Strict evaluation-only import of the sealed Gate01Private P:0006 graph.
+"""Strict development-validation import of the sealed Gate01Private P:0006 graph.
 
 This module does not train, select, or recompute a baseline model.  It verifies the
 existing Gate 0.1 archive, materializes no prediction arrays, and exposes the frozen
-P:0006 endpoints only to final evaluation after long-run readiness has been sealed.
+P:0006 endpoints only to development/model assessment after readiness has been sealed.
+This evidence cannot support population or generalization claims.
 """
 
 from __future__ import annotations
@@ -46,10 +47,17 @@ from fieldbridge.training.stage2_unified import (
 )
 
 GATE01_P0006_EVALUATION_PROTOCOL = (
-    "stage2-unified-gate01-p0006-evaluation-only-protocol-v1"
+    "stage2-unified-gate01-p0006-development-validation-evaluation-only-protocol-v2"
 )
 P0006_SUBJECT_GROUP = "P:0006"
 P0006_IDENTITY_SHA256 = sha256_text(P0006_SUBJECT_GROUP)
+P0006_DEVELOPMENT_VALIDATION_DATA_ROLE = (
+    "development_validation_P0006_evaluation_only"
+)
+P0006_EVIDENCE_LIMITATION = (
+    "development/model assessment only; cannot support population or generalization claims"
+)
+P0009_CONFIRMATION_STATUS = "frozen_and_unused_for_possible_later_confirmation"
 FORBIDDEN_OTHER_TRAVELLER_HASHES = {
     sha256_text("P:0007"),
     sha256_text("P:0009"),
@@ -64,7 +72,7 @@ def import_gate01_p0006_evaluation_protocol(
     validation_plan_path: str | Path,
     output_path: str | Path,
 ) -> dict[str, Any]:
-    """Validate Gate01Private_8012a3f and seal its P:0006 final-evaluation graph."""
+    """Seal Gate01Private_8012a3f for P:0006 development/model assessment only."""
 
     root = Path(archive_root).resolve()
     if not root.is_dir():
@@ -104,7 +112,7 @@ def import_gate01_p0006_evaluation_protocol(
         or evidence.get("evidence_kind") != "private"
         or evidence.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256
     ):
-        raise ValueError("Gate 0.1 archive is not the held-out P:0006 private graph.")
+        raise ValueError("Gate 0.1 archive is not the reviewed P:0006 private graph.")
     if lock.traveller_identity_sha256 != P0006_IDENTITY_SHA256:
         raise ValueError("Gate 0.1 protocol lock is not pinned to P:0006.")
     if lock.traveller_identity_sha256 in FORBIDDEN_OTHER_TRAVELLER_HASHES:
@@ -170,7 +178,9 @@ def import_gate01_p0006_evaluation_protocol(
 
     body: dict[str, Any] = {
         "contract_version": GATE01_P0006_EVALUATION_PROTOCOL,
-        "data_role": "held-out_P0006_final_evaluation_only_not_training_or_selection",
+        "data_role": P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+        "evidence_interpretation": P0006_EVIDENCE_LIMITATION,
+        "population_or_generalization_claims_authorized": False,
         "archive_identity": {
             "root_path_identity_sha256": sha256_text(str(root)),
             "inventory_file_sha256": sha256_file(inventory_path),
@@ -234,6 +244,8 @@ def import_gate01_p0006_evaluation_protocol(
         ),
         "training_or_model_selection_use": False,
         "forbidden_travellers": ["P:0007", "P:0009"],
+        "P0009_confirmation_status": P0009_CONFIRMATION_STATUS,
+        "P0009_executed": False,
     }
     body["protocol_sha256"] = sha256_json(body)
     write_json_atomic(output_path, body, refuse_existing=True)
@@ -255,8 +267,13 @@ def load_gate01_p0006_evaluation_protocol(
     if (
         protocol.get("subject_group_identity") != P0006_SUBJECT_GROUP
         or protocol.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256
+        or protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+        or protocol.get("evidence_interpretation") != P0006_EVIDENCE_LIMITATION
+        or protocol.get("population_or_generalization_claims_authorized") is not False
         or protocol.get("training_or_model_selection_use") is not False
         or protocol.get("private_arrays_validated") is not True
+        or protocol.get("P0009_confirmation_status") != P0009_CONFIRMATION_STATUS
+        or protocol.get("P0009_executed") is not False
     ):
         raise ValueError("P:0006 evaluation-only role or identity changed.")
     manifest_path = _verified_protocol_file(protocol, "gate01_manifest")
@@ -344,7 +361,7 @@ def _case_receipt(
         or case.traveller_identity_sha256 in FORBIDDEN_OTHER_TRAVELLER_HASHES
         or case.source_image is None
     ):
-        raise ValueError("Gate 0.1 case is not exclusively held-out P:0006.")
+        raise ValueError("Gate 0.1 case is not exclusively the reviewed P:0006 identity.")
     calibrated = calibrator.apply(
         case.raw_identity, case.target_domain, support_mask=case.support_mask
     )
@@ -504,8 +521,11 @@ def _verified_protocol_file(protocol: Mapping[str, Any], key: str) -> Path:
 
 __all__ = [
     "GATE01_P0006_EVALUATION_PROTOCOL",
+    "P0006_DEVELOPMENT_VALIDATION_DATA_ROLE",
+    "P0006_EVIDENCE_LIMITATION",
     "P0006_IDENTITY_SHA256",
     "P0006_SUBJECT_GROUP",
+    "P0009_CONFIRMATION_STATUS",
     "import_gate01_p0006_evaluation_protocol",
     "load_gate01_p0006_evaluation_protocol",
 ]

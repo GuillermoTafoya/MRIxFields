@@ -48,9 +48,13 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.train_loop import assert_frozen
 from fieldbridge.utils.seeding import seed_everything
 
-UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v4"
-UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v4"
-UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v4"
+UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v5"
+UNIFIED_STAGE2_CONFIG_CONTRACT = "stage2-unified-retrospective-full-model-config-v5"
+UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v5"
+UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v5"
+UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT = (
+    "stage2-unified-pilot-training-plus-validation-runtime-projection-v1"
+)
 UNIFIED_VALIDATION_PLAN_CONTRACT = "stage2-unified-validation-plan-v2"
 UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v3"
 UNIFIED_SELECTION_RULE_CONTRACT = "stage2-unified-critic-independent-selection-rule-v1"
@@ -141,6 +145,11 @@ class UnifiedStage2Config:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "UnifiedStage2Config":
+        declared_contract = data.get("contract")
+        if declared_contract is not None and declared_contract != UNIFIED_STAGE2_CONFIG_CONTRACT:
+            raise ValueError(
+                "Unified Stage-2 configuration contract is obsolete or unsupported."
+            )
         defaults = cls()
         training = data.get("training", data)
         if not isinstance(training, Mapping):
@@ -759,6 +768,9 @@ def run_stage2_unified_train(
     last_checkpoint: Path | None = cfg.resume_from
     start = time.perf_counter()
     for step in range(cursor, cfg.steps):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
         step_start = time.perf_counter()
         try:
             batch = _sample_training_batch(train_index, pools, stats, cfg, device, sampler)
@@ -793,13 +805,16 @@ def run_stage2_unified_train(
         generator_scheduler.step()
         if bool(row["critic/updated"]):
             critic_scheduler.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        step_seconds = time.perf_counter() - step_start
         row.update(
             {
                 "contract_version": UNIFIED_HISTORY_CONTRACT,
                 "step": step + 1,
                 "elapsed_seconds": time.perf_counter() - start,
-                "step_seconds": time.perf_counter() - step_start,
-                "examples_per_second": cfg.batch_size / max(1e-9, time.perf_counter() - step_start),
+                "step_seconds": step_seconds,
+                "examples_per_second": cfg.batch_size / max(1e-9, step_seconds),
                 "peak_cuda_bytes": (
                     int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
                 ),
@@ -813,41 +828,61 @@ def run_stage2_unified_train(
         print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
         if step < cfg.pilot_steps:
             pilot_rows.append(dict(row))
-        if cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps:
-            pilot_report = _pilot_report(pilot_rows, cfg)
-            _append_jsonl(
-                history_path,
-                {
-                    "contract_version": UNIFIED_HISTORY_CONTRACT,
-                    "event": "full_objective_pilot",
-                    "step": step + 1,
-                    "pilot": pilot_report,
-                    "run_fingerprint": run_fingerprint,
-                    "history_generation": history_generation,
-                },
-            )
-            if pilot_report["status"] != "pass":
-                raise RuntimeError(
-                    "Unified Stage-2 full-objective pilot failed: "
-                    + ", ".join(pilot_report["failures"])
-                )
+        pilot_complete = cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps
         validation_due = (
             (step + 1) % cfg.validation_every_steps == 0
             or step + 1 == cfg.steps
-            or (cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps)
+            or pilot_complete
         )
+        validation: dict[str, Any] | None = None
         if validation_due:
-            validation = _evaluate_unpaired_validation(
-                cfg,
-                translator,
-                critic,
-                decoder,
-                validation_index,
-                validation_plan,
-                stats,
-                device,
-                step=step + 1,
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize(device)
+            validation_start = time.perf_counter()
+            try:
+                validation = _evaluate_unpaired_validation(
+                    cfg,
+                    translator,
+                    critic,
+                    decoder,
+                    validation_index,
+                    validation_plan,
+                    stats,
+                    device,
+                    step=step + 1,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            except torch.OutOfMemoryError:
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                _append_jsonl(
+                    history_path,
+                    {
+                        "contract_version": UNIFIED_HISTORY_CONTRACT,
+                        "step": step + 1,
+                        "event": "oom_hard_stop",
+                        "phase": "complete_validation",
+                        "fallback": "forbidden",
+                        "run_fingerprint": run_fingerprint,
+                        "history_generation": history_generation,
+                    },
+                )
+                raise
+            complete_validation_seconds = time.perf_counter() - validation_start
+            validation_peak_cuda_bytes = (
+                int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
             )
+            validation["runtime"] = {
+                "contract_version": UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT,
+                "measured_complete_validation_seconds": complete_validation_seconds,
+                "complete_validation_edge_count": int(validation["edge_count"]),
+                "complete_validation_directed_domain_cell_count": len(
+                    validation["directed_domain_cell_counts"]
+                ),
+                "peak_cuda_bytes": validation_peak_cuda_bytes,
+            }
             _append_jsonl(
                 history_path,
                 {
@@ -864,6 +899,38 @@ def run_stage2_unified_train(
             if selection["best_score"] is None or current_score < float(selection["best_score"]):
                 selection["best_score"] = current_score
                 selection["best_step"] = step + 1
+        if pilot_complete:
+            if validation is None:
+                raise RuntimeError("Pilot completion requires one complete frozen-plan validation.")
+            validation_runtime = validation["runtime"]
+            pilot_report = _pilot_report(
+                pilot_rows,
+                cfg,
+                complete_validation_seconds=float(
+                    validation_runtime["measured_complete_validation_seconds"]
+                ),
+                validation_peak_cuda_bytes=int(validation_runtime["peak_cuda_bytes"]),
+                complete_validation_directed_domain_cell_count=int(
+                    validation_runtime["complete_validation_directed_domain_cell_count"]
+                ),
+            )
+            _append_jsonl(
+                history_path,
+                {
+                    "contract_version": UNIFIED_HISTORY_CONTRACT,
+                    "event": "full_objective_pilot",
+                    "step": step + 1,
+                    "pilot": pilot_report,
+                    "validation_plan_sha256": validation_plan_sha256,
+                    "run_fingerprint": run_fingerprint,
+                    "history_generation": history_generation,
+                },
+            )
+            if pilot_report["status"] != "pass":
+                raise RuntimeError(
+                    "Unified Stage-2 full-objective pilot failed: "
+                    + ", ".join(pilot_report["failures"])
+                )
         if cfg.checkpoint_dir is not None and cfg.checkpoint_every_steps > 0:
             if (step + 1) % cfg.checkpoint_every_steps == 0 or validation_due:
                 checkpoint_identity = str(
@@ -1940,7 +2007,12 @@ def _module_state_sha256(module: nn.Module) -> str:
 
 
 def _pilot_report(
-    rows: Sequence[Mapping[str, Any]], cfg: UnifiedStage2Config
+    rows: Sequence[Mapping[str, Any]],
+    cfg: UnifiedStage2Config,
+    *,
+    complete_validation_seconds: float,
+    validation_peak_cuda_bytes: int,
+    complete_validation_directed_domain_cell_count: int,
 ) -> dict[str, Any]:
     if not rows:
         return {"status": "not_requested", "steps": 0, "failures": []}
@@ -1997,11 +2069,19 @@ def _pilot_report(
         failures.append("uncontrolled_smoothed_loss_growth")
     step_seconds = [float(row["step_seconds"]) for row in rows]
     mean_step_seconds = float(np.mean(step_seconds))
-    projected_seconds = mean_step_seconds * cfg.projected_steps
-    projected_cost = (
-        projected_seconds / 3600.0 * cfg.gpu_hourly_cost_usd
-        if cfg.gpu_hourly_cost_usd is not None
-        else None
+    if not np.isfinite(complete_validation_seconds) or complete_validation_seconds <= 0:
+        failures.append("invalid_complete_validation_runtime")
+    if validation_peak_cuda_bytes < 0:
+        failures.append("invalid_validation_peak_memory")
+    runtime = _pilot_runtime_projection(
+        mean_training_step_seconds=mean_step_seconds,
+        complete_validation_seconds=complete_validation_seconds,
+        training_peak_cuda_bytes=max(int(row["peak_cuda_bytes"]) for row in rows),
+        validation_peak_cuda_bytes=validation_peak_cuda_bytes,
+        complete_validation_directed_domain_cell_count=(
+            complete_validation_directed_domain_cell_count
+        ),
+        cfg=cfg,
     )
     return {
         "status": "pass" if not failures else "fail",
@@ -2057,17 +2137,7 @@ def _pilot_report(
                 np.mean([float(row["critic/generated_domain_accuracy"]) for row in rows])
             ),
         },
-        "runtime": {
-            "mean_step_seconds": mean_step_seconds,
-            "examples_per_second": cfg.batch_size / max(mean_step_seconds, 1.0e-12),
-            "peak_cuda_bytes": max(int(row["peak_cuda_bytes"]) for row in rows),
-            "projected_steps": cfg.projected_steps,
-            "projected_seconds": projected_seconds,
-            "projected_hours": projected_seconds / 3600.0,
-            "gpu_hourly_cost_usd": cfg.gpu_hourly_cost_usd,
-            "projected_cost_usd": projected_cost,
-            "cost_status": "measured_rate" if projected_cost is not None else "operator_rate_required",
-        },
+        "runtime": runtime,
         "hard_stop_conditions": [
             "nonfinite",
             "missing_gradient",
@@ -2076,6 +2146,104 @@ def _pilot_report(
             "uncontrolled_loss_growth",
             "oom",
         ],
+    }
+
+
+def _pilot_runtime_projection(
+    *,
+    mean_training_step_seconds: float,
+    complete_validation_seconds: float,
+    training_peak_cuda_bytes: int,
+    validation_peak_cuda_bytes: int,
+    complete_validation_directed_domain_cell_count: int,
+    cfg: UnifiedStage2Config,
+) -> dict[str, Any]:
+    """Project the configured run from measured training and complete validation phases."""
+
+    if not np.isfinite(mean_training_step_seconds) or mean_training_step_seconds <= 0:
+        raise ValueError("Mean training-step runtime must be finite and positive.")
+    if not np.isfinite(complete_validation_seconds) or complete_validation_seconds <= 0:
+        raise ValueError("Complete-validation runtime must be finite and positive.")
+    if training_peak_cuda_bytes < 0 or validation_peak_cuda_bytes < 0:
+        raise ValueError("Peak memory measurements must be non-negative.")
+    if complete_validation_directed_domain_cell_count != 60:
+        raise ValueError("Pilot projection requires the complete 60-cell validation plan.")
+    schedule = _planned_validation_schedule(
+        projected_steps=cfg.projected_steps,
+        validation_every_steps=cfg.validation_every_steps,
+        pilot_steps=cfg.pilot_steps,
+    )
+    projected_training_seconds = mean_training_step_seconds * cfg.projected_steps
+    projected_validation_seconds = (
+        complete_validation_seconds * schedule["planned_validation_run_count"]
+    )
+    projected_total_seconds = projected_training_seconds + projected_validation_seconds
+    projected_total_hours = projected_total_seconds / 3600.0
+    projected_total_gpu_cost = (
+        projected_total_hours * cfg.gpu_hourly_cost_usd
+        if cfg.gpu_hourly_cost_usd is not None
+        else None
+    )
+    return {
+        "contract_version": UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT,
+        "authorization_estimate_scope": "projected_training_plus_complete_validation",
+        "measured_mean_training_step_seconds": mean_training_step_seconds,
+        "measured_complete_validation_seconds": complete_validation_seconds,
+        "measured_complete_validation_directed_domain_cell_count": (
+            complete_validation_directed_domain_cell_count
+        ),
+        "examples_per_training_second": cfg.batch_size
+        / max(mean_training_step_seconds, 1.0e-12),
+        "projected_steps": cfg.projected_steps,
+        "validation_every_steps": cfg.validation_every_steps,
+        **schedule,
+        "projected_training_seconds": projected_training_seconds,
+        "projected_validation_seconds": projected_validation_seconds,
+        "projected_total_seconds": projected_total_seconds,
+        "projected_total_hours": projected_total_hours,
+        "gpu_hourly_cost_usd": cfg.gpu_hourly_cost_usd,
+        "projected_total_gpu_cost_usd": projected_total_gpu_cost,
+        "cost_status": (
+            "measured_training_and_validation_with_operator_rate"
+            if projected_total_gpu_cost is not None
+            else "operator_rate_required"
+        ),
+        "training_peak_cuda_bytes": training_peak_cuda_bytes,
+        "validation_peak_cuda_bytes": validation_peak_cuda_bytes,
+        "peak_cuda_bytes_across_training_and_validation": max(
+            training_peak_cuda_bytes, validation_peak_cuda_bytes
+        ),
+    }
+
+
+def _planned_validation_schedule(
+    *, projected_steps: int, validation_every_steps: int, pilot_steps: int
+) -> dict[str, Any]:
+    """Count actual validation events, de-duplicating cadence, pilot, and terminal steps."""
+
+    if projected_steps < 1 or validation_every_steps < 1 or pilot_steps < 0:
+        raise ValueError("Projected steps/cadence must be positive and pilot steps non-negative.")
+    cadence_run_count = projected_steps // validation_every_steps
+    special_steps = {projected_steps}
+    pilot_in_projected_run = 0 < pilot_steps <= projected_steps
+    if pilot_in_projected_run:
+        special_steps.add(pilot_steps)
+    additional_steps = sorted(
+        step for step in special_steps if step % validation_every_steps != 0
+    )
+    return {
+        "cadence_validation_run_count": cadence_run_count,
+        "pilot_boundary_validation_in_projected_run": pilot_in_projected_run,
+        "terminal_validation_count": 1,
+        "terminal_validation_already_on_cadence": (
+            projected_steps % validation_every_steps == 0
+        ),
+        "additional_non_cadence_validation_steps": additional_steps,
+        "planned_validation_run_count": cadence_run_count + len(additional_steps),
+        "terminal_validation_counting_rule": (
+            "terminal step is the union of cadence, pilot-boundary, and terminal events "
+            "and is counted exactly once"
+        ),
     }
 
 

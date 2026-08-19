@@ -350,6 +350,7 @@ def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: P
         pilot_steps=2,
         pilot_smoothing_window=2,
         gpu_hourly_cost_usd=2.5,
+        validation_every_steps=1000,
     )
     rows = []
     for step in range(2):
@@ -375,12 +376,92 @@ def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: P
             row[f"weighted/{term}"] = weight
             row[f"gradient/term_{term}"] = 0.5
         rows.append(row)
-    report = unified._pilot_report(rows, cfg)
+    report = unified._pilot_report(
+        rows,
+        cfg,
+        complete_validation_seconds=30.0,
+        validation_peak_cuda_bytes=4321,
+        complete_validation_directed_domain_cell_count=60,
+    )
     assert report["status"] == "pass"
     assert set(report["term_gradient_norms"]) == set(DEFAULT_UNIFIED_WEIGHTS)
     assert report["critic"]["real_score_distribution"]["p50"] == 0.1
-    assert report["runtime"]["projected_seconds"] == 200_000.0
-    assert report["runtime"]["projected_cost_usd"] == pytest.approx(138.8888889)
+    runtime = report["runtime"]
+    assert runtime["authorization_estimate_scope"] == (
+        "projected_training_plus_complete_validation"
+    )
+    assert runtime["measured_mean_training_step_seconds"] == 2.0
+    assert runtime["measured_complete_validation_seconds"] == 30.0
+    assert runtime["measured_complete_validation_directed_domain_cell_count"] == 60
+    assert runtime["planned_validation_run_count"] == 101
+    assert runtime["terminal_validation_count"] == 1
+    assert runtime["projected_training_seconds"] == 200_000.0
+    assert runtime["projected_validation_seconds"] == 3030.0
+    assert runtime["projected_total_hours"] == pytest.approx(203_030.0 / 3600.0)
+    assert runtime["projected_total_gpu_cost_usd"] == pytest.approx(
+        203_030.0 / 3600.0 * 2.5
+    )
+    assert runtime["peak_cuda_bytes_across_training_and_validation"] == 4321
+
+
+def test_validation_schedule_counts_pilot_cadence_and_terminal_exactly_once(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        pilot_steps=200,
+        projected_steps=100_000,
+        validation_every_steps=1000,
+    )
+    schedule = unified._planned_validation_schedule(
+        projected_steps=cfg.projected_steps,
+        validation_every_steps=cfg.validation_every_steps,
+        pilot_steps=cfg.pilot_steps,
+    )
+    assert schedule["cadence_validation_run_count"] == 100
+    assert schedule["additional_non_cadence_validation_steps"] == [200]
+    assert schedule["planned_validation_run_count"] == 101
+    assert schedule["terminal_validation_count"] == 1
+    assert schedule["terminal_validation_already_on_cadence"] is True
+
+    terminal_is_pilot = unified._planned_validation_schedule(
+        projected_steps=200,
+        validation_every_steps=1000,
+        pilot_steps=200,
+    )
+    assert terminal_is_pilot["additional_non_cadence_validation_steps"] == [200]
+    assert terminal_is_pilot["planned_validation_run_count"] == 1
+    assert terminal_is_pilot["terminal_validation_count"] == 1
+
+
+def test_slow_complete_validation_increases_total_projection_and_cost(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(
+        tmp_path,
+        pilot_steps=200,
+        projected_steps=100_000,
+        validation_every_steps=1000,
+        gpu_hourly_cost_usd=4.0,
+    )
+    common = {
+        "mean_training_step_seconds": 1.0,
+        "training_peak_cuda_bytes": 100,
+        "validation_peak_cuda_bytes": 200,
+        "complete_validation_directed_domain_cell_count": 60,
+        "cfg": cfg,
+    }
+    fast = unified._pilot_runtime_projection(
+        complete_validation_seconds=1.0, **common
+    )
+    deliberately_slow = unified._pilot_runtime_projection(
+        complete_validation_seconds=600.0, **common
+    )
+    assert deliberately_slow["projected_validation_seconds"] == 600.0 * 101
+    assert deliberately_slow["projected_total_hours"] > fast["projected_total_hours"]
+    assert deliberately_slow["projected_total_gpu_cost_usd"] > fast[
+        "projected_total_gpu_cost_usd"
+    ]
 
 
 def test_validation_plan_is_step_and_variant_independent_and_freezes_all_draws() -> None:

@@ -28,7 +28,10 @@ from fieldbridge.evaluation.stage2_unified_preflight import (
 )
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     GATE01_P0006_EVALUATION_PROTOCOL,
+    P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+    P0006_EVIDENCE_LIMITATION,
     P0006_IDENTITY_SHA256,
+    P0009_CONFIRMATION_STATUS,
 )
 
 
@@ -382,7 +385,9 @@ def test_long_run_readiness_accepts_only_sealed_p0006_when_r_pairs_are_absent(
     )
     body = {
         "contract_version": GATE01_P0006_EVALUATION_PROTOCOL,
-        "data_role": "held-out_P0006_final_evaluation_only_not_training_or_selection",
+        "data_role": P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+        "evidence_interpretation": P0006_EVIDENCE_LIMITATION,
+        "population_or_generalization_claims_authorized": False,
         "traveller_identity_sha256": P0006_IDENTITY_SHA256,
         "acquisition_count": 15,
         "directed_pair_count": 60,
@@ -391,6 +396,8 @@ def test_long_run_readiness_accepts_only_sealed_p0006_when_r_pairs_are_absent(
         "training_or_model_selection_use": False,
         "factored_bank": {"P_record_count": 0},
         "frozen_unpaired_validation": {"P_endpoint_count": 0},
+        "P0009_confirmation_status": P0009_CONFIRMATION_STATUS,
+        "P0009_executed": False,
         "gate01_result": {"file_sha256": "a" * 64},
     }
     protocol = dict(body)
@@ -405,7 +412,11 @@ def test_long_run_readiness_accepts_only_sealed_p0006_when_r_pairs_are_absent(
     )
     assert feasibility["paired_evaluation_possible"] is False
     assert readiness["long_run_authorized_by_evaluation_path"] is True
-    assert readiness["evaluation_role"] == "sealed_held_out_P0006_final_evaluation_only"
+    assert readiness["evaluation_role"] == P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+    assert readiness["evidence_interpretation"] == P0006_EVIDENCE_LIMITATION
+    assert readiness["population_or_generalization_claims_authorized"] is False
+    assert readiness["P0009_confirmation_status"] == P0009_CONFIRMATION_STATUS
+    assert readiness["P0009_executed"] is False
     assert readiness["prospective_protocol_used"] is True
     assert readiness["prospective_training_or_model_selection_use"] is False
     assert readiness["directed_pair_count"] == 60
@@ -427,13 +438,18 @@ def test_long_run_readiness_rejects_p0006_shortcuts_or_wrong_traveller(
     feasibility_path = tmp_path / "feasibility.json"
     audit_retrospective_paired_feasibility(split_path, output_path=feasibility_path)
     for mutation in (
+        {"data_role": "legacy_p0006_evaluation_role"},
+        {"evidence_interpretation": "unsupported claim scope"},
         {"traveller_identity_sha256": "7" * 64},
         {"factored_bank": {"P_record_count": 1}},
         {"frozen_unpaired_validation": {"P_endpoint_count": 1}},
+        {"P0009_executed": True},
     ):
         body = {
             "contract_version": GATE01_P0006_EVALUATION_PROTOCOL,
-            "data_role": "held-out_P0006_final_evaluation_only_not_training_or_selection",
+            "data_role": P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+            "evidence_interpretation": P0006_EVIDENCE_LIMITATION,
+            "population_or_generalization_claims_authorized": False,
             "traveller_identity_sha256": P0006_IDENTITY_SHA256,
             "acquisition_count": 15,
             "directed_pair_count": 60,
@@ -442,6 +458,8 @@ def test_long_run_readiness_rejects_p0006_shortcuts_or_wrong_traveller(
             "training_or_model_selection_use": False,
             "factored_bank": {"P_record_count": 0},
             "frozen_unpaired_validation": {"P_endpoint_count": 0},
+            "P0009_confirmation_status": P0009_CONFIRMATION_STATUS,
+            "P0009_executed": False,
             "gate01_result": {"file_sha256": "a" * 64},
             **mutation,
         }

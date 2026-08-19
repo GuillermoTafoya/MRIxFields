@@ -563,7 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v4.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v5.yaml"),
     )
     train_unified.add_argument("--bank-dir", type=Path, required=True)
     train_unified.add_argument("--vae-config", type=Path, required=True)
@@ -622,7 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
         "import-stage2-gate01-p0006-evaluation",
         help=(
             "Validate the sealed Gate01Private P:0006 archive and create an "
-            "evaluation-only protocol receipt."
+            "evaluation-only development-validation protocol receipt."
         ),
     )
     p0006_import.add_argument("--archive-root", type=Path, required=True)
@@ -650,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v4.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v5.yaml"),
     )
     eval_unified.add_argument("--bank-dir", type=Path, required=True)
     evaluation_model = eval_unified.add_mutually_exclusive_group(required=True)

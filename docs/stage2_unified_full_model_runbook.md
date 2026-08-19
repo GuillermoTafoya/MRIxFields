@@ -66,7 +66,7 @@ conflicting R/P evidence is an integrity error; it cannot coexist with
 `complete_inventory_no_selection: true`. The audit then
 seals every same-subject/same-contrast/cross-field directed R/validation edge. If it reports no
 edges, paired R/validation evaluation is impossible and unrelated subjects must not be paired.
-A held-out P endpoint is never a substitute for validation or selection. If genuine R edges do
+A P endpoint is never a substitute for R-only validation or checkpoint selection. If genuine R edges do
 exist, import the reviewed producer-export archive and let the repository construct every
 evaluator manifest:
 
@@ -102,8 +102,10 @@ fieldbridge seal-stage2-long-run-evaluation-readiness \
 ```
 
 When the feasibility audit proves that no genuine R pair exists, import the already sealed
-`Gate01Private_8012a3f` graph instead. This is a separately versioned P:0006-only final-evaluation
-protocol, not a training or model-selection input:
+`Gate01Private_8012a3f` graph instead. Its forward-versioned data role is exactly
+`development_validation_P0006_evaluation_only`. P:0006 was already inspected during method
+development, so this protocol supports development/model assessment only and cannot support
+population or generalization claims. It is not a training or model-selection input:
 
 ```bash
 fieldbridge import-stage2-gate01-p0006-evaluation \
@@ -129,16 +131,17 @@ validation plan contains no P endpoint. Original SB-v2 arrays are imported; cali
 is deterministically re-derived from the existing raw identity, source support, and frozen Gate
 0.1 calibrator and its tensor identity is sealed. No baseline model is rerun.
 
-Readiness v2 accepts exactly one feasible route: complete genuine R/validation pairs when they
-exist, otherwise the sealed P:0006 evaluation-only protocol. Absence of both hard-stops before the
-long-run authorization flag.
+Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
+exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records
+that P:0009 remains frozen and unused for possible later confirmation; this PR does not execute
+P:0009. Absence of both routes hard-stops before the long-run authorization flag.
 
 5. Run the 200-step full-objective pilot. It uses the same six objectives and initial weights as
    the strongest model:
 
 ```bash
 fieldbridge train-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v4.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v5.yaml \
   --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
   --checkpoint-dir "$PILOT_CHECKPOINTS" --history-jsonl "$PILOT_HISTORY" \
   --steps 200 --pilot-steps 200 --device cuda
@@ -146,11 +149,16 @@ fieldbridge train-stage2-unified \
 
 The pilot logs raw/weighted terms, each term's translator-gradient norm, generator/critic norms,
 critic score means/std/quantiles/separation/saturation, real/generated domain accuracy,
-first/last/smoothed loss behavior, auxiliary/flow ratios, throughput, peak memory, and projected
-100k-step time. Cost is reported only when the operator supplies an hourly GPU rate. It hard-stops
-on nonfinite values, missing gradients, discriminator saturation, uncontrolled auxiliary
-dominance/loss growth, or OOM. Frozen decoder parameters remain unchanged and every decoder call
-receives denormalized latent coordinates.
+first/last/smoothed loss behavior and auxiliary/flow ratios. Runtime projection v1 measures and
+reports the mean training-step seconds and one complete 60-cell validation separately. It computes
+projected training seconds, the exact union of cadence, pilot-boundary, and terminal validation
+runs (with the terminal counted exactly once), projected validation seconds, total hours, total
+GPU cost at the operator-supplied rate, and peak memory across both phases. The long-run flag is
+shown only alongside this training-plus-validation total; a training-only projection is not an
+authorization estimate. The pilot hard-stops on nonfinite values, missing gradients,
+discriminator saturation, uncontrolled auxiliary dominance/loss growth, or training/validation
+OOM. Frozen decoder parameters remain unchanged and every decoder call receives denormalized
+latent coordinates.
 
 Before any validation array is loaded, `stage2-unified-validation-plan-v2` freezes the complete
 R/validation source inventory. Every source is assigned one subject-excluded target at each of
@@ -192,14 +200,14 @@ fieldbridge train-stage2-unified \
 ```
 
 7. Evaluate selected-best, never merely final. Use the genuine R manifests when feasibility
-   succeeds; otherwise use the sealed P:0006 protocol. P:0006 is encoded at evaluation time as
+   succeeds; otherwise use the sealed P:0006 development-validation protocol. P:0006 is encoded at evaluation time as
    `E(N_d(x))` through the frozen posterior-mean full-volume encoder and normalized with R/train
    factored-bank statistics. It never enters that bank, the pilot, validation, selection, or
    checkpoints.
 
 ```bash
 fieldbridge eval-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v4.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v5.yaml \
   --bank-dir "$BANK_DIR" --selection-receipt "$LATEST_FULL_SELECTION_RECEIPT" \
   --sb-only-checkpoint "$SB_ONLY_CHECKPOINT" \
   --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
@@ -223,8 +231,11 @@ domain, target domain, contrast, directed pair, and ordinary/catastrophic stratu
 intermediates; anatomy/edge/gradient preservation; raw pre-mask decoder background leakage; and
 montages containing raw identity, calibrated identity, original SB-v2, factored SB-only when
 trained, full prediction, Stage-1 ceiling, and error. This makes no learned-disentanglement or
-promotion claim. The P:0006 branch is separately labelled held-out final evaluation evidence and
-must never be described as retrospective validation.
+promotion claim. The P:0006 branch is labelled
+`development_validation_P0006_evaluation_only`: it supports development/model assessment only
+and cannot support population or generalization claims. It is separate from the frozen unpaired
+R/validation plan and never enters training or checkpoint selection. P:0009 stays frozen and
+unused for possible later confirmation.
 
 Spectral normalization and lazy R1 remain disabled in the primary configuration. Critic score
 distributions, domain accuracy, and saturation evidence must be reviewed before either is added as

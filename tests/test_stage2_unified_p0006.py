@@ -216,6 +216,11 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert protocol["factored_bank"]["P_record_count"] == 0
     assert protocol["frozen_unpaired_validation"]["P_endpoint_count"] == 0
     assert protocol["full_volume_decode_proof"]["path_used"] == ["full"]
+    assert protocol["data_role"] == p0006.P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+    assert protocol["evidence_interpretation"] == p0006.P0006_EVIDENCE_LIMITATION
+    assert protocol["population_or_generalization_claims_authorized"] is False
+    assert protocol["P0009_confirmation_status"] == p0006.P0009_CONFIRMATION_STATUS
+    assert protocol["P0009_executed"] is False
     assert len(protocol["case_receipts"]) == 60
 
     reloaded, paired_cases, baselines = p0006.load_gate01_p0006_evaluation_protocol(output)
@@ -223,6 +228,19 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert len(paired_cases) == len(baselines) == 60
     assert {case.subject_group_identity for case in paired_cases} == {"P:0006"}
     assert all(case.source_provenance["data_role"] == protocol["data_role"] for case in paired_cases)
+
+    obsolete_body = dict(protocol)
+    obsolete_body.pop("protocol_sha256")
+    obsolete_body["contract_version"] = (
+        "stage2-unified-gate01-p0006-evaluation-only-protocol-v1"
+    )
+    obsolete_path = tmp_path / "obsolete-p0006-protocol.json"
+    _write_json(
+        obsolete_path,
+        {**obsolete_body, "protocol_sha256": sha256_json(obsolete_body)},
+    )
+    with pytest.raises(ValueError, match="Unsupported"):
+        p0006.load_gate01_p0006_evaluation_protocol(obsolete_path)
 
     cases[0].array_sha256["target"] = "0" * 64  # type: ignore[index]
     with pytest.raises(ValueError, match="changed"):

@@ -41,7 +41,6 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
         "audit-photometry-factored-latent-bank",
         "preflight-stage2-factored-domain-separability",
         "audit-stage2-retrospective-pair-feasibility",
-        "seal-stage2-long-run-evaluation-readiness",
         "train-stage2-unified",
         "eval-stage2-unified",
     ]
@@ -68,7 +67,15 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     assert "FROZEN_VALIDATION_PLAN_SHA256" in source
     assert "selected_best_checkpoint" in source
     assert "final_checkpoint_diagnostic_only" in source
-    assert "no separately versioned reviewed prospective protocol is authorized" in source
+    assert "import-stage2-gate01-p0006-evaluation" in source
+    assert "import-stage2-retrospective-paired-evaluation" in source
+    assert "Gate01Private_8012a3f" in source
+    assert "stage2_unified_validation_plan_v2.json" in source
+    assert "required_directed_domain_cell_count" in source
+    assert "validation_directed_domain_cell_count': 60" in source
+    assert "prospective_training_or_model_selection': False" in source
+    assert "MATERIALIZED_VALIDATION_ARRAYS_RAW" not in source
+    assert "BASELINE_SOURCE_ARTIFACT_RAW" not in source
     assert "stage2_unified_full_retrospective_v2.yaml" not in source
 
 

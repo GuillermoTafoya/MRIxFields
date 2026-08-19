@@ -161,10 +161,14 @@ from fieldbridge.training.stage2_unified import (
     run_stage2_unified_train,
 )
 from fieldbridge.evaluation.stage2_unified import evaluate_stage2_unified
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    import_gate01_p0006_evaluation_protocol,
+)
 from fieldbridge.evaluation.stage2_unified_preflight import (
     audit_retrospective_paired_feasibility,
     build_baseline_prediction_manifest,
     build_retrospective_paired_manifest,
+    import_retrospective_paired_evaluation_archive,
     quantify_factored_domain_separability,
     seal_long_run_evaluation_readiness,
 )
@@ -604,15 +608,39 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_builder.add_argument("--source-artifact", type=Path, required=True)
     baseline_builder.add_argument("--out", type=Path, required=True)
 
+    r_paired_import = subparsers.add_parser(
+        "import-stage2-retrospective-paired-evaluation",
+        help="Import reviewed R-paired producer exports and construct all evaluator manifests.",
+    )
+    r_paired_import.add_argument("--feasibility", type=Path, required=True)
+    r_paired_import.add_argument("--archive-root", type=Path, required=True)
+    r_paired_import.add_argument("--photometry-artifact", type=Path, required=True)
+    r_paired_import.add_argument("--authorization-reference", required=True)
+    r_paired_import.add_argument("--out-dir", type=Path, required=True)
+
+    p0006_import = subparsers.add_parser(
+        "import-stage2-gate01-p0006-evaluation",
+        help=(
+            "Validate the sealed Gate01Private P:0006 archive and create an "
+            "evaluation-only protocol receipt."
+        ),
+    )
+    p0006_import.add_argument("--archive-root", type=Path, required=True)
+    p0006_import.add_argument("--expected-gate01-result-sha256", required=True)
+    p0006_import.add_argument("--bank-dir", type=Path, required=True)
+    p0006_import.add_argument("--validation-plan", type=Path, required=True)
+    p0006_import.add_argument("--out", type=Path, required=True)
+
     readiness = subparsers.add_parser(
         "seal-stage2-long-run-evaluation-readiness",
         help="Seal the complete deterministic paired R/validation path required before 100k training.",
     )
     readiness.add_argument("--feasibility", type=Path, required=True)
-    readiness.add_argument("--materialized-arrays", type=Path, required=True)
-    readiness.add_argument("--paired-manifest", type=Path, required=True)
-    readiness.add_argument("--baseline-source", type=Path, required=True)
-    readiness.add_argument("--baseline-predictions", type=Path, required=True)
+    readiness.add_argument("--materialized-arrays", type=Path)
+    readiness.add_argument("--paired-manifest", type=Path)
+    readiness.add_argument("--baseline-source", type=Path)
+    readiness.add_argument("--baseline-predictions", type=Path)
+    readiness.add_argument("--p0006-evaluation-protocol", type=Path)
     readiness.add_argument("--out", type=Path, required=True)
 
     eval_unified = subparsers.add_parser(
@@ -635,8 +663,9 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument("--vae-config", type=Path, required=True)
     eval_unified.add_argument("--vae-checkpoint", type=Path, required=True)
     eval_unified.add_argument("--photometry-artifact", type=Path, required=True)
-    eval_unified.add_argument("--paired-manifest", type=Path, required=True)
-    eval_unified.add_argument("--baseline-predictions", type=Path, required=True)
+    eval_unified.add_argument("--paired-manifest", type=Path)
+    eval_unified.add_argument("--baseline-predictions", type=Path)
+    eval_unified.add_argument("--p0006-evaluation-protocol", type=Path)
     eval_unified.add_argument("--sb-only-checkpoint", type=Path, default=None)
     eval_unified.add_argument(
         "--ablation-checkpoint",
@@ -1872,6 +1901,29 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
         return 0
 
+    if args.command == "import-stage2-retrospective-paired-evaluation":
+        artifact = FrozenPhotometryArtifact.load(args.photometry_artifact)
+        result = import_retrospective_paired_evaluation_archive(
+            args.feasibility,
+            args.archive_root,
+            artifact,
+            output_dir=args.out_dir,
+            authorization_reference=args.authorization_reference,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "import-stage2-gate01-p0006-evaluation":
+        result = import_gate01_p0006_evaluation_protocol(
+            args.archive_root,
+            expected_gate01_result_sha256=args.expected_gate01_result_sha256,
+            bank_dir=args.bank_dir,
+            validation_plan_path=args.validation_plan,
+            output_path=args.out,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
     if args.command == "seal-stage2-long-run-evaluation-readiness":
         result = seal_long_run_evaluation_readiness(
             args.feasibility,
@@ -1879,6 +1931,7 @@ def main(argv: list[str] | None = None) -> int:
             args.paired_manifest,
             args.baseline_source,
             args.baseline_predictions,
+            p0006_evaluation_protocol_path=args.p0006_evaluation_protocol,
             output_path=args.out,
         )
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
@@ -1886,7 +1939,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v3":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v4":
             raise ValueError("Unified training config contract mismatch.")
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
@@ -1935,7 +1988,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v3":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v4":
             raise ValueError("Unified evaluation config contract mismatch.")
         validation_index = PhotometryFactoredLatentBankIndex(
             args.bank_dir, "validation"
@@ -1980,20 +2033,28 @@ def main(argv: list[str] | None = None) -> int:
             ablations[name] = make_translator(Path(checkpoint_value))
         vae_config = _load_optional_config(args.vae_config)
         vae_model_config = _model_config(vae_config)
+        encoder = build_encoder(
+            "kl_vae", **_kl_vae_kwargs(vae_model_config, "encoder")
+        )
         decoder = build_decoder(
             "kl_vae", **_kl_vae_kwargs(vae_model_config, "decoder")
         )
-        decoder.load_state_dict(load_checkpoint(args.vae_checkpoint)["decoder"], strict=True)
+        vae_state = load_checkpoint(args.vae_checkpoint)
+        encoder.load_state_dict(vae_state["encoder"], strict=True)
+        decoder.load_state_dict(vae_state["decoder"], strict=True)
+        encoder.requires_grad_(False)
         decoder.requires_grad_(False)
         artifact = FrozenPhotometryArtifact.load(args.photometry_artifact)
         result = evaluate_stage2_unified(
             translator=translator,
+            encoder=encoder,
             decoder=decoder,
             artifact=artifact,
             bank=validation_index,
             stats=stats,
             paired_manifest_path=args.paired_manifest,
             baseline_predictions_path=args.baseline_predictions,
+            p0006_evaluation_protocol_path=args.p0006_evaluation_protocol,
             output_dir=args.out,
             sb_only_translator=sb_only,
             ablation_translators=ablations,

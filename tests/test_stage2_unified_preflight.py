@@ -22,8 +22,13 @@ from fieldbridge.evaluation.stage2_unified_preflight import (
     audit_retrospective_paired_feasibility,
     build_baseline_prediction_manifest,
     build_retrospective_paired_manifest,
+    import_retrospective_paired_evaluation_archive,
     quantify_factored_domain_separability,
     seal_long_run_evaluation_readiness,
+)
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    GATE01_P0006_EVALUATION_PROTOCOL,
+    P0006_IDENTITY_SHA256,
 )
 
 
@@ -298,6 +303,32 @@ def test_paired_manifest_builder_uses_complete_feasible_inventory_and_stage1_cei
     assert readiness["prospective_protocol_used"] is False
     assert readiness["directed_pair_count"] == len(baseline_predictions["cases"])
 
+    archive = tmp_path / "reviewed-r-paired-archive"
+    archive.mkdir()
+    archived_arrays = archive / "materialized.json"
+    archived_source = archive / "baseline-source.json"
+    archived_arrays.write_bytes(materialized_path.read_bytes())
+    archived_source.write_bytes(baseline_source_path.read_bytes())
+    imported_dir = tmp_path / "imported-evaluator-inputs"
+    imported = import_retrospective_paired_evaluation_archive(
+        feasibility_path,
+        archive,
+        ArtifactIdentity(),  # type: ignore[arg-type]
+        output_dir=imported_dir,
+        authorization_reference="synthetic-complete-inventory",
+    )
+    resumed = import_retrospective_paired_evaluation_archive(
+        feasibility_path,
+        archive,
+        ArtifactIdentity(),  # type: ignore[arg-type]
+        output_dir=imported_dir,
+        authorization_reference="synthetic-complete-inventory",
+    )
+    assert imported == resumed
+    assert imported["readiness_sha256"]
+    assert Path(imported["paired_manifest_path"]).is_file()
+    assert Path(imported["baseline_predictions_path"]).is_file()
+
 
 def test_long_run_readiness_hard_stops_when_genuine_pairs_do_not_exist(
     tmp_path: Path,
@@ -327,3 +358,99 @@ def test_long_run_readiness_hard_stops_when_genuine_pairs_do_not_exist(
             output_path=tmp_path / "must-not-exist.json",
         )
     assert not (tmp_path / "must-not-exist.json").exists()
+
+
+def test_long_run_readiness_accepts_only_sealed_p0006_when_r_pairs_are_absent(
+    tmp_path: Path,
+) -> None:
+    split_path = save_vae_splits(
+        VaeSplits(
+            (),
+            (
+                _record(tmp_path, "R_one", "one", 0.1),
+                _record(tmp_path, "R_two", "two", 3.0),
+            ),
+            (),
+            13,
+            (0.0, 1.0, 0.0),
+        ),
+        tmp_path / "no-r-pairs.json",
+    )
+    feasibility_path = tmp_path / "feasibility.json"
+    feasibility = audit_retrospective_paired_feasibility(
+        split_path, output_path=feasibility_path
+    )
+    body = {
+        "contract_version": GATE01_P0006_EVALUATION_PROTOCOL,
+        "data_role": "held-out_P0006_final_evaluation_only_not_training_or_selection",
+        "traveller_identity_sha256": P0006_IDENTITY_SHA256,
+        "acquisition_count": 15,
+        "directed_pair_count": 60,
+        "wrong_target_reference_count": 180,
+        "private_arrays_validated": True,
+        "training_or_model_selection_use": False,
+        "factored_bank": {"P_record_count": 0},
+        "frozen_unpaired_validation": {"P_endpoint_count": 0},
+        "gate01_result": {"file_sha256": "a" * 64},
+    }
+    protocol = dict(body)
+    protocol["protocol_sha256"] = sha256_json(body)
+    protocol_path = tmp_path / "p0006-protocol.json"
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+    output = tmp_path / "readiness.json"
+    readiness = seal_long_run_evaluation_readiness(
+        feasibility_path,
+        p0006_evaluation_protocol_path=protocol_path,
+        output_path=output,
+    )
+    assert feasibility["paired_evaluation_possible"] is False
+    assert readiness["long_run_authorized_by_evaluation_path"] is True
+    assert readiness["evaluation_role"] == "sealed_held_out_P0006_final_evaluation_only"
+    assert readiness["prospective_protocol_used"] is True
+    assert readiness["prospective_training_or_model_selection_use"] is False
+    assert readiness["directed_pair_count"] == 60
+
+
+def test_long_run_readiness_rejects_p0006_shortcuts_or_wrong_traveller(
+    tmp_path: Path,
+) -> None:
+    split_path = save_vae_splits(
+        VaeSplits(
+            (),
+            (_record(tmp_path, "R_only", "one", 0.1),),
+            (),
+            13,
+            (0.0, 1.0, 0.0),
+        ),
+        tmp_path / "no-pairs.json",
+    )
+    feasibility_path = tmp_path / "feasibility.json"
+    audit_retrospective_paired_feasibility(split_path, output_path=feasibility_path)
+    for mutation in (
+        {"traveller_identity_sha256": "7" * 64},
+        {"factored_bank": {"P_record_count": 1}},
+        {"frozen_unpaired_validation": {"P_endpoint_count": 1}},
+    ):
+        body = {
+            "contract_version": GATE01_P0006_EVALUATION_PROTOCOL,
+            "data_role": "held-out_P0006_final_evaluation_only_not_training_or_selection",
+            "traveller_identity_sha256": P0006_IDENTITY_SHA256,
+            "acquisition_count": 15,
+            "directed_pair_count": 60,
+            "wrong_target_reference_count": 180,
+            "private_arrays_validated": True,
+            "training_or_model_selection_use": False,
+            "factored_bank": {"P_record_count": 0},
+            "frozen_unpaired_validation": {"P_endpoint_count": 0},
+            "gate01_result": {"file_sha256": "a" * 64},
+            **mutation,
+        }
+        protocol = {**body, "protocol_sha256": sha256_json(body)}
+        path = tmp_path / f"bad-{len(list(tmp_path.glob('bad-*.json')))}.json"
+        path.write_text(json.dumps(protocol), encoding="utf-8")
+        with pytest.raises(ValueError, match="incomplete"):
+            seal_long_run_evaluation_readiness(
+                feasibility_path,
+                p0006_evaluation_protocol_path=path,
+                output_path=tmp_path / "must-not-exist.json",
+            )

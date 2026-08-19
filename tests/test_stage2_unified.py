@@ -31,6 +31,7 @@ from fieldbridge.training.stage2_unified import (
     UnifiedStage2Config,
     anatomy_preservation_components,
     build_unified_validation_plan,
+    directed_domain_macro_means,
     find_latest_stage2_selection_receipt,
     graph_consistency_loss,
     integrate_transport,
@@ -389,7 +390,14 @@ def test_validation_plan_is_step_and_variant_independent_and_freezes_all_draws()
     assert first == second
     assert first["derivation"]["training_step_dependency"] is False
     assert first["derivation"]["model_or_variant_dependency"] is False
-    assert len(first["entries"]) == len(index.records)
+    assert len(first["entries"]) == len(index.records) * 4
+    assert first["required_directed_domain_cell_count"] == 60
+    assert len(first["directed_domain_cell_counts"]) == 60
+    assert set(first["directed_domain_cell_counts"].values()) == {2}
+    assert all(value == 4 for value in first["source_usage_counts"].values())
+    cells = set(first["directed_domain_cell_counts"])
+    assert "T1w:0.1T->7T" in cells
+    assert "T1w:7T->0.1T" in cells
     assert all(
         entry["source_subject_group_identity"]
         != entry["target_subject_group_identity"]
@@ -399,6 +407,24 @@ def test_validation_plan_is_step_and_variant_independent_and_freezes_all_draws()
     )
     changed = build_unified_validation_plan(index, validation_seed=20260819)
     assert changed["validation_plan_sha256"] != first["validation_plan_sha256"]
+
+
+def test_directed_domain_macro_means_prevent_record_count_dominance() -> None:
+    cells = ["T1w:0.1T->3T", "T1w:3T->0.1T"]
+    balanced = [
+        {"directed_domain_cell": cells[0], "sb": 0.0, "identity": 0.0},
+        {"directed_domain_cell": cells[1], "sb": 10.0, "identity": 2.0},
+    ]
+    imbalanced = [balanced[0], *([balanced[1]] * 99)]
+    balanced_macro, _, balanced_weighted = directed_domain_macro_means(
+        balanced, required_cells=cells
+    )
+    imbalanced_macro, _, imbalanced_weighted = directed_domain_macro_means(
+        imbalanced, required_cells=cells
+    )
+    assert balanced_macro == imbalanced_macro == {"identity": 1.0, "sb": 5.0}
+    assert balanced_weighted["sb"] == 5.0
+    assert imbalanced_weighted["sb"] == pytest.approx(9.9)
 
 
 def test_validation_draws_are_identical_at_every_checkpoint_step(tmp_path: Path) -> None:

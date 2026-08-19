@@ -48,13 +48,13 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.train_loop import assert_frozen
 from fieldbridge.utils.seeding import seed_everything
 
-UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v3"
-UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v3"
-UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v3"
-UNIFIED_VALIDATION_PLAN_CONTRACT = "stage2-unified-validation-plan-v1"
-UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v2"
+UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v4"
+UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v4"
+UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v4"
+UNIFIED_VALIDATION_PLAN_CONTRACT = "stage2-unified-validation-plan-v2"
+UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v3"
 UNIFIED_SELECTION_RULE_CONTRACT = "stage2-unified-critic-independent-selection-rule-v1"
-UNIFIED_SELECTION_RECEIPT_CONTRACT = "stage2-unified-selection-receipt-v2"
+UNIFIED_SELECTION_RECEIPT_CONTRACT = "stage2-unified-selection-receipt-v3"
 
 VALIDATION_PLAN_BRIDGE_EPS = 1.0e-3
 UNIFIED_SELECTION_RULE: dict[str, Any] = {
@@ -72,7 +72,8 @@ UNIFIED_SELECTION_RULE: dict[str, Any] = {
     "critic_and_domain_accuracy_diagnostic_only": True,
     "applies_to_all_variants_including_sb_only": True,
     "provenance": (
-        "fixed engineering rule over frozen-plan complete-R/validation diagnostics; "
+        "fixed engineering rule over equal-weighted frozen-plan directed-domain macro "
+        "means from complete-R/validation diagnostics; "
         "independent of training loss weights and the jointly trained critic"
     ),
 }
@@ -438,51 +439,79 @@ def build_unified_validation_plan(
     pools = _DomainPools.from_index(index)
     pools.require_all_domains()
     entries: list[dict[str, Any]] = []
+    directed_cell_counts: dict[str, int] = {
+        _directed_domain_cell(contrast, source_field, target_field): 0
+        for contrast in Contrast
+        for source_field in FIELD_STRENGTHS_T
+        for target_field in FIELD_STRENGTHS_T
+        if source_field != target_field
+    }
+    source_usage_counts: dict[str, int] = defaultdict(int)
     for source_record in sorted(index.records, key=lambda item: item.case_id):
-        target_field = _next_field(source_record.domain.field_strength_t)
-        candidates = sorted(
-            (
-                index.records[position]
-                for position in pools.table[
-                    Contrast.parse(source_record.domain.contrast)
-                ][target_field]
-                if index.records[position].subject_group_id
-                != source_record.subject_group_id
-            ),
-            key=lambda item: item.case_id,
-        )
-        if not candidates:
-            raise ValueError(
-                "Complete R/validation diagnostics have no subject-excluded target."
+        contrast = Contrast.parse(source_record.domain.contrast)
+        for target_field in FIELD_STRENGTHS_T:
+            if target_field == source_record.domain.field_strength_t:
+                continue
+            cell = _directed_domain_cell(
+                contrast, source_record.domain.field_strength_t, target_field
             )
-        target_position = _validation_u64(
-            validation_seed, source_record.case_id, "independent_target"
-        ) % len(candidates)
-        target_record = candidates[target_position]
-        raw_time = _validation_u64(
-            validation_seed, source_record.case_id, "bridge_time"
+            candidates = sorted(
+                (
+                    index.records[position]
+                    for position in pools.table[contrast][target_field]
+                    if index.records[position].subject_group_id
+                    != source_record.subject_group_id
+                ),
+                key=lambda item: item.case_id,
+            )
+            if not candidates:
+                raise ValueError(
+                    "Frozen R/validation plan cannot represent required directed-domain "
+                    f"cell {cell!r} with a subject-excluded target."
+                )
+            edge_identity = f"{source_record.case_id}|{cell}"
+            target_position = _validation_u64(
+                validation_seed, edge_identity, "independent_target"
+            ) % len(candidates)
+            target_record = candidates[target_position]
+            raw_time = _validation_u64(
+                validation_seed, edge_identity, "bridge_time"
+            )
+            unit_time = (raw_time + 0.5) / float(1 << 64)
+            bridge_time = VALIDATION_PLAN_BRIDGE_EPS + (
+                1.0 - 2.0 * VALIDATION_PLAN_BRIDGE_EPS
+            ) * unit_time
+            noise_seed = _validation_u64(
+                validation_seed, edge_identity, "stochastic_noise"
+            ) % ((1 << 63) - 1)
+            entries.append(
+                {
+                    "directed_domain_cell": cell,
+                    "edge_identity_sha256": sha256_json(
+                        [validation_seed, source_record.case_id, cell]
+                    ),
+                    "source_case_identity": source_record.case_id,
+                    "source_resume_key": source_record.resume_key,
+                    "source_subject_group_identity": source_record.subject_group_id,
+                    "source_domain": source_record.domain.to_dict(),
+                    "target_case_identity": target_record.case_id,
+                    "target_resume_key": target_record.resume_key,
+                    "target_subject_group_identity": target_record.subject_group_id,
+                    "target_domain": target_record.domain.to_dict(),
+                    "bridge_t": bridge_time,
+                    "noise_seed": noise_seed,
+                }
+            )
+            directed_cell_counts[cell] += 1
+            source_usage_counts[source_record.case_id] += 1
+    missing_cells = sorted(cell for cell, count in directed_cell_counts.items() if count < 1)
+    if missing_cells:
+        raise ValueError(
+            "Frozen R/validation plan is missing required directed-domain cells: "
+            f"{missing_cells}."
         )
-        unit_time = (raw_time + 0.5) / float(1 << 64)
-        bridge_time = VALIDATION_PLAN_BRIDGE_EPS + (
-            1.0 - 2.0 * VALIDATION_PLAN_BRIDGE_EPS
-        ) * unit_time
-        noise_seed = _validation_u64(
-            validation_seed, source_record.case_id, "stochastic_noise"
-        ) % ((1 << 63) - 1)
-        entries.append(
-            {
-                "source_case_identity": source_record.case_id,
-                "source_resume_key": source_record.resume_key,
-                "source_subject_group_identity": source_record.subject_group_id,
-                "source_domain": source_record.domain.to_dict(),
-                "target_case_identity": target_record.case_id,
-                "target_resume_key": target_record.resume_key,
-                "target_subject_group_identity": target_record.subject_group_id,
-                "target_domain": target_record.domain.to_dict(),
-                "bridge_t": bridge_time,
-                "noise_seed": noise_seed,
-            }
-        )
+    if set(source_usage_counts) != set(records_by_case) or set(source_usage_counts.values()) != {4}:
+        raise ValueError("Frozen validation plan must use every source once per other field.")
     inventory = [
         {
             "case_identity": record.case_id,
@@ -499,16 +528,28 @@ def build_unified_validation_plan(
         "bank_artifact_sha256": index.artifact_sha256,
         "inventory_record_count": len(inventory),
         "inventory_sha256": sha256_json(inventory),
+        "edge_count": len(entries),
+        "required_directed_domain_cell_count": 60,
+        "directed_domain_cell_counts": dict(sorted(directed_cell_counts.items())),
+        "source_usage_counts": dict(sorted(source_usage_counts.items())),
         "derivation": {
-            "target_assignment": "sha256(seed,source_case_identity,independent_target)_mod_sorted_subject_excluded_pool",
+            "target_assignment": (
+                "for_each_source_and_each_other_field_sha256(seed,source_case_identity,"
+                "directed_domain_cell,independent_target)_mod_sorted_subject_excluded_pool"
+            ),
             "bridge_t": (
-                "open_interval_affine_sha256_u64(seed,source_case_identity,bridge_time)"
+                "edge_specific_open_interval_affine_sha256_u64(seed,source_case_identity,"
+                "directed_domain_cell,bridge_time)"
             ),
             "bridge_t_eps": VALIDATION_PLAN_BRIDGE_EPS,
             "stochastic_noise": (
                 "torch_cpu_float32_randn_seeded_by_"
-                "sha256_u63(seed,source_case_identity,stochastic_noise)"
+                "sha256_u63(seed,source_case_identity,directed_domain_cell,stochastic_noise)"
             ),
+            "source_edges": "exactly_one_edge_to_each_of_four_other_fields",
+            "target_subject_exclusion": True,
+            "required_cells": "all_3_contrasts_x_20_directed_field_pairs",
+            "aggregation": "equal_weighted_directed_domain_macro_mean",
             "training_step_dependency": False,
             "model_or_variant_dependency": False,
             "array_payloads_opened": 0,
@@ -529,6 +570,55 @@ def unified_validation_selection_score(means: Mapping[str, float]) -> float:
     if not np.isfinite(score):
         raise FloatingPointError("Unpaired R/validation selection score is non-finite.")
     return float(score)
+
+
+def directed_domain_macro_means(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    required_cells: Sequence[str],
+) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, float]]:
+    """Aggregate validation metrics with one equal vote per directed-domain cell."""
+
+    if not rows:
+        raise ValueError("Directed-domain macro aggregation requires validation rows.")
+    expected = set(required_cells)
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        cell = str(row.get("directed_domain_cell", ""))
+        if cell not in expected:
+            raise ValueError(f"Unexpected directed-domain validation cell {cell!r}.")
+        grouped[cell].append(row)
+    if set(grouped) != expected:
+        raise ValueError(
+            "Directed-domain macro aggregation is missing required cells: "
+            f"{sorted(expected - set(grouped))}."
+        )
+    metric_names = sorted(set(rows[0]) - {"directed_domain_cell"})
+    if any(set(row) - {"directed_domain_cell"} != set(metric_names) for row in rows):
+        raise ValueError("Validation rows do not expose an identical metric schema.")
+    cell_means = {
+        cell: {
+            name: float(np.mean([float(row[name]) for row in cell_rows]))
+            for name in metric_names
+        }
+        for cell, cell_rows in sorted(grouped.items())
+    }
+    macro = {
+        name: float(np.mean([values[name] for values in cell_means.values()]))
+        for name in metric_names
+    }
+    record_weighted = {
+        name: float(np.mean([float(row[name]) for row in rows])) for name in metric_names
+    }
+    if not all(np.isfinite(value) for value in (*macro.values(), *record_weighted.values())):
+        raise FloatingPointError("Validation aggregation produced a non-finite value.")
+    return macro, cell_means, record_weighted
+
+
+def _directed_domain_cell(
+    contrast: Contrast, source_field: float, target_field: float
+) -> str:
+    return f"{contrast.value}:{source_field:g}T->{target_field:g}T"
 
 
 def _validation_u64(seed: int, case_identity: str, purpose: str) -> int:
@@ -602,7 +692,7 @@ def run_stage2_unified_train(
     if cfg.checkpoint_dir is not None:
         cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         _seal_or_verify_validation_plan(
-            cfg.checkpoint_dir / "stage2_unified_validation_plan_v1.json",
+            cfg.checkpoint_dir / "stage2_unified_validation_plan_v2.json",
             validation_plan,
         )
     history_path = cfg.history_jsonl or (
@@ -1422,7 +1512,7 @@ def _evaluate_unpaired_validation(
     by_case = {record.case_id: position for position, record in enumerate(index.records)}
     translator.eval()
     critic.eval()
-    rows: list[dict[str, float]] = []
+    rows: list[dict[str, Any]] = []
     for plan_entry in validation_plan["entries"]:
         source_index = by_case[str(plan_entry["source_case_identity"])]
         target_index = by_case[str(plan_entry["target_case_identity"])]
@@ -1498,6 +1588,7 @@ def _evaluate_unpaired_validation(
         labels = domain_labels(target_domains, 1, device)
         rows.append(
             {
+                "directed_domain_cell": str(plan_entry["directed_domain_cell"]),
                 "sb": float(sb.float().cpu()),
                 "identity": float(identity.float().cpu()),
                 "graph": float(graph.float().cpu()),
@@ -1508,31 +1599,33 @@ def _evaluate_unpaired_validation(
                 "generated_domain_correct": float(fake_logits.argmax(1).eq(labels).float().cpu()),
             }
         )
-    means = {
-        key: float(np.mean([row[key] for row in rows]))
-        for key in rows[0]
-    }
+    required_cells = sorted(validation_plan["directed_domain_cell_counts"])
+    means, cell_means, record_weighted_means = directed_domain_macro_means(
+        rows, required_cells=required_cells
+    )
     selection_score = unified_validation_selection_score(means)
     return {
         "contract_version": UNIFIED_SELECTION_CONTRACT,
         "step": step,
         "validation_plan_sha256": stored_plan_sha256,
         "inventory_record_count": len(index.records),
+        "edge_count": len(rows),
         "inventory_sha256": validation_plan["inventory_sha256"],
         "complete_inventory_used": True,
         "paired_endpoint_assumption": False,
         "subject_group_exclusion": True,
         "means": means,
+        "aggregation": "equal_weighted_directed_domain_macro_mean",
+        "directed_domain_cell_counts": dict(
+            validation_plan["directed_domain_cell_counts"]
+        ),
+        "directed_domain_cell_means": cell_means,
+        "record_weighted_means_diagnostic_only": record_weighted_means,
         "selection_score": selection_score,
         "selection_rule": dict(UNIFIED_SELECTION_RULE),
         "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
         "critic_and_domain_metrics_role": "diagnostic_only_excluded_from_selection",
     }
-
-
-def _next_field(value: float) -> float:
-    position = FIELD_STRENGTHS_T.index(value)
-    return FIELD_STRENGTHS_T[(position + 1) % len(FIELD_STRENGTHS_T)]
 
 
 def _save_exact_checkpoint(
@@ -2020,7 +2113,7 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
     if cfg.critic_spectral_normalization or cfg.critic_lazy_r1:
         raise ValueError(
             "Spectral normalization/lazy R1 are evidence-gated ablations and are not "
-            "enabled by the primary v3 contract."
+            "enabled by the primary v4 contract."
         )
     if cfg.precision not in {"fp32", "bf16"}:
         raise ValueError("precision must be fp32 or bf16.")
@@ -2063,6 +2156,7 @@ __all__ = [
     "UnifiedStage2Result",
     "anatomy_preservation_components",
     "build_unified_validation_plan",
+    "directed_domain_macro_means",
     "find_latest_stage2_selection_receipt",
     "graph_consistency_loss",
     "generator_term_gradient_norms",

@@ -19,6 +19,10 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentStats,
     PhotometryFactoredLatentBankIndex,
 )
+from fieldbridge.data.latent_bank import encode_latent
+from fieldbridge.data.photometry_factored_latent_bank import (
+    propagate_encoder_local_valid_core_support,
+)
 from fieldbridge.data.photometry_factorization import (
     FrozenPhotometryArtifact,
     canonical_tensor_sha256,
@@ -36,6 +40,9 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
     RAW_IDENTITY_CATASTROPHIC_BOUNDARY,
     load_paired_evaluation_manifest,
 )
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    load_gate01_p0006_evaluation_protocol,
+)
 from fieldbridge.models.translators.base import BaseTranslator
 from fieldbridge.training.stage2_unified import (
     anatomy_preservation_components,
@@ -43,7 +50,7 @@ from fieldbridge.training.stage2_unified import (
     integrate_transport,
 )
 
-UNIFIED_EVALUATION_CONTRACT = "stage2-unified-retrospective-evaluation-v2"
+UNIFIED_EVALUATION_CONTRACT = "stage2-unified-selected-best-evaluation-v3"
 BASELINE_PREDICTIONS_CONTRACT = "stage2-unified-retrospective-baseline-predictions-v1"
 
 
@@ -51,12 +58,14 @@ BASELINE_PREDICTIONS_CONTRACT = "stage2-unified-retrospective-baseline-predictio
 def evaluate_stage2_unified(
     *,
     translator: BaseTranslator,
+    encoder: torch.nn.Module | None,
     decoder: torch.nn.Module,
     artifact: FrozenPhotometryArtifact,
     bank: PhotometryFactoredLatentBankIndex,
     stats: FactoredLatentStats,
-    paired_manifest_path: str | Path,
-    baseline_predictions_path: str | Path,
+    paired_manifest_path: str | Path | None,
+    baseline_predictions_path: str | Path | None,
+    p0006_evaluation_protocol_path: str | Path | None = None,
     output_dir: str | Path,
     sb_only_translator: BaseTranslator | None = None,
     ablation_translators: Mapping[str, BaseTranslator] | None = None,
@@ -65,20 +74,47 @@ def evaluate_stage2_unified(
     solver: str = "heun",
     resume: bool = False,
 ) -> dict[str, Any]:
-    """Score all sealed retrospective validation pairs; prospective endpoints are refused."""
+    """Score sealed genuine-R pairs or the held-out P:0006 evaluation-only graph."""
 
     if bank.split != "validation":
         raise ValueError("Unified evaluation is restricted to the complete R/validation bank.")
-    _preflight_paired_retrospective_manifest(paired_manifest_path)
-    manifest, cases = load_paired_evaluation_manifest(paired_manifest_path, artifact=artifact)
+    if p0006_evaluation_protocol_path is not None:
+        if paired_manifest_path is not None or baseline_predictions_path is not None:
+            raise ValueError("Choose either genuine R pairs or P:0006 evaluation, never both.")
+        if encoder is None:
+            raise ValueError("P:0006 evaluation requires the frozen full-volume VAE encoder.")
+        manifest, cases, baselines = load_gate01_p0006_evaluation_protocol(
+            p0006_evaluation_protocol_path
+        )
+        evaluation_role = "held_out_P0006_final_evaluation_only"
+        evaluation_identity_sha256 = str(manifest["protocol_sha256"])
+        baseline_identity = {
+            "contract_version": manifest["contract_version"],
+            "protocol_sha256": manifest["protocol_sha256"],
+            "case_count": len(cases),
+            "source": "sealed_Gate01Private_8012a3f_graph",
+        }
+    else:
+        if paired_manifest_path is None or baseline_predictions_path is None:
+            raise ValueError("Genuine R evaluation requires paired and baseline manifests.")
+        _preflight_paired_retrospective_manifest(paired_manifest_path)
+        manifest, cases = load_paired_evaluation_manifest(
+            paired_manifest_path, artifact=artifact
+        )
+        baselines, baseline_identity = _load_baseline_predictions(
+            baseline_predictions_path, cases
+        )
+        evaluation_role = "complete_genuine_paired_R_validation"
+        evaluation_identity_sha256 = str(manifest["manifest_sha256"])
     if not cases:
-        raise ValueError("Unified evaluation requires at least one R/validation pair.")
-    baselines, baseline_identity = _load_baseline_predictions(
-        baseline_predictions_path, cases
-    )
+        raise ValueError("Unified evaluation requires at least one sealed pair.")
     device_obj = torch.device(device)
     translator = translator.to(device_obj).eval()
     decoder = decoder.to(device_obj).eval()
+    if encoder is not None:
+        if any(parameter.requires_grad for parameter in encoder.parameters()):
+            raise ValueError("Unified evaluation requires a frozen VAE encoder.")
+        encoder = encoder.to(device_obj).eval()
     if sb_only_translator is not None:
         sb_only_translator = sb_only_translator.to(device_obj).eval()
     ablation_translators = dict(ablation_translators or {})
@@ -106,8 +142,9 @@ def evaluate_stage2_unified(
     shard_dir = root / "case_shards"
     shard_dir.mkdir(exist_ok=True)
     run_contract: dict[str, Any] = {
-        "contract_version": "stage2-unified-retrospective-evaluation-run-v2",
-        "paired_manifest_sha256": manifest["manifest_sha256"],
+        "contract_version": "stage2-unified-selected-best-evaluation-run-v3",
+        "evaluation_role": evaluation_role,
+        "evaluation_protocol_sha256": evaluation_identity_sha256,
         "bank_artifact_sha256": bank.artifact_sha256,
         "latent_statistics_sha256": stats.artifact_sha256,
         "photometry_artifact_sha256": artifact.artifact_sha256,
@@ -121,6 +158,9 @@ def evaluate_stage2_unified(
             for name, model in sorted(ablation_translators.items())
         },
         "frozen_decoder_state_sha256": _module_state_sha256(decoder),
+        "frozen_encoder_state_sha256": (
+            _module_state_sha256(encoder) if encoder is not None else None
+        ),
         "integration": {"steps": integration_steps, "solver": solver},
         "case_identities": sorted(case.case_identity for case in cases),
     }
@@ -157,12 +197,51 @@ def evaluate_stage2_unified(
                 raise ValueError("Unified evaluation montage is missing or changed.")
             rows.append(row)
             continue
+        canonical_context = artifact.normalize_source(case.source, case.source_domain)
+        canonical_support = canonical_context.support_mask.detach().to(torch.bool)
+        while canonical_support.ndim > 3 and canonical_support.shape[0] == 1:
+            canonical_support = canonical_support[0]
+        if canonical_support.ndim != 3:
+            raise ValueError("Unified evaluation source support is not a 3-D full volume.")
+        image_support_batch = canonical_support[None, None].to(device_obj)
         source_id = str(case.source_provenance["case_id"])
-        if source_id not in by_case:
-            raise ValueError(f"Paired source {source_id!r} is absent from the validation bank.")
-        latent, support = bank.load(by_case[source_id])
-        z = stats.normalize(latent[None].to(device_obj), support[None, None].to(device_obj))
+        if evaluation_role == "held_out_P0006_final_evaluation_only":
+            assert encoder is not None
+            canonical = canonical_context.values
+            if canonical.ndim == 3:
+                canonical = canonical[None, None]
+            elif canonical.ndim == 4:
+                canonical = canonical[None]
+            if canonical.ndim != 5:
+                raise ValueError("P:0006 canonical source is not a full 3-D VAE batch.")
+            latent, path_used = encode_latent(
+                encoder,
+                canonical.to(device_obj),
+                case.source_domain,
+                strategy="full",
+                block_size=(1, 1, 1),
+                halo=(0, 0, 0),
+                precision="fp32",
+            )
+            if path_used != "full":
+                raise ValueError("P:0006 evaluation requires actual full VAE encoding.")
+            support = propagate_encoder_local_valid_core_support(
+                canonical_support,
+                encoder,
+                expected_rule_sha256=str(
+                    bank.manifest["operational_support_rule"]["rule_sha256"]
+                ),
+            )
+        else:
+            if source_id not in by_case:
+                raise ValueError(
+                    f"Paired source {source_id!r} is absent from the validation bank."
+                )
+            latent, support = bank.load(by_case[source_id])
+            latent = latent[None].to(device_obj)
+            path_used = "frozen_factored_bank_full_encode"
         support_batch = support[None, None].to(device_obj)
+        z = stats.normalize(latent.to(device_obj), support_batch)
         generated_z = integrate_transport(
             translator,
             z,
@@ -174,7 +253,6 @@ def evaluate_stage2_unified(
         decoded_canonical = _decode(
             decoder, stats.denormalize(generated_z), [case.target_domain]
         )[0].cpu()
-        canonical_context = artifact.normalize_source(case.source, case.source_domain)
         full_prediction = artifact.render_target(
             canonical_context.with_values(decoded_canonical), case.target_domain
         )
@@ -236,7 +314,7 @@ def evaluate_stage2_unified(
         anatomy = anatomy_preservation_components(
             canonical_context.values[None].to(device_obj),
             decoded_canonical[None].to(device_obj),
-            support_batch,
+            image_support_batch,
         )
         graph_paths = []
         for intermediate in _all_intermediates(case.source_domain, case.target_domain):
@@ -328,6 +406,7 @@ def evaluate_stage2_unified(
             "rendered_post_mask_background_leakage_mae": rendered_background,
             "source_provenance": dict(case.source_provenance),
             "target_provenance": dict(case.target_provenance),
+            "source_encoding_path": path_used,
             "montage": {
                 "path": montage_path.relative_to(root).as_posix(),
                 "file_sha256": sha256_file(montage_path),
@@ -355,9 +434,12 @@ def evaluate_stage2_unified(
         )
     result: dict[str, Any] = {
         "contract_version": UNIFIED_EVALUATION_CONTRACT,
-        "scope": "retrospective_R_validation_only",
-        "prospective_records_loaded": 0,
-        "paired_manifest_sha256": manifest["manifest_sha256"],
+        "scope": evaluation_role,
+        "prospective_records_loaded": (
+            len(rows) if evaluation_role == "held_out_P0006_final_evaluation_only" else 0
+        ),
+        "training_or_model_selection_prospective_records": 0,
+        "evaluation_protocol_sha256": evaluation_identity_sha256,
         "bank_artifact_sha256": bank.artifact_sha256,
         "latent_statistics_sha256": stats.artifact_sha256,
         "photometry_artifact_sha256": artifact.artifact_sha256,

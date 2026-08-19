@@ -43,6 +43,10 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
     seal_paired_evaluation_manifest,
 )
 from fieldbridge.evaluation.stage2_unified import BASELINE_PREDICTIONS_CONTRACT
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    GATE01_P0006_EVALUATION_PROTOCOL,
+    P0006_IDENTITY_SHA256,
+)
 
 DOMAIN_SEPARABILITY_CONTRACT = "stage2-factored-latent-domain-separability-v1"
 PAIRED_FEASIBILITY_CONTRACT = "stage2-retrospective-paired-feasibility-v2"
@@ -52,7 +56,7 @@ MATERIALIZED_VALIDATION_PRODUCER_CONTRACT = (
 )
 BASELINE_SOURCE_CONTRACT = "stage2-existing-gate01-sbv2-baseline-source-v2"
 BASELINE_SOURCE_PRODUCER_CONTRACT = "stage2-gate01-sbv2-baseline-export-producer-v1"
-LONG_RUN_EVALUATION_READINESS_CONTRACT = "stage2-long-run-evaluation-readiness-v1"
+LONG_RUN_EVALUATION_READINESS_CONTRACT = "stage2-long-run-evaluation-readiness-v2"
 
 
 def quantify_factored_domain_separability(
@@ -412,31 +416,171 @@ def build_baseline_prediction_manifest(
     return body
 
 
+def import_retrospective_paired_evaluation_archive(
+    feasibility_path: str | Path,
+    archive_root: str | Path,
+    artifact: FrozenPhotometryArtifact,
+    *,
+    output_dir: str | Path,
+    authorization_reference: str,
+) -> dict[str, Any]:
+    """Import the two reviewed R-paired producer exports and construct evaluator inputs."""
+
+    root = Path(archive_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"R-paired evaluation archive does not exist: {root}")
+    materialized_path = _single_self_hashed_contract(
+        root, MATERIALIZED_VALIDATION_ARRAYS_CONTRACT
+    )
+    baseline_source_path = _single_self_hashed_contract(root, BASELINE_SOURCE_CONTRACT)
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    paired_path = destination / "stage2_complete_R_validation_paired_manifest.json"
+    baselines_path = destination / "stage2_complete_gate01_sbv2_baselines.json"
+    readiness_path = destination / "stage2_long_run_evaluation_readiness_v2.json"
+    if paired_path.exists():
+        paired = _load_self_hashed(paired_path, "manifest_sha256")
+        provenance = paired.get("provenance", {})
+        feasibility = _load_self_hashed(feasibility_path, "result_sha256")
+        materialized = _load_self_hashed(materialized_path, "manifest_sha256")
+        if (
+            paired.get("photometry_artifact_sha256") != artifact.artifact_sha256
+            or provenance.get("feasibility_result_sha256")
+            != feasibility["result_sha256"]
+            or provenance.get("materialized_arrays_sha256")
+            != materialized["manifest_sha256"]
+            or provenance.get("authorization_reference") != authorization_reference
+        ):
+            raise ValueError("Existing R-paired manifest is not an exact import resume.")
+    else:
+        paired = build_retrospective_paired_manifest(
+            feasibility_path,
+            materialized_path,
+            artifact,
+            output_path=paired_path,
+            authorization_reference=authorization_reference,
+        )
+    if baselines_path.exists():
+        baselines = _load_self_hashed(baselines_path, "manifest_sha256")
+        source = _load_self_hashed(baseline_source_path, "manifest_sha256")
+        if (
+            baselines.get("source_artifact_sha256") != source["manifest_sha256"]
+            or {item.get("case_identity") for item in baselines.get("cases", [])}
+            != {item.get("case_identity") for item in paired.get("cases", [])}
+        ):
+            raise ValueError("Existing R baseline manifest is not an exact import resume.")
+    else:
+        baselines = build_baseline_prediction_manifest(
+            paired_path, baseline_source_path, output_path=baselines_path
+        )
+    if readiness_path.exists():
+        readiness = _load_self_hashed(readiness_path, "readiness_sha256")
+        if (
+            readiness.get("paired_manifest_sha256") != paired["manifest_sha256"]
+            or readiness.get("baseline_predictions_sha256")
+            != baselines["manifest_sha256"]
+        ):
+            raise ValueError("Existing R readiness receipt is not an exact import resume.")
+    else:
+        readiness = seal_long_run_evaluation_readiness(
+            feasibility_path,
+            materialized_path,
+            paired_path,
+            baseline_source_path,
+            baselines_path,
+            output_path=readiness_path,
+        )
+    return {
+        "contract_version": "stage2-unified-r-paired-evaluation-archive-import-v1",
+        "materialized_arrays_path": str(materialized_path),
+        "baseline_source_path": str(baseline_source_path),
+        "paired_manifest_path": str(paired_path),
+        "paired_manifest_sha256": paired["manifest_sha256"],
+        "baseline_predictions_path": str(baselines_path),
+        "baseline_predictions_sha256": baselines["manifest_sha256"],
+        "readiness_path": str(readiness_path),
+        "readiness_sha256": readiness["readiness_sha256"],
+    }
+
+
 def seal_long_run_evaluation_readiness(
     feasibility_path: str | Path,
-    materialized_arrays_path: str | Path,
-    paired_manifest_path: str | Path,
-    baseline_source_artifact_path: str | Path,
-    baseline_predictions_path: str | Path,
+    materialized_arrays_path: str | Path | None = None,
+    paired_manifest_path: str | Path | None = None,
+    baseline_source_artifact_path: str | Path | None = None,
+    baseline_predictions_path: str | Path | None = None,
     *,
+    p0006_evaluation_protocol_path: str | Path | None = None,
     output_path: str | Path,
 ) -> dict[str, Any]:
-    """Fail closed unless a complete deterministic retrospective evaluation path exists.
-
-    This contract intentionally has no prospective fallback.  A prospective protocol
-    would require a separately versioned, reviewed implementation and authorization.
-    """
+    """Seal genuine R pairs or the separately reviewed P:0006 evaluation-only path."""
 
     feasibility = _load_self_hashed(feasibility_path, "result_sha256")
-    if (
-        feasibility.get("contract_version") != PAIRED_FEASIBILITY_CONTRACT
-        or feasibility.get("paired_evaluation_possible") is not True
-        or feasibility.get("complete_inventory_no_selection") is not True
+    if feasibility.get("contract_version") != PAIRED_FEASIBILITY_CONTRACT or (
+        feasibility.get("complete_inventory_no_selection") is not True
     ):
-        raise ValueError(
-            "Long training is blocked: no complete genuine paired R/validation inventory. "
-            "Do not fabricate pairs; a prospective protocol requires separate review."
+        raise ValueError("Long training is blocked: paired-feasibility receipt is invalid.")
+    if feasibility.get("paired_evaluation_possible") is not True:
+        if p0006_evaluation_protocol_path is None:
+            raise ValueError(
+                "Long training is blocked: no genuine R/validation pairs and no sealed "
+                "P:0006 evaluation-only protocol were supplied."
+            )
+        protocol = _load_self_hashed(
+            p0006_evaluation_protocol_path, "protocol_sha256"
         )
+        if (
+            protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL
+            or protocol.get("data_role")
+            != "held-out_P0006_final_evaluation_only_not_training_or_selection"
+            or protocol.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256
+            or protocol.get("acquisition_count") != 15
+            or protocol.get("directed_pair_count") != 60
+            or protocol.get("wrong_target_reference_count") != 180
+            or protocol.get("private_arrays_validated") is not True
+            or protocol.get("training_or_model_selection_use") is not False
+            or protocol.get("factored_bank", {}).get("P_record_count") != 0
+            or protocol.get("frozen_unpaired_validation", {}).get("P_endpoint_count") != 0
+        ):
+            raise ValueError(
+                "Long training is blocked: P:0006 evaluation-only protocol is incomplete."
+            )
+        result: dict[str, Any] = {
+            "contract_version": LONG_RUN_EVALUATION_READINESS_CONTRACT,
+            "long_run_authorized_by_evaluation_path": True,
+            "evaluation_role": "sealed_held_out_P0006_final_evaluation_only",
+            "prospective_protocol_used": True,
+            "prospective_training_or_model_selection_use": False,
+            "reviewed_prospective_protocol_available": True,
+            "complete_inventory_no_selection": True,
+            "directed_pair_count": 60,
+            "feasibility_result_sha256": feasibility["result_sha256"],
+            "retrospective_pair_feasibility": False,
+            "p0006_evaluation_protocol_sha256": protocol["protocol_sha256"],
+            "p0006_gate01_result_file_sha256": protocol["gate01_result"][
+                "file_sha256"
+            ],
+            "factored_bank_P_record_count": 0,
+            "unpaired_validation_P_endpoint_count": 0,
+        }
+        result["readiness_sha256"] = sha256_json(result)
+        write_json_atomic(output_path, result, refuse_existing=True)
+        return result
+    required_r_paths = (
+        materialized_arrays_path,
+        paired_manifest_path,
+        baseline_source_artifact_path,
+        baseline_predictions_path,
+    )
+    if any(path is None for path in required_r_paths):
+        raise ValueError(
+            "Long training is blocked: genuine R/validation pairs exist, so the complete "
+            "reviewed R-paired arrays, ceilings, and baseline path is required."
+        )
+    assert materialized_arrays_path is not None
+    assert paired_manifest_path is not None
+    assert baseline_source_artifact_path is not None
+    assert baseline_predictions_path is not None
     arrays = _load_self_hashed(materialized_arrays_path, "manifest_sha256")
     if arrays.get("contract_version") != MATERIALIZED_VALIDATION_ARRAYS_CONTRACT:
         raise ValueError("Long training is blocked: materialized array/ceiling contract mismatch.")
@@ -521,6 +665,22 @@ def _bank_features(
         features.append(feature.double().cpu().numpy())
         labels.append(record.domain.label)
     return np.stack(features), labels
+
+
+def _single_self_hashed_contract(root: Path, contract: str) -> Path:
+    matches: list[Path] = []
+    for path in root.rglob("*.json"):
+        try:
+            payload = _load_self_hashed(path, "manifest_sha256")
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if payload.get("contract_version") == contract:
+            matches.append(path.resolve())
+    if len(matches) != 1:
+        raise ValueError(
+            f"R-paired archive requires exactly one {contract!r} export; found {len(matches)}."
+        )
+    return matches[0]
 
 
 def _nearest_centroid(features: np.ndarray, centroids: np.ndarray, labels: Sequence[str]) -> list[str]:
@@ -609,6 +769,7 @@ __all__ = [
     "PAIRED_FEASIBILITY_CONTRACT",
     "audit_retrospective_paired_feasibility",
     "build_baseline_prediction_manifest",
+    "import_retrospective_paired_evaluation_archive",
     "build_retrospective_paired_manifest",
     "quantify_factored_domain_separability",
     "seal_long_run_evaluation_readiness",

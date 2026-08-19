@@ -1,4 +1,4 @@
-contract: stage2-unified-retrospective-full-model-config-v3
+contract: stage2-unified-retrospective-full-model-config-v4
 scope: retrospective_R_only
 input_contract: photometry-factored-latent-bank-v2
 descriptor_coupling: forbidden_unauthorized
@@ -65,7 +65,7 @@ training:
     gpu_hourly_cost_usd: null
     failure: hard_stop_before_long_run
   validation:
-    contract: stage2-unified-validation-plan-v1
+    contract: stage2-unified-validation-plan-v2
     seed: 20260818
     every_steps: 1000
     complete_inventory: true
@@ -73,6 +73,10 @@ training:
     paired_endpoint_assumption: false
     training_step_dependency: forbidden
     model_or_variant_dependency: forbidden
+    required_directed_domain_cells: 60
+    source_edges: each_source_to_each_other_field
+    target_subject_exclusion: required
+    aggregation: equal_weighted_directed_domain_macro_mean
     selection_rule_contract: stage2-unified-critic-independent-selection-rule-v1
     selection_rule: val_sb+0.1*val_identity+0.02*val_anatomy+0.01*val_graph
     jointly_trained_critic_metrics: diagnostic_only

@@ -87,6 +87,7 @@ class Gate01Case:
     traveller_identity_sha256: str = ""
     array_sha256: Mapping[str, str] = field(default_factory=dict)
     wrong_target_sb_v2: Mapping[str, torch.Tensor] = field(default_factory=dict)
+    source_image: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if not self.case_id:
@@ -108,6 +109,8 @@ class Gate01Case:
                 for label, tensor in self.wrong_target_sb_v2.items()
             },
         }
+        if self.source_image is not None:
+            tensors["source_image"] = self.source_image
         target_shape = tuple(self.target.shape)
         for name, tensor in tensors.items():
             if not isinstance(tensor, torch.Tensor):
@@ -1307,6 +1310,7 @@ def _load_gate01_case(
         support_mask=support_mask,
         array_sha256=identities,
         wrong_target_sb_v2=wrong,
+        source_image=source_image,
     )
 
 

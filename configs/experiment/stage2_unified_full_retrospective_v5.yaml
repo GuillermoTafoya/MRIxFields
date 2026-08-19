@@ -1,0 +1,103 @@
+contract: stage2-unified-retrospective-full-model-config-v5
+scope: retrospective_R_only
+input_contract: photometry-factored-latent-bank-v2
+descriptor_coupling: forbidden_unauthorized
+
+development_validation_evidence:
+  P0006_data_role: development_validation_P0006_evaluation_only
+  interpretation: development/model assessment only
+  population_or_generalization_claims_authorized: false
+  P0009_status: frozen_and_unused_for_possible_later_confirmation
+  P0009_execution: forbidden
+
+model:
+  name: flow_matching_latent
+  latent_channels: 4
+  hidden_channels: [64, 128]
+  bottleneck_channels: 256
+  cond_dim: 128
+  time_embed_dim: 128
+  spatial_dims: 3
+  activation: silu
+  use_norm: true
+  upsample_mode: interpolate
+  skip_mode: concat
+  pad_to_multiple: true
+  zero_init_output: false
+
+training:
+  variant: full
+  steps: 100000
+  batch_size: 2
+  seed: 13
+  device: auto
+  precision: bf16
+  bridge: schrodinger
+  sigma: 0.1
+  time_eps: 0.001
+  integration_steps: 4
+  integration_solver: heun
+  lr_generator: 0.0002
+  lr_critic: 0.0002
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  scheduler_t_max: 100000
+  loss_weights:
+    sb: 1.0
+    identity: 0.1
+    anatomy: 0.02
+    graph: 0.01
+    adversarial: 0.05
+    domain: 0.1
+  critic:
+    space: latent
+    channels: [32, 64, 128]
+    image_space_available_as_separate_ablation: true
+    spectral_normalization: false
+    lazy_r1: false
+    stability_decision: evidence_required_before_enabling
+  anatomy:
+    pool_scales: [1, 2, 4]
+    support_erosion: 1
+    raw_high_frequency_equality: forbidden
+  pilot:
+    runtime_projection_contract: stage2-unified-pilot-training-plus-validation-runtime-projection-v1
+    steps: 200
+    smoothing_window: 20
+    max_aux_to_flow_ratio: 1.0
+    min_term_gradient_norm: 1.0e-12
+    max_smoothed_loss_growth: 10.0
+    score_saturation_threshold: 20.0
+    max_saturation_fraction: 0.95
+    projected_steps: 100000
+    projection_scope: training_plus_complete_validation
+    terminal_validation_count: exactly_once
+    gpu_hourly_cost_usd: null
+    failure: hard_stop_before_long_run
+  validation:
+    contract: stage2-unified-validation-plan-v2
+    seed: 20260818
+    every_steps: 1000
+    complete_inventory: true
+    inventory: complete_R_validation
+    paired_endpoint_assumption: false
+    training_step_dependency: forbidden
+    model_or_variant_dependency: forbidden
+    required_directed_domain_cells: 60
+    source_edges: each_source_to_each_other_field
+    target_subject_exclusion: required
+    aggregation: equal_weighted_directed_domain_macro_mean
+    selection_rule_contract: stage2-unified-critic-independent-selection-rule-v1
+    selection_rule: val_sb+0.1*val_identity+0.02*val_anatomy+0.01*val_graph
+    jointly_trained_critic_metrics: diagnostic_only
+  checkpoint:
+    every_steps: 1000
+    max_bytes: 1500000000
+
+ablation_order:
+  - full
+  - no_graph
+  - no_anatomy_graph
+  - no_adversarial_domain
+  - sb_identity_only
+  - sb_only

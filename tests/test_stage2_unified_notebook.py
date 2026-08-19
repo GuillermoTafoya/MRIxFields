@@ -83,7 +83,7 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
     import yaml
 
     payload = yaml.safe_load(
-        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v3.yaml").read_text()
+        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v4.yaml").read_text()
     )
     config = UnifiedStage2Config.from_mapping(payload)
     assert config.loss_weights == {

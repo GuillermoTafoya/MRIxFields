@@ -138,7 +138,7 @@ long-run authorization flag.
 
 ```bash
 fieldbridge train-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v3.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v4.yaml \
   --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
   --checkpoint-dir "$PILOT_CHECKPOINTS" --history-jsonl "$PILOT_HISTORY" \
   --steps 200 --pilot-steps 200 --device cuda
@@ -199,7 +199,7 @@ fieldbridge train-stage2-unified \
 
 ```bash
 fieldbridge eval-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v3.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v4.yaml \
   --bank-dir "$BANK_DIR" --selection-receipt "$LATEST_FULL_SELECTION_RECEIPT" \
   --sb-only-checkpoint "$SB_ONLY_CHECKPOINT" \
   --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \

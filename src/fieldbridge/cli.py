@@ -563,7 +563,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v3.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v4.yaml"),
     )
     train_unified.add_argument("--bank-dir", type=Path, required=True)
     train_unified.add_argument("--vae-config", type=Path, required=True)
@@ -650,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v3.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v4.yaml"),
     )
     eval_unified.add_argument("--bank-dir", type=Path, required=True)
     evaluation_model = eval_unified.add_mutually_exclusive_group(required=True)

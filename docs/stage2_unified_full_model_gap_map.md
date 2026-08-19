@@ -26,8 +26,8 @@ This document records the qualification of current `origin/main` at
 | Normalized latents passed directly to frozen decoder | Every anatomy, image-critic, validation, and evaluation decode receives `stats.denormalize(latent)`; the VAE remains frozen |
 | No auxiliary-dominance check | The default 200-step full-objective pilot gates finite terms, per-term gradients, smoothed behavior, critic saturation, auxiliary/flow ratios, OOM, runtime, and projected 100k cost |
 | No term-level diagnostics | Append-only JSONL records raw/weighted terms, per-term translator gradients, critic distributions/domain accuracies, graph paths, transitions, throughput, time, memory, and OOM hard stops |
-| Training-loss-only checkpointing | Complete unpaired R/validation distribution diagnostics drive a sealed deterministic latest/best selection rule without paired endpoint assumptions |
-| Unspecified paired and baseline manifests | Metadata-only feasibility seals every genuine R/validation edge; deterministic builders consume complete materialized arrays/Stage-1 ceilings and existing Gate-0.1/SB-v2 artifacts, or fail with exact instructions |
+| Training-loss-only checkpointing | A versioned, step/variant-independent validation plan freezes target, bridge time, and stochastic noise per case; a critic-independent rule drives sealed latest/best receipts and evaluation resolves the selected best checkpoint |
+| Unspecified paired and baseline manifests | Strict feasibility excludes only positively classified P identities and raises on malformed evidence; deterministic producer contracts cover complete materialized arrays/Stage-1 ceilings and existing Gate-0.1/SB-v2 artifacts, and a readiness receipt blocks 100k training until the complete path exists |
 
 ## Scientific boundary
 
@@ -49,8 +49,8 @@ independence.
 The repository contains no private data or model artifacts. A run therefore supplies the
 sealed split, retrospective root, frozen Variant-A artifact/qualification, and frozen VAE config
 and checkpoint. The notebook first audits whether genuine R/validation pairs exist. Only when
-they do, the operator additionally supplies a complete materialized R/validation array export
-with Stage-1 ceilings and a sealed source index over existing Gate 0.1 calibrated-identity and
-original-SB-v2 predictions. Production commands build the final manifests; no operator-curated
-paired subset is accepted. These are paths and identities only; no endpoint or prospective data
-is committed.
+they do, the operator additionally supplies complete deterministic-producer artifacts for
+materialized R/validation arrays with Stage-1 ceilings and existing Gate 0.1
+calibrated-identity/original-SB-v2 predictions. Production commands build the final manifests and
+seal long-run readiness; no operator-curated paired subset is accepted. Without that receipt the
+100k authorization is never consulted. No endpoint or prospective data is committed.

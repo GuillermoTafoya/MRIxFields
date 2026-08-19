@@ -41,6 +41,7 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
         "audit-photometry-factored-latent-bank",
         "preflight-stage2-factored-domain-separability",
         "audit-stage2-retrospective-pair-feasibility",
+        "seal-stage2-long-run-evaluation-readiness",
         "train-stage2-unified",
         "eval-stage2-unified",
     ]
@@ -59,13 +60,23 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     assert "classification_before_array_load" in source
     assert "StarGAN_control_claim': False" in source
     assert "learned_disentanglement_claim': False" in source
+    assert source.index("seal-stage2-long-run-evaluation-readiness") < source.index(
+        "AUTHORIZE_LONG_FULL_MODEL = False"
+    )
+    assert "find_latest_stage2_selection_receipt" in source
+    assert "--selection-receipt" in source
+    assert "FROZEN_VALIDATION_PLAN_SHA256" in source
+    assert "selected_best_checkpoint" in source
+    assert "final_checkpoint_diagnostic_only" in source
+    assert "no separately versioned reviewed prospective protocol is authorized" in source
+    assert "stage2_unified_full_retrospective_v2.yaml" not in source
 
 
 def test_full_config_uses_reviewed_initial_weights() -> None:
     import yaml
 
     payload = yaml.safe_load(
-        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v2.yaml").read_text()
+        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v3.yaml").read_text()
     )
     config = UnifiedStage2Config.from_mapping(payload)
     assert config.loss_weights == {
@@ -79,6 +90,7 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
     assert config.critic_space == "latent"
     assert config.pilot_steps == 200
     assert config.validation_complete_inventory is True
+    assert config.validation_plan_seed == 20260818
     assert config.critic_spectral_normalization is False
     assert config.critic_lazy_r1 is False
     with pytest.raises(ValueError, match="obsolete"):

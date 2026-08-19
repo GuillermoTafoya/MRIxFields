@@ -16,6 +16,7 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentStats,
     PhotometryFactoredLatentBankIndex,
 )
+from fieldbridge.data.photometry_factorization import sha256_json
 from fieldbridge.models.discriminators import (
     DOMAIN_COUNT,
     DomainProjectionDiscriminator,
@@ -25,11 +26,17 @@ from fieldbridge.models.discriminators import (
 from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.stage2_unified import (
     DEFAULT_UNIFIED_WEIGHTS,
+    UNIFIED_SELECTION_RULE,
+    UNIFIED_SELECTION_RULE_SHA256,
     UnifiedStage2Config,
     anatomy_preservation_components,
+    build_unified_validation_plan,
+    find_latest_stage2_selection_receipt,
     graph_consistency_loss,
     integrate_transport,
+    load_stage2_selection_receipt,
     run_stage2_unified_train,
+    unified_validation_selection_score,
 )
 
 
@@ -375,6 +382,64 @@ def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: P
     assert report["runtime"]["projected_cost_usd"] == pytest.approx(138.8888889)
 
 
+def test_validation_plan_is_step_and_variant_independent_and_freezes_all_draws() -> None:
+    index = SyntheticFactoredIndex("validation")
+    first = build_unified_validation_plan(index, validation_seed=20260818)
+    second = build_unified_validation_plan(index, validation_seed=20260818)
+    assert first == second
+    assert first["derivation"]["training_step_dependency"] is False
+    assert first["derivation"]["model_or_variant_dependency"] is False
+    assert len(first["entries"]) == len(index.records)
+    assert all(
+        entry["source_subject_group_identity"]
+        != entry["target_subject_group_identity"]
+        and 0.0 < entry["bridge_t"] < 1.0
+        and isinstance(entry["noise_seed"], int)
+        for entry in first["entries"]
+    )
+    changed = build_unified_validation_plan(index, validation_seed=20260819)
+    assert changed["validation_plan_sha256"] != first["validation_plan_sha256"]
+
+
+def test_validation_draws_are_identical_at_every_checkpoint_step(tmp_path: Path) -> None:
+    index = SyntheticFactoredIndex("validation")
+    cfg = _config(tmp_path, checkpoint_dir=None, history_jsonl=None)
+    plan = build_unified_validation_plan(index, validation_seed=cfg.validation_plan_seed)
+    translator = TinyTranslator()
+    critic = DomainProjectionDiscriminator(5, (4,))
+    decoder = TinyDecoder().requires_grad_(False)
+    first = unified._evaluate_unpaired_validation(
+        cfg, translator, critic, decoder, index, plan, _stats(), torch.device("cpu"), step=1
+    )
+    last = unified._evaluate_unpaired_validation(
+        cfg,
+        translator,
+        critic,
+        decoder,
+        index,
+        plan,
+        _stats(),
+        torch.device("cpu"),
+        step=100_000,
+    )
+    assert first["validation_plan_sha256"] == last["validation_plan_sha256"]
+    assert first["means"] == last["means"]
+    assert first["selection_score"] == last["selection_score"]
+
+
+def test_selection_rule_is_critic_independent_and_meaningful_for_sb_only() -> None:
+    means = {"sb": 1.0, "identity": 2.0, "anatomy": 3.0, "graph": 4.0}
+    score = unified_validation_selection_score(
+        {**means, "generated_domain_correct": 0.0, "real_score": -1.0e6}
+    )
+    changed_critic = unified_validation_selection_score(
+        {**means, "generated_domain_correct": 1.0, "real_score": 1.0e6}
+    )
+    assert score == changed_critic == pytest.approx(1.3)
+    assert UNIFIED_SELECTION_RULE["training_critic_inputs"] == []
+    assert UNIFIED_SELECTION_RULE["applies_to_all_variants_including_sb_only"] is True
+
+
 def test_prospective_manifest_is_rejected_before_payload_load(monkeypatch, tmp_path: Path) -> None:
     manifest = {
         "artifact_sha256": "a" * 64,
@@ -423,9 +488,31 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
     assert state["critic"]
     assert state["generator_scheduler"] and state["critic_scheduler"]
     assert state["sampler_rng"].numel() > 0
+    assert state["validation_plan_sha256"]
+    assert state["selection_rule_sha256"] == UNIFIED_SELECTION_RULE_SHA256
     assert state["validation_selection"]["paired_targets_used"] is False
     assert state["validation_selection"]["best_step"] == 1
-    assert (cfg.checkpoint_dir / "stage2_unified_full_selection_step000000001.json").is_file()
+    receipt_path, receipt = find_latest_stage2_selection_receipt(
+        cfg.checkpoint_dir, variant="full", require_complete=True
+    )
+    assert receipt_path.name == "stage2_unified_full_selection_step000000001.json"
+    assert receipt["best_checkpoint"] == str(checkpoint.resolve())
+    assert receipt["validation_plan_sha256"] == state["validation_plan_sha256"]
+    assert receipt["checkpoint_hashes"]["best"]["file_sha256"]
+    assert receipt["checkpoint_hashes"]["final"] == receipt["checkpoint_hashes"]["latest"]
+    assert load_stage2_selection_receipt(receipt_path) == receipt
+    for field, message in (
+        ("validation_plan_sha256", "another validation plan"),
+        ("selection_rule_sha256", "rule provenance"),
+    ):
+        mutated = dict(receipt)
+        mutated.pop("selection_sha256")
+        mutated[field] = "f" * 64
+        mutated["selection_sha256"] = sha256_json(mutated)
+        mutation_path = tmp_path / f"mutated-{field}.json"
+        mutation_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            load_stage2_selection_receipt(mutation_path)
     assert before.keys() == decoder.state_dict().keys()
     for key, value in before.items():
         assert torch.equal(value, decoder.state_dict()[key])
@@ -478,14 +565,25 @@ def test_oom_is_hard_stop_and_diagnostic_is_preserved(tmp_path: Path) -> None:
 def test_sb_only_backward_ablation_disables_every_auxiliary_path(tmp_path: Path) -> None:
     weights = {name: 0.0 for name in DEFAULT_UNIFIED_WEIGHTS}
     weights["sb"] = 1.0
-    run_stage2_unified_train(
-        _config(tmp_path, loss_weights=weights),
+    validation_index = SyntheticFactoredIndex("validation")
+    cfg = _config(tmp_path, loss_weights=weights, variant="sb_only")
+    result = run_stage2_unified_train(
+        cfg,
         translator=TinyTranslator(),
         decoder=TinyDecoder().requires_grad_(False),
         train_index=SyntheticFactoredIndex(),
-        validation_index=SyntheticFactoredIndex("validation"),
+        validation_index=validation_index,
         stats=_stats(),
     )
+    state = load_checkpoint(Path(result.checkpoint))
+    expected_plan = build_unified_validation_plan(
+        validation_index, validation_seed=cfg.validation_plan_seed
+    )
+    assert state["validation_plan_sha256"] == expected_plan["validation_plan_sha256"]
+    _, receipt = find_latest_stage2_selection_receipt(
+        cfg.checkpoint_dir, variant="sb_only", require_complete=True
+    )
+    assert receipt["validation_plan_sha256"] == expected_plan["validation_plan_sha256"]
     row = next(
         json.loads(line)
         for line in (tmp_path / "history.jsonl").read_text().splitlines()

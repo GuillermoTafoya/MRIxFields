@@ -45,9 +45,14 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
 from fieldbridge.evaluation.stage2_unified import BASELINE_PREDICTIONS_CONTRACT
 
 DOMAIN_SEPARABILITY_CONTRACT = "stage2-factored-latent-domain-separability-v1"
-PAIRED_FEASIBILITY_CONTRACT = "stage2-retrospective-paired-feasibility-v1"
-MATERIALIZED_VALIDATION_ARRAYS_CONTRACT = "stage2-materialized-r-validation-arrays-v1"
-BASELINE_SOURCE_CONTRACT = "stage2-existing-gate01-sbv2-baseline-source-v1"
+PAIRED_FEASIBILITY_CONTRACT = "stage2-retrospective-paired-feasibility-v2"
+MATERIALIZED_VALIDATION_ARRAYS_CONTRACT = "stage2-materialized-r-validation-arrays-v2"
+MATERIALIZED_VALIDATION_PRODUCER_CONTRACT = (
+    "stage2-r-validation-array-and-stage1-ceiling-producer-v1"
+)
+BASELINE_SOURCE_CONTRACT = "stage2-existing-gate01-sbv2-baseline-source-v2"
+BASELINE_SOURCE_PRODUCER_CONTRACT = "stage2-gate01-sbv2-baseline-export-producer-v1"
+LONG_RUN_EVALUATION_READINESS_CONTRACT = "stage2-long-run-evaluation-readiness-v1"
 
 
 def quantify_factored_domain_separability(
@@ -147,7 +152,9 @@ def audit_retrospective_paired_feasibility(
     splits = load_vae_splits(source)
     eligible: list[tuple[Any, Any]] = []
     excluded: list[dict[str, Any]] = []
-    # Classification and role checks precede every source-file access.
+    # Independent classification and role checks precede every source-file access.
+    # Only a positive, reconciled P identity is excluded.  Missing, malformed, or
+    # conflicting identities are integrity failures and are never recast as P.
     for record in splits.validation:
         try:
             identity = classify_variant_a_cohort(
@@ -155,10 +162,20 @@ def audit_retrospective_paired_feasibility(
                 metadata_prefix=record.metadata.get("prefix"),
                 supplied_cohort=record.metadata.get("cohort"),
                 subject_identity=record.subject_id,
-                allowed_cohorts=("R",),
+                allowed_cohorts=("R", "P"),
             )
         except ValueError as exc:
-            excluded.append({"case_id": record.case_id, "reason": str(exc)})
+            raise ValueError(
+                "Malformed/conflicting validation cohort identity; complete_inventory_no_selection "
+                f"cannot be asserted for {record.case_id!r}: {exc}"
+            ) from exc
+        if identity.cohort == "P":
+            excluded.append(
+                {
+                    "case_id": identity.case_identity,
+                    "reason": "independently_and_positively_classified_as_P_before_source_access",
+                }
+            )
             continue
         eligible.append((record, identity))
     groups: dict[tuple[str, str], list[tuple[Any, Any]]] = defaultdict(list)
@@ -206,6 +223,8 @@ def audit_retrospective_paired_feasibility(
             "path_identity_sha256": sha256_text(str(source.resolve())),
         },
         "classification_before_source_file_access": True,
+        "prospective_exclusion_rule": "exclude_only_independently_reconciled_positive_P",
+        "malformed_or_conflicting_identity_policy": "raise_before_source_file_access",
         "array_payloads_opened": 0,
         "eligible_record_count": len(eligible),
         "eligible_domain_counts": {
@@ -259,10 +278,19 @@ def build_retrospective_paired_manifest(
     arrays = _load_self_hashed(materialized_arrays_path, "manifest_sha256")
     if arrays.get("contract_version") != MATERIALIZED_VALIDATION_ARRAYS_CONTRACT:
         raise ValueError("Materialized R/validation array contract mismatch.")
+    producer = _require_deterministic_producer(
+        arrays, MATERIALIZED_VALIDATION_PRODUCER_CONTRACT
+    )
+    if producer.get("feasibility_result_sha256") != feasibility["result_sha256"]:
+        raise ValueError("Materialized arrays were produced from another feasibility plan.")
     entries = arrays.get("records")
     if not isinstance(entries, list):
         raise ValueError("Materialized validation arrays require a records list.")
     by_record = {str(item.get("record_identity")): item for item in entries}
+    if set(by_record) != set(feasibility["source_files"]):
+        raise ValueError(
+            "Materialized arrays must exactly cover the complete feasible record inventory."
+        )
     cases = []
     for edge in feasibility["pairs"]:
         source_id = str(edge["source_record_identity"])
@@ -321,7 +349,7 @@ def build_baseline_prediction_manifest(
 ) -> dict[str, Any]:
     """Seal complete Gate-0.1/SB-v2 predictions from an existing artifact index."""
 
-    paired = json.loads(Path(paired_manifest_path).read_text(encoding="utf-8"))
+    paired = _load_self_hashed(paired_manifest_path, "manifest_sha256")
     source = _load_self_hashed(source_artifact_path, "manifest_sha256")
     if source.get("contract_version") != BASELINE_SOURCE_CONTRACT:
         raise ValueError(
@@ -329,6 +357,11 @@ def build_baseline_prediction_manifest(
             "identity and original SB-v2 predictions with contract "
             f"{BASELINE_SOURCE_CONTRACT}."
         )
+    producer = _require_deterministic_producer(
+        source, BASELINE_SOURCE_PRODUCER_CONTRACT
+    )
+    if producer.get("paired_manifest_sha256") != paired["manifest_sha256"]:
+        raise ValueError("Baseline predictions were exported for another paired inventory.")
     cases = paired.get("cases")
     source_cases = source.get("cases")
     if not isinstance(cases, list) or not isinstance(source_cases, list):
@@ -377,6 +410,99 @@ def build_baseline_prediction_manifest(
     body["manifest_sha256"] = sha256_json(body)
     write_json_atomic(output_path, body, refuse_existing=True)
     return body
+
+
+def seal_long_run_evaluation_readiness(
+    feasibility_path: str | Path,
+    materialized_arrays_path: str | Path,
+    paired_manifest_path: str | Path,
+    baseline_source_artifact_path: str | Path,
+    baseline_predictions_path: str | Path,
+    *,
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Fail closed unless a complete deterministic retrospective evaluation path exists.
+
+    This contract intentionally has no prospective fallback.  A prospective protocol
+    would require a separately versioned, reviewed implementation and authorization.
+    """
+
+    feasibility = _load_self_hashed(feasibility_path, "result_sha256")
+    if (
+        feasibility.get("contract_version") != PAIRED_FEASIBILITY_CONTRACT
+        or feasibility.get("paired_evaluation_possible") is not True
+        or feasibility.get("complete_inventory_no_selection") is not True
+    ):
+        raise ValueError(
+            "Long training is blocked: no complete genuine paired R/validation inventory. "
+            "Do not fabricate pairs; a prospective protocol requires separate review."
+        )
+    arrays = _load_self_hashed(materialized_arrays_path, "manifest_sha256")
+    if arrays.get("contract_version") != MATERIALIZED_VALIDATION_ARRAYS_CONTRACT:
+        raise ValueError("Long training is blocked: materialized array/ceiling contract mismatch.")
+    array_producer = _require_deterministic_producer(
+        arrays, MATERIALIZED_VALIDATION_PRODUCER_CONTRACT
+    )
+    if array_producer.get("feasibility_result_sha256") != feasibility["result_sha256"]:
+        raise ValueError("Long training is blocked: array producer used another inventory.")
+    paired = _load_self_hashed(paired_manifest_path, "manifest_sha256")
+    paired_provenance = paired.get("provenance")
+    if not isinstance(paired_provenance, Mapping) or (
+        paired_provenance.get("feasibility_result_sha256")
+        != feasibility["result_sha256"]
+        or paired_provenance.get("materialized_arrays_sha256")
+        != arrays["manifest_sha256"]
+        or paired_provenance.get("complete_inventory_no_selection") is not True
+    ):
+        raise ValueError("Long training is blocked: paired manifest provenance is incomplete.")
+    baseline_source = _load_self_hashed(
+        baseline_source_artifact_path, "manifest_sha256"
+    )
+    if baseline_source.get("contract_version") != BASELINE_SOURCE_CONTRACT:
+        raise ValueError("Long training is blocked: baseline-source contract mismatch.")
+    baseline_producer = _require_deterministic_producer(
+        baseline_source, BASELINE_SOURCE_PRODUCER_CONTRACT
+    )
+    if baseline_producer.get("paired_manifest_sha256") != paired["manifest_sha256"]:
+        raise ValueError("Long training is blocked: baseline producer used another inventory.")
+    baselines = _load_self_hashed(baseline_predictions_path, "manifest_sha256")
+    if (
+        baselines.get("contract_version") != BASELINE_PREDICTIONS_CONTRACT
+        or baselines.get("source_artifact_sha256")
+        != baseline_source["manifest_sha256"]
+        or baselines.get("complete_inventory_no_selection") is not True
+    ):
+        raise ValueError("Long training is blocked: final baseline manifest is incomplete.")
+    case_ids = {
+        str(case.get("case_identity")) for case in paired.get("cases", [])
+    }
+    baseline_case_ids = {
+        str(case.get("case_identity")) for case in baselines.get("cases", [])
+    }
+    if not case_ids or case_ids != baseline_case_ids or len(case_ids) != int(
+        feasibility["directed_pair_count"]
+    ):
+        raise ValueError("Long training is blocked: evaluation case inventories disagree.")
+    result: dict[str, Any] = {
+        "contract_version": LONG_RUN_EVALUATION_READINESS_CONTRACT,
+        "long_run_authorized_by_evaluation_path": True,
+        "evaluation_role": "complete_genuine_paired_R_validation",
+        "prospective_protocol_used": False,
+        "reviewed_prospective_protocol_available": False,
+        "complete_inventory_no_selection": True,
+        "directed_pair_count": len(case_ids),
+        "feasibility_result_sha256": feasibility["result_sha256"],
+        "materialized_arrays_sha256": arrays["manifest_sha256"],
+        "materialized_array_producer": dict(array_producer),
+        "paired_manifest_sha256": paired["manifest_sha256"],
+        "baseline_source_sha256": baseline_source["manifest_sha256"],
+        "baseline_source_producer": dict(baseline_producer),
+        "baseline_predictions_sha256": baselines["manifest_sha256"],
+        "case_inventory_sha256": sha256_json(sorted(case_ids)),
+    }
+    result["readiness_sha256"] = sha256_json(result)
+    write_json_atomic(output_path, result, refuse_existing=True)
+    return result
 
 
 def _bank_features(
@@ -438,6 +564,29 @@ def _endpoint_spec(entry: Mapping[str, Any], domain: Mapping[str, Any]) -> dict[
     }
 
 
+def _require_deterministic_producer(
+    artifact: Mapping[str, Any], expected_contract: str
+) -> dict[str, Any]:
+    producer = artifact.get("producer")
+    if not isinstance(producer, Mapping):
+        raise ValueError(
+            f"Artifact requires deterministic producer provenance {expected_contract}."
+        )
+    required_hashes = ("source_code_provenance_sha256", "resolved_config_sha256")
+    if (
+        producer.get("contract_version") != expected_contract
+        or producer.get("deterministic") is not True
+        or producer.get("complete_inventory_no_selection") is not True
+        or producer.get("full_volume_arithmetic") is not True
+        or any(
+            not isinstance(producer.get(key), str) or len(str(producer.get(key))) != 64
+            for key in required_hashes
+        )
+    ):
+        raise ValueError(f"Artifact producer provenance does not satisfy {expected_contract}.")
+    return dict(producer)
+
+
 def _load_self_hashed(path: str | Path, hash_key: str) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
@@ -452,11 +601,15 @@ def _load_self_hashed(path: str | Path, hash_key: str) -> dict[str, Any]:
 
 __all__ = [
     "BASELINE_SOURCE_CONTRACT",
+    "BASELINE_SOURCE_PRODUCER_CONTRACT",
     "DOMAIN_SEPARABILITY_CONTRACT",
+    "LONG_RUN_EVALUATION_READINESS_CONTRACT",
     "MATERIALIZED_VALIDATION_ARRAYS_CONTRACT",
+    "MATERIALIZED_VALIDATION_PRODUCER_CONTRACT",
     "PAIRED_FEASIBILITY_CONTRACT",
     "audit_retrospective_paired_feasibility",
     "build_baseline_prediction_manifest",
     "build_retrospective_paired_manifest",
     "quantify_factored_domain_separability",
+    "seal_long_run_evaluation_readiness",
 ]

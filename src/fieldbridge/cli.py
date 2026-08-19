@@ -154,13 +154,19 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentStats,
     PhotometryFactoredLatentBankIndex,
 )
-from fieldbridge.training.stage2_unified import UnifiedStage2Config, run_stage2_unified_train
+from fieldbridge.training.stage2_unified import (
+    UNIFIED_RESUME_CONTRACT,
+    UnifiedStage2Config,
+    load_stage2_selection_receipt,
+    run_stage2_unified_train,
+)
 from fieldbridge.evaluation.stage2_unified import evaluate_stage2_unified
 from fieldbridge.evaluation.stage2_unified_preflight import (
     audit_retrospective_paired_feasibility,
     build_baseline_prediction_manifest,
     build_retrospective_paired_manifest,
     quantify_factored_domain_separability,
+    seal_long_run_evaluation_readiness,
 )
 from fieldbridge.utils.seeding import seed_everything
 from fieldbridge.data.photometry_factored_latent_bank import (
@@ -553,7 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v2.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v3.yaml"),
     )
     train_unified.add_argument("--bank-dir", type=Path, required=True)
     train_unified.add_argument("--vae-config", type=Path, required=True)
@@ -598,6 +604,17 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_builder.add_argument("--source-artifact", type=Path, required=True)
     baseline_builder.add_argument("--out", type=Path, required=True)
 
+    readiness = subparsers.add_parser(
+        "seal-stage2-long-run-evaluation-readiness",
+        help="Seal the complete deterministic paired R/validation path required before 100k training.",
+    )
+    readiness.add_argument("--feasibility", type=Path, required=True)
+    readiness.add_argument("--materialized-arrays", type=Path, required=True)
+    readiness.add_argument("--paired-manifest", type=Path, required=True)
+    readiness.add_argument("--baseline-source", type=Path, required=True)
+    readiness.add_argument("--baseline-predictions", type=Path, required=True)
+    readiness.add_argument("--out", type=Path, required=True)
+
     eval_unified = subparsers.add_parser(
         "eval-stage2-unified",
         help="Run complete retrospective R/validation controls, metrics, and montages.",
@@ -605,10 +622,16 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v2.yaml"),
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v3.yaml"),
     )
     eval_unified.add_argument("--bank-dir", type=Path, required=True)
-    eval_unified.add_argument("--checkpoint", type=Path, required=True)
+    evaluation_model = eval_unified.add_mutually_exclusive_group(required=True)
+    evaluation_model.add_argument("--checkpoint", type=Path)
+    evaluation_model.add_argument(
+        "--selection-receipt",
+        type=Path,
+        help="Verify and evaluate the selected best checkpoint from a completed run receipt.",
+    )
     eval_unified.add_argument("--vae-config", type=Path, required=True)
     eval_unified.add_argument("--vae-checkpoint", type=Path, required=True)
     eval_unified.add_argument("--photometry-artifact", type=Path, required=True)
@@ -1849,9 +1872,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
         return 0
 
+    if args.command == "seal-stage2-long-run-evaluation-readiness":
+        result = seal_long_run_evaluation_readiness(
+            args.feasibility,
+            args.materialized_arrays,
+            args.paired_manifest,
+            args.baseline_source,
+            args.baseline_predictions,
+            output_path=args.out,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
     if args.command == "train-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v2":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v3":
             raise ValueError("Unified training config contract mismatch.")
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
@@ -1900,7 +1935,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v2":
+        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v3":
             raise ValueError("Unified evaluation config contract mismatch.")
         validation_index = PhotometryFactoredLatentBankIndex(
             args.bank_dir, "validation"
@@ -1917,12 +1952,21 @@ def main(argv: list[str] | None = None) -> int:
                 **{key: value for key, value in model_config.items() if key != "name"},
             )
             state = load_checkpoint(checkpoint_path)
-            if state.get("contract_version") != "stage2-unified-exact-resume-v2":
+            if state.get("contract_version") != UNIFIED_RESUME_CONTRACT:
                 raise ValueError("Unified evaluation checkpoint contract mismatch.")
             model.load_state_dict(state["translator"], strict=True)
             return model
 
-        translator = make_translator(args.checkpoint)
+        selected_checkpoint = args.checkpoint
+        if args.selection_receipt is not None:
+            selected = load_stage2_selection_receipt(
+                args.selection_receipt,
+                expected_variant=str(config.get("training", {}).get("variant", "full")),
+                require_complete=True,
+            )
+            selected_checkpoint = Path(str(selected["best_checkpoint"]))
+        assert selected_checkpoint is not None
+        translator = make_translator(selected_checkpoint)
         sb_only = (
             make_translator(args.sb_only_checkpoint)
             if args.sb_only_checkpoint is not None

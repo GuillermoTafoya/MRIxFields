@@ -12,12 +12,18 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     FactoredLatentRecord,
     FactoredLatentStats,
 )
-from fieldbridge.data.photometry_factorization import sha256_json
+from fieldbridge.data.photometry_factorization import sha256_file, sha256_json
 from fieldbridge.data.vae_splits import VaeSplits, save_vae_splits
 from fieldbridge.evaluation.stage2_unified_preflight import (
+    BASELINE_SOURCE_CONTRACT,
+    BASELINE_SOURCE_PRODUCER_CONTRACT,
+    MATERIALIZED_VALIDATION_ARRAYS_CONTRACT,
+    MATERIALIZED_VALIDATION_PRODUCER_CONTRACT,
     audit_retrospective_paired_feasibility,
+    build_baseline_prediction_manifest,
     build_retrospective_paired_manifest,
     quantify_factored_domain_separability,
+    seal_long_run_evaluation_readiness,
 )
 
 
@@ -132,6 +138,40 @@ def test_paired_feasibility_fails_closed_when_r_validation_has_no_cross_field_su
     assert "do not fabricate" in result["failure_instruction"]
 
 
+def test_corrupted_r_identity_raises_before_source_access_or_complete_inventory_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    valid = _record(tmp_path, "R_valid", "same", 0.1)
+    corrupt = VolumeRecord(
+        case_id="R_corrupt",
+        image_path=tmp_path / "must-not-open.bin",
+        domain=Domain(3.0, Contrast.T1W),
+        subject_id="same",
+        split="validation",
+        metadata={"prefix": "R", "cohort": "P"},
+    )
+    split_path = save_vae_splits(
+        VaeSplits((), (valid, corrupt), (), 13, (0.0, 1.0, 0.0)),
+        tmp_path / "corrupt-split.json",
+    )
+    accessed = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal accessed
+        accessed = True
+        raise AssertionError("source identity accessed")
+
+    monkeypatch.setattr(
+        "fieldbridge.evaluation.stage2_unified_preflight._source_file_identity",
+        forbidden,
+    )
+    output = tmp_path / "must-not-exist.json"
+    with pytest.raises(ValueError, match="complete_inventory_no_selection"):
+        audit_retrospective_paired_feasibility(split_path, output_path=output)
+    assert accessed is False
+    assert not output.exists()
+
+
 class ArtifactIdentity:
     artifact_sha256 = "e" * 64
     provenance = {"resolved_config_sha256": "f" * 64}
@@ -152,7 +192,16 @@ def test_paired_manifest_builder_uses_complete_feasible_inventory_and_stage1_cei
         split_path, output_path=feasibility_path
     )
     materialized_body = {
-        "contract_version": "stage2-materialized-r-validation-arrays-v1",
+        "contract_version": MATERIALIZED_VALIDATION_ARRAYS_CONTRACT,
+        "producer": {
+            "contract_version": MATERIALIZED_VALIDATION_PRODUCER_CONTRACT,
+            "deterministic": True,
+            "complete_inventory_no_selection": True,
+            "full_volume_arithmetic": True,
+            "source_code_provenance_sha256": "a" * 64,
+            "resolved_config_sha256": "b" * 64,
+            "feasibility_result_sha256": feasibility["result_sha256"],
+        },
         "records": [],
     }
     for record in records:
@@ -191,3 +240,90 @@ def test_paired_manifest_builder_uses_complete_feasible_inventory_and_stage1_cei
     assert all(case["stage1_reconstruction"] for case in result["cases"])
     assert result["provenance"]["complete_inventory_no_selection"] is True
     assert json.loads(output.read_text())["manifest_sha256"] == result["manifest_sha256"]
+
+    source_cases = []
+    for edge in feasibility["pairs"]:
+        methods = {}
+        for method in ("gate01_calibrated_identity", "original_sb_v2"):
+            prediction = tmp_path / f"{edge['case_identity']}-{method}.npy"
+            prediction.write_bytes(f"{edge['case_identity']}:{method}".encode())
+            methods[method] = {
+                "path": str(prediction),
+                "file_sha256": sha256_file(prediction),
+            }
+        source_cases.append(
+            {
+                "case_identity": edge["case_identity"],
+                "record_identity": edge["source_record_identity"],
+                "subject_identity": edge["subject_group_identity"].split(":", 1)[-1],
+                "metadata_prefix": "R",
+                "cohort": "R",
+                "split": "validation",
+                **methods,
+            }
+        )
+    baseline_source_body = {
+        "contract_version": BASELINE_SOURCE_CONTRACT,
+        "producer": {
+            "contract_version": BASELINE_SOURCE_PRODUCER_CONTRACT,
+            "deterministic": True,
+            "complete_inventory_no_selection": True,
+            "full_volume_arithmetic": True,
+            "source_code_provenance_sha256": "c" * 64,
+            "resolved_config_sha256": "d" * 64,
+            "paired_manifest_sha256": result["manifest_sha256"],
+        },
+        "cases": source_cases,
+    }
+    baseline_source = dict(baseline_source_body)
+    baseline_source["manifest_sha256"] = sha256_json(baseline_source_body)
+    baseline_source_path = tmp_path / "baseline-source.json"
+    baseline_source_path.write_text(json.dumps(baseline_source), encoding="utf-8")
+    baseline_predictions_path = tmp_path / "baseline-predictions.json"
+    baseline_predictions = build_baseline_prediction_manifest(
+        output,
+        baseline_source_path,
+        output_path=baseline_predictions_path,
+    )
+    readiness_path = tmp_path / "readiness.json"
+    readiness = seal_long_run_evaluation_readiness(
+        feasibility_path,
+        materialized_path,
+        output,
+        baseline_source_path,
+        baseline_predictions_path,
+        output_path=readiness_path,
+    )
+    assert readiness["long_run_authorized_by_evaluation_path"] is True
+    assert readiness["prospective_protocol_used"] is False
+    assert readiness["directed_pair_count"] == len(baseline_predictions["cases"])
+
+
+def test_long_run_readiness_hard_stops_when_genuine_pairs_do_not_exist(
+    tmp_path: Path,
+) -> None:
+    split_path = save_vae_splits(
+        VaeSplits(
+            (),
+            (
+                _record(tmp_path, "R_one", "one", 0.1),
+                _record(tmp_path, "R_two", "two", 3.0),
+            ),
+            (),
+            13,
+            (0.0, 1.0, 0.0),
+        ),
+        tmp_path / "no-pairs-split.json",
+    )
+    feasibility_path = tmp_path / "no-pairs.json"
+    audit_retrospective_paired_feasibility(split_path, output_path=feasibility_path)
+    with pytest.raises(ValueError, match="Long training is blocked"):
+        seal_long_run_evaluation_readiness(
+            feasibility_path,
+            tmp_path / "not-opened-arrays.json",
+            tmp_path / "not-opened-pairs.json",
+            tmp_path / "not-opened-source.json",
+            tmp_path / "not-opened-baselines.json",
+            output_path=tmp_path / "must-not-exist.json",
+        )
+    assert not (tmp_path / "must-not-exist.json").exists()

@@ -30,6 +30,7 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
     PhotometryFactoredLatentBankIndex,
 )
 from fieldbridge.data.photometry_factorization import sha256_json, write_json_atomic
+from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.data.stage2_canonical_volume import storage_tensor_sha256
 from fieldbridge.models.discriminators import (
     DomainProjectionDiscriminator,
@@ -47,10 +48,35 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.train_loop import assert_frozen
 from fieldbridge.utils.seeding import seed_everything
 
-UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v2"
-UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v2"
-UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v2"
-UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v1"
+UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v3"
+UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v3"
+UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v3"
+UNIFIED_VALIDATION_PLAN_CONTRACT = "stage2-unified-validation-plan-v1"
+UNIFIED_SELECTION_CONTRACT = "stage2-unified-unpaired-validation-selection-v2"
+UNIFIED_SELECTION_RULE_CONTRACT = "stage2-unified-critic-independent-selection-rule-v1"
+UNIFIED_SELECTION_RECEIPT_CONTRACT = "stage2-unified-selection-receipt-v2"
+
+VALIDATION_PLAN_BRIDGE_EPS = 1.0e-3
+UNIFIED_SELECTION_RULE: dict[str, Any] = {
+    "contract_version": UNIFIED_SELECTION_RULE_CONTRACT,
+    "objective": "minimize",
+    "expression": "val_sb+0.1*val_identity+0.02*val_anatomy+0.01*val_graph",
+    "coefficients": {
+        "sb": 1.0,
+        "identity": 0.1,
+        "anatomy": 0.02,
+        "graph": 0.01,
+    },
+    "paired_endpoint_assumption": False,
+    "training_critic_inputs": [],
+    "critic_and_domain_accuracy_diagnostic_only": True,
+    "applies_to_all_variants_including_sb_only": True,
+    "provenance": (
+        "fixed engineering rule over frozen-plan complete-R/validation diagnostics; "
+        "independent of training loss weights and the jointly trained critic"
+    ),
+}
+UNIFIED_SELECTION_RULE_SHA256 = sha256_json(UNIFIED_SELECTION_RULE)
 
 CriticSpace = Literal["latent", "image"]
 Precision = Literal["fp32", "bf16"]
@@ -109,6 +135,7 @@ class UnifiedStage2Config:
     gpu_hourly_cost_usd: float | None = None
     validation_every_steps: int = 1000
     validation_complete_inventory: bool = True
+    validation_plan_seed: int = 20_260_818
     variant: str = "full"
 
     @classmethod
@@ -204,6 +231,9 @@ class UnifiedStage2Config:
             validation_complete_inventory=bool(
                 validation.get("complete_inventory", defaults.validation_complete_inventory)
             ),
+            validation_plan_seed=int(
+                validation.get("seed", defaults.validation_plan_seed)
+            ),
             variant=str(training.get("variant", defaults.variant)),
         )
         validate_unified_config(value)
@@ -245,6 +275,7 @@ class UnifiedStage2Config:
             "gpu_hourly_cost_usd": self.gpu_hourly_cost_usd,
             "validation_every_steps": self.validation_every_steps,
             "validation_complete_inventory": self.validation_complete_inventory,
+            "validation_plan_seed": self.validation_plan_seed,
             "variant": self.variant,
         }
 
@@ -383,6 +414,138 @@ def anatomy_preservation_components(
     return result
 
 
+def build_unified_validation_plan(
+    index: PhotometryFactoredLatentBankIndex,
+    *,
+    validation_seed: int,
+) -> dict[str, Any]:
+    """Freeze complete unpaired R/validation draws without opening latent arrays.
+
+    Target assignment, bridge time, and stochastic-noise seed are functions only of
+    the reviewed validation seed and source case identity.  No training-step, model,
+    variant, checkpoint, or training RNG state enters this contract.
+    """
+
+    if index.split != "validation":
+        raise ValueError("A unified validation plan requires the R/validation bank role.")
+    if validation_seed < 0:
+        raise ValueError("The frozen validation-plan seed must be non-negative.")
+    records_by_case: dict[str, FactoredLatentRecord] = {}
+    for record in index.records:
+        if record.case_id in records_by_case:
+            raise ValueError(f"Validation case identity is not unique: {record.case_id}.")
+        records_by_case[record.case_id] = record
+    pools = _DomainPools.from_index(index)
+    pools.require_all_domains()
+    entries: list[dict[str, Any]] = []
+    for source_record in sorted(index.records, key=lambda item: item.case_id):
+        target_field = _next_field(source_record.domain.field_strength_t)
+        candidates = sorted(
+            (
+                index.records[position]
+                for position in pools.table[
+                    Contrast.parse(source_record.domain.contrast)
+                ][target_field]
+                if index.records[position].subject_group_id
+                != source_record.subject_group_id
+            ),
+            key=lambda item: item.case_id,
+        )
+        if not candidates:
+            raise ValueError(
+                "Complete R/validation diagnostics have no subject-excluded target."
+            )
+        target_position = _validation_u64(
+            validation_seed, source_record.case_id, "independent_target"
+        ) % len(candidates)
+        target_record = candidates[target_position]
+        raw_time = _validation_u64(
+            validation_seed, source_record.case_id, "bridge_time"
+        )
+        unit_time = (raw_time + 0.5) / float(1 << 64)
+        bridge_time = VALIDATION_PLAN_BRIDGE_EPS + (
+            1.0 - 2.0 * VALIDATION_PLAN_BRIDGE_EPS
+        ) * unit_time
+        noise_seed = _validation_u64(
+            validation_seed, source_record.case_id, "stochastic_noise"
+        ) % ((1 << 63) - 1)
+        entries.append(
+            {
+                "source_case_identity": source_record.case_id,
+                "source_resume_key": source_record.resume_key,
+                "source_subject_group_identity": source_record.subject_group_id,
+                "source_domain": source_record.domain.to_dict(),
+                "target_case_identity": target_record.case_id,
+                "target_resume_key": target_record.resume_key,
+                "target_subject_group_identity": target_record.subject_group_id,
+                "target_domain": target_record.domain.to_dict(),
+                "bridge_t": bridge_time,
+                "noise_seed": noise_seed,
+            }
+        )
+    inventory = [
+        {
+            "case_identity": record.case_id,
+            "resume_key": record.resume_key,
+            "subject_group_identity": record.subject_group_id,
+            "domain": record.domain.to_dict(),
+        }
+        for record in sorted(index.records, key=lambda item: item.case_id)
+    ]
+    body: dict[str, Any] = {
+        "contract_version": UNIFIED_VALIDATION_PLAN_CONTRACT,
+        "validation_seed": validation_seed,
+        "scope": "complete_R_validation_inventory",
+        "bank_artifact_sha256": index.artifact_sha256,
+        "inventory_record_count": len(inventory),
+        "inventory_sha256": sha256_json(inventory),
+        "derivation": {
+            "target_assignment": "sha256(seed,source_case_identity,independent_target)_mod_sorted_subject_excluded_pool",
+            "bridge_t": (
+                "open_interval_affine_sha256_u64(seed,source_case_identity,bridge_time)"
+            ),
+            "bridge_t_eps": VALIDATION_PLAN_BRIDGE_EPS,
+            "stochastic_noise": (
+                "torch_cpu_float32_randn_seeded_by_"
+                "sha256_u63(seed,source_case_identity,stochastic_noise)"
+            ),
+            "training_step_dependency": False,
+            "model_or_variant_dependency": False,
+            "array_payloads_opened": 0,
+        },
+        "entries": entries,
+    }
+    body["validation_plan_sha256"] = sha256_json(body)
+    return body
+
+
+def unified_validation_selection_score(means: Mapping[str, float]) -> float:
+    """Apply the frozen critic-independent rule to complete validation means."""
+
+    score = sum(
+        float(coefficient) * float(means[name])
+        for name, coefficient in UNIFIED_SELECTION_RULE["coefficients"].items()
+    )
+    if not np.isfinite(score):
+        raise FloatingPointError("Unpaired R/validation selection score is non-finite.")
+    return float(score)
+
+
+def _validation_u64(seed: int, case_identity: str, purpose: str) -> int:
+    return int(sha256_json([int(seed), str(case_identity), str(purpose)])[:16], 16)
+
+
+def _seal_or_verify_validation_plan(path: Path, plan: Mapping[str, Any]) -> None:
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != dict(plan):
+            raise ValueError(
+                "Existing validation plan differs from the frozen seed/inventory contract."
+            )
+        return
+    write_json_atomic(path, plan, refuse_existing=True)
+
+
 def run_stage2_unified_train(
     config: UnifiedStage2Config | Mapping[str, Any],
     *,
@@ -432,8 +595,16 @@ def run_stage2_unified_train(
     sampler = torch.Generator().manual_seed(cfg.seed)
     pools = _DomainPools.from_index(train_index)
     pools.require_all_domains()
-    validation_pools = _DomainPools.from_index(validation_index)
-    validation_pools.require_all_domains()
+    validation_plan = build_unified_validation_plan(
+        validation_index, validation_seed=cfg.validation_plan_seed
+    )
+    validation_plan_sha256 = str(validation_plan["validation_plan_sha256"])
+    if cfg.checkpoint_dir is not None:
+        cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        _seal_or_verify_validation_plan(
+            cfg.checkpoint_dir / "stage2_unified_validation_plan_v1.json",
+            validation_plan,
+        )
     history_path = cfg.history_jsonl or (
         (cfg.checkpoint_dir or Path.cwd()) / "stage2_unified_history.jsonl"
     )
@@ -446,6 +617,8 @@ def run_stage2_unified_train(
         "validation_inventory_sha256": sha256_json(
             [item.resume_key for item in validation_index.records]
         ),
+        "validation_plan_sha256": validation_plan_sha256,
+        "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
         "latent_statistics_sha256": stats.artifact_sha256,
         "bank_vae_provenance": dict(getattr(train_index, "manifest", {}).get("vae", {})),
         "frozen_decoder_state_sha256": _module_state_sha256(decoder),
@@ -456,7 +629,9 @@ def run_stage2_unified_train(
     history_generation = 0
     selection: dict[str, Any] = {
         "contract_version": UNIFIED_SELECTION_CONTRACT,
-        "rule": "min(val_sb+0.1*val_identity+0.01*val_graph+0.1*(1-generated_domain_accuracy))",
+        "validation_plan_sha256": validation_plan_sha256,
+        "selection_rule": dict(UNIFIED_SELECTION_RULE),
+        "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
         "paired_targets_used": False,
         "complete_r_validation_inventory": True,
         "latest_step": None,
@@ -478,6 +653,7 @@ def run_stage2_unified_train(
             scaler=scaler,
             sampler=sampler,
             expected_run_fingerprint=run_fingerprint,
+            expected_validation_plan_sha256=validation_plan_sha256,
             history_path=history_path,
         )
         selection.update(restored_selection)
@@ -577,7 +753,7 @@ def run_stage2_unified_train(
                 critic,
                 decoder,
                 validation_index,
-                validation_pools,
+                validation_plan,
                 stats,
                 device,
                 step=step + 1,
@@ -601,8 +777,10 @@ def run_stage2_unified_train(
         if cfg.checkpoint_dir is not None and cfg.checkpoint_every_steps > 0:
             if (step + 1) % cfg.checkpoint_every_steps == 0 or validation_due:
                 checkpoint_identity = str(
-                    cfg.checkpoint_dir
-                    / f"stage2_unified_{cfg.variant}_step{step + 1:09d}.pt"
+                    (
+                        cfg.checkpoint_dir
+                        / f"stage2_unified_{cfg.variant}_step{step + 1:09d}.pt"
+                    ).resolve()
                 )
                 selection["latest_checkpoint"] = checkpoint_identity
                 if selection["best_step"] == step + 1:
@@ -619,25 +797,34 @@ def run_stage2_unified_train(
                     scaler,
                     sampler,
                     run_fingerprint,
+                    validation_plan_sha256,
                     history_path,
                     selection,
                     pilot_report,
                 )
                 if validation_due:
-                    receipt = dict(selection)
-                    receipt["selection_sha256"] = sha256_json(receipt)
-                    write_json_atomic(
+                    receipt_path = (
                         cfg.checkpoint_dir
-                        / f"stage2_unified_{cfg.variant}_selection_step{step + 1:09d}.json",
-                        receipt,
-                        refuse_existing=True,
+                        / f"stage2_unified_{cfg.variant}_selection_step{step + 1:09d}.json"
                     )
+                    _write_selection_receipt(
+                        receipt_path,
+                        cfg=cfg,
+                        step=step + 1,
+                        selection=selection,
+                        validation_plan_sha256=validation_plan_sha256,
+                    )
+                    selection["latest_selection_receipt"] = str(receipt_path)
+                    selection["latest_selection_receipt_sha256"] = sha256_file(receipt_path)
     if cfg.checkpoint_dir is not None and cfg.steps > cursor and (
         last_checkpoint is None
         or not last_checkpoint.name.endswith(f"step{cfg.steps:09d}.pt")
     ):
         checkpoint_identity = str(
-            cfg.checkpoint_dir / f"stage2_unified_{cfg.variant}_step{cfg.steps:09d}.pt"
+            (
+                cfg.checkpoint_dir
+                / f"stage2_unified_{cfg.variant}_step{cfg.steps:09d}.pt"
+            ).resolve()
         )
         selection["latest_checkpoint"] = checkpoint_identity
         if selection["best_step"] == cfg.steps:
@@ -654,6 +841,7 @@ def run_stage2_unified_train(
             scaler,
             sampler,
             run_fingerprint,
+            validation_plan_sha256,
             history_path,
             selection,
             pilot_report,
@@ -1058,13 +1246,20 @@ def _bridge_sample(
     target: torch.Tensor,
     time_values: torch.Tensor,
     cfg: UnifiedStage2Config,
-    sampler: torch.Generator,
+    sampler: torch.Generator | None = None,
+    *,
+    noise: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = (source.shape[0],) + (1,) * (source.ndim - 1)
     t = time_values.reshape(shape)
     if cfg.bridge == "ot_cfm":
         return (1.0 - t) * source + t * target, target - source
-    noise = _randn(tuple(source.shape), sampler, source.device, source.dtype)
+    if noise is None:
+        if sampler is None:
+            raise ValueError("Schrodinger bridge sampling requires a sampler or frozen noise.")
+        noise = _randn(tuple(source.shape), sampler, source.device, source.dtype)
+    if noise.shape != source.shape or noise.device != source.device:
+        raise ValueError("Frozen validation noise is shape/device inconsistent.")
     z_t = (1.0 - t) * source + t * target + cfg.sigma * torch.sqrt(t * (1.0 - t)) * noise
     return z_t, (target - z_t) / (1.0 - t).clamp_min(cfg.time_eps)
 
@@ -1199,7 +1394,7 @@ def _evaluate_unpaired_validation(
     critic: DomainProjectionDiscriminator,
     decoder: nn.Module,
     index: PhotometryFactoredLatentBankIndex,
-    pools: _DomainPools,
+    validation_plan: Mapping[str, Any],
     stats: FactoredLatentStats,
     device: torch.device,
     *,
@@ -1211,24 +1406,26 @@ def _evaluate_unpaired_validation(
     distribution/flow diagnostics only and are never represented as paired endpoints.
     """
 
+    stored_plan_sha256 = validation_plan.get("validation_plan_sha256")
+    plan_body = dict(validation_plan)
+    plan_body.pop("validation_plan_sha256", None)
+    if (
+        validation_plan.get("contract_version") != UNIFIED_VALIDATION_PLAN_CONTRACT
+        or stored_plan_sha256 != sha256_json(plan_body)
+    ):
+        raise ValueError("Unified validation-plan identity mismatch.")
+    current_plan = build_unified_validation_plan(
+        index, validation_seed=cfg.validation_plan_seed
+    )
+    if current_plan != dict(validation_plan):
+        raise ValueError("Unified validation inventory or frozen draw plan changed.")
+    by_case = {record.case_id: position for position, record in enumerate(index.records)}
     translator.eval()
     critic.eval()
-    sampler = torch.Generator().manual_seed(cfg.seed + step * 1_000_003)
     rows: list[dict[str, float]] = []
-    for source_index, source_record in enumerate(index.records):
-        target_field = _next_field(source_record.domain.field_strength_t)
-        candidates = [
-            value
-            for value in pools.table[Contrast.parse(source_record.domain.contrast)][target_field]
-            if index.records[value].subject_group_id != source_record.subject_group_id
-        ]
-        if not candidates:
-            raise ValueError(
-                "Complete R/validation diagnostics have no subject-excluded target."
-            )
-        target_index = candidates[
-            int(sha256_json([source_record.case_id, step])[:8], 16) % len(candidates)
-        ]
+    for plan_entry in validation_plan["entries"]:
+        source_index = by_case[str(plan_entry["source_case_identity"])]
+        target_index = by_case[str(plan_entry["target_case_identity"])]
         source, source_support, source_domains, _ = index.load_batch([source_index])
         target, target_support, target_domains, _ = index.load_batch([target_index])
         source = stats.normalize(source.to(device), source_support.to(device))
@@ -1238,8 +1435,20 @@ def _evaluate_unpaired_validation(
         support = source_support & target_support
         if not bool(support.any()):
             raise ValueError("R/validation source/target support intersection is empty.")
-        time_values = _rand((1,), sampler, device).clamp(cfg.time_eps, 1.0 - cfg.time_eps)
-        z_t, flow_target = _bridge_sample(source, target, time_values, cfg, sampler)
+        time_values = torch.tensor(
+            [float(plan_entry["bridge_t"])], device=device, dtype=source.dtype
+        )
+        noise_generator = torch.Generator().manual_seed(int(plan_entry["noise_seed"]))
+        fixed_noise = _randn(
+            tuple(source.shape), noise_generator, device, source.dtype
+        )
+        z_t, flow_target = _bridge_sample(
+            source,
+            target,
+            time_values,
+            cfg,
+            noise=fixed_noise,
+        )
         predicted_velocity = translator(z_t, source_domains, target_domains, time_values)
         sb = _masked_mse(predicted_velocity, flow_target, support)
         identity_generated = integrate_transport(
@@ -1303,25 +1512,21 @@ def _evaluate_unpaired_validation(
         key: float(np.mean([row[key] for row in rows]))
         for key in rows[0]
     }
-    selection_score = (
-        means["sb"]
-        + 0.1 * means["identity"]
-        + 0.01 * means["graph"]
-        + 0.1 * (1.0 - means["generated_domain_correct"])
-    )
-    if not np.isfinite(selection_score):
-        raise FloatingPointError("Unpaired R/validation selection score is non-finite.")
+    selection_score = unified_validation_selection_score(means)
     return {
         "contract_version": UNIFIED_SELECTION_CONTRACT,
         "step": step,
+        "validation_plan_sha256": stored_plan_sha256,
         "inventory_record_count": len(index.records),
-        "inventory_sha256": sha256_json([item.resume_key for item in index.records]),
+        "inventory_sha256": validation_plan["inventory_sha256"],
         "complete_inventory_used": True,
         "paired_endpoint_assumption": False,
         "subject_group_exclusion": True,
         "means": means,
         "selection_score": selection_score,
-        "selection_rule": "val_sb+0.1*val_identity+0.01*val_graph+0.1*(1-generated_domain_accuracy)",
+        "selection_rule": dict(UNIFIED_SELECTION_RULE),
+        "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
+        "critic_and_domain_metrics_role": "diagnostic_only_excluded_from_selection",
     }
 
 
@@ -1342,6 +1547,7 @@ def _save_exact_checkpoint(
     scaler: torch.amp.GradScaler,
     sampler: torch.Generator,
     run_fingerprint: str,
+    validation_plan_sha256: str,
     history_path: Path,
     selection: Mapping[str, Any],
     pilot_report: Mapping[str, Any],
@@ -1352,6 +1558,8 @@ def _save_exact_checkpoint(
     state = {
         "contract_version": UNIFIED_RESUME_CONTRACT,
         "run_fingerprint": run_fingerprint,
+        "validation_plan_sha256": validation_plan_sha256,
+        "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
         "training_cursor": cursor,
         "translator": translator.state_dict(),
         "critic": critic.state_dict(),
@@ -1380,6 +1588,136 @@ def _save_exact_checkpoint(
     )
 
 
+def _write_selection_receipt(
+    path: Path,
+    *,
+    cfg: UnifiedStage2Config,
+    step: int,
+    selection: Mapping[str, Any],
+    validation_plan_sha256: str,
+) -> dict[str, Any]:
+    latest_path = Path(str(selection["latest_checkpoint"]))
+    best_path = Path(str(selection["best_checkpoint"]))
+    if not latest_path.is_file() or not best_path.is_file():
+        raise ValueError("Selection receipt cannot resolve latest/best checkpoints.")
+    checkpoints: dict[str, Any] = {
+        "latest": {
+            "path": str(latest_path),
+            "file_sha256": sha256_file(latest_path),
+        },
+        "best": {
+            "path": str(best_path),
+            "file_sha256": sha256_file(best_path),
+        },
+    }
+    run_complete = step == cfg.steps
+    if run_complete:
+        checkpoints["final"] = dict(checkpoints["latest"])
+    body: dict[str, Any] = {
+        **dict(selection),
+        "receipt_contract_version": UNIFIED_SELECTION_RECEIPT_CONTRACT,
+        "variant": cfg.variant,
+        "receipt_step": step,
+        "terminal_step": cfg.steps,
+        "run_complete": run_complete,
+        "validation_plan_sha256": validation_plan_sha256,
+        "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
+        "checkpoint_hashes": checkpoints,
+    }
+    body["selection_sha256"] = sha256_json(body)
+    write_json_atomic(path, body, refuse_existing=True)
+    return body
+
+
+def load_stage2_selection_receipt(
+    path: str | Path,
+    *,
+    expected_variant: str | None = None,
+    require_complete: bool = True,
+) -> dict[str, Any]:
+    """Verify a receipt and every referenced best/final checkpoint identity."""
+
+    receipt_path = Path(path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, Mapping):
+        raise ValueError("Unified selection receipt root must be an object.")
+    normalized = dict(receipt)
+    stored = normalized.pop("selection_sha256", None)
+    if stored != sha256_json(normalized):
+        raise ValueError("Unified selection receipt SHA-256 mismatch.")
+    normalized["selection_sha256"] = stored
+    if (
+        normalized.get("receipt_contract_version")
+        != UNIFIED_SELECTION_RECEIPT_CONTRACT
+        or normalized.get("contract_version") != UNIFIED_SELECTION_CONTRACT
+    ):
+        raise ValueError("Unified selection receipt contract mismatch.")
+    if expected_variant is not None and normalized.get("variant") != expected_variant:
+        raise ValueError("Unified selection receipt variant mismatch.")
+    if require_complete and normalized.get("run_complete") is not True:
+        raise ValueError("Unified selection receipt does not represent a completed run.")
+    if normalized.get("selection_rule_sha256") != UNIFIED_SELECTION_RULE_SHA256:
+        raise ValueError("Unified selection receipt rule provenance mismatch.")
+    plan_sha = normalized.get("validation_plan_sha256")
+    if not isinstance(plan_sha, str) or len(plan_sha) != 64:
+        raise ValueError("Unified selection receipt validation-plan identity is invalid.")
+    checkpoint_hashes = normalized.get("checkpoint_hashes")
+    if not isinstance(checkpoint_hashes, Mapping):
+        raise ValueError("Unified selection receipt checkpoint hashes are missing.")
+    required = {"latest", "best"} | ({"final"} if require_complete else set())
+    if not required <= set(checkpoint_hashes):
+        raise ValueError("Unified selection receipt omits a required checkpoint identity.")
+    for role, raw in checkpoint_hashes.items():
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"Unified selection checkpoint {role!r} is malformed.")
+        checkpoint_path = Path(str(raw.get("path", "")))
+        if not checkpoint_path.is_file() or sha256_file(checkpoint_path) != raw.get(
+            "file_sha256"
+        ):
+            raise ValueError(f"Unified selection checkpoint {role!r} hash mismatch.")
+        state = load_checkpoint(checkpoint_path)
+        if state.get("contract_version") != UNIFIED_RESUME_CONTRACT:
+            raise ValueError(f"Unified selection checkpoint {role!r} contract mismatch.")
+        if state.get("validation_plan_sha256") != plan_sha:
+            raise ValueError(
+                f"Unified selection checkpoint {role!r} uses another validation plan."
+            )
+        if state.get("selection_rule_sha256") != UNIFIED_SELECTION_RULE_SHA256:
+            raise ValueError(
+                f"Unified selection checkpoint {role!r} uses another selection rule."
+            )
+    if str(normalized.get("best_checkpoint")) != str(
+        checkpoint_hashes["best"]["path"]
+    ):
+        raise ValueError("Unified selection receipt best-checkpoint pointer mismatch.")
+    if require_complete and checkpoint_hashes["final"] != checkpoint_hashes["latest"]:
+        raise ValueError("Unified final/latest checkpoint identities disagree.")
+    return normalized
+
+
+def find_latest_stage2_selection_receipt(
+    checkpoint_dir: str | Path,
+    *,
+    variant: str,
+    require_complete: bool = True,
+) -> tuple[Path, dict[str, Any]]:
+    root = Path(checkpoint_dir)
+    candidates = sorted(root.glob(f"stage2_unified_{variant}_selection_step*.json"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No immutable selection receipt exists for variant {variant!r}."
+        )
+    latest = candidates[-1]
+    receipt = load_stage2_selection_receipt(
+        latest, expected_variant=variant, require_complete=require_complete
+    )
+    if int(receipt["receipt_step"]) != max(
+        int(candidate.stem.rsplit("step", 1)[1]) for candidate in candidates
+    ):
+        raise ValueError("Latest unified selection receipt filename/cursor mismatch.")
+    return latest, receipt
+
+
 def _restore_exact(
     path: Path,
     *,
@@ -1392,6 +1730,7 @@ def _restore_exact(
     scaler: torch.amp.GradScaler,
     sampler: torch.Generator,
     expected_run_fingerprint: str,
+    expected_validation_plan_sha256: str,
     history_path: Path,
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
     state = load_checkpoint(path)
@@ -1399,6 +1738,10 @@ def _restore_exact(
         raise ValueError("Unified checkpoint exact-resume contract mismatch.")
     if state.get("run_fingerprint") != expected_run_fingerprint:
         raise ValueError("Unified checkpoint config/bank/code identity mismatch.")
+    if state.get("validation_plan_sha256") != expected_validation_plan_sha256:
+        raise ValueError("Unified checkpoint validation-plan identity mismatch.")
+    if state.get("selection_rule_sha256") != UNIFIED_SELECTION_RULE_SHA256:
+        raise ValueError("Unified checkpoint selection-rule identity mismatch.")
     if not history_path.is_file():
         raise ValueError("Exact resume requires the checkpoint-bound JSONL history.")
     history_bytes = history_path.read_bytes()
@@ -1437,6 +1780,10 @@ def _restore_exact(
         "contract_version"
     ) != UNIFIED_SELECTION_CONTRACT:
         raise ValueError("Unified checkpoint validation-selection contract mismatch.")
+    if selection.get("validation_plan_sha256") != expected_validation_plan_sha256:
+        raise ValueError("Unified checkpoint selection uses another validation plan.")
+    if selection.get("selection_rule_sha256") != UNIFIED_SELECTION_RULE_SHA256:
+        raise ValueError("Unified checkpoint selection uses another selection rule.")
     pilot_report = state.get("pilot_report")
     if not isinstance(pilot_report, Mapping):
         raise ValueError("Unified checkpoint pilot-report contract mismatch.")
@@ -1673,7 +2020,7 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
     if cfg.critic_spectral_normalization or cfg.critic_lazy_r1:
         raise ValueError(
             "Spectral normalization/lazy R1 are evidence-gated ablations and are not "
-            "enabled by the primary v2 contract."
+            "enabled by the primary v3 contract."
         )
     if cfg.precision not in {"fp32", "bf16"}:
         raise ValueError("precision must be fp32 or bf16.")
@@ -1697,6 +2044,8 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         raise ValueError("Pilot projection steps/cost are invalid.")
     if cfg.validation_every_steps < 1 or not cfg.validation_complete_inventory:
         raise ValueError("Validation must use the complete R/validation inventory.")
+    if cfg.validation_plan_seed < 0:
+        raise ValueError("The frozen validation-plan seed must be non-negative.")
 
 
 __all__ = [
@@ -1704,13 +2053,22 @@ __all__ = [
     "UNIFIED_HISTORY_CONTRACT",
     "UNIFIED_RESUME_CONTRACT",
     "UNIFIED_SELECTION_CONTRACT",
+    "UNIFIED_SELECTION_RECEIPT_CONTRACT",
+    "UNIFIED_SELECTION_RULE",
+    "UNIFIED_SELECTION_RULE_CONTRACT",
+    "UNIFIED_SELECTION_RULE_SHA256",
     "UNIFIED_STAGE2_CONTRACT",
+    "UNIFIED_VALIDATION_PLAN_CONTRACT",
     "UnifiedStage2Config",
     "UnifiedStage2Result",
     "anatomy_preservation_components",
+    "build_unified_validation_plan",
+    "find_latest_stage2_selection_receipt",
     "graph_consistency_loss",
     "generator_term_gradient_norms",
     "integrate_transport",
+    "load_stage2_selection_receipt",
     "run_stage2_unified_train",
+    "unified_validation_selection_score",
     "validate_unified_config",
 ]

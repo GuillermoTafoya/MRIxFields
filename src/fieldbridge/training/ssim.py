@@ -104,7 +104,16 @@ def _stable_training_ssim(
             local_mean(tgt.square()) - mu_tgt.square()
         ).clamp_min(0.0)
         covariance = local_mean(pred * tgt) - mu_pred * mu_tgt
-        covariance_limit = (var_pred * var_tgt).sqrt()
+        # The projection bound is a forward-only numerical constraint. Differentiating
+        # through sqrt(var_pred * var_tgt) is singular at the exact-zero local
+        # variances that are required by the MRI background contract: sqrt'(0) is
+        # unbounded even though the projected covariance and final SSIM are finite.
+        # Detaching the bound preserves the exact forward projection and documented
+        # [-1, 1] semantics while gradients continue through covariance, luminance,
+        # variance, and the structure denominator. At the projection boundary this is
+        # the standard stop-gradient treatment of a feasibility bound, rather than an
+        # epsilon that would relax the Cauchy-Schwarz constraint.
+        covariance_limit = (var_pred * var_tgt).detach().sqrt()
         covariance = torch.maximum(
             torch.minimum(covariance, covariance_limit), -covariance_limit
         )

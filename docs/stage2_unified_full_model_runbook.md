@@ -217,6 +217,14 @@ exact-resume checkpoints and their history prefix remain in the variant's durabl
 attempt directory; temporary files, package caches, command logs, and all bank training reads use
 local scratch. Existing attempts and logs are never appended across namespaces or overwritten.
 
+Exact-resume v8 checkpoints also seal the authoritative in-progress pilot rows while the cursor is
+below the configured pilot boundary. Resume verifies the payload hash, run fingerprint, pilot
+target, cursor, and the exact row sequence 1..cursor before restoring model, optimizer, scheduler,
+scaler, sampler, or RNG state. The restored rows are combined with later rows, so interruption at
+step 10 of the 20-step probe or step 20 of the 200-step pilot still produces the complete 20- or
+200-row report. Once the pilot report is complete, checkpoints retain that report and no longer
+duplicate the in-progress rows.
+
 The pilot logs raw/weighted terms, each term's translator-gradient norm, generator/critic norms,
 critic score means/std/quantiles/separation/saturation, real/generated domain accuracy,
 first/last/smoothed loss behavior and auxiliary/flow ratios. Runtime projection v1 measures and

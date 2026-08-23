@@ -55,8 +55,11 @@ from fieldbridge.utils.seeding import seed_everything
 
 UNIFIED_STAGE2_CONTRACT = 'stage2-unified-retrospective-full-model-v7'
 UNIFIED_STAGE2_CONFIG_CONTRACT = 'stage2-unified-retrospective-full-model-config-v7'
-UNIFIED_RESUME_CONTRACT = 'stage2-unified-exact-resume-v7'
+UNIFIED_RESUME_CONTRACT = 'stage2-unified-exact-resume-v8'
 UNIFIED_HISTORY_CONTRACT = 'stage2-unified-term-history-v7'
+UNIFIED_IN_PROGRESS_PILOT_ROWS_CONTRACT = (
+    'stage2-unified-in-progress-pilot-rows-v1'
+)
 UNIFIED_ANATOMY_MEMORY_CONTRACT = 'stage2-unified-anatomy-memory-qualification-v1'
 UNIFIED_GENERATOR_ACCUMULATION_CONTRACT = (
     'stage2-unified-term-wise-recomputation-v6'
@@ -965,8 +968,9 @@ def run_stage2_unified_train(
         "best_score": None,
     }
     pilot_report: dict[str, Any] = {"status": "not_requested", "steps": 0}
+    pilot_rows: list[dict[str, Any]] = []
     if cfg.resume_from is not None:
-        cursor, restored_selection, pilot_report = _restore_exact(
+        cursor, restored_selection, pilot_report, pilot_rows = _restore_exact(
             cfg.resume_from,
             translator=translator,
             critic=critic,
@@ -978,6 +982,7 @@ def run_stage2_unified_train(
             sampler=sampler,
             expected_run_fingerprint=run_fingerprint,
             expected_validation_plan_sha256=validation_plan_sha256,
+            expected_pilot_steps=cfg.pilot_steps,
             history_path=history_path,
         )
         selection.update(restored_selection)
@@ -989,7 +994,6 @@ def run_stage2_unified_train(
     elif history_path.exists() and history_path.stat().st_size:
         raise FileExistsError("Non-empty history exists but no exact-resume checkpoint was supplied.")
 
-    pilot_rows: list[dict[str, Any]] = []
     last_checkpoint: Path | None = cfg.resume_from
     start = time.perf_counter()
     for step in range(cursor, cfg.steps):
@@ -1310,6 +1314,7 @@ def run_stage2_unified_train(
                     history_path,
                     selection,
                     pilot_report,
+                    pilot_rows,
                 )
                 if validation_due:
                     receipt_path = (
@@ -1354,6 +1359,7 @@ def run_stage2_unified_train(
             history_path,
             selection,
             pilot_report,
+            pilot_rows,
         )
     if cfg.pilot_steps > 0 and cfg.steps < cfg.pilot_steps:
         pilot_report = {
@@ -2487,6 +2493,90 @@ def _evaluate_unpaired_validation(
     }
 
 
+def _pilot_rows_checkpoint_payload(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    cursor: int,
+    pilot_steps: int,
+    run_fingerprint: str,
+) -> dict[str, Any]:
+    in_progress = cursor < pilot_steps
+    authoritative_rows = [dict(row) for row in rows] if in_progress else []
+    if in_progress:
+        if len(authoritative_rows) != cursor:
+            raise RuntimeError(
+                "In-progress pilot evidence must contain exactly one row per completed step."
+            )
+        for expected_step, row in enumerate(authoritative_rows, start=1):
+            if row.get("contract_version") != UNIFIED_HISTORY_CONTRACT:
+                raise RuntimeError("In-progress pilot row history contract mismatch.")
+            if type(row.get("step")) is not int or row["step"] != expected_step:
+                raise RuntimeError("In-progress pilot row steps must be exactly 1..cursor.")
+            if row.get("run_fingerprint") != run_fingerprint:
+                raise RuntimeError("In-progress pilot row belongs to another run.")
+    body: dict[str, Any] = {
+        "contract_version": UNIFIED_IN_PROGRESS_PILOT_ROWS_CONTRACT,
+        "run_fingerprint": run_fingerprint,
+        "training_cursor": cursor,
+        "pilot_steps": pilot_steps,
+        "in_progress": in_progress,
+        "rows": authoritative_rows,
+    }
+    body["payload_sha256"] = sha256_json(body)
+    return body
+
+
+def _restore_in_progress_pilot_rows(
+    state: Mapping[str, Any],
+    *,
+    cursor: int,
+    expected_pilot_steps: int,
+    expected_run_fingerprint: str,
+) -> list[dict[str, Any]]:
+    raw = state.get("in_progress_pilot_rows")
+    if not isinstance(raw, Mapping):
+        raise ValueError("Unified checkpoint in-progress pilot rows are missing.")
+    body = dict(raw)
+    stored_sha256 = body.pop("payload_sha256", None)
+    if stored_sha256 != sha256_json(body):
+        raise ValueError("Unified checkpoint in-progress pilot-row payload hash mismatch.")
+    if body.get("contract_version") != UNIFIED_IN_PROGRESS_PILOT_ROWS_CONTRACT:
+        raise ValueError("Unified checkpoint in-progress pilot-row contract mismatch.")
+    if body.get("run_fingerprint") != expected_run_fingerprint:
+        raise ValueError("Unified checkpoint pilot rows belong to another run.")
+    if body.get("training_cursor") != cursor:
+        raise ValueError("Unified checkpoint pilot-row cursor mismatch.")
+    if body.get("pilot_steps") != expected_pilot_steps:
+        raise ValueError("Unified checkpoint pilot-row target mismatch.")
+    expected_in_progress = cursor < expected_pilot_steps
+    if body.get("in_progress") is not expected_in_progress:
+        raise ValueError("Unified checkpoint pilot-row completion state mismatch.")
+    rows = body.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("Unified checkpoint pilot rows must be a list.")
+    if not expected_in_progress:
+        if rows:
+            raise ValueError("Completed pilot checkpoints must not retain in-progress rows.")
+        return []
+    if len(rows) != cursor:
+        raise ValueError(
+            "Unified checkpoint pilot rows must contain exactly one row per completed step."
+        )
+    normalized: list[dict[str, Any]] = []
+    for expected_step, raw_row in enumerate(rows, start=1):
+        if not isinstance(raw_row, Mapping):
+            raise ValueError("Unified checkpoint contains a malformed pilot row.")
+        row = dict(raw_row)
+        if row.get("contract_version") != UNIFIED_HISTORY_CONTRACT:
+            raise ValueError("Unified checkpoint pilot-row history contract mismatch.")
+        if type(row.get("step")) is not int or row["step"] != expected_step:
+            raise ValueError("Unified checkpoint pilot row steps must be exactly 1..cursor.")
+        if row.get("run_fingerprint") != expected_run_fingerprint:
+            raise ValueError("Unified checkpoint pilot row belongs to another run.")
+        normalized.append(row)
+    return normalized
+
+
 def _save_exact_checkpoint(
     cfg: UnifiedStage2Config,
     cursor: int,
@@ -2503,6 +2593,7 @@ def _save_exact_checkpoint(
     history_path: Path,
     selection: Mapping[str, Any],
     pilot_report: Mapping[str, Any],
+    pilot_rows: Sequence[Mapping[str, Any]],
 ) -> Path:
     assert cfg.checkpoint_dir is not None
     path = cfg.checkpoint_dir / f"stage2_unified_{cfg.variant}_step{cursor:09d}.pt"
@@ -2529,6 +2620,12 @@ def _save_exact_checkpoint(
         "history_prefix_sha256": hashlib.sha256(history_bytes).hexdigest(),
         "validation_selection": dict(selection),
         "pilot_report": dict(pilot_report),
+        "in_progress_pilot_rows": _pilot_rows_checkpoint_payload(
+            pilot_rows,
+            cursor=cursor,
+            pilot_steps=cfg.pilot_steps,
+            run_fingerprint=run_fingerprint,
+        ),
     }
     return save_checkpoint(
         path,
@@ -2683,8 +2780,9 @@ def _restore_exact(
     sampler: torch.Generator,
     expected_run_fingerprint: str,
     expected_validation_plan_sha256: str,
+    expected_pilot_steps: int,
     history_path: Path,
-) -> tuple[int, dict[str, Any], dict[str, Any]]:
+) -> tuple[int, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     state = load_checkpoint(path)
     if state.get("contract_version") != UNIFIED_RESUME_CONTRACT:
         raise ValueError("Unified checkpoint exact-resume contract mismatch.")
@@ -2702,6 +2800,15 @@ def _restore_exact(
         history_bytes[:prefix_bytes]
     ).hexdigest() != state.get("history_prefix_sha256"):
         raise ValueError("Unified checkpoint history prefix changed or is incomplete.")
+    cursor = int(state["training_cursor"])
+    if cursor < 0:
+        raise ValueError("Unified checkpoint has an invalid training cursor.")
+    pilot_rows = _restore_in_progress_pilot_rows(
+        state,
+        cursor=cursor,
+        expected_pilot_steps=expected_pilot_steps,
+        expected_run_fingerprint=expected_run_fingerprint,
+    )
     translator.load_state_dict(state["translator"], strict=True)
     critic.load_state_dict(state["critic"], strict=True)
     generator_optimizer.load_state_dict(state["generator_optimizer"])
@@ -2724,9 +2831,6 @@ def _restore_exact(
             float(numpy_rng["cached_gaussian"]),
         )
     )
-    cursor = int(state["training_cursor"])
-    if cursor < 0:
-        raise ValueError("Unified checkpoint has an invalid training cursor.")
     selection = state.get("validation_selection")
     if not isinstance(selection, Mapping) or selection.get(
         "contract_version"
@@ -2739,7 +2843,7 @@ def _restore_exact(
     pilot_report = state.get("pilot_report")
     if not isinstance(pilot_report, Mapping):
         raise ValueError("Unified checkpoint pilot-report contract mismatch.")
-    return cursor, dict(selection), dict(pilot_report)
+    return cursor, dict(selection), dict(pilot_report), pilot_rows
 
 
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
@@ -3173,6 +3277,7 @@ __all__ = [
     'UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES',
     'UNIFIED_GENERATOR_ACCUMULATION_CONTRACT',
     "UNIFIED_HISTORY_CONTRACT",
+    "UNIFIED_IN_PROGRESS_PILOT_ROWS_CONTRACT",
     "UNIFIED_RESUME_CONTRACT",
     "UNIFIED_SELECTION_CONTRACT",
     "UNIFIED_SELECTION_RECEIPT_CONTRACT",

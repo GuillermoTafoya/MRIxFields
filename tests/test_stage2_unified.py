@@ -1434,3 +1434,131 @@ def test_interrupted_resume_reproduces_uninterrupted_next_step(tmp_path: Path) -
             assert torch.equal(value, actual[component][name])
     assert expected["sampler_rng"].equal(actual["sampler_rng"])
     assert expected["training_cursor"] == actual["training_cursor"] == 2
+
+
+def test_interrupted_pilot_restores_all_rows_and_matches_uninterrupted_step20(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fast_complete_validation(
+        cfg,
+        translator,
+        critic,
+        decoder,
+        validation_index,
+        validation_plan,
+        stats,
+        device,
+        *,
+        step,
+    ):
+        del cfg, translator, critic, decoder, validation_index, stats, device
+        counts = dict(validation_plan["directed_domain_cell_counts"])
+        return {
+            "contract_version": unified.UNIFIED_SELECTION_CONTRACT,
+            "step": step,
+            "validation_plan_sha256": validation_plan["validation_plan_sha256"],
+            "inventory_record_count": 30,
+            "edge_count": sum(int(value) for value in counts.values()),
+            "inventory_sha256": validation_plan["inventory_sha256"],
+            "complete_inventory_used": True,
+            "paired_endpoint_assumption": False,
+            "subject_group_exclusion": True,
+            "means": {"sb": 1.0, "identity": 1.0, "anatomy": 1.0, "graph": 1.0},
+            "aggregation": "equal_weighted_directed_domain_macro_mean",
+            "directed_domain_cell_counts": counts,
+            "directed_domain_cell_means": {},
+            "record_weighted_means_diagnostic_only": {},
+            "selection_score": 1.0,
+            "selection_rule": dict(UNIFIED_SELECTION_RULE),
+            "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
+            "critic_and_domain_metrics_role": "diagnostic_only_excluded_from_selection",
+        }
+
+    monkeypatch.setattr(unified, "_evaluate_unpaired_validation", fast_complete_validation)
+    cfg = _config(
+        tmp_path / "uninterrupted",
+        steps=20,
+        pilot_steps=20,
+        pilot_smoothing_window=5,
+        pilot_max_aux_to_flow_ratio=1.0e30,
+        pilot_min_term_gradient_norm=0.0,
+        pilot_max_smoothed_loss_growth=1.0e30,
+        pilot_max_saturation_fraction=1.0,
+        checkpoint_every_steps=10,
+        validation_every_steps=20,
+    )
+    train_index = SyntheticFactoredIndex()
+    validation_index = SyntheticFactoredIndex("validation")
+    decoder = TinyDecoder().requires_grad_(False)
+    uninterrupted = TinyTranslator()
+    uninterrupted_result = run_stage2_unified_train(
+        cfg,
+        translator=uninterrupted,
+        decoder=decoder,
+        train_index=train_index,
+        validation_index=validation_index,
+        stats=_stats(),
+    )
+    assert uninterrupted_result.pilot_report["status"] == "pass"
+    assert uninterrupted_result.pilot_report["steps"] == 20
+
+    step10 = cfg.checkpoint_dir / "stage2_unified_full_step000000010.pt"
+    step20 = cfg.checkpoint_dir / "stage2_unified_full_step000000020.pt"
+    partial_state = load_checkpoint(step10)
+    payload = partial_state["in_progress_pilot_rows"]
+    assert payload["contract_version"] == unified.UNIFIED_IN_PROGRESS_PILOT_ROWS_CONTRACT
+    assert payload["training_cursor"] == 10
+    assert payload["pilot_steps"] == 20
+    assert payload["in_progress"] is True
+    assert [row["step"] for row in payload["rows"]] == list(range(1, 11))
+    assert {
+        row["run_fingerprint"] for row in payload["rows"]
+    } == {partial_state["run_fingerprint"]}
+
+    for mutation, message in (("step", "exactly 1..cursor"), ("fingerprint", "another run")):
+        changed = copy.deepcopy(payload)
+        if mutation == "step":
+            changed["rows"][4]["step"] = 99
+        else:
+            changed["rows"][4]["run_fingerprint"] = "f" * 64
+        changed.pop("payload_sha256")
+        changed["payload_sha256"] = sha256_json(changed)
+        with pytest.raises(ValueError, match=message):
+            unified._restore_in_progress_pilot_rows(
+                {"in_progress_pilot_rows": changed},
+                cursor=10,
+                expected_pilot_steps=20,
+                expected_run_fingerprint=partial_state["run_fingerprint"],
+            )
+
+    resumed = TinyTranslator()
+    resumed_cfg = replace(
+        cfg,
+        checkpoint_dir=tmp_path / "resumed" / "checkpoints",
+        history_jsonl=cfg.history_jsonl,
+        resume_from=step10,
+    )
+    resumed_result = run_stage2_unified_train(
+        resumed_cfg,
+        translator=resumed,
+        decoder=decoder,
+        train_index=train_index,
+        validation_index=validation_index,
+        stats=_stats(),
+    )
+    assert resumed_result.pilot_report["status"] == "pass"
+    assert resumed_result.pilot_report["steps"] == 20
+
+    expected = load_checkpoint(step20)
+    actual = load_checkpoint(Path(resumed_result.checkpoint))
+    for component in ("translator", "critic"):
+        assert expected[component].keys() == actual[component].keys()
+        for name, value in expected[component].items():
+            assert torch.equal(value, actual[component][name])
+    assert expected["sampler_rng"].equal(actual["sampler_rng"])
+    assert expected["training_cursor"] == actual["training_cursor"] == 20
+    assert actual["pilot_report"]["status"] == "pass"
+    assert actual["pilot_report"]["steps"] == 20
+    assert actual["in_progress_pilot_rows"]["in_progress"] is False
+    assert actual["in_progress_pilot_rows"]["rows"] == []

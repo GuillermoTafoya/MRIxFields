@@ -2,16 +2,20 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+import fieldbridge.models.autoencoders.kl_vae as kl_vae_module
 from fieldbridge.data.contracts import RawBatch
 from fieldbridge.data.datasets import collate_raw_batches
 from fieldbridge.data.domains import Domain
 from fieldbridge.data.latent_bank import downsample_factor as bank_downsample_factor
 from fieldbridge.models.autoencoders.kl_vae import (
+    KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+    KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
     _LOGVAR_MAX,
     _LOGVAR_MIN,
     KLVAEDecoder,
     KLVAEEncoder,
 )
+from fieldbridge.training.stage2_unified import _module_state_sha256
 from fieldbridge.models.factory import build_decoder, build_encoder
 from fieldbridge.training.losses import kl_divergence
 from fieldbridge.training.stage1_vae import Stage1VAEConfig, run_stage1_vae_train
@@ -179,6 +183,137 @@ def test_encode_decode_roundtrip_3d_volume() -> None:
     assert z.shape == (1, 3, 2, 2, 2)
     assert y.shape == x.shape
     assert torch.isfinite(y).all()
+
+
+def test_fine_grained_decoder_forward_latent_gradient_and_state_hash_equivalence() -> None:
+    torch.manual_seed(101)
+    decoder = KLVAEDecoder(
+        base_channels=4,
+        latent_channels=3,
+        spatial_dims=3,
+        num_res_blocks=2,
+    ).eval()
+    decoder.requires_grad_(False)
+    domains = _domain_pair(1)
+    state_hash_before = _module_state_sha256(decoder)
+    ordinary_latent = torch.randn(1, 3, 3, 4, 5, requires_grad=True)
+    checkpointed_latent = ordinary_latent.detach().clone().requires_grad_(True)
+
+    ordinary = decoder.decode(ordinary_latent, domains)
+    checkpointed = decoder.decode_fine_grained_checkpointed(
+        checkpointed_latent, domains
+    )
+    torch.testing.assert_close(checkpointed, ordinary, rtol=0.0, atol=0.0)
+    probe = torch.linspace(
+        -0.75, 0.5, ordinary.numel(), dtype=ordinary.dtype
+    ).reshape_as(ordinary)
+    ordinary_gradient = torch.autograd.grad((ordinary * probe).sum(), ordinary_latent)[0]
+    checkpointed_gradient = torch.autograd.grad(
+        (checkpointed * probe).sum(), checkpointed_latent
+    )[0]
+    torch.testing.assert_close(
+        checkpointed_gradient, ordinary_gradient, rtol=1e-5, atol=1e-6
+    )
+    assert _module_state_sha256(decoder) == state_hash_before
+
+
+def test_fine_grained_decoder_preserves_single_update_with_replay_tolerance() -> None:
+    torch.manual_seed(103)
+    decoder = KLVAEDecoder(
+        base_channels=4, latent_channels=3, spatial_dims=3, num_res_blocks=1
+    ).eval()
+    decoder.requires_grad_(False)
+    ordinary_projector = torch.nn.Conv3d(3, 3, 1)
+    checkpointed_projector = torch.nn.Conv3d(3, 3, 1)
+    checkpointed_projector.load_state_dict(ordinary_projector.state_dict())
+    source = torch.randn(1, 3, 3, 3, 3)
+    target = torch.randn(1, 1, 12, 12, 12)
+    domains = _domain_pair(1)
+    ordinary_optimizer = torch.optim.SGD(ordinary_projector.parameters(), lr=1e-3)
+    checkpointed_optimizer = torch.optim.SGD(
+        checkpointed_projector.parameters(), lr=1e-3
+    )
+    state_hash_before = _module_state_sha256(decoder)
+
+    ordinary_optimizer.zero_grad(set_to_none=True)
+    ordinary_loss = torch.nn.functional.mse_loss(
+        decoder.decode(ordinary_projector(source), domains), target
+    )
+    ordinary_loss.backward()
+    ordinary_optimizer.step()
+
+    checkpointed_optimizer.zero_grad(set_to_none=True)
+    checkpointed_loss = torch.nn.functional.mse_loss(
+        decoder.decode_fine_grained_checkpointed(
+            checkpointed_projector(source), domains
+        ),
+        target,
+    )
+    checkpointed_loss.backward()
+    checkpointed_optimizer.step()
+
+    torch.testing.assert_close(checkpointed_loss, ordinary_loss, rtol=0.0, atol=0.0)
+    for ordinary_parameter, checkpointed_parameter in zip(
+        ordinary_projector.parameters(), checkpointed_projector.parameters()
+    ):
+        torch.testing.assert_close(
+            checkpointed_parameter, ordinary_parameter, rtol=1e-5, atol=1e-7
+        )
+    assert _module_state_sha256(decoder) == state_hash_before
+
+
+def test_fine_grained_decoder_regions_and_source_no_grad_bypass(monkeypatch) -> None:
+    decoder = KLVAEDecoder(
+        base_channels=4, latent_channels=3, spatial_dims=3, num_res_blocks=2
+    ).eval()
+    decoder.requires_grad_(False)
+    original_checkpoint = kl_vae_module.checkpoint
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def checkpoint_spy(function, *args, **kwargs):
+        calls.append(
+            (getattr(function, '__name__', function.__class__.__name__), dict(kwargs))
+        )
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(kl_vae_module, 'checkpoint', checkpoint_spy)
+    latent = torch.randn(1, 3, 2, 2, 2, requires_grad=True)
+    output = decoder.decode_fine_grained_checkpointed(latent, _domain_pair(1))
+    output.square().mean().backward()
+    assert len(calls) == 14
+    names = [name for name, _ in calls]
+    assert names.count('_branch1') == 6
+    assert names.count('_branch2') == 6
+    assert names.count('Sequential') == 2
+    assert all(
+        kwargs == {'use_reentrant': False, 'preserve_rng_state': True}
+        for _, kwargs in calls
+    )
+
+    calls.clear()
+    with torch.no_grad():
+        source_output = decoder.decode_fine_grained_checkpointed(
+            latent.detach(), _domain_pair(1)
+        )
+    assert source_output.shape == (1, 1, 8, 8, 8)
+    assert calls == []
+
+    evidence = decoder.activation_checkpoint_evidence()
+    assert evidence['contract_version'] == KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT
+    assert evidence['mode'] == KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+    assert evidence['upsample_regions'] == ['up1', 'up2']
+    assert len(evidence['residual_branch_regions']) == 12
+    assert evidence['group_norm_scope'] == 'complete_spatial_volume'
+    assert evidence['outer_full_decoder_checkpoint'] is False
+
+
+def test_fine_grained_decoder_rejects_2d_without_changing_ordinary_decode() -> None:
+    decoder = KLVAEDecoder(base_channels=4, latent_channels=3, spatial_dims=2)
+    latent = torch.randn(1, 3, 4, 4, requires_grad=True)
+    ordinary = decoder.decode(latent, _domain_pair(1))
+    assert ordinary.shape == (1, 1, 16, 16)
+    with pytest.raises(ValueError, match='3-D'):
+        decoder.decode_fine_grained_checkpointed(latent, _domain_pair(1))
 
 
 def test_vae_res_blocks_3d_forward_backward_no_nan() -> None:

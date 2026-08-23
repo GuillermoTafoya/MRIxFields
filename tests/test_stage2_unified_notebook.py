@@ -98,13 +98,21 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     assert "MATERIALIZED_VALIDATION_ARRAYS_RAW" not in source
     assert "BASELINE_SOURCE_ARTIFACT_RAW" not in source
     assert "stage2_unified_full_retrospective_v2.yaml" not in source
+    assert 'stage2_unified_full_retrospective_v7.yaml' in source
+    assert "output_root / 'stage2_unified_v7'" in source
+    assert 'fine_grained_full_volume_v1' in source
+    assert 'outer_full_decoder_checkpoint' in source
+    assert 'one_step_anatomy_memory_qualification' in source
+    assert 'anatomy_cuda_peak_memory' in source
+    assert 'generator_optimizer_updates_per_step' in source
+    assert '_memory_checkpointed_decode' not in source
 
 
 def test_full_config_uses_reviewed_initial_weights() -> None:
     import yaml
 
     payload = yaml.safe_load(
-        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v5.yaml").read_text()
+        (ROOT / "configs/experiment/stage2_unified_full_retrospective_v7.yaml").read_text()
     )
     config = UnifiedStage2Config.from_mapping(payload)
     assert config.loss_weights == {
@@ -115,6 +123,17 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         "adversarial": 0.05,
         "domain": 0.1,
     }
+    assert config.batch_size == 1
+    assert config.precision == 'bf16'
+    assert config.integration_steps == 4
+    assert config.integration_solver == 'heun'
+    assert config.decoder_activation_checkpoint_mode == 'fine_grained_full_volume_v1'
+    assert payload['training']['decoder_activation_checkpoint'][
+        'outer_full_decoder_checkpoint'
+    ] == 'forbidden'
+    assert payload['training']['generator_gradient_accumulation'][
+        'optimizer_updates_per_step'
+    ] == 1
     assert config.critic_space == "latent"
     assert config.pilot_steps == 200
     assert config.validation_complete_inventory is True

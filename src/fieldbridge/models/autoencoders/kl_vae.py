@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from fieldbridge.data.domains import Domain
 from fieldbridge.models.autoencoders.base import BaseDecoder, BaseEncoder
@@ -30,6 +31,11 @@ DomainBatch = Domain | Sequence[Domain]
 SpatialDims = Literal[2, 3]
 
 _DOWNSAMPLE_FACTOR = 4  # 2 stride-2 blocks
+
+KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT = (
+    'klvae3d-full-volume-fine-grained-activation-checkpoint-v1'
+)
+KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE = 'fine_grained_full_volume_v1'
 
 # Clamp the encoder's log-variance: keeps exp(logvar) finite (fp32 overflow guard) and
 # stops the KL term from running away during early, unstable training. The range covers
@@ -188,6 +194,47 @@ class KLVAEDecoder(BaseDecoder):
             self.domain_film3 = None
 
     def decode(self, z: torch.Tensor, domain: DomainBatch) -> torch.Tensor:
+        return self._decode_impl(z, domain, activation_checkpointing=False)
+
+    def decode_fine_grained_checkpointed(
+        self, z: torch.Tensor, domain: DomainBatch
+    ) -> torch.Tensor:
+        if self.spatial_dims != 3:
+            raise ValueError('Fine-grained checkpointing requires a 3-D KL-VAE decoder.')
+        enabled = torch.is_grad_enabled() and z.requires_grad
+        return self._decode_impl(z, domain, activation_checkpointing=enabled)
+
+    def activation_checkpoint_evidence(self) -> dict[str, object]:
+        residual_regions = [
+            f'{stack}.{block}.{branch}'
+            for stack in ('res1', 'res2', 'res3')
+            for block in range(self.num_res_blocks)
+            for branch in ('norm1_silu_conv1', 'norm2_silu_conv2')
+        ]
+        return {
+            'contract_version': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+            'mode': KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
+            'spatial_dims': self.spatial_dims,
+            'full_volume': True,
+            'group_norm_scope': 'complete_spatial_volume',
+            'upsample_regions': ['up1', 'up2'],
+            'residual_branch_regions': residual_regions,
+            'residual_skip_checkpointed': False,
+            'residual_skip_evaluation_order': 'after_branch2_before_add',
+            'outer_full_decoder_checkpoint': False,
+            'checkpoint_use_reentrant': False,
+            'checkpoint_preserve_rng_state': True,
+            'source_no_grad_decode_checkpointed': False,
+            'state_dict_schema_changed': False,
+        }
+
+    def _decode_impl(
+        self,
+        z: torch.Tensor,
+        domain: DomainBatch,
+        *,
+        activation_checkpointing: bool,
+    ) -> torch.Tensor:
         expected_dims = self.spatial_dims + 2
         if z.ndim != expected_dims:
             raise ValueError(f"Expected a {expected_dims}D latent tensor, got shape {tuple(z.shape)}.")
@@ -199,17 +246,17 @@ class KLVAEDecoder(BaseDecoder):
             else None
         )
         h = self.from_latent(z)
-        h = self.res1(h)
+        h = _run_res_stack(self.res1, h, checkpoint_branches=activation_checkpointing)
         if conditioning is not None:
             assert self.domain_film1 is not None
             h = self.domain_film1(h, conditioning.to(dtype=h.dtype))
-        h = self.up1(h)
-        h = self.res2(h)
+        h = _checkpoint_region(self.up1, h) if activation_checkpointing else self.up1(h)
+        h = _run_res_stack(self.res2, h, checkpoint_branches=activation_checkpointing)
         if conditioning is not None:
             assert self.domain_film2 is not None
             h = self.domain_film2(h, conditioning.to(dtype=h.dtype))
-        h = self.up2(h)
-        h = self.res3(h)
+        h = _checkpoint_region(self.up2, h) if activation_checkpointing else self.up2(h)
+        h = _run_res_stack(self.res3, h, checkpoint_branches=activation_checkpointing)
         if conditioning is not None:
             assert self.domain_film3 is not None
             h = self.domain_film3(h, conditioning.to(dtype=h.dtype))
@@ -243,9 +290,20 @@ class _ResBlock(nn.Module):
         self.skip = conv(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(self.act1(self.norm1(x)))
-        h = self.conv2(self.act2(self.norm2(h)))
+        h = self._branch1(x)
+        h = self._branch2(h)
         return h + self.skip(x)
+
+    def forward_checkpointed(self, x: torch.Tensor) -> torch.Tensor:
+        h = _checkpoint_region(self._branch1, x)
+        h = _checkpoint_region(self._branch2, h)
+        return h + self.skip(x)
+
+    def _branch1(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv1(self.act1(self.norm1(x)))
+
+    def _branch2(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv2(self.act2(self.norm2(x)))
 
 
 def _res_stack(
@@ -265,6 +323,30 @@ def _res_stack(
         )
         channels = out_channels
     return nn.Sequential(*blocks)
+
+
+def _run_res_stack(
+    stack: nn.Sequential, x: torch.Tensor, *, checkpoint_branches: bool
+) -> torch.Tensor:
+    if not checkpoint_branches:
+        return stack(x)
+    current = x
+    for block in stack:
+        if not isinstance(block, _ResBlock):
+            raise TypeError('Fine-grained checkpointing requires _ResBlock stacks.')
+        current = block.forward_checkpointed(current)
+    return current
+
+
+def _checkpoint_region(function: object, tensor: torch.Tensor) -> torch.Tensor:
+    if not callable(function):
+        raise TypeError('Checkpoint region must be callable.')
+    return checkpoint(  # type: ignore[arg-type,no-any-return]
+        function,
+        tensor,
+        use_reentrant=False,
+        preserve_rng_state=True,
+    )
 
 
 def _downsample(in_channels: int, out_channels: int, *, spatial_dims: SpatialDims) -> nn.Module:

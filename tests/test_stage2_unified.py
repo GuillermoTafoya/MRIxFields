@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from torch import nn
 
 import fieldbridge.data.photometry_factored_bank_dataset as factored_reader
@@ -23,6 +25,7 @@ from fieldbridge.models.discriminators import (
     domain_labels,
     supported_critic_input,
 )
+from fieldbridge.models.autoencoders.kl_vae import KLVAEDecoder
 from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.stage2_unified import (
     DEFAULT_UNIFIED_WEIGHTS,
@@ -82,6 +85,16 @@ class DecoderSpy(TinyDecoder):
     def decode(self, z, domains):
         self.calls.append(z.detach().clone())
         return super().decode(z, domains)
+
+
+class CountingAdamW(torch.optim.AdamW):
+    def __init__(self, params, **kwargs) -> None:
+        super().__init__(params, **kwargs)
+        self.step_calls = 0
+
+    def step(self, closure=None):
+        self.step_calls += 1
+        return super().step(closure)
 
 
 class SyntheticFactoredIndex:
@@ -149,6 +162,7 @@ def _config(tmp_path: Path, **overrides) -> UnifiedStage2Config:
         integration_steps=1,
         anatomy_pool_scales=(1,),
         anatomy_support_erosion=0,
+        decoder_activation_checkpoint_mode='disabled',
         critic_channels=(4,),
         checkpoint_dir=tmp_path / "checkpoints",
         checkpoint_every_steps=1,
@@ -159,6 +173,77 @@ def _config(tmp_path: Path, **overrides) -> UnifiedStage2Config:
         loss_weights=dict(DEFAULT_UNIFIED_WEIGHTS),
     )
     return replace(value, **overrides)
+
+
+def test_v7_primary_config_seals_full_volume_checkpoint_and_exact_arithmetic() -> None:
+    config_path = (
+        Path(__file__).parents[1]
+        / 'configs'
+        / 'experiment'
+        / 'stage2_unified_full_retrospective_v7.yaml'
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+    cfg = UnifiedStage2Config.from_mapping(payload)
+    assert cfg.batch_size == 1
+    assert cfg.precision == 'bf16'
+    assert cfg.integration_steps == 4
+    assert cfg.integration_solver == 'heun'
+    assert cfg.loss_weights == DEFAULT_UNIFIED_WEIGHTS
+    assert (
+        cfg.decoder_activation_checkpoint_mode
+        == unified.KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+    )
+
+    for path, replacement in (
+        (('training', 'batch_size'), 2),
+        (('training', 'integration_steps'), 3),
+        (('training', 'precision'), 'fp32'),
+        (('training', 'decoder_activation_checkpoint', 'mode'), 'disabled'),
+        (
+            ('training', 'generator_gradient_accumulation', 'optimizer_updates_per_step'),
+            2,
+        ),
+        (('training', 'pilot', 'anatomy_memory_qualification_steps'), 2),
+    ):
+        mutated = copy.deepcopy(payload)
+        cursor = mutated
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = replacement
+        with pytest.raises(ValueError):
+            UnifiedStage2Config.from_mapping(mutated)
+    obsolete = copy.deepcopy(payload)
+    obsolete['contract'] = 'stage2-unified-retrospective-full-model-config-v5'
+    with pytest.raises(ValueError, match='obsolete'):
+        UnifiedStage2Config.from_mapping(obsolete)
+
+
+def test_decoder_checkpoint_evidence_is_fail_closed_and_has_no_outer_wrapper(
+    monkeypatch,
+) -> None:
+    decoder = KLVAEDecoder(
+        base_channels=4, latent_channels=4, spatial_dims=3, num_res_blocks=1
+    )
+    cfg = UnifiedStage2Config(
+        decoder_activation_checkpoint_mode=(
+            unified.KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+        )
+    )
+    evidence = unified._decoder_checkpoint_evidence(cfg, decoder)
+    assert evidence['upsample_regions'] == ['up1', 'up2']
+    assert len(evidence['residual_branch_regions']) == 6
+    assert evidence['outer_full_decoder_checkpoint'] is False
+    production_source = Path(unified.__file__).read_text(encoding='utf-8')
+    assert '_memory_checkpointed_decode' not in production_source
+
+    original = decoder.activation_checkpoint_evidence
+    monkeypatch.setattr(
+        decoder,
+        'activation_checkpoint_evidence',
+        lambda: {**original(), 'group_norm_scope': 'tiled'},
+    )
+    with pytest.raises(ValueError, match='does not satisfy'):
+        unified._decoder_checkpoint_evidence(cfg, decoder)
 
 
 def test_shared_critic_covers_all_15_domains_and_support() -> None:
@@ -287,8 +372,8 @@ def test_every_generator_term_has_finite_nonzero_gradient_and_decoder_stays_froz
         steps=cfg.integration_steps,
         solver=cfg.integration_solver,
     ).detach()
-    generator_optimizer = torch.optim.AdamW(translator.parameters(), lr=1.0e-4)
-    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=1.0e-4)
+    generator_optimizer = CountingAdamW(translator.parameters(), lr=1.0e-4)
+    critic_optimizer = CountingAdamW(critic.parameters(), lr=1.0e-4)
     row = unified._train_step(
         cfg,
         translator,
@@ -318,6 +403,73 @@ def test_every_generator_term_has_finite_nonzero_gradient_and_decoder_stays_froz
     assert all(parameter.grad is None for parameter in decoder.parameters())
     for name, value in decoder_before.items():
         assert torch.equal(value, decoder.state_dict()[name])
+    assert generator_optimizer.step_calls == 1
+    assert critic_optimizer.step_calls == 1
+    assert row['generator/weighted_term_order'] == list(DEFAULT_UNIFIED_WEIGHTS)
+    assert row['generator/optimizer_updates'] == 1
+    assert row['memory/anatomy_qualification']['status'] == 'not_applicable_cpu'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA peak diagnostics require CUDA')
+def test_one_step_full_objective_anatomy_cuda_memory_qualification(tmp_path: Path) -> None:
+    device = torch.device('cuda')
+    translator = TinyTranslator().to(device)
+    decoder = KLVAEDecoder(
+        base_channels=4,
+        latent_channels=4,
+        spatial_dims=3,
+        num_res_blocks=2,
+    ).to(device).eval().requires_grad_(False)
+    critic = DomainProjectionDiscriminator(5, (4,)).to(device)
+    source_domain = Domain(0.1, Contrast.T1W)
+    target_domain = Domain(7.0, Contrast.T1W)
+    record = FactoredLatentRecord(
+        case_id='R_cuda',
+        subject_group_id='R:cuda',
+        domain=source_domain,
+        split='train',
+        path=tmp_path / 'unused.pt',
+        resume_key='e' * 64,
+        sidecar={'cohort': 'R', 'split': 'train'},
+    )
+    support = torch.ones(1, 1, 2, 2, 2, dtype=torch.bool, device=device)
+    batch = unified._TrainingBatch(
+        torch.randn(1, 4, 2, 2, 2, device=device),
+        support,
+        [source_domain],
+        torch.randn(1, 4, 2, 2, 2, device=device),
+        support.clone(),
+        [target_domain],
+        [record],
+        [replace(record, case_id='R_cuda_target', domain=target_domain)],
+    )
+    cfg = _config(
+        tmp_path,
+        precision='bf16',
+        integration_steps=4,
+        integration_solver='heun',
+        anatomy_pool_scales=(1,),
+        decoder_activation_checkpoint_mode=(
+            unified.KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+        ),
+    )
+    row = unified._train_step(
+        cfg,
+        translator,
+        critic,
+        decoder,
+        CountingAdamW(translator.parameters(), lr=1e-4),
+        CountingAdamW(critic.parameters(), lr=1e-4),
+        torch.amp.GradScaler('cuda', enabled=True),
+        batch,
+        torch.Generator().manual_seed(23),
+        _nontrivial_stats(),
+        qualify_term_gradients=False,
+    )
+    assert row['memory/anatomy_qualification']['status'] == 'pass'
+    assert row['memory/anatomy_forward_peak_cuda_allocated_bytes'] > 0
+    assert row['memory/anatomy_backward_peak_cuda_allocated_bytes'] > 0
+    assert row['memory/training_peak_cuda_reserved_bytes'] > 0
 
 
 def test_graph_loss_backpropagates_through_direct_and_composed_paths() -> None:
@@ -367,6 +519,16 @@ def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: P
             "critic/generated_domain_accuracy": 0.25,
             "step_seconds": 2.0,
             "peak_cuda_bytes": 1234,
+            'peak_cuda_reserved_bytes': 2345,
+            'memory/anatomy_forward_peak_cuda_allocated_bytes': 0,
+            'memory/anatomy_forward_peak_cuda_reserved_bytes': 0,
+            'memory/anatomy_backward_peak_cuda_allocated_bytes': 0,
+            'memory/anatomy_backward_peak_cuda_reserved_bytes': 0,
+            'memory/anatomy_qualification': {
+                'contract_version': unified.UNIFIED_ANATOMY_MEMORY_CONTRACT,
+                'status': 'not_applicable_cpu',
+                'decoder_state_unchanged': True,
+            },
         }
         for branch in ("real", "fake"):
             for quantile in ("p05", "p50", "p95"):

@@ -156,6 +156,7 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
 )
 from fieldbridge.training.stage2_unified import (
     UNIFIED_RESUME_CONTRACT,
+    UNIFIED_STAGE2_CONFIG_CONTRACT,
     UnifiedStage2Config,
     load_stage2_selection_receipt,
     run_stage2_unified_train,
@@ -563,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v5.yaml"),
+        default=Path('configs/experiment/stage2_unified_full_retrospective_v7.yaml'),
     )
     train_unified.add_argument("--bank-dir", type=Path, required=True)
     train_unified.add_argument("--vae-config", type=Path, required=True)
@@ -650,7 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/experiment/stage2_unified_full_retrospective_v5.yaml"),
+        default=Path('configs/experiment/stage2_unified_full_retrospective_v7.yaml'),
     )
     eval_unified.add_argument("--bank-dir", type=Path, required=True)
     evaluation_model = eval_unified.add_mutually_exclusive_group(required=True)
@@ -1939,7 +1940,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v4":
+        if config.get('contract') != UNIFIED_STAGE2_CONFIG_CONTRACT:
             raise ValueError("Unified training config contract mismatch.")
         _override(config, "training", "steps", args.steps)
         _override(config, "training", "batch_size", args.batch_size)
@@ -1988,7 +1989,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "eval-stage2-unified":
         config = _load_optional_config(args.config)
-        if config.get("contract") != "stage2-unified-retrospective-full-model-config-v4":
+        if config.get('contract') != UNIFIED_STAGE2_CONFIG_CONTRACT:
             raise ValueError("Unified evaluation config contract mismatch.")
         validation_index = PhotometryFactoredLatentBankIndex(
             args.bank_dir, "validation"

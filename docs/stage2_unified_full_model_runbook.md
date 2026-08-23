@@ -5,6 +5,9 @@ contracts and fail-closed preflights remain authoritative. All paths below are e
 repository. Use the complete R/train and R/validation inventories; never point these commands at
 prospective records.
 
+The operational namespace and configuration contract are v7. Earlier unified configuration and
+resume plans are retained only as historical review material and are rejected by the v7 loader.
+
 ## Ordered execution
 
 1. Apply the reviewed Windows-root-to-Colab-root remap without changing the immutable split.
@@ -141,11 +144,26 @@ P:0009. Absence of both routes hard-stops before the long-run authorization flag
 
 ```bash
 fieldbridge train-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v5.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v7.yaml \
   --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
   --checkpoint-dir "$PILOT_CHECKPOINTS" --history-jsonl "$PILOT_HISTORY" \
   --steps 200 --pilot-steps 200 --device cuda
 ```
+
+The v7 primary profile is fixed to BF16, batch size one, four-step Heun transport, and the same
+six weights. Its decoder contract checkpoints up1 and up2 as separate complete-volume regions.
+Each residual block has two separate complete-volume GroupNorm -> SiLU -> Conv3d regions.
+Residual skips remain outside replay and execute after the second branch exactly as in the
+frozen decoder. There is no outer whole-decoder checkpoint, crop, tile, normalization
+approximation, resolution reduction, integration-step reduction, disabled full-model loss, or
+allocator fallback. Source-image anatomy decoding is under no_grad and uses the ordinary
+decoder; only generated, gradient-bearing decoding takes the fine-grained path.
+
+The six weighted generator terms accumulate sequentially in the sealed order sb, identity,
+anatomy, graph, adversarial, domain, followed by exactly one generator optimizer update. The
+pilot's first step emits stage2-unified-anatomy-memory-qualification-v1 with allocated and
+reserved CUDA peaks for anatomy forward/backward and the whole step, the checkpoint-granularity
+hash, and unchanged before/after frozen-decoder state hashes.
 
 The pilot logs raw/weighted terms, each term's translator-gradient norm, generator/critic norms,
 critic score means/std/quantiles/separation/saturation, real/generated domain accuracy,
@@ -207,7 +225,7 @@ fieldbridge train-stage2-unified \
 
 ```bash
 fieldbridge eval-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v5.yaml \
+  --config configs/experiment/stage2_unified_full_retrospective_v7.yaml \
   --bank-dir "$BANK_DIR" --selection-receipt "$LATEST_FULL_SELECTION_RECEIPT" \
   --sb-only-checkpoint "$SB_ONLY_CHECKPOINT" \
   --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \

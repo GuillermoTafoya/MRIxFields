@@ -32,6 +32,10 @@ from fieldbridge.data.photometry_factored_bank_dataset import (
 from fieldbridge.data.photometry_factorization import sha256_json, write_json_atomic
 from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.data.stage2_canonical_volume import storage_tensor_sha256
+from fieldbridge.models.autoencoders.kl_vae import (
+    KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+    KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
+)
 from fieldbridge.models.discriminators import (
     DomainProjectionDiscriminator,
     domain_labels,
@@ -48,10 +52,14 @@ from fieldbridge.training.losses import (
 from fieldbridge.training.train_loop import assert_frozen
 from fieldbridge.utils.seeding import seed_everything
 
-UNIFIED_STAGE2_CONTRACT = "stage2-unified-retrospective-full-model-v5"
-UNIFIED_STAGE2_CONFIG_CONTRACT = "stage2-unified-retrospective-full-model-config-v5"
-UNIFIED_RESUME_CONTRACT = "stage2-unified-exact-resume-v5"
-UNIFIED_HISTORY_CONTRACT = "stage2-unified-term-history-v5"
+UNIFIED_STAGE2_CONTRACT = 'stage2-unified-retrospective-full-model-v7'
+UNIFIED_STAGE2_CONFIG_CONTRACT = 'stage2-unified-retrospective-full-model-config-v7'
+UNIFIED_RESUME_CONTRACT = 'stage2-unified-exact-resume-v7'
+UNIFIED_HISTORY_CONTRACT = 'stage2-unified-term-history-v7'
+UNIFIED_ANATOMY_MEMORY_CONTRACT = 'stage2-unified-anatomy-memory-qualification-v1'
+UNIFIED_GENERATOR_ACCUMULATION_CONTRACT = (
+    'stage2-unified-sequential-weighted-gradient-accumulation-v1'
+)
 UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT = (
     "stage2-unified-pilot-training-plus-validation-runtime-projection-v1"
 )
@@ -87,6 +95,7 @@ CriticSpace = Literal["latent", "image"]
 Precision = Literal["fp32", "bf16"]
 Solver = Literal["euler", "heun"]
 Bridge = Literal["schrodinger", "ot_cfm"]
+DecoderCheckpointMode = Literal['disabled', 'fine_grained_full_volume_v1']
 
 DEFAULT_UNIFIED_WEIGHTS: dict[str, float] = {
     "sb": 1.0,
@@ -117,6 +126,9 @@ class UnifiedStage2Config:
     critic_lazy_r1: bool = False
     anatomy_pool_scales: tuple[int, ...] = (1, 2, 4)
     anatomy_support_erosion: int = 1
+    decoder_activation_checkpoint_mode: DecoderCheckpointMode = (
+        KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+    )
     loss_weights: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_UNIFIED_WEIGHTS)
     )
@@ -160,12 +172,63 @@ class UnifiedStage2Config:
         critic = critic if isinstance(critic, Mapping) else {}
         anatomy = training.get("anatomy", {})
         anatomy = anatomy if isinstance(anatomy, Mapping) else {}
+        decoder_checkpointing = training.get('decoder_activation_checkpoint', {})
+        if not isinstance(decoder_checkpointing, Mapping):
+            raise ValueError('decoder_activation_checkpoint must be a mapping.')
+        checkpointing_contract = decoder_checkpointing.get('contract')
+        if (
+            checkpointing_contract is not None
+            and checkpointing_contract != KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT
+        ):
+            raise ValueError('Decoder activation-checkpoint contract is unsupported.')
+        accumulation = training.get('generator_gradient_accumulation', {})
+        if not isinstance(accumulation, Mapping):
+            raise ValueError('generator_gradient_accumulation must be a mapping.')
+        if declared_contract == UNIFIED_STAGE2_CONFIG_CONTRACT:
+            required_checkpointing = {
+                'contract': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+                'mode': KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
+                'full_volume': 'required',
+                'group_norm_scope': 'complete_spatial_volume',
+                'upsample_regions': ['up1', 'up2'],
+                'residual_branch_regions': 'each_norm_activation_conv',
+                'outer_full_decoder_checkpoint': 'forbidden',
+                'source_no_grad_decode': 'ordinary_uncheckpointed',
+                'spatial_crop_or_tile': 'forbidden',
+                'allocator_fallback': 'forbidden',
+            }
+            if any(
+                decoder_checkpointing.get(key) != value
+                for key, value in required_checkpointing.items()
+            ):
+                raise ValueError('The v7 decoder checkpoint block is incomplete or changed.')
+            required_accumulation = {
+                'contract': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
+                'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
+                'weighted_terms': 'sequential',
+                'optimizer_updates_per_step': 1,
+            }
+            if any(
+                accumulation.get(key) != value
+                for key, value in required_accumulation.items()
+            ):
+                raise ValueError('The v7 generator accumulation block is incomplete or changed.')
         checkpoint = training.get("checkpoint", {})
         checkpoint = checkpoint if isinstance(checkpoint, Mapping) else {}
         if "sanity" in training:
             raise ValueError("The v1 sanity block is obsolete; use the v2 pilot contract.")
         pilot = training.get("pilot", {})
         pilot = pilot if isinstance(pilot, Mapping) else {}
+        if declared_contract == UNIFIED_STAGE2_CONFIG_CONTRACT:
+            required_memory_qualification = {
+                'anatomy_memory_contract': UNIFIED_ANATOMY_MEMORY_CONTRACT,
+                'anatomy_memory_qualification_steps': 1,
+            }
+            if any(
+                pilot.get(key) != value
+                for key, value in required_memory_qualification.items()
+            ):
+                raise ValueError('The v7 one-step anatomy memory qualification changed.')
         validation = training.get("validation", {})
         validation = validation if isinstance(validation, Mapping) else {}
         value = cls(
@@ -192,6 +255,9 @@ class UnifiedStage2Config:
             anatomy_support_erosion=int(
                 anatomy.get("support_erosion", defaults.anatomy_support_erosion)
             ),
+            decoder_activation_checkpoint_mode=str(
+                decoder_checkpointing.get('mode', defaults.decoder_activation_checkpoint_mode)
+            ),  # type: ignore[arg-type]
             loss_weights=weights,
             device=str(training.get("device", defaults.device)),
             precision=str(training.get("precision", defaults.precision)),  # type: ignore[arg-type]
@@ -247,6 +313,24 @@ class UnifiedStage2Config:
             variant=str(training.get("variant", defaults.variant)),
         )
         validate_unified_config(value)
+        if declared_contract == UNIFIED_STAGE2_CONFIG_CONTRACT:
+            primary_invariants = {
+                'batch_size': value.batch_size == 1,
+                'precision': value.precision == 'bf16',
+                'integration_steps': value.integration_steps == 4,
+                'integration_solver': value.integration_solver == 'heun',
+                'six_weights': (
+                    value.variant != 'full'
+                    or value.loss_weights == DEFAULT_UNIFIED_WEIGHTS
+                ),
+                'checkpoint_mode': (
+                    value.decoder_activation_checkpoint_mode
+                    == KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
+                ),
+            }
+            failed = [name for name, satisfied in primary_invariants.items() if not satisfied]
+            if failed:
+                raise ValueError(f'Primary v7 execution invariants changed: {failed}.')
         return value
 
     def to_dict(self) -> dict[str, Any]:
@@ -269,6 +353,10 @@ class UnifiedStage2Config:
             "critic_lazy_r1": self.critic_lazy_r1,
             "anatomy_pool_scales": list(self.anatomy_pool_scales),
             "anatomy_support_erosion": self.anatomy_support_erosion,
+            'decoder_activation_checkpoint': {
+                'contract': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+                'mode': self.decoder_activation_checkpoint_mode,
+            },
             "loss_weights": dict(self.loss_weights),
             "device": self.device,
             "precision": self.precision,
@@ -672,6 +760,8 @@ def run_stage2_unified_train(
     decoder = decoder.to(device).eval()
     decoder.requires_grad_(False)
     assert_frozen(decoder)
+    decoder_checkpoint_evidence = _decoder_checkpoint_evidence(cfg, decoder)
+    frozen_decoder_state_sha256 = _module_state_sha256(decoder)
     latent_channels = int(stats.mean.numel())
     critic_input_channels = latent_channels + 1 if cfg.critic_space == "latent" else 2
     critic = critic or DomainProjectionDiscriminator(
@@ -720,7 +810,15 @@ def run_stage2_unified_train(
         "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
         "latent_statistics_sha256": stats.artifact_sha256,
         "bank_vae_provenance": dict(getattr(train_index, "manifest", {}).get("vae", {})),
-        "frozen_decoder_state_sha256": _module_state_sha256(decoder),
+        "frozen_decoder_state_sha256": frozen_decoder_state_sha256,
+        'decoder_activation_checkpoint': decoder_checkpoint_evidence,
+        'decoder_activation_checkpoint_sha256': sha256_json(decoder_checkpoint_evidence),
+        'generator_gradient_accumulation': {
+            'contract_version': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
+            'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
+            'weighted_terms_accumulated_sequentially': True,
+            'generator_optimizer_updates_per_step': 1,
+        },
         "git_commit": resolve_git_commit(),
     }
     run_fingerprint = sha256_json(run_identity)
@@ -802,6 +900,22 @@ def run_stage2_unified_train(
                 },
             )
             raise
+        if step == 0:
+            decoder_state_after_qualification = _module_state_sha256(decoder)
+            if decoder_state_after_qualification != frozen_decoder_state_sha256:
+                raise RuntimeError('Frozen decoder state changed during anatomy qualification.')
+            row['memory/anatomy_qualification'].update(
+                {
+                    'step': 1,
+                    'decoder_state_sha256_before': frozen_decoder_state_sha256,
+                    'decoder_state_sha256_after': decoder_state_after_qualification,
+                    'decoder_state_unchanged': True,
+                    'checkpoint_evidence_sha256': sha256_json(
+                        decoder_checkpoint_evidence
+                    ),
+                    'checkpoint_evidence': decoder_checkpoint_evidence,
+                }
+            )
         generator_scheduler.step()
         if bool(row["critic/updated"]):
             critic_scheduler.step()
@@ -816,7 +930,20 @@ def run_stage2_unified_train(
                 "step_seconds": step_seconds,
                 "examples_per_second": cfg.batch_size / max(1e-9, step_seconds),
                 "peak_cuda_bytes": (
-                    int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+                    max(
+                        int(row['memory/training_peak_cuda_allocated_bytes']),
+                        int(torch.cuda.max_memory_allocated(device)),
+                    )
+                    if device.type == "cuda"
+                    else 0
+                ),
+                'peak_cuda_reserved_bytes': (
+                    max(
+                        int(row['memory/training_peak_cuda_reserved_bytes']),
+                        int(torch.cuda.max_memory_reserved(device)),
+                    )
+                    if device.type == 'cuda'
+                    else 0
                 ),
                 "generator_lr": generator_scheduler.get_last_lr()[0],
                 "critic_lr": critic_scheduler.get_last_lr()[0],
@@ -826,6 +953,18 @@ def run_stage2_unified_train(
         )
         _append_jsonl(history_path, row)
         print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
+        if step == 0:
+            _append_jsonl(
+                history_path,
+                {
+                    'contract_version': UNIFIED_HISTORY_CONTRACT,
+                    'event': 'one_step_anatomy_memory_qualification',
+                    'step': 1,
+                    'qualification': row['memory/anatomy_qualification'],
+                    'run_fingerprint': run_fingerprint,
+                    'history_generation': history_generation,
+                },
+            )
         if step < cfg.pilot_steps:
             pilot_rows.append(dict(row))
         pilot_complete = cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps
@@ -1057,6 +1196,9 @@ def _train_step(
         else nullcontext()
     )
     zero = batch.source.sum() * 0.0
+    cuda_peak_segments: list[dict[str, Any]] = []
+    anatomy_forward_peak = {'allocated_bytes': 0, 'reserved_bytes': 0}
+    anatomy_backward_peak = {'allocated_bytes': 0, 'reserved_bytes': 0}
     adversarial_active = cfg.loss_weights["adversarial"] > 0
     domain_active = cfg.loss_weights["domain"] > 0
     critic_active = adversarial_active or domain_active
@@ -1164,11 +1306,21 @@ def _train_step(
         anatomy_parts = {"low_mid": zero, "edge": zero, "gradient": zero, "total": zero}
         if cfg.loss_weights["anatomy"] > 0:
             assert generated is not None
-            source_image = _decode(
-                decoder, stats.denormalize(batch.source), batch.source_domains
+            _capture_and_reset_cuda_peak(
+                batch.source.device, cuda_peak_segments, phase='before_anatomy_decode'
             )
+            with torch.no_grad():
+                source_image = _decode(
+                    decoder,
+                    stats.denormalize(batch.source),
+                    batch.source_domains,
+                    checkpoint_mode='disabled',
+                )
             generated_image = _decode(
-                decoder, stats.denormalize(generated), batch.target_domains
+                decoder,
+                stats.denormalize(generated),
+                batch.target_domains,
+                checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
             )
             anatomy_parts = anatomy_preservation_components(
                 source_image,
@@ -1177,12 +1329,21 @@ def _train_step(
                 pool_scales=cfg.anatomy_pool_scales,
                 support_erosion=cfg.anatomy_support_erosion,
             )
+            anatomy_forward_peak = _capture_and_reset_cuda_peak(
+                batch.source.device, cuda_peak_segments, phase='anatomy_forward'
+            )
         adversarial = zero
         domain = zero
         if critic_active:
             assert generated is not None
             generated_view = _critic_view(
-                generated, support, batch.target_domains, decoder, stats, cfg.critic_space
+                generated,
+                support,
+                batch.target_domains,
+                decoder,
+                stats,
+                cfg.critic_space,
+                checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
             )
             fake_score_for_generator, fake_domain_logits = critic(
                 generated_view, batch.target_domains
@@ -1213,16 +1374,59 @@ def _train_step(
         )
     if not bool(torch.isfinite(generator_total)):
         raise FloatingPointError("Unified generator loss is non-finite.")
-    scaler.scale(generator_total).backward()
+    active_weighted_terms = [
+        (name, weighted[name])
+        for name in DEFAULT_UNIFIED_WEIGHTS
+        if cfg.loss_weights[name] > 0
+    ]
+    if not active_weighted_terms:
+        raise ValueError('At least one generator objective must be active.')
+    _capture_and_reset_cuda_peak(
+        batch.source.device, cuda_peak_segments, phase='before_generator_backward'
+    )
+    for index, (term_name, weighted_term) in enumerate(active_weighted_terms):
+        if term_name == 'anatomy':
+            _capture_and_reset_cuda_peak(
+                batch.source.device, cuda_peak_segments, phase='before_anatomy_backward'
+            )
+        scaler.scale(weighted_term).backward(
+            retain_graph=index + 1 < len(active_weighted_terms)
+        )
+        if term_name == 'anatomy':
+            anatomy_backward_peak = _capture_and_reset_cuda_peak(
+                batch.source.device, cuda_peak_segments, phase='anatomy_backward'
+            )
     scaler.unscale_(generator_optimizer)
     generator_grad = float(
         torch.nn.utils.clip_grad_norm_(translator.parameters(), cfg.grad_clip_norm)
     )
     scaler.step(generator_optimizer)
     scaler.update()
+    _capture_and_reset_cuda_peak(
+        batch.source.device, cuda_peak_segments, phase='after_generator_update'
+    )
     if critic_active:
         critic.requires_grad_(True)
     weighted_aux = sum(weighted[name].abs() for name in weighted if name != "sb")
+    training_peak_allocated = max(
+        (segment['allocated_bytes'] for segment in cuda_peak_segments), default=0
+    )
+    training_peak_reserved = max(
+        (segment['reserved_bytes'] for segment in cuda_peak_segments), default=0
+    )
+    anatomy_memory_status = (
+        'disabled_for_ablation'
+        if cfg.loss_weights['anatomy'] == 0
+        else 'pass'
+        if batch.source.device.type == 'cuda'
+        and anatomy_forward_peak['allocated_bytes'] > 0
+        and anatomy_backward_peak['allocated_bytes'] > 0
+        else 'not_applicable_cpu'
+        if batch.source.device.type != 'cuda'
+        else 'fail'
+    )
+    if anatomy_memory_status == 'fail':
+        raise RuntimeError('CUDA anatomy memory qualification did not record both phases.')
     row: dict[str, Any] = {
         **{f"raw/{key}": float(value.detach().float().cpu()) for key, value in raw_terms.items()},
         **{f"weighted/{key}": float(value.detach().float().cpu()) for key, value in weighted.items()},
@@ -1321,11 +1525,86 @@ def _train_step(
         "target_records": [item.case_id for item in batch.target_records],
         "prospective_records_loaded": 0,
         "descriptor_coupling_used": False,
+        'generator/accumulation_contract': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
+        'generator/weighted_term_order': [name for name, _ in active_weighted_terms],
+        'generator/optimizer_updates': 1,
+        'memory/training_peak_cuda_allocated_bytes': training_peak_allocated,
+        'memory/training_peak_cuda_reserved_bytes': training_peak_reserved,
+        'memory/anatomy_forward_peak_cuda_allocated_bytes': anatomy_forward_peak[
+            'allocated_bytes'
+        ],
+        'memory/anatomy_forward_peak_cuda_reserved_bytes': anatomy_forward_peak[
+            'reserved_bytes'
+        ],
+        'memory/anatomy_backward_peak_cuda_allocated_bytes': anatomy_backward_peak[
+            'allocated_bytes'
+        ],
+        'memory/anatomy_backward_peak_cuda_reserved_bytes': anatomy_backward_peak[
+            'reserved_bytes'
+        ],
+        'memory/anatomy_qualification': {
+            'contract_version': UNIFIED_ANATOMY_MEMORY_CONTRACT,
+            'status': anatomy_memory_status,
+            'full_volume': True,
+            'source_decode_checkpointed': False,
+            'generated_decode_checkpoint_mode': cfg.decoder_activation_checkpoint_mode,
+            'group_norm_scope': 'complete_spatial_volume',
+            'spatial_crop_or_tile': False,
+            'allocator_fallback': False,
+        },
     }
     return row
 
 
-def _decode(decoder: nn.Module, latent: torch.Tensor, domains: Sequence[Domain]) -> torch.Tensor:
+def _decoder_checkpoint_evidence(
+    cfg: UnifiedStage2Config, decoder: nn.Module
+) -> dict[str, Any]:
+    if cfg.decoder_activation_checkpoint_mode == 'disabled':
+        return {
+            'contract_version': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+            'mode': 'disabled',
+            'outer_full_decoder_checkpoint': False,
+        }
+    evidence_method = getattr(decoder, 'activation_checkpoint_evidence', None)
+    decode_method = getattr(decoder, 'decode_fine_grained_checkpointed', None)
+    if not callable(evidence_method) or not callable(decode_method):
+        raise TypeError(
+            'Fine-grained checkpointing requires the reviewed 3-D KL-VAE decoder API.'
+        )
+    evidence = dict(evidence_method())
+    required = {
+        'contract_version': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+        'mode': KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
+        'spatial_dims': 3,
+        'full_volume': True,
+        'group_norm_scope': 'complete_spatial_volume',
+        'upsample_regions': ['up1', 'up2'],
+        'residual_skip_checkpointed': False,
+        'outer_full_decoder_checkpoint': False,
+        'checkpoint_use_reentrant': False,
+        'checkpoint_preserve_rng_state': True,
+        'source_no_grad_decode_checkpointed': False,
+        'state_dict_schema_changed': False,
+    }
+    if any(evidence.get(key) != value for key, value in required.items()):
+        raise ValueError('Frozen decoder checkpoint evidence does not satisfy the v7 contract.')
+    if not evidence.get('residual_branch_regions'):
+        raise ValueError('Frozen decoder has no sealed residual checkpoint regions.')
+    return evidence
+
+
+def _decode(
+    decoder: nn.Module,
+    latent: torch.Tensor,
+    domains: Sequence[Domain],
+    *,
+    checkpoint_mode: DecoderCheckpointMode = 'disabled',
+) -> torch.Tensor:
+    if checkpoint_mode == KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE:
+        method = getattr(decoder, 'decode_fine_grained_checkpointed', None)
+        if not callable(method):
+            raise TypeError('Decoder does not implement fine-grained full-volume checkpointing.')
+        return method(latent, domains)  # type: ignore[no-any-return]
     if hasattr(decoder, "decode"):
         return decoder.decode(latent, domains)  # type: ignore[attr-defined,no-any-return]
     return decoder(latent)  # type: ignore[no-any-return]
@@ -1343,6 +1622,28 @@ def _score_quantiles(score: torch.Tensor | None) -> dict[str, float]:
     }
 
 
+def _capture_and_reset_cuda_peak(
+    device: torch.device,
+    segments: list[dict[str, Any]],
+    *,
+    phase: str,
+) -> dict[str, int]:
+    if device.type != 'cuda':
+        return {'allocated_bytes': 0, 'reserved_bytes': 0}
+    torch.cuda.synchronize(device)
+    value = {
+        'phase': phase,
+        'allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
+        'reserved_bytes': int(torch.cuda.max_memory_reserved(device)),
+    }
+    segments.append(value)
+    torch.cuda.reset_peak_memory_stats(device)
+    return {
+        'allocated_bytes': value['allocated_bytes'],
+        'reserved_bytes': value['reserved_bytes'],
+    }
+
+
 def _critic_view(
     latent: torch.Tensor,
     support: torch.Tensor,
@@ -1350,10 +1651,17 @@ def _critic_view(
     decoder: nn.Module,
     stats: FactoredLatentStats,
     space: CriticSpace,
+    *,
+    checkpoint_mode: DecoderCheckpointMode = 'disabled',
 ) -> torch.Tensor:
     if space == "latent":
         return supported_critic_input(latent, support)
-    image = _decode(decoder, stats.denormalize(latent), domains)
+    image = _decode(
+        decoder,
+        stats.denormalize(latent),
+        domains,
+        checkpoint_mode=checkpoint_mode,
+    )
     image_support = F.interpolate(support.float(), size=image.shape[2:], mode="nearest") > 0.5
     return supported_critic_input(image, image_support)
 
@@ -2027,6 +2335,11 @@ def _pilot_report(
         "critic/real_domain_accuracy",
         "critic/generated_domain_accuracy",
         "step_seconds",
+        'peak_cuda_reserved_bytes',
+        'memory/anatomy_forward_peak_cuda_allocated_bytes',
+        'memory/anatomy_forward_peak_cuda_reserved_bytes',
+        'memory/anatomy_backward_peak_cuda_allocated_bytes',
+        'memory/anatomy_backward_peak_cuda_reserved_bytes',
     ]
     for branch in ("real", "fake"):
         numeric_keys.extend(f"critic/{branch}_score_{name}" for name in ("p05", "p50", "p95"))
@@ -2138,6 +2451,37 @@ def _pilot_report(
             ),
         },
         "runtime": runtime,
+        'decoder_activation_checkpoint': {
+            'contract_version': KLVAE_DECODER_ACTIVATION_CHECKPOINT_CONTRACT,
+            'mode': cfg.decoder_activation_checkpoint_mode,
+            'outer_full_decoder_checkpoint': False,
+        },
+        'generator_gradient_accumulation': {
+            'contract_version': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
+            'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
+            'generator_optimizer_updates_per_step': 1,
+        },
+        'one_step_anatomy_memory_qualification': rows[0][
+            'memory/anatomy_qualification'
+        ],
+        'anatomy_cuda_peak_memory': {
+            'forward_allocated_bytes_max': max(
+                int(row['memory/anatomy_forward_peak_cuda_allocated_bytes'])
+                for row in rows
+            ),
+            'forward_reserved_bytes_max': max(
+                int(row['memory/anatomy_forward_peak_cuda_reserved_bytes'])
+                for row in rows
+            ),
+            'backward_allocated_bytes_max': max(
+                int(row['memory/anatomy_backward_peak_cuda_allocated_bytes'])
+                for row in rows
+            ),
+            'backward_reserved_bytes_max': max(
+                int(row['memory/anatomy_backward_peak_cuda_reserved_bytes'])
+                for row in rows
+            ),
+        },
         "hard_stop_conditions": [
             "nonfinite",
             "missing_gradient",
@@ -2285,6 +2629,11 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         )
     if cfg.precision not in {"fp32", "bf16"}:
         raise ValueError("precision must be fp32 or bf16.")
+    if cfg.decoder_activation_checkpoint_mode not in {
+        'disabled',
+        KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE,
+    }:
+        raise ValueError('Decoder activation-checkpoint mode is unsupported.')
     if set(cfg.loss_weights) != set(DEFAULT_UNIFIED_WEIGHTS):
         raise ValueError("Unified loss weights must specify exactly all six objectives.")
     if any(not np.isfinite(value) or value < 0 for value in cfg.loss_weights.values()):
@@ -2311,6 +2660,8 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
 
 __all__ = [
     "DEFAULT_UNIFIED_WEIGHTS",
+    'UNIFIED_ANATOMY_MEMORY_CONTRACT',
+    'UNIFIED_GENERATOR_ACCUMULATION_CONTRACT',
     "UNIFIED_HISTORY_CONTRACT",
     "UNIFIED_RESUME_CONTRACT",
     "UNIFIED_SELECTION_CONTRACT",
@@ -2319,6 +2670,7 @@ __all__ = [
     "UNIFIED_SELECTION_RULE_CONTRACT",
     "UNIFIED_SELECTION_RULE_SHA256",
     "UNIFIED_STAGE2_CONTRACT",
+    'UNIFIED_STAGE2_CONFIG_CONTRACT',
     "UNIFIED_VALIDATION_PLAN_CONTRACT",
     "UnifiedStage2Config",
     "UnifiedStage2Result",

@@ -73,14 +73,22 @@ training:
     raw_high_frequency_equality: forbidden
     full_volume: required
   generator_gradient_accumulation:
-    contract: stage2-unified-sequential-weighted-gradient-accumulation-v1
+    contract: stage2-unified-term-wise-recomputation-v6
     term_order: [sb, identity, anatomy, graph, adversarial, domain]
-    weighted_terms: sequential
+    graph_construction: one_term_at_a_time
+    gradient_measurement: inline_during_term_backward
+    backward: immediate_without_retain_graph
+    graph_release: before_next_term
+    translator_checkpoint: non_reentrant_rng_preserving_every_differentiable_call
+    saved_tensor_policy: save_on_cpu
     optimizer_updates_per_step: 1
   pilot:
     runtime_projection_contract: stage2-unified-pilot-training-plus-validation-runtime-projection-v1
     anatomy_memory_contract: stage2-unified-anatomy-memory-qualification-v1
     anatomy_memory_qualification_steps: 1
+    a100_memory_gate_contract: stage2-unified-a100-one-step-memory-gate-v1
+    a100_memory_gate_steps: 1
+    a100_peak_allocated_limit_bytes: 77309411328
     steps: 200
     smoothing_window: 20
     max_aux_to_flow_ratio: 1.0

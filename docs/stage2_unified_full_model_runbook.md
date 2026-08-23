@@ -139,15 +139,29 @@ exist, otherwise the sealed P:0006 development-validation evaluation-only protoc
 that P:0009 remains frozen and unused for possible later confirmation; this PR does not execute
 P:0009. Absence of both routes hard-stops before the long-run authorization flag.
 
-5. Run the 200-step full-objective pilot. It uses the same six objectives and initial weights as
-   the strongest model:
+5. Run the dedicated one-step A100 gate, then the 20-step recovery probe, and only then the
+   200-step full-objective pilot. All three use the same six objectives and initial weights as
+   the strongest model. The notebook derives three separately sealed resolved configurations
+   and exact-resume directories from the primary v7 file:
 
 ```bash
 fieldbridge train-stage2-unified \
-  --config configs/experiment/stage2_unified_full_retrospective_v7.yaml \
+  --config "$A100_GATE_RESOLVED_CONFIG" \
+  --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
+  --checkpoint-dir "$A100_GATE_CHECKPOINTS" --history-jsonl "$A100_GATE_HISTORY" \
+  --device cuda
+
+fieldbridge train-stage2-unified \
+  --config "$PILOT_20_RESOLVED_CONFIG" \
+  --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
+  --checkpoint-dir "$PILOT_20_CHECKPOINTS" --history-jsonl "$PILOT_20_HISTORY" \
+  --device cuda [--resume-from "$LATEST_PILOT_20_CHECKPOINT"]
+
+fieldbridge train-stage2-unified \
+  --config "$PILOT_200_RESOLVED_CONFIG" \
   --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
   --checkpoint-dir "$PILOT_CHECKPOINTS" --history-jsonl "$PILOT_HISTORY" \
-  --steps 200 --pilot-steps 200 --device cuda
+  --device cuda [--resume-from "$LATEST_PILOT_200_CHECKPOINT"]
 ```
 
 The v7 primary profile is fixed to BF16, batch size one, four-step Heun transport, and the same
@@ -159,11 +173,30 @@ approximation, resolution reduction, integration-step reduction, disabled full-m
 allocator fallback. Source-image anatomy decoding is under no_grad and uses the ordinary
 decoder; only generated, gradient-bearing decoding takes the fine-grained path.
 
-The six weighted generator terms accumulate sequentially in the sealed order sb, identity,
-anatomy, graph, adversarial, domain, followed by exactly one generator optimizer update. The
-pilot's first step emits stage2-unified-anatomy-memory-qualification-v1 with allocated and
-reserved CUDA peaks for anatomy forward/backward and the whole step, the checkpoint-granularity
-hash, and unchanged before/after frozen-decoder state hashes.
+The generator ports the reviewed term-wise v6 lifetime exactly. It freezes the selected batch,
+bridge time/noise, intermediate domains, and a differentiable-forward RNG replay seed once per
+step. For each enabled term in the sealed order sb, identity, anatomy, graph, adversarial,
+domain, it constructs only that term's graph under `save_on_cpu`, routes every differentiable
+translator invocation through non-reentrant RNG-preserving checkpointing, measures the term's
+translator gradient from that same backward, immediately calls backward without retaining the
+graph, releases the graph, and only then constructs the next term. The pilot gradient probe does
+not reconstruct a joint six-term graph. Accumulated weighted gradients receive exactly one
+generator optimizer update.
+
+The first step emits `stage2-unified-anatomy-memory-qualification-v1` with allocated and reserved
+CUDA peaks for anatomy forward/backward and the whole step, the checkpoint-granularity hash, and
+unchanged before/after frozen-decoder state hashes. It also emits
+`stage2-unified-a100-one-step-memory-gate-v1`. The gate requires an NVIDIA A100 and peak allocated
+memory no greater than 72 GiB (77,309,411,328 bytes); failure stops before the 20- or 200-step
+command is launched.
+
+Each Colab command is an attempt. Stdout is streamed visibly into an ephemeral
+`/content/stage2_unified_v7_scratch` log; no Drive log is held open while the subprocess runs.
+After completion, the local log is copied once into a unique external attempt path and sealed
+with a SHA-256 receipt. A rerun discovers the greatest immutable step checkpoint and passes it as
+`--resume-from`. Critical exact-resume checkpoints and their history prefix remain in the
+variant's durable external directory; temporary files, package caches, and command logs use
+local scratch. Existing attempt logs are never appended or overwritten.
 
 The pilot logs raw/weighted terms, each term's translator-gradient norm, generator/critic norms,
 critic score means/std/quantiles/separation/saturation, real/generated domain accuracy,

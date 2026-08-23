@@ -13,7 +13,7 @@ import random
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from fieldbridge.data.domains import Contrast, Domain, FIELD_STRENGTHS_T
 from fieldbridge.data.photometry_factored_bank_dataset import (
@@ -58,8 +59,13 @@ UNIFIED_RESUME_CONTRACT = 'stage2-unified-exact-resume-v7'
 UNIFIED_HISTORY_CONTRACT = 'stage2-unified-term-history-v7'
 UNIFIED_ANATOMY_MEMORY_CONTRACT = 'stage2-unified-anatomy-memory-qualification-v1'
 UNIFIED_GENERATOR_ACCUMULATION_CONTRACT = (
-    'stage2-unified-sequential-weighted-gradient-accumulation-v1'
+    'stage2-unified-term-wise-recomputation-v6'
 )
+UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT = (
+    'stage2-unified-nonreentrant-rng-preserving-translator-checkpoint-v1'
+)
+UNIFIED_A100_GATE_CONTRACT = 'stage2-unified-a100-one-step-memory-gate-v1'
+UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES = 72 * 1024**3
 UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT = (
     "stage2-unified-pilot-training-plus-validation-runtime-projection-v1"
 )
@@ -148,6 +154,7 @@ class UnifiedStage2Config:
     pilot_max_smoothed_loss_growth: float = 10.0
     pilot_score_saturation_threshold: float = 20.0
     pilot_max_saturation_fraction: float = 0.95
+    pilot_a100_peak_allocated_limit_bytes: int = UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
     projected_steps: int = 100_000
     gpu_hourly_cost_usd: float | None = None
     validation_every_steps: int = 1000
@@ -205,7 +212,14 @@ class UnifiedStage2Config:
             required_accumulation = {
                 'contract': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
                 'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
-                'weighted_terms': 'sequential',
+                'graph_construction': 'one_term_at_a_time',
+                'gradient_measurement': 'inline_during_term_backward',
+                'backward': 'immediate_without_retain_graph',
+                'graph_release': 'before_next_term',
+                'translator_checkpoint': (
+                    'non_reentrant_rng_preserving_every_differentiable_call'
+                ),
+                'saved_tensor_policy': 'save_on_cpu',
                 'optimizer_updates_per_step': 1,
             }
             if any(
@@ -223,6 +237,11 @@ class UnifiedStage2Config:
             required_memory_qualification = {
                 'anatomy_memory_contract': UNIFIED_ANATOMY_MEMORY_CONTRACT,
                 'anatomy_memory_qualification_steps': 1,
+                'a100_memory_gate_contract': UNIFIED_A100_GATE_CONTRACT,
+                'a100_memory_gate_steps': 1,
+                'a100_peak_allocated_limit_bytes': (
+                    UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
+                ),
             }
             if any(
                 pilot.get(key) != value
@@ -294,6 +313,12 @@ class UnifiedStage2Config:
             ),
             pilot_max_saturation_fraction=float(
                 pilot.get("max_saturation_fraction", defaults.pilot_max_saturation_fraction)
+            ),
+            pilot_a100_peak_allocated_limit_bytes=int(
+                pilot.get(
+                    'a100_peak_allocated_limit_bytes',
+                    defaults.pilot_a100_peak_allocated_limit_bytes,
+                )
             ),
             projected_steps=int(pilot.get("projected_steps", defaults.projected_steps)),
             gpu_hourly_cost_usd=(
@@ -369,6 +394,9 @@ class UnifiedStage2Config:
             "pilot_max_smoothed_loss_growth": self.pilot_max_smoothed_loss_growth,
             "pilot_score_saturation_threshold": self.pilot_score_saturation_threshold,
             "pilot_max_saturation_fraction": self.pilot_max_saturation_fraction,
+            'pilot_a100_peak_allocated_limit_bytes': (
+                self.pilot_a100_peak_allocated_limit_bytes
+            ),
             "projected_steps": self.projected_steps,
             "gpu_hourly_cost_usd": self.gpu_hourly_cost_usd,
             "validation_every_steps": self.validation_every_steps,
@@ -399,6 +427,30 @@ class UnifiedStage2Result:
         }
 
 
+def _translator_call(
+    translator: BaseTranslator,
+    latent: torch.Tensor,
+    source_domains: Sequence[Domain],
+    target_domains: Sequence[Domain],
+    time_values: torch.Tensor,
+    *,
+    checkpoint_differentiable: bool,
+) -> torch.Tensor:
+    if not checkpoint_differentiable or not torch.is_grad_enabled():
+        return translator(latent, source_domains, target_domains, time_values)
+
+    def forward(value: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        return translator(value, source_domains, target_domains, time)
+
+    return checkpoint(
+        forward,
+        latent,
+        time_values,
+        use_reentrant=False,
+        preserve_rng_state=True,
+    )
+
+
 def integrate_transport(
     translator: BaseTranslator,
     z: torch.Tensor,
@@ -407,6 +459,7 @@ def integrate_transport(
     *,
     steps: int,
     solver: Solver = "heun",
+    checkpoint_differentiable: bool = False,
 ) -> torch.Tensor:
     """Differentiable fixed-grid ODE integration used by identity and graph losses."""
 
@@ -416,13 +469,27 @@ def integrate_transport(
     current = z
     for index in range(steps):
         t0 = torch.full((z.shape[0],), index * h, device=z.device, dtype=z.dtype)
-        velocity = translator(current, source_domains, target_domains, t0)
+        velocity = _translator_call(
+            translator,
+            current,
+            source_domains,
+            target_domains,
+            t0,
+            checkpoint_differentiable=checkpoint_differentiable,
+        )
         proposal = current + h * velocity
         if solver == "euler":
             current = proposal
         else:
             t1 = torch.full((z.shape[0],), (index + 1) * h, device=z.device, dtype=z.dtype)
-            correction = translator(proposal, source_domains, target_domains, t1)
+            correction = _translator_call(
+                translator,
+                proposal,
+                source_domains,
+                target_domains,
+                t1,
+                checkpoint_differentiable=checkpoint_differentiable,
+            )
             current = current + 0.5 * h * (velocity + correction)
     return current
 
@@ -437,15 +504,34 @@ def graph_consistency_loss(
     *,
     steps: int,
     solver: Solver,
+    checkpoint_differentiable: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     direct = integrate_transport(
-        translator, z, source_domains, target_domains, steps=steps, solver=solver
+        translator,
+        z,
+        source_domains,
+        target_domains,
+        steps=steps,
+        solver=solver,
+        checkpoint_differentiable=checkpoint_differentiable,
     )
     first = integrate_transport(
-        translator, z, source_domains, intermediate_domains, steps=steps, solver=solver
+        translator,
+        z,
+        source_domains,
+        intermediate_domains,
+        steps=steps,
+        solver=solver,
+        checkpoint_differentiable=checkpoint_differentiable,
     )
     composed = integrate_transport(
-        translator, first, intermediate_domains, target_domains, steps=steps, solver=solver
+        translator,
+        first,
+        intermediate_domains,
+        target_domains,
+        steps=steps,
+        solver=solver,
+        checkpoint_differentiable=checkpoint_differentiable,
     )
     return masked_l1_loss(direct, composed, support), direct, composed
 
@@ -816,7 +902,16 @@ def run_stage2_unified_train(
         'generator_gradient_accumulation': {
             'contract_version': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
             'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
-            'weighted_terms_accumulated_sequentially': True,
+            'graph_construction': 'one_term_at_a_time',
+            'forward_backward_interleaved': True,
+            'retain_graph': False,
+            'graph_release': 'before_next_term',
+            'gradient_measurement': 'inline_during_term_backward',
+            'saved_tensor_policy': 'save_on_cpu',
+            'translator_checkpoint_contract': UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT,
+            'translator_checkpoint_use_reentrant': False,
+            'translator_checkpoint_preserve_rng_state': True,
+            'frozen_step_plan_replayed_per_term': True,
             'generator_optimizer_updates_per_step': 1,
         },
         "git_commit": resolve_git_commit(),
@@ -951,6 +1046,12 @@ def run_stage2_unified_train(
                 "history_generation": history_generation,
             }
         )
+        if step == 0:
+            row['memory/a100_one_step_gate'] = _a100_one_step_gate(
+                row,
+                device=device,
+                limit_bytes=cfg.pilot_a100_peak_allocated_limit_bytes,
+            )
         _append_jsonl(history_path, row)
         print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
         if step == 0:
@@ -965,6 +1066,24 @@ def run_stage2_unified_train(
                     'history_generation': history_generation,
                 },
             )
+            _append_jsonl(
+                history_path,
+                {
+                    'contract_version': UNIFIED_HISTORY_CONTRACT,
+                    'event': 'one_step_a100_memory_gate',
+                    'step': 1,
+                    'gate': row['memory/a100_one_step_gate'],
+                    'run_fingerprint': run_fingerprint,
+                    'history_generation': history_generation,
+                },
+            )
+            if (
+                device.type == 'cuda'
+                and row['memory/a100_one_step_gate']['status'] != 'pass'
+            ):
+                raise RuntimeError(
+                    'The dedicated one-step A100 <=72 GiB allocated-memory gate failed.'
+                )
         if step < cfg.pilot_steps:
             pilot_rows.append(dict(row))
         pilot_complete = cfg.pilot_steps > 0 and step + 1 == cfg.pilot_steps
@@ -1171,6 +1290,280 @@ class _TrainingBatch:
     target_records: list[FactoredLatentRecord]
 
 
+@dataclass(frozen=True, slots=True)
+class _FrozenTrainingStepPlan:
+    time_values: torch.Tensor
+    bridge_noise: torch.Tensor | None
+    bridge_noise_seed: int | None
+    intermediate_domains: tuple[Domain, ...] | None
+    differentiable_replay_seed: int
+    plan_sha256: str
+
+
+@dataclass(slots=True)
+class _TermForward:
+    loss: torch.Tensor
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+def _freeze_training_step_plan(
+    cfg: UnifiedStage2Config,
+    batch: _TrainingBatch,
+    sampler: torch.Generator,
+) -> _FrozenTrainingStepPlan:
+    time_values = _rand((cfg.batch_size,), sampler, batch.source.device).clamp(
+        cfg.time_eps, 1.0 - cfg.time_eps
+    )
+    bridge_noise_seed: int | None = None
+    bridge_noise: torch.Tensor | None = None
+    if cfg.bridge == 'schrodinger':
+        bridge_noise_seed = int(
+            torch.randint(0, (1 << 63) - 1, (1,), generator=sampler, dtype=torch.int64)
+        )
+        noise_generator = torch.Generator().manual_seed(bridge_noise_seed)
+        bridge_noise = _randn(
+            tuple(batch.source.shape),
+            noise_generator,
+            batch.source.device,
+            batch.source.dtype,
+        )
+    intermediate = (
+        tuple(_intermediate_domains(batch.source_domains, batch.target_domains, sampler))
+        if cfg.loss_weights['graph'] > 0
+        else None
+    )
+    replay_seed = int(
+        torch.randint(0, (1 << 63) - 1, (1,), generator=sampler, dtype=torch.int64)
+    )
+    body = {
+        'source_records': [item.case_id for item in batch.source_records],
+        'target_records': [item.case_id for item in batch.target_records],
+        'time_values': [float(value) for value in time_values.detach().cpu()],
+        'bridge': cfg.bridge,
+        'bridge_noise_seed': bridge_noise_seed,
+        'bridge_noise_shape': list(bridge_noise.shape) if bridge_noise is not None else None,
+        'intermediate_domains': (
+            [domain.to_dict() for domain in intermediate] if intermediate is not None else None
+        ),
+        'differentiable_replay_seed': replay_seed,
+    }
+    return _FrozenTrainingStepPlan(
+        time_values=time_values,
+        bridge_noise=bridge_noise,
+        bridge_noise_seed=bridge_noise_seed,
+        intermediate_domains=intermediate,
+        differentiable_replay_seed=replay_seed,
+        plan_sha256=sha256_json(body),
+    )
+
+
+@contextmanager
+def _replay_step_rng(plan: _FrozenTrainingStepPlan, device: torch.device):
+    cuda_devices: list[int] = []
+    if device.type == 'cuda':
+        cuda_devices = [
+            torch.cuda.current_device() if device.index is None else int(device.index)
+        ]
+    with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+        torch.manual_seed(plan.differentiable_replay_seed)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(plan.differentiable_replay_seed)
+        yield
+
+
+def _autocast_context(cfg: UnifiedStage2Config, device: torch.device):
+    if device.type == 'cuda' and cfg.precision == 'bf16':
+        return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def _saved_tensor_offload_context(device: torch.device):
+    return torch.autograd.graph.save_on_cpu(
+        pin_memory=device.type == 'cuda',
+        device_type=device.type,
+    )
+
+
+def _backward_isolated_generator_term(
+    loss: torch.Tensor,
+    translator: nn.Module,
+    *,
+    weight: float,
+    scaler: torch.amp.GradScaler,
+) -> float:
+    if weight <= 0:
+        raise ValueError('Only enabled generator terms may enter isolated backward.')
+    parameters = tuple(value for value in translator.parameters() if value.requires_grad)
+    if not parameters:
+        raise ValueError('Translator has no trainable parameters for gradient qualification.')
+    squared_parts: list[torch.Tensor] = []
+
+    def capture(gradient: torch.Tensor) -> None:
+        squared_parts.append(gradient.detach().float().square().sum())
+
+    handles = [parameter.register_hook(capture) for parameter in parameters]
+    scale = float(scaler.get_scale())
+    try:
+        scaler.scale(loss * weight).backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    if not squared_parts:
+        return 0.0
+    scaled_weighted_norm = torch.stack(squared_parts).sum().sqrt()
+    raw_norm = float(
+        (scaled_weighted_norm / max(abs(weight) * scale, 1.0e-30)).detach().cpu()
+    )
+    if not np.isfinite(raw_norm):
+        raise FloatingPointError('Generator term has a non-finite translator gradient.')
+    return raw_norm
+
+
+def _forward_generator_term(
+    name: str,
+    cfg: UnifiedStage2Config,
+    translator: BaseTranslator,
+    critic: DomainProjectionDiscriminator,
+    decoder: nn.Module,
+    batch: _TrainingBatch,
+    support: torch.Tensor,
+    stats: FactoredLatentStats,
+    plan: _FrozenTrainingStepPlan,
+) -> _TermForward:
+    if name == 'sb':
+        z_t, flow_target = _bridge_sample(
+            batch.source,
+            batch.target,
+            plan.time_values,
+            cfg,
+            noise=plan.bridge_noise,
+        )
+        predicted_velocity = _translator_call(
+            translator,
+            z_t,
+            batch.source_domains,
+            batch.target_domains,
+            plan.time_values,
+            checkpoint_differentiable=True,
+        )
+        return _TermForward(_masked_mse(predicted_velocity, flow_target, support))
+
+    if name == 'identity':
+        generated = integrate_transport(
+            translator,
+            batch.source,
+            batch.source_domains,
+            batch.source_domains,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+            checkpoint_differentiable=True,
+        )
+        return _TermForward(
+            masked_l1_loss(generated, batch.source, batch.source_support)
+        )
+
+    if name == 'anatomy':
+        generated = integrate_transport(
+            translator,
+            batch.source,
+            batch.source_domains,
+            batch.target_domains,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+            checkpoint_differentiable=True,
+        )
+        with torch.no_grad():
+            source_image = _decode(
+                decoder,
+                stats.denormalize(batch.source),
+                batch.source_domains,
+                checkpoint_mode='disabled',
+            )
+        generated_image = _decode(
+            decoder,
+            stats.denormalize(generated),
+            batch.target_domains,
+            checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
+        )
+        parts = anatomy_preservation_components(
+            source_image,
+            generated_image,
+            batch.source_support,
+            pool_scales=cfg.anatomy_pool_scales,
+            support_erosion=cfg.anatomy_support_erosion,
+        )
+        return _TermForward(
+            parts['total'],
+            {
+                'anatomy_low_mid': parts['low_mid'].detach(),
+                'anatomy_edge': parts['edge'].detach(),
+                'anatomy_gradient': parts['gradient'].detach(),
+            },
+        )
+
+    if name == 'graph':
+        if plan.intermediate_domains is None:
+            raise RuntimeError('Enabled graph loss has no frozen intermediate domains.')
+        graph, direct, composed = graph_consistency_loss(
+            translator,
+            batch.source,
+            batch.source_domains,
+            plan.intermediate_domains,
+            batch.target_domains,
+            support,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+            checkpoint_differentiable=True,
+        )
+        return _TermForward(
+            graph,
+            {'graph_mse': _masked_mse(direct, composed, support).detach()},
+        )
+
+    if name in {'adversarial', 'domain'}:
+        generated = integrate_transport(
+            translator,
+            batch.source,
+            batch.source_domains,
+            batch.target_domains,
+            steps=cfg.integration_steps,
+            solver=cfg.integration_solver,
+            checkpoint_differentiable=True,
+        )
+        generated_view = _critic_view(
+            generated,
+            support,
+            batch.target_domains,
+            decoder,
+            stats,
+            cfg.critic_space,
+            checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
+        )
+        fake_score, fake_domain_logits = critic(generated_view, batch.target_domains)
+        diagnostics = {
+            'generator_fake_score': fake_score.detach(),
+            'generator_fake_domain_logits': fake_domain_logits.detach(),
+        }
+        if name == 'adversarial':
+            return _TermForward(
+                adversarial_hinge_loss_generator(fake_score),
+                diagnostics,
+            )
+        return _TermForward(
+            F.cross_entropy(
+                fake_domain_logits,
+                domain_labels(
+                    batch.target_domains,
+                    len(batch.target_domains),
+                    batch.source.device,
+                ),
+            ),
+            diagnostics,
+        )
+
+    raise ValueError(f'Unsupported unified generator term: {name!r}.')
+
+
 def _train_step(
     cfg: UnifiedStage2Config,
     translator: BaseTranslator,
@@ -1190,15 +1583,11 @@ def _train_step(
     support = batch.source_support & batch.target_support
     if not bool(support.any(dim=(1, 2, 3, 4)).all()):
         raise ValueError("Source/target operational support intersection is empty.")
-    autocast = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if batch.source.device.type == "cuda" and cfg.precision == "bf16"
-        else nullcontext()
-    )
     zero = batch.source.sum() * 0.0
     cuda_peak_segments: list[dict[str, Any]] = []
     anatomy_forward_peak = {'allocated_bytes': 0, 'reserved_bytes': 0}
     anatomy_backward_peak = {'allocated_bytes': 0, 'reserved_bytes': 0}
+    plan = _freeze_training_step_plan(cfg, batch, sampler)
     adversarial_active = cfg.loss_weights["adversarial"] > 0
     domain_active = cfg.loss_weights["domain"] > 0
     critic_active = adversarial_active or domain_active
@@ -1206,10 +1595,15 @@ def _train_step(
     critic_domain = zero
     critic_total = zero
     critic_grad = 0.0
+    real_score: torch.Tensor | None = None
+    fake_score: torch.Tensor | None = None
+    real_domain_logits: torch.Tensor | None = None
     if critic_active:
         # Critic update uses a detached, fully integrated generator sample.
         critic_optimizer.zero_grad(set_to_none=True)
-        with torch.no_grad(), autocast:
+        with _replay_step_rng(plan, batch.source.device), torch.no_grad(), _autocast_context(
+            cfg, batch.source.device
+        ):
             fake_detached = integrate_transport(
                 translator,
                 batch.source,
@@ -1226,7 +1620,7 @@ def _train_step(
         fake_view = _critic_view(
             fake_detached, support, batch.target_domains, decoder, stats, cfg.critic_space
         )
-        with autocast:
+        with _autocast_context(cfg, batch.source.device):
             real_score, real_domain_logits = critic(real_view, batch.target_domains)
             fake_score, _ = critic(fake_view, batch.target_domains)
             critic_adv = adversarial_hinge_loss_discriminator(real_score, fake_score)
@@ -1250,152 +1644,108 @@ def _train_step(
     generator_optimizer.zero_grad(set_to_none=True)
     if critic_active:
         critic.requires_grad_(False)
-    with autocast:
-        time_values = _rand((cfg.batch_size,), sampler, batch.source.device).clamp(
-            cfg.time_eps, 1.0 - cfg.time_eps
-        )
-        z_t, flow_target = _bridge_sample(batch.source, batch.target, time_values, cfg, sampler)
-        predicted_velocity = translator(
-            z_t, batch.source_domains, batch.target_domains, time_values
-        )
-        flow = _masked_mse(predicted_velocity, flow_target, support)
-        identity = zero
-        if cfg.loss_weights["identity"] > 0:
-            identity_generated = integrate_transport(
-                translator,
-                batch.source,
-                batch.source_domains,
-                batch.source_domains,
-                steps=cfg.integration_steps,
-                solver=cfg.integration_solver,
-            )
-            identity = masked_l1_loss(
-                identity_generated, batch.source, batch.source_support
-            )
-        graph = zero
-        graph_discrepancy = zero
-        intermediate: list[Domain] | None = None
-        generated: torch.Tensor | None = None
-        if cfg.loss_weights["graph"] > 0:
-            intermediate = _intermediate_domains(
-                batch.source_domains, batch.target_domains, sampler
-            )
-            graph, generated, composed = graph_consistency_loss(
-                translator,
-                batch.source,
-                batch.source_domains,
-                intermediate,
-                batch.target_domains,
-                support,
-                steps=cfg.integration_steps,
-                solver=cfg.integration_solver,
-            )
-            graph_discrepancy = _masked_mse(generated, composed, support)
-        needs_generated = (
-            cfg.loss_weights["anatomy"] > 0 or adversarial_active or domain_active
-        )
-        if generated is None and needs_generated:
-            generated = integrate_transport(
-                translator,
-                batch.source,
-                batch.source_domains,
-                batch.target_domains,
-                steps=cfg.integration_steps,
-                solver=cfg.integration_solver,
-            )
-        anatomy_parts = {"low_mid": zero, "edge": zero, "gradient": zero, "total": zero}
-        if cfg.loss_weights["anatomy"] > 0:
-            assert generated is not None
-            _capture_and_reset_cuda_peak(
-                batch.source.device, cuda_peak_segments, phase='before_anatomy_decode'
-            )
-            with torch.no_grad():
-                source_image = _decode(
-                    decoder,
-                    stats.denormalize(batch.source),
-                    batch.source_domains,
-                    checkpoint_mode='disabled',
-                )
-            generated_image = _decode(
-                decoder,
-                stats.denormalize(generated),
-                batch.target_domains,
-                checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
-            )
-            anatomy_parts = anatomy_preservation_components(
-                source_image,
-                generated_image,
-                batch.source_support,
-                pool_scales=cfg.anatomy_pool_scales,
-                support_erosion=cfg.anatomy_support_erosion,
-            )
-            anatomy_forward_peak = _capture_and_reset_cuda_peak(
-                batch.source.device, cuda_peak_segments, phase='anatomy_forward'
-            )
-        adversarial = zero
-        domain = zero
-        if critic_active:
-            assert generated is not None
-            generated_view = _critic_view(
-                generated,
-                support,
-                batch.target_domains,
-                decoder,
-                stats,
-                cfg.critic_space,
-                checkpoint_mode=cfg.decoder_activation_checkpoint_mode,
-            )
-            fake_score_for_generator, fake_domain_logits = critic(
-                generated_view, batch.target_domains
-            )
-            if adversarial_active:
-                adversarial = adversarial_hinge_loss_generator(fake_score_for_generator)
-            if domain_active:
-                domain = F.cross_entropy(
-                    fake_domain_logits,
-                    domain_labels(
-                        batch.target_domains, len(batch.target_domains), batch.source.device
-                    ),
-                )
-        raw_terms = {
-            "sb": flow,
-            "identity": identity,
-            "anatomy": anatomy_parts["total"],
-            "graph": graph,
-            "adversarial": adversarial,
-            "domain": domain,
-        }
-        weighted = {name: cfg.loss_weights[name] * value for name, value in raw_terms.items()}
-        generator_total = sum(weighted.values())
-        term_gradient_norms = (
-            generator_term_gradient_norms(raw_terms, translator, cfg.loss_weights)
-            if qualify_term_gradients
-            else {name: None for name in raw_terms}
-        )
-    if not bool(torch.isfinite(generator_total)):
-        raise FloatingPointError("Unified generator loss is non-finite.")
-    active_weighted_terms = [
-        (name, weighted[name])
-        for name in DEFAULT_UNIFIED_WEIGHTS
-        if cfg.loss_weights[name] > 0
+    active_terms = [
+        name for name in DEFAULT_UNIFIED_WEIGHTS if cfg.loss_weights[name] > 0
     ]
-    if not active_weighted_terms:
+    if not active_terms:
         raise ValueError('At least one generator objective must be active.')
-    _capture_and_reset_cuda_peak(
-        batch.source.device, cuda_peak_segments, phase='before_generator_backward'
-    )
-    for index, (term_name, weighted_term) in enumerate(active_weighted_terms):
-        if term_name == 'anatomy':
+
+    raw_values = {name: 0.0 for name in DEFAULT_UNIFIED_WEIGHTS}
+    weighted_values = {name: 0.0 for name in DEFAULT_UNIFIED_WEIGHTS}
+    term_gradient_norms = {name: 0.0 for name in DEFAULT_UNIFIED_WEIGHTS}
+    term_execution: list[dict[str, Any]] = []
+    anatomy_diagnostics = {
+        'anatomy_low_mid': 0.0,
+        'anatomy_edge': 0.0,
+        'anatomy_gradient': 0.0,
+    }
+    graph_mse = 0.0
+    generator_fake_domain_logits: torch.Tensor | None = None
+
+    for name in active_terms:
+        if name == 'anatomy':
             _capture_and_reset_cuda_peak(
-                batch.source.device, cuda_peak_segments, phase='before_anatomy_backward'
+                batch.source.device,
+                cuda_peak_segments,
+                phase='before_anatomy_term_forward',
             )
-        scaler.scale(weighted_term).backward(
-            retain_graph=index + 1 < len(active_weighted_terms)
+        with (
+            _replay_step_rng(plan, batch.source.device),
+            _saved_tensor_offload_context(batch.source.device),
+            _autocast_context(cfg, batch.source.device),
+        ):
+            term_forward = _forward_generator_term(
+                name,
+                cfg,
+                translator,
+                critic,
+                decoder,
+                batch,
+                support,
+                stats,
+                plan,
+            )
+        raw_loss = term_forward.loss
+        if not bool(torch.isfinite(raw_loss)):
+            raise FloatingPointError(f'Unified generator term {name!r} is non-finite.')
+        raw_values[name] = float(raw_loss.detach().float().cpu())
+        weighted_values[name] = cfg.loss_weights[name] * raw_values[name]
+        if name == 'anatomy':
+            anatomy_diagnostics = {
+                key: float(value.float().cpu())
+                for key, value in term_forward.diagnostics.items()
+            }
+            anatomy_forward_peak = _capture_and_reset_cuda_peak(
+                batch.source.device,
+                cuda_peak_segments,
+                phase='anatomy_term_forward',
+            )
+            _capture_and_reset_cuda_peak(
+                batch.source.device,
+                cuda_peak_segments,
+                phase='before_anatomy_term_backward',
+            )
+        elif name == 'graph':
+            graph_mse = float(term_forward.diagnostics['graph_mse'].float().cpu())
+        elif name in {'adversarial', 'domain'}:
+            generator_fake_domain_logits = term_forward.diagnostics[
+                'generator_fake_domain_logits'
+            ]
+
+        forward_sequence = len(term_execution)
+        term_execution.append(
+            {
+                'sequence': forward_sequence,
+                'event': 'forward_complete',
+                'term': name,
+                'isolated_graph': True,
+                'saved_tensor_policy': 'save_on_cpu',
+                'frozen_step_plan_sha256': plan.plan_sha256,
+            }
         )
-        if term_name == 'anatomy':
+        term_gradient_norms[name] = _backward_isolated_generator_term(
+            raw_loss,
+            translator,
+            weight=cfg.loss_weights[name],
+            scaler=scaler,
+        )
+        term_execution.append(
+            {
+                'sequence': len(term_execution),
+                'event': 'backward_complete',
+                'term': name,
+                'retain_graph': False,
+                'graph_released_before_next_term': True,
+            }
+        )
+        if name == 'anatomy':
             anatomy_backward_peak = _capture_and_reset_cuda_peak(
-                batch.source.device, cuda_peak_segments, phase='anatomy_backward'
+                batch.source.device,
+                cuda_peak_segments,
+                phase='anatomy_term_backward',
             )
+        del raw_loss, term_forward
+
     scaler.unscale_(generator_optimizer)
     generator_grad = float(
         torch.nn.utils.clip_grad_norm_(translator.parameters(), cfg.grad_clip_norm)
@@ -1407,7 +1757,12 @@ def _train_step(
     )
     if critic_active:
         critic.requires_grad_(True)
-    weighted_aux = sum(weighted[name].abs() for name in weighted if name != "sb")
+    generator_total = sum(weighted_values.values())
+    if not np.isfinite(generator_total):
+        raise FloatingPointError('Unified weighted generator loss is non-finite.')
+    weighted_aux = sum(
+        abs(weighted_values[name]) for name in weighted_values if name != 'sb'
+    )
     training_peak_allocated = max(
         (segment['allocated_bytes'] for segment in cuda_peak_segments), default=0
     )
@@ -1428,18 +1783,18 @@ def _train_step(
     if anatomy_memory_status == 'fail':
         raise RuntimeError('CUDA anatomy memory qualification did not record both phases.')
     row: dict[str, Any] = {
-        **{f"raw/{key}": float(value.detach().float().cpu()) for key, value in raw_terms.items()},
-        **{f"weighted/{key}": float(value.detach().float().cpu()) for key, value in weighted.items()},
-        "weighted/generator_total": float(generator_total.detach().float().cpu()),
-        "weighted/auxiliary_total": float(weighted_aux.detach().float().cpu()),
-        "weighted/aux_to_flow_ratio": float(
-            (weighted_aux / weighted["sb"].abs().clamp_min(1e-12)).detach().float().cpu()
+        **{f'raw/{key}': value for key, value in raw_values.items()},
+        **{f'weighted/{key}': value for key, value in weighted_values.items()},
+        'weighted/generator_total': generator_total,
+        'weighted/auxiliary_total': weighted_aux,
+        'weighted/aux_to_flow_ratio': (
+            weighted_aux / max(abs(weighted_values['sb']), 1.0e-12)
         ),
-        "raw/anatomy_low_mid": float(anatomy_parts["low_mid"].detach().float().cpu()),
-        "raw/anatomy_edge": float(anatomy_parts["edge"].detach().float().cpu()),
-        "raw/anatomy_gradient": float(anatomy_parts["gradient"].detach().float().cpu()),
-        "graph/direct_vs_composed_l1": float(graph.detach().float().cpu()),
-        "graph/direct_vs_composed_mse": float(graph_discrepancy.detach().float().cpu()),
+        'raw/anatomy_low_mid': anatomy_diagnostics['anatomy_low_mid'],
+        'raw/anatomy_edge': anatomy_diagnostics['anatomy_edge'],
+        'raw/anatomy_gradient': anatomy_diagnostics['anatomy_gradient'],
+        'graph/direct_vs_composed_l1': raw_values['graph'],
+        'graph/direct_vs_composed_mse': graph_mse,
         "critic/total": float(critic_total.detach().float().cpu()),
         "critic/adversarial": float(critic_adv.detach().float().cpu()),
         "critic/domain": float(critic_domain.detach().float().cpu()),
@@ -1496,14 +1851,14 @@ def _train_step(
         ),
         "critic/generated_domain_accuracy": (
             float(
-                fake_domain_logits.detach()
+                generator_fake_domain_logits
                 .argmax(1)
                 .eq(domain_labels(batch.target_domains, len(batch.target_domains), batch.source.device))
                 .float()
                 .mean()
                 .cpu()
             )
-            if critic_active
+            if generator_fake_domain_logits is not None
             else 0.0
         ),
         "gradient/generator_norm": generator_grad,
@@ -1516,9 +1871,9 @@ def _train_step(
         "critic/support_cell_count": int(support.sum().detach().cpu()),
         "transition": f"{batch.source_domains[0].label}->{batch.target_domains[0].label}",
         "graph_path": (
-            f"{batch.source_domains[0].label}->{intermediate[0].label}"
+            f"{batch.source_domains[0].label}->{plan.intermediate_domains[0].label}"
             f"->{batch.target_domains[0].label}"
-            if intermediate is not None
+            if plan.intermediate_domains is not None
             else "disabled"
         ),
         "source_records": [item.case_id for item in batch.source_records],
@@ -1526,8 +1881,36 @@ def _train_step(
         "prospective_records_loaded": 0,
         "descriptor_coupling_used": False,
         'generator/accumulation_contract': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
-        'generator/weighted_term_order': [name for name, _ in active_weighted_terms],
+        'generator/weighted_term_order': active_terms,
         'generator/optimizer_updates': 1,
+        'generator/term_execution': term_execution,
+        'generator/forward_backward_interleaved': True,
+        'generator/retain_graph_used': False,
+        'generator/save_on_cpu': True,
+        'generator/translator_checkpoint_contract': (
+            UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT
+        ),
+        'generator/translator_checkpoint_use_reentrant': False,
+        'generator/translator_checkpoint_preserve_rng_state': True,
+        'generator/term_gradient_probe_reconstructed_joint_graph': False,
+        'generator/term_gradients_qualified': qualify_term_gradients,
+        'generator/frozen_step_plan_sha256': plan.plan_sha256,
+        'generator/frozen_step_plan': {
+            'time_values': [
+                float(value) for value in plan.time_values.detach().cpu()
+            ],
+            'bridge_noise_seed': plan.bridge_noise_seed,
+            'bridge_noise_shape': (
+                list(plan.bridge_noise.shape) if plan.bridge_noise is not None else None
+            ),
+            'intermediate_domains': (
+                [domain.to_dict() for domain in plan.intermediate_domains]
+                if plan.intermediate_domains is not None
+                else None
+            ),
+            'differentiable_replay_seed': plan.differentiable_replay_seed,
+            'rng_replayed_for_each_term': True,
+        },
         'memory/training_peak_cuda_allocated_bytes': training_peak_allocated,
         'memory/training_peak_cuda_reserved_bytes': training_peak_reserved,
         'memory/anatomy_forward_peak_cuda_allocated_bytes': anatomy_forward_peak[
@@ -1622,6 +2005,45 @@ def _score_quantiles(score: torch.Tensor | None) -> dict[str, float]:
     }
 
 
+def _a100_one_step_gate(
+    row: Mapping[str, Any],
+    *,
+    device: torch.device,
+    limit_bytes: int,
+) -> dict[str, Any]:
+    if limit_bytes != UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES:
+        raise ValueError('The reviewed A100 allocated-memory limit changed.')
+    if device.type != 'cuda':
+        return {
+            'contract_version': UNIFIED_A100_GATE_CONTRACT,
+            'status': 'not_applicable_cpu',
+            'required_gpu': 'NVIDIA A100',
+            'peak_allocated_limit_bytes': limit_bytes,
+            'peak_allocated_bytes': 0,
+            'before_pilot_steps': [20, 200],
+        }
+    gpu_name = torch.cuda.get_device_name(device)
+    peak_allocated = int(row['peak_cuda_bytes'])
+    is_a100 = 'A100' in gpu_name.upper()
+    within_limit = peak_allocated <= limit_bytes
+    return {
+        'contract_version': UNIFIED_A100_GATE_CONTRACT,
+        'status': 'pass' if is_a100 and within_limit else 'fail',
+        'required_gpu': 'NVIDIA A100',
+        'gpu_name': gpu_name,
+        'gpu_identity_matches': is_a100,
+        'peak_allocated_limit_bytes': limit_bytes,
+        'peak_allocated_bytes': peak_allocated,
+        'within_allocated_limit': within_limit,
+        'before_pilot_steps': [20, 200],
+        'full_objective': True,
+        'batch_size': 1,
+        'precision': 'bf16',
+        'integration_steps': 4,
+        'integration_solver': 'heun',
+    }
+
+
 def _capture_and_reset_cuda_peak(
     device: torch.device,
     segments: list[dict[str, Any]],
@@ -1664,46 +2086,6 @@ def _critic_view(
     )
     image_support = F.interpolate(support.float(), size=image.shape[2:], mode="nearest") > 0.5
     return supported_critic_input(image, image_support)
-
-
-def generator_term_gradient_norms(
-    raw_terms: Mapping[str, torch.Tensor],
-    translator: nn.Module,
-    weights: Mapping[str, float],
-) -> dict[str, float]:
-    """Measure each enabled objective's translator gradient on the intact graph.
-
-    The raw term, rather than the sum, is differentiated so a configured weight cannot
-    hide a disconnected objective.  Disabled objectives are sealed as exactly zero.
-    """
-
-    parameters = tuple(value for value in translator.parameters() if value.requires_grad)
-    if not parameters:
-        raise ValueError("Translator has no trainable parameters for gradient qualification.")
-    result: dict[str, float] = {}
-    for name in DEFAULT_UNIFIED_WEIGHTS:
-        weight = float(weights[name])
-        if weight == 0.0:
-            result[name] = 0.0
-            continue
-        term = raw_terms[name]
-        if not bool(torch.isfinite(term)):
-            raise FloatingPointError(f"Generator term {name!r} is non-finite.")
-        gradients = torch.autograd.grad(
-            term,
-            parameters,
-            retain_graph=True,
-            allow_unused=True,
-        )
-        squared = term.new_zeros(())
-        for gradient in gradients:
-            if gradient is not None:
-                squared = squared + gradient.float().square().sum()
-        norm = float(squared.sqrt().detach().cpu())
-        if not np.isfinite(norm):
-            raise FloatingPointError(f"Generator term {name!r} has a non-finite gradient.")
-        result[name] = norm
-    return result
 
 
 def _bridge_sample(
@@ -2459,8 +2841,20 @@ def _pilot_report(
         'generator_gradient_accumulation': {
             'contract_version': UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
             'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
+            'graph_construction': 'one_term_at_a_time',
+            'forward_backward_interleaved': True,
+            'retain_graph': False,
+            'graph_release': 'before_next_term',
+            'gradient_measurement': 'inline_during_term_backward',
+            'joint_six_term_gradient_probe': False,
+            'saved_tensor_policy': 'save_on_cpu',
+            'translator_checkpoint_contract': UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT,
+            'translator_checkpoint_use_reentrant': False,
+            'translator_checkpoint_preserve_rng_state': True,
+            'frozen_step_plan_replayed_per_term': True,
             'generator_optimizer_updates_per_step': 1,
         },
+        'one_step_a100_memory_gate': rows[0]['memory/a100_one_step_gate'],
         'one_step_anatomy_memory_qualification': rows[0][
             'memory/anatomy_qualification'
         ],
@@ -2648,6 +3042,11 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         raise ValueError("Pilot gradient/growth thresholds are invalid.")
     if cfg.pilot_score_saturation_threshold <= 0 or not 0 <= cfg.pilot_max_saturation_fraction <= 1:
         raise ValueError("Pilot critic-saturation thresholds are invalid.")
+    if (
+        cfg.pilot_a100_peak_allocated_limit_bytes
+        != UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
+    ):
+        raise ValueError('The one-step A100 peak-allocated gate must remain exactly 72 GiB.')
     if cfg.projected_steps < 1 or (
         cfg.gpu_hourly_cost_usd is not None and cfg.gpu_hourly_cost_usd < 0
     ):
@@ -2661,6 +3060,8 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
 __all__ = [
     "DEFAULT_UNIFIED_WEIGHTS",
     'UNIFIED_ANATOMY_MEMORY_CONTRACT',
+    'UNIFIED_A100_GATE_CONTRACT',
+    'UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES',
     'UNIFIED_GENERATOR_ACCUMULATION_CONTRACT',
     "UNIFIED_HISTORY_CONTRACT",
     "UNIFIED_RESUME_CONTRACT",
@@ -2671,6 +3072,7 @@ __all__ = [
     "UNIFIED_SELECTION_RULE_SHA256",
     "UNIFIED_STAGE2_CONTRACT",
     'UNIFIED_STAGE2_CONFIG_CONTRACT',
+    'UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT',
     "UNIFIED_VALIDATION_PLAN_CONTRACT",
     "UnifiedStage2Config",
     "UnifiedStage2Result",
@@ -2679,7 +3081,6 @@ __all__ = [
     "directed_domain_macro_means",
     "find_latest_stage2_selection_receipt",
     "graph_consistency_loss",
-    "generator_term_gradient_norms",
     "integrate_transport",
     "load_stage2_selection_receipt",
     "run_stage2_unified_train",

@@ -193,6 +193,21 @@ def test_v7_primary_config_seals_full_volume_checkpoint_and_exact_arithmetic() -
         cfg.decoder_activation_checkpoint_mode
         == unified.KLVAE_DECODER_ACTIVATION_CHECKPOINT_MODE
     )
+    accumulation = payload['training']['generator_gradient_accumulation']
+    assert accumulation == {
+        'contract': unified.UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
+        'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
+        'graph_construction': 'one_term_at_a_time',
+        'gradient_measurement': 'inline_during_term_backward',
+        'backward': 'immediate_without_retain_graph',
+        'graph_release': 'before_next_term',
+        'translator_checkpoint': (
+            'non_reentrant_rng_preserving_every_differentiable_call'
+        ),
+        'saved_tensor_policy': 'save_on_cpu',
+        'optimizer_updates_per_step': 1,
+    }
+    assert payload['training']['pilot']['a100_peak_allocated_limit_bytes'] == 72 * 1024**3
 
     for path, replacement in (
         (('training', 'batch_size'), 2),
@@ -204,6 +219,7 @@ def test_v7_primary_config_seals_full_volume_checkpoint_and_exact_arithmetic() -
             2,
         ),
         (('training', 'pilot', 'anatomy_memory_qualification_steps'), 2),
+        (('training', 'pilot', 'a100_peak_allocated_limit_bytes'), 72 * 1024**3 - 1),
     ):
         mutated = copy.deepcopy(payload)
         cursor = mutated
@@ -390,14 +406,6 @@ def test_every_generator_term_has_finite_nonzero_gradient_and_decoder_stays_froz
     for term in DEFAULT_UNIFIED_WEIGHTS:
         assert torch.isfinite(torch.tensor(row[f"raw/{term}"]))
         assert row[f"gradient/term_{term}"] > 0.0
-        disabled = dict(DEFAULT_UNIFIED_WEIGHTS)
-        disabled[term] = 0.0
-        norms = unified.generator_term_gradient_norms(
-            {name: (translator.conv.weight * (position + 1)).sum() for position, name in enumerate(DEFAULT_UNIFIED_WEIGHTS)},
-            translator,
-            disabled,
-        )
-        assert norms[term] == 0.0
     assert torch.equal(decoder.calls[0], stats.denormalize(source))
     assert torch.allclose(decoder.calls[1], stats.denormalize(expected_generated))
     assert all(parameter.grad is None for parameter in decoder.parameters())
@@ -407,7 +415,175 @@ def test_every_generator_term_has_finite_nonzero_gradient_and_decoder_stays_froz
     assert critic_optimizer.step_calls == 1
     assert row['generator/weighted_term_order'] == list(DEFAULT_UNIFIED_WEIGHTS)
     assert row['generator/optimizer_updates'] == 1
+    assert row['generator/retain_graph_used'] is False
+    assert row['generator/save_on_cpu'] is True
+    assert row['generator/term_gradient_probe_reconstructed_joint_graph'] is False
     assert row['memory/anatomy_qualification']['status'] == 'not_applicable_cpu'
+
+
+def test_generator_terms_interleave_forward_backward_without_retained_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    translator = TinyTranslator()
+    decoder = TinyDecoder().requires_grad_(False)
+    critic = DomainProjectionDiscriminator(5, (4,))
+    source_domain = Domain(0.1, Contrast.T1W)
+    target_domain = Domain(7.0, Contrast.T1W)
+    record = FactoredLatentRecord(
+        case_id='R_interleave_source',
+        subject_group_id='R:interleave-source',
+        domain=source_domain,
+        split='train',
+        path=tmp_path / 'unused.pt',
+        resume_key='1' * 64,
+        sidecar={'cohort': 'R', 'split': 'train'},
+    )
+    support = torch.ones(1, 1, 5, 5, 5, dtype=torch.bool)
+    batch = unified._TrainingBatch(
+        torch.randn(1, 4, 5, 5, 5),
+        support,
+        [source_domain],
+        torch.randn(1, 4, 5, 5, 5),
+        support.clone(),
+        [target_domain],
+        [record],
+        [
+            replace(
+                record,
+                case_id='R_interleave_target',
+                subject_group_id='R:interleave-target',
+                domain=target_domain,
+            )
+        ],
+    )
+    events: list[str] = []
+    active_term: list[str | None] = [None]
+    original_forward = unified._forward_generator_term
+
+    def forward_spy(name, *args, **kwargs):
+        assert active_term[0] is None
+        active_term[0] = name
+        events.append(f'forward:{name}')
+        return original_forward(name, *args, **kwargs)
+
+    original_backward = torch.Tensor.backward
+
+    def backward_spy(tensor, *args, **kwargs):
+        term = active_term[0]
+        if term is not None:
+            assert kwargs.get('retain_graph') is not True
+            assert len(args) < 2 or args[1] is not True
+            events.append(f'backward:{term}')
+        result = original_backward(tensor, *args, **kwargs)
+        if term is not None:
+            active_term[0] = None
+        return result
+
+    checkpoint_calls: list[dict[str, object]] = []
+    original_checkpoint = unified.checkpoint
+    save_on_cpu_calls: list[torch.device] = []
+    original_save_on_cpu = unified._saved_tensor_offload_context
+
+    def checkpoint_spy(function, *args, **kwargs):
+        checkpoint_calls.append(dict(kwargs))
+        return original_checkpoint(function, *args, **kwargs)
+
+    def save_on_cpu_spy(device):
+        save_on_cpu_calls.append(device)
+        return original_save_on_cpu(device)
+
+    monkeypatch.setattr(unified, '_forward_generator_term', forward_spy)
+    monkeypatch.setattr(torch.Tensor, 'backward', backward_spy)
+    monkeypatch.setattr(unified, 'checkpoint', checkpoint_spy)
+    monkeypatch.setattr(unified, '_saved_tensor_offload_context', save_on_cpu_spy)
+    generator_optimizer = CountingAdamW(translator.parameters(), lr=1.0e-4)
+    row = unified._train_step(
+        _config(tmp_path, checkpoint_dir=None, history_jsonl=None),
+        translator,
+        critic,
+        decoder,
+        generator_optimizer,
+        CountingAdamW(critic.parameters(), lr=1.0e-4),
+        torch.amp.GradScaler('cuda', enabled=False),
+        batch,
+        torch.Generator().manual_seed(101),
+        _nontrivial_stats(),
+        qualify_term_gradients=True,
+    )
+    assert events == [
+        event
+        for term in DEFAULT_UNIFIED_WEIGHTS
+        for event in (f'forward:{term}', f'backward:{term}')
+    ]
+    assert len(checkpoint_calls) == 15
+    assert all(
+        call == {'use_reentrant': False, 'preserve_rng_state': True}
+        for call in checkpoint_calls
+    )
+    assert save_on_cpu_calls == [torch.device('cpu')] * len(DEFAULT_UNIFIED_WEIGHTS)
+    assert generator_optimizer.step_calls == 1
+    assert row['generator/forward_backward_interleaved'] is True
+    assert row['generator/retain_graph_used'] is False
+    assert all(
+        event['retain_graph'] is False
+        for event in row['generator/term_execution']
+        if event['event'] == 'backward_complete'
+    )
+    production_source = Path(unified.__file__).read_text(encoding='utf-8')
+    assert 'retain_graph=True' not in production_source
+    assert 'retain_graph = True' not in production_source
+
+
+def test_frozen_step_plan_replays_time_noise_intermediate_domains_and_rng(
+    tmp_path: Path,
+) -> None:
+    cfg = _config(tmp_path, checkpoint_dir=None, history_jsonl=None)
+    source_domain = Domain(0.1, Contrast.T2W)
+    target_domain = Domain(7.0, Contrast.T2W)
+    record = FactoredLatentRecord(
+        case_id='R_plan_source',
+        subject_group_id='R:plan-source',
+        domain=source_domain,
+        split='train',
+        path=tmp_path / 'unused.pt',
+        resume_key='2' * 64,
+        sidecar={'cohort': 'R', 'split': 'train'},
+    )
+    support = torch.ones(1, 1, 3, 3, 3, dtype=torch.bool)
+    batch = unified._TrainingBatch(
+        torch.randn(1, 4, 3, 3, 3),
+        support,
+        [source_domain],
+        torch.randn(1, 4, 3, 3, 3),
+        support.clone(),
+        [target_domain],
+        [record],
+        [
+            replace(
+                record,
+                case_id='R_plan_target',
+                subject_group_id='R:plan-target',
+                domain=target_domain,
+            )
+        ],
+    )
+    first = unified._freeze_training_step_plan(
+        cfg, batch, torch.Generator().manual_seed(211)
+    )
+    second = unified._freeze_training_step_plan(
+        cfg, batch, torch.Generator().manual_seed(211)
+    )
+    assert first.plan_sha256 == second.plan_sha256
+    assert torch.equal(first.time_values, second.time_values)
+    assert torch.equal(first.bridge_noise, second.bridge_noise)
+    assert first.intermediate_domains == second.intermediate_domains
+    assert first.differentiable_replay_seed == second.differentiable_replay_seed
+    with unified._replay_step_rng(first, torch.device('cpu')):
+        first_draw = torch.rand(16)
+    with unified._replay_step_rng(first, torch.device('cpu')):
+        replayed_draw = torch.rand(16)
+    assert torch.equal(first_draw, replayed_draw)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA peak diagnostics require CUDA')
@@ -472,6 +648,35 @@ def test_one_step_full_objective_anatomy_cuda_memory_qualification(tmp_path: Pat
     assert row['memory/training_peak_cuda_reserved_bytes'] > 0
 
 
+def test_a100_one_step_gate_enforces_exact_72_gib_allocated_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda device: 'NVIDIA A100-SXM4-80GB')
+    limit = unified.UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
+    passing = unified._a100_one_step_gate(
+        {'peak_cuda_bytes': limit},
+        device=torch.device('cuda'),
+        limit_bytes=limit,
+    )
+    assert passing['status'] == 'pass'
+    assert passing['within_allocated_limit'] is True
+    failing = unified._a100_one_step_gate(
+        {'peak_cuda_bytes': limit + 1},
+        device=torch.device('cuda'),
+        limit_bytes=limit,
+    )
+    assert failing['status'] == 'fail'
+    assert failing['within_allocated_limit'] is False
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda device: 'NVIDIA H100 80GB HBM3')
+    wrong_gpu = unified._a100_one_step_gate(
+        {'peak_cuda_bytes': 1},
+        device=torch.device('cuda'),
+        limit_bytes=limit,
+    )
+    assert wrong_gpu['status'] == 'fail'
+    assert wrong_gpu['gpu_identity_matches'] is False
+
+
 def test_graph_loss_backpropagates_through_direct_and_composed_paths() -> None:
     torch.manual_seed(43)
     translator = TinyTranslator()
@@ -524,11 +729,16 @@ def test_full_objective_pilot_reports_gradients_gan_runtime_and_cost(tmp_path: P
             'memory/anatomy_forward_peak_cuda_reserved_bytes': 0,
             'memory/anatomy_backward_peak_cuda_allocated_bytes': 0,
             'memory/anatomy_backward_peak_cuda_reserved_bytes': 0,
-            'memory/anatomy_qualification': {
-                'contract_version': unified.UNIFIED_ANATOMY_MEMORY_CONTRACT,
-                'status': 'not_applicable_cpu',
-                'decoder_state_unchanged': True,
-            },
+                'memory/anatomy_qualification': {
+                    'contract_version': unified.UNIFIED_ANATOMY_MEMORY_CONTRACT,
+                    'status': 'not_applicable_cpu',
+                    'decoder_state_unchanged': True,
+                },
+                'memory/a100_one_step_gate': {
+                    'contract_version': unified.UNIFIED_A100_GATE_CONTRACT,
+                    'status': 'not_applicable_cpu',
+                    'peak_allocated_limit_bytes': 72 * 1024**3,
+                },
         }
         for branch in ("real", "fake"):
             for quantile in ("p05", "p50", "p95"):
@@ -864,6 +1074,7 @@ def test_sb_only_backward_ablation_disables_every_auxiliary_path(tmp_path: Path)
     for term in ("identity", "anatomy", "graph", "adversarial", "domain"):
         assert row[f"raw/{term}"] == 0.0
         assert row[f"weighted/{term}"] == 0.0
+        assert row[f"gradient/term_{term}"] == 0.0
 
 
 def test_interrupted_resume_reproduces_uninterrupted_next_step(tmp_path: Path) -> None:

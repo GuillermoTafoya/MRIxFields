@@ -50,7 +50,23 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     assert source.count("AUTHORIZE_LONG_FULL_MODEL = False") == 1
     assert source.count("AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False") == 1
     assert "RUN_LONG_FULL_AND_BACKWARD_ABLATIONS" not in source
-    assert "--steps', '200', '--pilot-steps', '200'" in source
+    assert "a100-full-objective-gate-1" in source
+    assert "full-objective-pilot-20" in source
+    assert "full-objective-pilot-200" in source
+    assert source.index("a100-full-objective-gate-1") < source.index(
+        "full-objective-pilot-20"
+    ) < source.index("full-objective-pilot-200")
+    assert "a100_peak_allocated_limit_bytes': 72 * 1024**3" in source
+    assert "stage2-unified-a100-one-step-memory-gate-v1" in source
+    assert "stage2-unified-term-wise-recomputation-v6" in source
+    assert "immediate_without_retain_graph" in source
+    assert "non_reentrant_rng_preserving_every_differentiable_call" in source
+    assert "saved_tensor_policy': 'save_on_cpu'" in source
+    assert "run_resumable_training" in source
+    assert "stage2-colab-attempt-recovery-v1" in source
+    assert "LOCAL_SCRATCH_ROOT = Path('/content/stage2_unified_v7_scratch')" in source
+    assert "drive_file_held_open_during_process': False" in source
+    assert ".open('a'" not in source
     assert "No ablation is launched by this flag" in source
     assert "Complete paired R/validation manifest with Stage-1 ceilings" not in source
     assert "AUTHORIZE_FIT_AFTER" not in source
@@ -134,6 +150,14 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
     assert payload['training']['generator_gradient_accumulation'][
         'optimizer_updates_per_step'
     ] == 1
+    accumulation = payload['training']['generator_gradient_accumulation']
+    assert accumulation['contract'] == 'stage2-unified-term-wise-recomputation-v6'
+    assert accumulation['graph_construction'] == 'one_term_at_a_time'
+    assert accumulation['backward'] == 'immediate_without_retain_graph'
+    assert accumulation['saved_tensor_policy'] == 'save_on_cpu'
+    assert payload['training']['pilot']['a100_peak_allocated_limit_bytes'] == (
+        72 * 1024**3
+    )
     assert config.critic_space == "latent"
     assert config.pilot_steps == 200
     assert config.validation_complete_inventory is True

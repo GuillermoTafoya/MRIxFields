@@ -19,6 +19,32 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "stage2_unified_retrospective_full_model_colab.ipynb"
 
 
+def _load_notebook_functions(*names: str, namespace: dict) -> dict:
+    payload = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
+    source = next(
+        ''.join(cell['source'])
+        for cell in payload['cells']
+        if cell['cell_type'] == 'code'
+        and ''.join(cell['source']).startswith(
+            '# Visible attempt-based execution:'
+        )
+    )
+    tree = ast.parse(source)
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in names
+    ]
+    assert {node.name for node in selected} == set(names)
+    scope = dict(namespace)
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(NOTEBOOK), 'exec'),
+        scope,
+    )
+    return scope
+
+
 def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     payload = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     code_cells = [cell for cell in payload["cells"] if cell["cell_type"] == "code"]
@@ -58,14 +84,31 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     ) < source.index("full-objective-pilot-200")
     assert "a100_peak_allocated_limit_bytes': 72 * 1024**3" in source
     assert "stage2-unified-a100-one-step-memory-gate-v1" in source
+    assert "stage2-unified-a100-qualification-only-exit-v1" in source
+    assert "--qualification-only" in source
+    assert "complete_validation_executed') is not False" in source
+    assert "a100_gate_checkpoint" not in source
     assert "stage2-unified-term-wise-recomputation-v6" in source
     assert "immediate_without_retain_graph" in source
     assert "non_reentrant_rng_preserving_every_differentiable_call" in source
     assert "saved_tensor_policy': 'save_on_cpu'" in source
+    assert "gradient_measurement_scope': 'pilot_steps_only'" in source
+    assert "long_run_hook_measurement': 'disabled_after_pilot'" in source
     assert "run_resumable_training" in source
     assert "stage2-colab-attempt-recovery-v1" in source
+    assert "stage2-colab-scientific-attempt-recovery-v2" in source
+    assert "scientific_attempts/attempt-" in source
+    assert "poisoned_without_checkpoint" in source
+    assert "not candidates and attempt_dir.exists() and any(attempt_dir.iterdir())" in source
     assert "LOCAL_SCRATCH_ROOT = Path('/content/stage2_unified_v7_scratch')" in source
     assert "drive_file_held_open_during_process': False" in source
+    assert "drive.mount('/content/drive', force_remount=True)" in source
+    assert "BANK_DIR = LOCAL_BANK_ROOT" in source
+    assert "BANK_DIR = output_root / 'photometry_factored_latent_bank_v2'" not in source
+    assert "stage2-colab-local-bank-staging-v1" in source
+    assert "drive_used_for_training_reads': False" in source
+    assert "publish_local_bank_no_clobber" in source
+    assert "tree_identity(BANK_ARCHIVE_DIR)" in source
     assert ".open('a'" not in source
     assert "No ablation is launched by this flag" in source
     assert "Complete paired R/validation manifest with Stage-1 ceilings" not in source
@@ -124,6 +167,67 @@ def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
     assert '_memory_checkpointed_decode' not in source
 
 
+def test_notebook_rotates_nonempty_precheckpoint_attempt_and_resumes_checkpoint(
+    tmp_path: Path,
+) -> None:
+    captured: list[list[str]] = []
+
+    def run_logged(command, log_path, operation):
+        del log_path, operation
+        captured.append(list(command))
+        return {'return_code': 0}
+
+    scope = _load_notebook_functions(
+        'replace_flag_value',
+        'run_resumable_training',
+        namespace={
+            'drive_retry': lambda label, operation: operation(),
+            'run_logged': run_logged,
+        },
+    )
+    run_dir = tmp_path / 'run'
+    failed = run_dir / 'scientific_attempts' / 'attempt-0001'
+    failed.mkdir(parents=True)
+    (failed / 'history.jsonl').write_text('{"event":"oom_hard_stop"}\n')
+    command = [
+        'fieldbridge',
+        'train-stage2-unified',
+        '--checkpoint-dir',
+        str(run_dir / 'checkpoints'),
+        '--history-jsonl',
+        str(run_dir / 'history.jsonl'),
+    ]
+    first = scope['run_resumable_training'](
+        command,
+        run_dir / 'checkpoints',
+        'stage2_unified_full_step*.pt',
+        run_dir / 'diagnostic.log',
+        'synthetic',
+    )
+    assert first['attempt'] == 2
+    assert Path(first['checkpoint_dir']).parent.name == 'attempt-0002'
+    assert '--resume-from' not in captured[-1]
+    assert captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
+        'attempt-0002\\history.jsonl'
+    ) or captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
+        'attempt-0002/history.jsonl'
+    )
+
+    checkpoint_dir = Path(first['checkpoint_dir'])
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint = checkpoint_dir / 'stage2_unified_full_step000000010.pt'
+    checkpoint.write_bytes(b'synthetic')
+    second = scope['run_resumable_training'](
+        command,
+        run_dir / 'checkpoints',
+        'stage2_unified_full_step*.pt',
+        run_dir / 'diagnostic.log',
+        'synthetic',
+    )
+    assert second['attempt'] == 2
+    assert captured[-1][-2:] == ['--resume-from', str(checkpoint)]
+
+
 def test_full_config_uses_reviewed_initial_weights() -> None:
     import yaml
 
@@ -155,6 +259,8 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
     assert accumulation['graph_construction'] == 'one_term_at_a_time'
     assert accumulation['backward'] == 'immediate_without_retain_graph'
     assert accumulation['saved_tensor_policy'] == 'save_on_cpu'
+    assert accumulation['gradient_measurement_scope'] == 'pilot_steps_only'
+    assert accumulation['long_run_hook_measurement'] == 'disabled_after_pilot'
     assert payload['training']['pilot']['a100_peak_allocated_limit_bytes'] == (
         72 * 1024**3
     )

@@ -576,6 +576,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_unified.add_argument("--batch-size", type=int, default=None)
     train_unified.add_argument("--pilot-steps", type=int, default=None)
     train_unified.add_argument("--device", choices=("auto", "cpu", "cuda"), default=None)
+    train_unified.add_argument(
+        "--qualification-only",
+        action="store_true",
+        help=(
+            "Run exactly one full-objective A100 memory qualification step, "
+            "write its atomic receipt, and exit before complete validation."
+        ),
+    )
 
     domain_preflight = subparsers.add_parser(
         "preflight-stage2-factored-domain-separability",
@@ -1983,6 +1991,7 @@ def main(argv: list[str] | None = None) -> int:
             train_index=train_index,
             validation_index=validation_index,
             stats=stats,
+            qualification_only=args.qualification_only,
         )
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True, allow_nan=False))
         return 0

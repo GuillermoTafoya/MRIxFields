@@ -199,6 +199,8 @@ def test_v7_primary_config_seals_full_volume_checkpoint_and_exact_arithmetic() -
         'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
         'graph_construction': 'one_term_at_a_time',
         'gradient_measurement': 'inline_during_term_backward',
+        'gradient_measurement_scope': 'pilot_steps_only',
+        'long_run_hook_measurement': 'disabled_after_pilot',
         'backward': 'immediate_without_retain_graph',
         'graph_release': 'before_next_term',
         'translator_checkpoint': (
@@ -584,6 +586,266 @@ def test_frozen_step_plan_replays_time_noise_intermediate_domains_and_rng(
     with unified._replay_step_rng(first, torch.device('cpu')):
         replayed_draw = torch.rand(16)
     assert torch.equal(first_draw, replayed_draw)
+
+
+def test_long_run_backward_skips_term_gradient_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_domain = Domain(0.1, Contrast.T2W)
+    target_domain = Domain(7.0, Contrast.T2W)
+    record = FactoredLatentRecord(
+        case_id='R_no_gradient_probe',
+        subject_group_id='R:no-gradient-probe',
+        domain=source_domain,
+        split='train',
+        path=tmp_path / 'unused.pt',
+        resume_key='3' * 64,
+        sidecar={'cohort': 'R', 'split': 'train'},
+    )
+    support = torch.ones(1, 1, 3, 3, 3, dtype=torch.bool)
+    batch = unified._TrainingBatch(
+        torch.randn(1, 4, 3, 3, 3),
+        support,
+        [source_domain],
+        torch.randn(1, 4, 3, 3, 3),
+        support.clone(),
+        [target_domain],
+        [record],
+        [
+            replace(
+                record,
+                case_id='R_no_gradient_probe_target',
+                subject_group_id='R:no-gradient-probe-target',
+                domain=target_domain,
+            )
+        ],
+    )
+
+    def forbidden_probe(*args, **kwargs):
+        raise AssertionError('Long-run steps must not install term-gradient hooks.')
+
+    monkeypatch.setattr(
+        unified, '_backward_isolated_generator_term', forbidden_probe
+    )
+    translator = TinyTranslator()
+    critic = DomainProjectionDiscriminator(5, (4,))
+    row = unified._train_step(
+        _config(tmp_path, checkpoint_dir=None, history_jsonl=None),
+        translator,
+        critic,
+        TinyDecoder().requires_grad_(False),
+        CountingAdamW(translator.parameters(), lr=1.0e-4),
+        CountingAdamW(critic.parameters(), lr=1.0e-4),
+        torch.amp.GradScaler('cuda', enabled=False),
+        batch,
+        torch.Generator().manual_seed(307),
+        _nontrivial_stats(),
+        qualify_term_gradients=False,
+    )
+    assert row['generator/term_gradients_qualified'] is False
+    assert row['generator/term_gradient_measurement_scope'] == 'pilot_steps_only'
+    assert all(row[f'gradient/term_{term}'] == 0.0 for term in DEFAULT_UNIFIED_WEIGHTS)
+    assert all(
+        event['term_gradient_qualified'] is False
+        for event in row['generator/term_execution']
+        if event['event'] == 'backward_complete'
+    )
+
+
+def test_isolated_six_term_update_matches_combined_weighted_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(317)
+    source_domain = Domain(0.1, Contrast.T1W)
+    target_domain = Domain(7.0, Contrast.T1W)
+    record = FactoredLatentRecord(
+        case_id='R_equivalence_source',
+        subject_group_id='R:equivalence-source',
+        domain=source_domain,
+        split='train',
+        path=tmp_path / 'unused.pt',
+        resume_key='4' * 64,
+        sidecar={'cohort': 'R', 'split': 'train'},
+    )
+    support = torch.ones(1, 1, 3, 3, 3, dtype=torch.bool)
+    batch = unified._TrainingBatch(
+        torch.randn(1, 4, 3, 3, 3),
+        support,
+        [source_domain],
+        torch.randn(1, 4, 3, 3, 3) + 0.25,
+        support.clone(),
+        [target_domain],
+        [record],
+        [
+            replace(
+                record,
+                case_id='R_equivalence_target',
+                subject_group_id='R:equivalence-target',
+                domain=target_domain,
+            )
+        ],
+    )
+    cfg = _config(tmp_path, checkpoint_dir=None, history_jsonl=None)
+    stats = _nontrivial_stats()
+    decoder = TinyDecoder().requires_grad_(False)
+    critic = DomainProjectionDiscriminator(5, (4,))
+    base = TinyTranslator()
+    isolated = copy.deepcopy(base)
+    per_term_reference = copy.deepcopy(base)
+    combined = copy.deepcopy(base)
+    plan = unified._freeze_training_step_plan(
+        cfg, batch, torch.Generator().manual_seed(331)
+    )
+    valid_support = batch.source_support & batch.target_support
+
+    active_term: list[str | None] = [None]
+    production_parameters = tuple(isolated.parameters())
+    captured_weighted_gradients = {
+        term: [torch.zeros_like(parameter) for parameter in production_parameters]
+        for term in DEFAULT_UNIFIED_WEIGHTS
+    }
+    original_forward = unified._forward_generator_term
+
+    def forward_spy(term, *args, **kwargs):
+        active_term[0] = term
+        return original_forward(term, *args, **kwargs)
+
+    def capture_parameter(index):
+        def capture(gradient):
+            term = active_term[0]
+            if term is not None:
+                captured_weighted_gradients[term][index].add_(gradient.detach())
+        return capture
+
+    handles = [
+        parameter.register_hook(capture_parameter(index))
+        for index, parameter in enumerate(production_parameters)
+    ]
+    monkeypatch.setattr(unified, '_forward_generator_term', forward_spy)
+    isolated_optimizer = torch.optim.SGD(isolated.parameters(), lr=2.0e-3)
+    production_row = unified._train_step(
+        cfg,
+        isolated,
+        critic,
+        decoder,
+        isolated_optimizer,
+        torch.optim.SGD(critic.parameters(), lr=0.0),
+        torch.amp.GradScaler('cuda', enabled=False),
+        batch,
+        torch.Generator().manual_seed(331),
+        stats,
+        qualify_term_gradients=True,
+    )
+    for handle in handles:
+        handle.remove()
+    monkeypatch.setattr(unified, '_forward_generator_term', original_forward)
+    assert production_row['generator/frozen_step_plan_sha256'] == plan.plan_sha256
+    isolated_raw = {
+        term: torch.tensor(production_row[f'raw/{term}'])
+        for term in DEFAULT_UNIFIED_WEIGHTS
+    }
+    isolated_term_gradients = {
+        term: [
+            gradient / cfg.loss_weights[term]
+            for gradient in captured_weighted_gradients[term]
+        ]
+        for term in DEFAULT_UNIFIED_WEIGHTS
+    }
+    isolated_accumulated_preclip = [
+        sum(
+            captured_weighted_gradients[term][index]
+            for term in DEFAULT_UNIFIED_WEIGHTS
+        )
+        for index in range(len(production_parameters))
+    ]
+    isolated_accumulated = [
+        parameter.grad.detach().clone() for parameter in isolated.parameters()
+    ]
+    critic.requires_grad_(False)
+
+    def term_loss(model: nn.Module, term: str) -> torch.Tensor:
+        with (
+            unified._replay_step_rng(plan, torch.device('cpu')),
+            unified._saved_tensor_offload_context(torch.device('cpu')),
+        ):
+            return unified._forward_generator_term(
+                term,
+                cfg,
+                model,
+                critic,
+                decoder,
+                batch,
+                valid_support,
+                stats,
+                plan,
+            ).loss
+
+    reference_raw: dict[str, torch.Tensor] = {}
+    reference_term_gradients: dict[str, list[torch.Tensor]] = {}
+    reference_parameters = tuple(per_term_reference.parameters())
+    for term in DEFAULT_UNIFIED_WEIGHTS:
+        loss = term_loss(per_term_reference, term)
+        reference_raw[term] = loss.detach().clone()
+        gradients = torch.autograd.grad(
+            loss, reference_parameters, allow_unused=True
+        )
+        reference_term_gradients[term] = [
+            gradient.detach().clone()
+            if gradient is not None
+            else torch.zeros_like(parameter)
+            for parameter, gradient in zip(reference_parameters, gradients)
+        ]
+        del loss
+
+    combined_optimizer = torch.optim.SGD(combined.parameters(), lr=2.0e-3)
+    combined_optimizer.zero_grad(set_to_none=True)
+    combined_losses = {
+        term: term_loss(combined, term) for term in DEFAULT_UNIFIED_WEIGHTS
+    }
+    combined_total = sum(
+        combined_losses[term] * cfg.loss_weights[term]
+        for term in DEFAULT_UNIFIED_WEIGHTS
+    )
+    combined_total.backward()
+    combined_accumulated_preclip = [
+        parameter.grad.detach().clone() for parameter in combined.parameters()
+    ]
+    torch.nn.utils.clip_grad_norm_(combined.parameters(), cfg.grad_clip_norm)
+    combined_accumulated = [
+        parameter.grad.detach().clone() for parameter in combined.parameters()
+    ]
+    combined_optimizer.step()
+
+    for term in DEFAULT_UNIFIED_WEIGHTS:
+        torch.testing.assert_close(
+            isolated_raw[term], reference_raw[term], rtol=1.0e-6, atol=1.0e-7
+        )
+        torch.testing.assert_close(
+            isolated_raw[term],
+            combined_losses[term].detach(),
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+        for actual, expected in zip(
+            isolated_term_gradients[term], reference_term_gradients[term]
+        ):
+            torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-6)
+        expected_norm = torch.stack(
+            [gradient.float().square().sum() for gradient in reference_term_gradients[term]]
+        ).sum().sqrt()
+        assert production_row[f'gradient/term_{term}'] == pytest.approx(
+            float(expected_norm), rel=2.0e-5, abs=2.0e-6
+        )
+    for actual, expected in zip(
+        isolated_accumulated_preclip, combined_accumulated_preclip
+    ):
+        torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-6)
+    for actual, expected in zip(isolated_accumulated, combined_accumulated):
+        torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-6)
+    for actual, expected in zip(isolated.parameters(), combined.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA peak diagnostics require CUDA')
@@ -1039,6 +1301,67 @@ def test_oom_is_hard_stop_and_diagnostic_is_preserved(tmp_path: Path) -> None:
     row = json.loads((tmp_path / "history.jsonl").read_text().strip())
     assert row["event"] == "oom_hard_stop"
     assert row["fallback"] == "forbidden"
+
+
+def test_qualification_only_writes_receipt_and_exits_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def passing_gate(row, *, device, limit_bytes):
+        del row, device
+        return {
+            'contract_version': unified.UNIFIED_A100_GATE_CONTRACT,
+            'status': 'pass',
+            'gpu_name': 'NVIDIA A100-SXM4-80GB',
+            'gpu_identity_matches': True,
+            'peak_allocated_bytes': limit_bytes,
+            'limit_bytes': limit_bytes,
+            'within_allocated_limit': True,
+        }
+
+    def forbidden_validation(*args, **kwargs):
+        raise AssertionError('Qualification-only mode must exit before validation.')
+
+    monkeypatch.setattr(unified, '_a100_one_step_gate', passing_gate)
+    monkeypatch.setattr(unified, '_evaluate_unpaired_validation', forbidden_validation)
+    cfg = _config(tmp_path, steps=1, pilot_steps=0)
+    result = run_stage2_unified_train(
+        cfg,
+        translator=TinyTranslator(),
+        decoder=TinyDecoder().requires_grad_(False),
+        train_index=SyntheticFactoredIndex(),
+        validation_index=SyntheticFactoredIndex('validation'),
+        stats=_stats(),
+        qualification_only=True,
+    )
+    assert result.completed_steps == 1
+    assert result.checkpoint is None
+    assert result.pilot_report['status'] == 'qualification_only_pass'
+    assert result.pilot_report['complete_validation_executed'] is False
+    receipt_path = (
+        cfg.checkpoint_dir
+        / unified.UNIFIED_A100_QUALIFICATION_RECEIPT_FILENAME
+    )
+    receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+    stored = receipt.pop('receipt_sha256')
+    assert stored == sha256_json(receipt)
+    assert (
+        receipt['contract_version']
+        == unified.UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT
+    )
+    assert receipt['complete_validation_executed'] is False
+    assert receipt['checkpoint_written'] is False
+    assert not list(cfg.checkpoint_dir.glob('*.pt'))
+    events = [
+        json.loads(line)
+        for line in cfg.history_jsonl.read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    ]
+    assert any(
+        event.get('event') == 'a100_qualification_only_complete'
+        for event in events
+    )
+    assert all(event.get('event') != 'unpaired_validation' for event in events)
 
 
 def test_sb_only_backward_ablation_disables_every_auxiliary_path(tmp_path: Path) -> None:

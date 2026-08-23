@@ -65,7 +65,16 @@ UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT = (
     'stage2-unified-nonreentrant-rng-preserving-translator-checkpoint-v1'
 )
 UNIFIED_A100_GATE_CONTRACT = 'stage2-unified-a100-one-step-memory-gate-v1'
+UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT = (
+    'stage2-unified-a100-qualification-only-exit-v1'
+)
+UNIFIED_A100_QUALIFICATION_RECEIPT_FILENAME = (
+    'stage2_unified_a100_qualification_only_receipt_v1.json'
+)
 UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES = 72 * 1024**3
+UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT = (
+    'stage2-unified-term-gradient-qualification-v1'
+)
 UNIFIED_PILOT_RUNTIME_PROJECTION_CONTRACT = (
     "stage2-unified-pilot-training-plus-validation-runtime-projection-v1"
 )
@@ -214,6 +223,8 @@ class UnifiedStage2Config:
                 'term_order': list(DEFAULT_UNIFIED_WEIGHTS),
                 'graph_construction': 'one_term_at_a_time',
                 'gradient_measurement': 'inline_during_term_backward',
+                'gradient_measurement_scope': 'pilot_steps_only',
+                'long_run_hook_measurement': 'disabled_after_pilot',
                 'backward': 'immediate_without_retain_graph',
                 'graph_release': 'before_next_term',
                 'translator_checkpoint': (
@@ -828,9 +839,20 @@ def run_stage2_unified_train(
     validation_index: PhotometryFactoredLatentBankIndex,
     stats: FactoredLatentStats,
     critic: DomainProjectionDiscriminator | None = None,
+    qualification_only: bool = False,
 ) -> UnifiedStage2Result:
     cfg = config if isinstance(config, UnifiedStage2Config) else UnifiedStage2Config.from_mapping(config)
     validate_unified_config(cfg)
+    if qualification_only and (
+        cfg.steps != 1
+        or cfg.pilot_steps != 0
+        or cfg.resume_from is not None
+        or cfg.checkpoint_dir is None
+    ):
+        raise ValueError(
+            'Qualification-only execution requires steps=1, pilot_steps=0, '
+            'no resume checkpoint, and an explicit receipt directory.'
+        )
     if train_index.split != "train":
         raise ValueError("Unified model fitting is restricted to R/train.")
     if validation_index.split != "validation":
@@ -907,6 +929,11 @@ def run_stage2_unified_train(
             'retain_graph': False,
             'graph_release': 'before_next_term',
             'gradient_measurement': 'inline_during_term_backward',
+            'gradient_measurement_contract': (
+                UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+            ),
+            'gradient_measurement_scope': 'pilot_steps_only',
+            'long_run_hook_measurement': 'disabled_after_pilot',
             'saved_tensor_policy': 'save_on_cpu',
             'translator_checkpoint_contract': UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT,
             'translator_checkpoint_use_reentrant': False,
@@ -914,6 +941,11 @@ def run_stage2_unified_train(
             'frozen_step_plan_replayed_per_term': True,
             'generator_optimizer_updates_per_step': 1,
         },
+        'execution_mode': (
+            UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT
+            if qualification_only
+            else 'train_with_frozen_validation_and_selection'
+        ),
         "git_commit": resolve_git_commit(),
     }
     run_fingerprint = sha256_json(run_identity)
@@ -1083,6 +1115,68 @@ def run_stage2_unified_train(
             ):
                 raise RuntimeError(
                     'The dedicated one-step A100 <=72 GiB allocated-memory gate failed.'
+                )
+            if qualification_only:
+                gate = row['memory/a100_one_step_gate']
+                if gate['status'] != 'pass':
+                    raise RuntimeError(
+                        'Qualification-only execution requires a passing A100 gate.'
+                    )
+                receipt = {
+                    'contract_version': UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT,
+                    'status': 'pass',
+                    'step': 1,
+                    'gate': gate,
+                    'anatomy_memory_qualification': row[
+                        'memory/anatomy_qualification'
+                    ],
+                    'run_fingerprint': run_fingerprint,
+                    'validation_plan_sha256': validation_plan_sha256,
+                    'complete_validation_executed': False,
+                    'checkpoint_written': False,
+                    'generator_optimizer_updates': 1,
+                    'generator_gradient_accumulation_contract': (
+                        UNIFIED_GENERATOR_ACCUMULATION_CONTRACT
+                    ),
+                    'term_gradient_qualification_contract': (
+                        UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+                    ),
+                    'frozen_decoder_state_sha256': frozen_decoder_state_sha256,
+                    'decoder_activation_checkpoint_sha256': sha256_json(
+                        decoder_checkpoint_evidence
+                    ),
+                }
+                receipt['receipt_sha256'] = sha256_json(receipt)
+                receipt_path = (
+                    cfg.checkpoint_dir
+                    / UNIFIED_A100_QUALIFICATION_RECEIPT_FILENAME
+                )
+                write_json_atomic(receipt_path, receipt, refuse_existing=True)
+                _append_jsonl(
+                    history_path,
+                    {
+                        'contract_version': UNIFIED_HISTORY_CONTRACT,
+                        'event': 'a100_qualification_only_complete',
+                        'step': 1,
+                        'receipt': str(receipt_path),
+                        'receipt_sha256': receipt['receipt_sha256'],
+                        'complete_validation_executed': False,
+                        'run_fingerprint': run_fingerprint,
+                        'history_generation': history_generation,
+                    },
+                )
+                return UnifiedStage2Result(
+                    completed_steps=1,
+                    checkpoint=None,
+                    history_jsonl=str(history_path),
+                    pilot_report={
+                        'status': 'qualification_only_pass',
+                        'steps': 1,
+                        'receipt': str(receipt_path),
+                        'complete_validation_executed': False,
+                    },
+                    selection=selection,
+                    run_fingerprint=run_fingerprint,
                 )
         if step < cfg.pilot_steps:
             pilot_rows.append(dict(row))
@@ -1723,12 +1817,15 @@ def _train_step(
                 'frozen_step_plan_sha256': plan.plan_sha256,
             }
         )
-        term_gradient_norms[name] = _backward_isolated_generator_term(
-            raw_loss,
-            translator,
-            weight=cfg.loss_weights[name],
-            scaler=scaler,
-        )
+        if qualify_term_gradients:
+            term_gradient_norms[name] = _backward_isolated_generator_term(
+                raw_loss,
+                translator,
+                weight=cfg.loss_weights[name],
+                scaler=scaler,
+            )
+        else:
+            scaler.scale(raw_loss * cfg.loss_weights[name]).backward()
         term_execution.append(
             {
                 'sequence': len(term_execution),
@@ -1736,6 +1833,7 @@ def _train_step(
                 'term': name,
                 'retain_graph': False,
                 'graph_released_before_next_term': True,
+                'term_gradient_qualified': qualify_term_gradients,
             }
         )
         if name == 'anatomy':
@@ -1894,6 +1992,10 @@ def _train_step(
         'generator/translator_checkpoint_preserve_rng_state': True,
         'generator/term_gradient_probe_reconstructed_joint_graph': False,
         'generator/term_gradients_qualified': qualify_term_gradients,
+        'generator/term_gradient_qualification_contract': (
+            UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+        ),
+        'generator/term_gradient_measurement_scope': 'pilot_steps_only',
         'generator/frozen_step_plan_sha256': plan.plan_sha256,
         'generator/frozen_step_plan': {
             'time_values': [
@@ -2846,6 +2948,11 @@ def _pilot_report(
             'retain_graph': False,
             'graph_release': 'before_next_term',
             'gradient_measurement': 'inline_during_term_backward',
+            'gradient_measurement_contract': (
+                UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+            ),
+            'gradient_measurement_scope': 'pilot_steps_only',
+            'long_run_hook_measurement': 'disabled_after_pilot',
             'joint_six_term_gradient_probe': False,
             'saved_tensor_policy': 'save_on_cpu',
             'translator_checkpoint_contract': UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT,
@@ -3061,6 +3168,8 @@ __all__ = [
     "DEFAULT_UNIFIED_WEIGHTS",
     'UNIFIED_ANATOMY_MEMORY_CONTRACT',
     'UNIFIED_A100_GATE_CONTRACT',
+    'UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT',
+    'UNIFIED_A100_QUALIFICATION_RECEIPT_FILENAME',
     'UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES',
     'UNIFIED_GENERATOR_ACCUMULATION_CONTRACT',
     "UNIFIED_HISTORY_CONTRACT",
@@ -3073,6 +3182,7 @@ __all__ = [
     "UNIFIED_STAGE2_CONTRACT",
     'UNIFIED_STAGE2_CONFIG_CONTRACT',
     'UNIFIED_TRANSLATOR_CHECKPOINT_CONTRACT',
+    'UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT',
     "UNIFIED_VALIDATION_PLAN_CONTRACT",
     "UnifiedStage2Config",
     "UnifiedStage2Result",

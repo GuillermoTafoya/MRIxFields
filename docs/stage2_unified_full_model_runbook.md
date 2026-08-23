@@ -16,7 +16,10 @@ resume plans are retained only as historical review material and are rejected by
 2. Run `fit-stage2-photometry`, build the Gate 0.1 continuity reference, and run
    `audit-stage2-photometry`. Stop only if the official qualification result has
    `canonical_latent_bank_authorized: false` or an integrity check fails.
-3. Run the canonical artifact storage/filesystem preflight, streamed build, and full audit:
+3. Set `BANK_DIR` to local scratch (for Colab v7,
+   `/content/stage2_unified_v7_scratch/photometry_factored_latent_bank_v2_working`),
+   never to the mounted Drive. Run the canonical artifact storage/filesystem preflight, streamed
+   build, and full audit against that local path:
 
 ```bash
 fieldbridge preflight-photometry-factored-latent-bank \
@@ -44,8 +47,12 @@ fieldbridge audit-photometry-factored-latent-bank \
   --bank-dir "$BANK_DIR" --device cuda --log-every 1
 ```
 
-If hard-link atomic publication is unsupported on the external filesystem, the preflight must
-stop. Build on local scratch and hash-verify archival; do not introduce an overwrite fallback.
+After the local audit passes, compute a deterministic tree identity over every relative path,
+byte count, and file SHA-256. Copy to a unique partial archive attempt on Drive, verify the same
+tree identity, and publish by no-clobber rename. If publication or Drive remount/retry fails, stop
+with the local bank intact; do not introduce an overwrite fallback. On a later runtime, copy the
+immutable archive back to local scratch and require byte-identical tree identity before any
+training read.
 
 4. Quantify residual domain separability on the normalized factored latents and audit paired
    evaluation feasibility before asking an operator for a paired manifest:
@@ -146,6 +153,7 @@ P:0009. Absence of both routes hard-stops before the long-run authorization flag
 
 ```bash
 fieldbridge train-stage2-unified \
+  --qualification-only \
   --config "$A100_GATE_RESOLVED_CONFIG" \
   --bank-dir "$BANK_DIR" --vae-config "$VAE_CONFIG" --vae-checkpoint "$VAE_CHECKPOINT" \
   --checkpoint-dir "$A100_GATE_CHECKPOINTS" --history-jsonl "$A100_GATE_HISTORY" \
@@ -177,26 +185,37 @@ The generator ports the reviewed term-wise v6 lifetime exactly. It freezes the s
 bridge time/noise, intermediate domains, and a differentiable-forward RNG replay seed once per
 step. For each enabled term in the sealed order sb, identity, anatomy, graph, adversarial,
 domain, it constructs only that term's graph under `save_on_cpu`, routes every differentiable
-translator invocation through non-reentrant RNG-preserving checkpointing, measures the term's
-translator gradient from that same backward, immediately calls backward without retaining the
+translator invocation through non-reentrant RNG-preserving checkpointing, and immediately calls
+backward without retaining the
 graph, releases the graph, and only then constructs the next term. The pilot gradient probe does
 not reconstruct a joint six-term graph. Accumulated weighted gradients receive exactly one
-generator optimizer update.
+generator optimizer update. During the configured pilot steps only, parameter hooks measure each
+term's translator gradient from that same backward. After the pilot,
+`qualify_term_gradients=false` bypasses all six hook sets and their GPU-to-CPU norm
+synchronizations while preserving the identical weighted backward and optimizer update.
 
 The first step emits `stage2-unified-anatomy-memory-qualification-v1` with allocated and reserved
 CUDA peaks for anatomy forward/backward and the whole step, the checkpoint-granularity hash, and
 unchanged before/after frozen-decoder state hashes. It also emits
 `stage2-unified-a100-one-step-memory-gate-v1`. The gate requires an NVIDIA A100 and peak allocated
 memory no greater than 72 GiB (77,309,411,328 bytes); failure stops before the 20- or 200-step
-command is launched.
+command is launched. The first command uses
+`stage2-unified-a100-qualification-only-exit-v1`: it atomically writes
+`stage2_unified_a100_qualification_only_receipt_v1.json` and exits before complete 60-cell
+validation or checkpoint publication. The notebook verifies this receipt before launching the
+20-step probe.
 
 Each Colab command is an attempt. Stdout is streamed visibly into an ephemeral
 `/content/stage2_unified_v7_scratch` log; no Drive log is held open while the subprocess runs.
 After completion, the local log is copied once into a unique external attempt path and sealed
-with a SHA-256 receipt. A rerun discovers the greatest immutable step checkpoint and passes it as
-`--resume-from`. Critical exact-resume checkpoints and their history prefix remain in the
-variant's durable external directory; temporary files, package caches, and command logs use
-local scratch. Existing attempt logs are never appended or overwritten.
+with a SHA-256 receipt. Each scientific run also uses
+`scientific_attempts/attempt-NNNN/{history.jsonl,checkpoints/}`. A rerun resumes the greatest
+immutable checkpoint in the latest attempt. If the latest attempt is nonempty but has no
+checkpoint (including OOM or interruption before step 10/20), it is preserved and a new attempt
+namespace is selected, avoiding the nonempty-history/no-checkpoint collision. Critical
+exact-resume checkpoints and their history prefix remain in the variant's durable external
+attempt directory; temporary files, package caches, command logs, and all bank training reads use
+local scratch. Existing attempts and logs are never appended across namespaces or overwritten.
 
 The pilot logs raw/weighted terms, each term's translator-gradient norm, generator/critic norms,
 critic score means/std/quantiles/separation/saturation, real/generated domain accuracy,

@@ -77,6 +77,8 @@ training:
     term_order: [sb, identity, anatomy, graph, adversarial, domain]
     graph_construction: one_term_at_a_time
     gradient_measurement: inline_during_term_backward
+    gradient_measurement_scope: pilot_steps_only
+    long_run_hook_measurement: disabled_after_pilot
     backward: immediate_without_retain_graph
     graph_release: before_next_term
     translator_checkpoint: non_reentrant_rng_preserving_every_differentiable_call

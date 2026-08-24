@@ -156,6 +156,11 @@ basename/hash/size. Its loader retains validation compatibility for already-vali
 the scientific data role is unchanged. The recovery notebook described in
 `stage2_gate01_legacy_inventory_recovery.md` must be used for the completed v7 pilot. It reads the
 immutable `implementation_82633d66e5ea` evidence and must never launch a replacement pilot.
+That recovery resolves the evidence beneath the exact
+`MRIxFields2026/UnifiedStage2_1ca2b4a_01` output root and restores only its reviewed
+`photometry_factored_latent_bank_v2.tar`. The archive, extracted tree, manifest artifact, file
+count, and byte count are all pinned; the empty unreceipted bank directory is never selected as a
+source. The exact pair-feasibility receipt is also resolved directly beneath that output root.
 
 Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
 exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records

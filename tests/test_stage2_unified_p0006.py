@@ -168,7 +168,7 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     else:
         additional |= {
             "colab-operational-source-split.json",
-            "reviewed-module-hashes.json",
+            "gate01-reviewed-module-sha256-8012a3f.json",
         }
     for name in additional:
         _write_json(archive / name, {"synthetic_dependency": name})

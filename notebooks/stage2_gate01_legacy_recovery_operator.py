@@ -28,11 +28,26 @@ EXPECTED_VALIDATION_PLAN_SHA256 = (
 EXPECTED_SELECTION_RULE_SHA256 = (
     "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6"
 )
+EXPECTED_BANK_ARCHIVE_SHA256 = (
+    "78d323c02ceccdfcb054307da3c9e14575210869d22cade6c5ecd4afa4baf8d5"
+)
+EXPECTED_BANK_TREE_SHA256 = (
+    "f9cb09bfa177a3e389f87f087b0d756a2709e2054559a39c85e8272d5e1cfaa3"
+)
+EXPECTED_BANK_ARTIFACT_SHA256 = (
+    "8081ce89a0eac1522b4fb28cd7919de4a4ecf1d5af72552d141a0ee9b9944194"
+)
+EXPECTED_BANK_FILE_COUNT = 3312
+EXPECTED_BANK_TOTAL_BYTES = 12873486620
 DRIVE_ROOT = Path("/content/drive/MyDrive/MRIxFields2026")
 GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f"
-STAGE2_V7_ROOT = DRIVE_ROOT / "stage2_unified_v7"
+OUTPUT_ROOT = DRIVE_ROOT / "UnifiedStage2_1ca2b4a_01"
+STAGE2_V7_ROOT = OUTPUT_ROOT / "stage2_unified_v7"
 BANK_NAMESPACE = STAGE2_V7_ROOT / "bank_8081ce89a0ea"
 TRAINING_NAMESPACE = BANK_NAMESPACE / "implementation_82633d66e5ea"
+BANK_ARCHIVE = OUTPUT_ROOT / "photometry_factored_latent_bank_v2.tar"
+UNRECEIPTED_BANK_DIRECTORY = OUTPUT_ROOT / "photometry_factored_latent_bank_v2"
+PAIR_FEASIBILITY = OUTPUT_ROOT / "stage2_retrospective_pair_feasibility_v2.json"
 SELECTION_RECEIPT = (
     TRAINING_NAMESPACE
     / "unified_full_objective_pilot_200"
@@ -62,13 +77,45 @@ for module_name in tuple(sys.modules):
     if module_name == "fieldbridge" or module_name.startswith("fieldbridge."):
         del sys.modules[module_name]
 importlib.invalidate_caches()
-import fieldbridge
+dependency_versions = {}
+for dependency_name in ("numpy", "scipy", "torch", "yaml"):
+    try:
+        dependency = importlib.import_module(dependency_name)
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "Fresh-Colab dependency import preflight failed before Drive mount: "
+            f"{dependency_name}. Use the standard Colab CPU/high-RAM runtime; this "
+            "recovery does not install or download packages."
+        ) from error
+    dependency_versions[dependency_name] = str(
+        getattr(dependency, "__version__", "available")
+    )
+try:
+    import fieldbridge
+    import fieldbridge.cli
+except (ImportError, OSError) as error:
+    raise RuntimeError(
+        "Fresh-Colab FieldBridge import preflight failed before Drive mount."
+    ) from error
 
 if REPO_DIR not in Path(fieldbridge.__file__).resolve().parents:
     raise RuntimeError("FieldBridge import escaped the detached operator checkout.")
 CLI_ENV["PYTHONPATH"] = source_dir + os.pathsep + CLI_ENV.get("PYTHONPATH", "")
 if git_text("status", "--porcelain"):
     raise RuntimeError("Operator checkout changed before Drive mount.")
+print(
+    json.dumps(
+        {
+            "stage": "fresh_colab_dependency_import_preflight",
+            "dependencies": dependency_versions,
+            "fieldbridge_checkout": str(Path(fieldbridge.__file__).resolve()),
+            "status": "pass",
+            "packages_installed_or_downloaded": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
 
 
 from google.colab import drive
@@ -110,8 +157,42 @@ from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     P0009_CONFIRMATION_STATUS,
     load_gate01_p0006_evaluation_protocol,
     preflight_gate01_p0006_archive,
+    resolve_stage2_recovery_drive_layout,
+    restore_verified_stage2_bank_tar,
     verify_completed_stage2_pilot_evidence,
 )
+
+
+def load_self_hashed_json(path, hash_key):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object: {path}")
+    body = dict(payload)
+    stored = body.pop(hash_key, None)
+    if stored != sha256_json(body):
+        raise ValueError(f"Self-hash mismatch: {path}")
+    return payload
+
+
+# Resolve every persisted Stage-2 path before hashing large archives or opening checkpoints.
+stage2_drive_layout = drive_retry(
+    "resolve-exact-stage2-drive-layout",
+    lambda: resolve_stage2_recovery_drive_layout(DRIVE_ROOT),
+)
+if (
+    stage2_drive_layout.output_root != OUTPUT_ROOT.resolve()
+    or stage2_drive_layout.stage2_v7_root != STAGE2_V7_ROOT.resolve()
+    or stage2_drive_layout.bank_namespace != BANK_NAMESPACE.resolve()
+    or stage2_drive_layout.training_namespace != TRAINING_NAMESPACE.resolve()
+    or stage2_drive_layout.bank_archive != BANK_ARCHIVE.resolve()
+    or stage2_drive_layout.pair_feasibility != PAIR_FEASIBILITY.resolve()
+    or stage2_drive_layout.selection_receipt != SELECTION_RECEIPT.resolve()
+):
+    raise RuntimeError("Resolved Stage-2 Drive topology differs from the pinned operator paths.")
+if sha256_file(stage2_drive_layout.selection_receipt) != (
+    EXPECTED_SELECTION_RECEIPT_FILE_SHA256
+):
+    raise RuntimeError("Early step-200 selection-receipt file SHA-256 mismatch.")
 
 
 # First Drive artifact check: metadata-only, before bank/checkpoint/private-array work.
@@ -145,82 +226,54 @@ print(
 )
 
 
+pair_feasibility = drive_retry(
+    "read-pair-feasibility",
+    lambda: load_self_hashed_json(
+        stage2_drive_layout.pair_feasibility, "result_sha256"
+    ),
+)
+if (
+    pair_feasibility.get("complete_inventory_no_selection") is not True
+    or pair_feasibility.get("paired_evaluation_possible") is not False
+):
+    raise RuntimeError(
+        "P:0006 recovery requires sealed proof that genuine paired R validation is unavailable."
+    )
+ignored_empty_unreceipted_bank_directory = (
+    stage2_drive_layout.ignored_empty_unreceipted_bank_directory
+)
+print(
+    json.dumps(
+        {
+            "stage": "exact_stage2_drive_topology_preflight",
+            **stage2_drive_layout.to_dict(),
+            "selection_receipt_file_sha256": (
+                EXPECTED_SELECTION_RECEIPT_FILE_SHA256
+            ),
+            "pair_feasibility_file_sha256": sha256_file(
+                stage2_drive_layout.pair_feasibility
+            ),
+            "pair_feasibility_result_sha256": pair_feasibility["result_sha256"],
+            "status": "pass",
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
+
 LOCAL_LOG_ROOT.mkdir(parents=True, exist_ok=True)
 for environment_name in ("TMPDIR", "TEMP", "TMP", "TORCH_HOME"):
     CLI_ENV[environment_name] = str(LOCAL_SCRATCH_ROOT / environment_name.lower())
     Path(CLI_ENV[environment_name]).mkdir(parents=True, exist_ok=True)
 
 
-def tree_identity(root):
-    root = Path(root).resolve()
-    rows = [
-        {
-            "path": path.relative_to(root).as_posix(),
-            "bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        }
-        for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file())
-    ]
-    if not rows:
-        raise RuntimeError(f"Artifact tree is empty: {root}")
-    return {
-        "file_count": len(rows),
-        "total_bytes": sum(row["bytes"] for row in rows),
-        "tree_sha256": sha256_json(rows),
-    }
-
-
-def unique_existing(candidates, label):
-    matches = [Path(path).resolve() for path in candidates if Path(path).is_file()]
-    if len(matches) != 1:
-        raise RuntimeError(f"Expected exactly one {label}; found {len(matches)}.")
-    return matches[0]
-
-
-def unique_existing_directory(candidates, label):
-    matches = [Path(path).resolve() for path in candidates if Path(path).is_dir()]
-    if len(matches) != 1:
-        raise RuntimeError(f"Expected exactly one {label}; found {len(matches)}.")
-    return matches[0]
-
-
-def restore_bank_archive_to_scratch(bank_archive_dir):
-    archive_identity = drive_retry(
-        "hash-bank-archive", lambda: tree_identity(bank_archive_dir)
-    )
-    if LOCAL_BANK_ROOT.exists():
-        local_identity = tree_identity(LOCAL_BANK_ROOT)
-    else:
-        last_error = None
-        for attempt in range(1, 4):
-            staging = LOCAL_SCRATCH_ROOT / f"bank_restore_attempt-{attempt:04d}.partial"
-            if staging.exists():
-                continue
-            try:
-                shutil.copytree(bank_archive_dir, staging)
-                local_identity = tree_identity(staging)
-                if local_identity != archive_identity:
-                    raise RuntimeError("Drive-to-local bank staging hash mismatch.")
-                os.rename(staging, LOCAL_BANK_ROOT)
-                break
-            except (OSError, IOError) as error:
-                last_error = error
-                try:
-                    drive.mount("/content/drive", force_remount=True)
-                except Exception as remount_error:
-                    print({"drive_remount_warning": repr(remount_error)}, flush=True)
-        else:
-            raise RuntimeError(
-                "Drive-to-local bank staging failed; partial attempts were preserved."
-            ) from last_error
-    if local_identity != archive_identity:
-        raise RuntimeError("Hash-verified Drive-to-local bank staging failed closed.")
-    return archive_identity
-
-
 def run_logged(command, operation):
     attempt_root = RECOVERY_NAMESPACE / "operation_attempts" / operation
-    drive_retry("create-operation-attempt-root", lambda: attempt_root.mkdir(parents=True, exist_ok=True))
+    drive_retry(
+        "create-operation-attempt-root",
+        lambda: attempt_root.mkdir(parents=True, exist_ok=True),
+    )
     attempt = 1
     while (
         (attempt_root / f"attempt-{attempt:04d}.log").exists()
@@ -299,17 +352,6 @@ def run_logged(command, operation):
     return receipt
 
 
-def load_self_hashed_json(path, hash_key):
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected JSON object: {path}")
-    body = dict(payload)
-    stored = body.pop(hash_key, None)
-    if stored != sha256_json(body):
-        raise ValueError(f"Self-hash mismatch: {path}")
-    return payload
-
-
 def seal_or_verify_exact_json(path, payload, hash_key):
     path = Path(path)
     if path.exists():
@@ -324,22 +366,46 @@ def seal_or_verify_exact_json(path, payload, hash_key):
     return payload
 
 
-# No alternate bank may be built. One of these exact historical archive locations must exist.
-BANK_ARCHIVE_DIR = unique_existing_directory(
-    (
-        BANK_NAMESPACE / "photometry_factored_latent_bank_v2",
-        DRIVE_ROOT / "photometry_factored_latent_bank_v2",
+bank_restore = drive_retry(
+    "verify-and-restore-reviewed-bank-tar",
+    lambda: restore_verified_stage2_bank_tar(
+        stage2_drive_layout.bank_archive,
+        LOCAL_BANK_ROOT,
+        expected_archive_sha256=EXPECTED_BANK_ARCHIVE_SHA256,
+        expected_tree_sha256=EXPECTED_BANK_TREE_SHA256,
+        expected_bank_artifact_sha256=EXPECTED_BANK_ARTIFACT_SHA256,
+        expected_file_count=EXPECTED_BANK_FILE_COUNT,
+        expected_total_bytes=EXPECTED_BANK_TOTAL_BYTES,
     ),
-    "immutable factored-latent bank archive",
 )
-bank_archive_identity = restore_bank_archive_to_scratch(BANK_ARCHIVE_DIR)
+bank_archive_identity = bank_restore.to_dict()
+print(
+    json.dumps(
+        {
+            "stage": "reviewed_bank_tar_restore",
+            "archive_sha256": bank_archive_identity["archive_file_sha256"],
+            "tree_sha256": bank_archive_identity["tree_sha256"],
+            "bank_artifact_sha256": bank_archive_identity[
+                "bank_artifact_sha256"
+            ],
+            "file_count": bank_archive_identity["file_count"],
+            "total_bytes": bank_archive_identity["total_bytes"],
+            "ignored_empty_unreceipted_directory": (
+                ignored_empty_unreceipted_bank_directory
+            ),
+            "status": "pass",
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
 
 
 # This loads sealed model checkpoints on CPU only and reconstructs run fingerprints.
 completed_evidence = verify_completed_stage2_pilot_evidence(
-    TRAINING_NAMESPACE,
+    stage2_drive_layout.training_namespace,
     bank_dir=LOCAL_BANK_ROOT,
-    expected_selection_receipt_path=SELECTION_RECEIPT,
+    expected_selection_receipt_path=stage2_drive_layout.selection_receipt,
     training_evidence_commit=TRAINING_EVIDENCE_COMMIT,
     expected_selection_receipt_file_sha256=EXPECTED_SELECTION_RECEIPT_FILE_SHA256,
     expected_validation_plan_sha256=EXPECTED_VALIDATION_PLAN_SHA256,
@@ -372,24 +438,6 @@ print(
     ),
     flush=True,
 )
-
-
-PAIR_FEASIBILITY = unique_existing(
-    (
-        TRAINING_NAMESPACE / "stage2_retrospective_pair_feasibility_v2.json",
-        BANK_NAMESPACE / "stage2_retrospective_pair_feasibility_v2.json",
-        DRIVE_ROOT / "stage2_retrospective_pair_feasibility_v2.json",
-    ),
-    "sealed retrospective paired-feasibility receipt",
-)
-pair_feasibility = load_self_hashed_json(PAIR_FEASIBILITY, "result_sha256")
-if (
-    pair_feasibility.get("complete_inventory_no_selection") is not True
-    or pair_feasibility.get("paired_evaluation_possible") is not False
-):
-    raise RuntimeError(
-        "P:0006 recovery requires sealed proof that genuine paired R validation is unavailable."
-    )
 
 
 drive_retry(
@@ -501,8 +549,17 @@ recovery_receipt = {
     "training_namespace": str(TRAINING_NAMESPACE),
     "training_namespace_read_only": True,
     "recovery_namespace": str(RECOVERY_NAMESPACE),
-    "bank_archive": str(BANK_ARCHIVE_DIR),
+    "fresh_colab_dependency_versions": dependency_versions,
+    "packages_installed_or_downloaded": False,
+    "output_root": str(OUTPUT_ROOT),
+    "bank_archive": str(BANK_ARCHIVE),
     "bank_archive_tree": bank_archive_identity,
+    "ignored_empty_unreceipted_bank_directory": (
+        ignored_empty_unreceipted_bank_directory
+    ),
+    "pair_feasibility_path": str(PAIR_FEASIBILITY),
+    "pair_feasibility_file_sha256": sha256_file(PAIR_FEASIBILITY),
+    "pair_feasibility_result_sha256": pair_feasibility["result_sha256"],
     "gate01_preflight_sha256": gate01_preflight["preflight_sha256"],
     "gate01_layout_contract": gate01_preflight["archive_layout_contract"],
     "gate01_inventory_file_sha256": gate01_preflight["inventory_file_sha256"],

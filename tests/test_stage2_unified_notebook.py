@@ -72,34 +72,82 @@ def test_operator_scope_guard_separates_commits_and_rejects_training_diff() -> N
 def test_gate01_metadata_preflight_precedes_every_expensive_recovery_operation() -> None:
     source = OPERATOR.read_text(encoding="utf-8")
     ast.parse(source)
+    topology_preflight = source.index("stage2_drive_layout = drive_retry")
     preflight = source.index("gate01_preflight = drive_retry")
+    pair_preflight = source.index("pair_feasibility = drive_retry")
     assert source.index("preflight_gate01_p0006_archive(", preflight) > preflight
     for operation in (
-        "BANK_ARCHIVE_DIR = unique_existing_directory",
-        "restore_bank_archive_to_scratch(BANK_ARCHIVE_DIR)",
+        "bank_restore = drive_retry",
         "completed_evidence = verify_completed_stage2_pilot_evidence",
         "subprocess.Popen",
         "import-stage2-gate01-p0006-evaluation",
         "seal-stage2-long-run-evaluation-readiness",
     ):
         assert preflight < source.index(operation)
-    assert source.index("drive.mount") < preflight
+    assert source.index("drive.mount") < topology_preflight < preflight < pair_preflight
+    assert pair_preflight < source.index("bank_restore = drive_retry")
+    assert "resolve-exact-stage2-drive-layout" in source
+    assert "Early step-200 selection-receipt file SHA-256 mismatch" in source
     assert "private_array_payloads_opened" in source
     assert "early_gate01_metadata_preflight" in source
 
 
-def test_recovery_operator_uses_parent_gate_root_and_exact_completed_namespace() -> None:
+def test_fresh_colab_dependency_import_preflight_precedes_drive_and_artifacts() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    dependency_preflight = source.index("dependency_versions = {}")
+    drive_mount = source.index('drive.mount("/content/drive")')
+    gate_preflight = source.index("gate01_preflight = drive_retry")
+    assert dependency_preflight < drive_mount < gate_preflight
+    for dependency in ('"numpy"', '"scipy"', '"torch"', '"yaml"'):
+        assert dependency in source[dependency_preflight:drive_mount]
+    assert "import fieldbridge.cli" in source[dependency_preflight:drive_mount]
+    assert "fresh_colab_dependency_import_preflight" in source
+    assert '"packages_installed_or_downloaded": False' in source
+
+
+def test_recovery_operator_uses_actual_drive_topology_and_completed_namespace() -> None:
     source = OPERATOR.read_text(encoding="utf-8")
     assert 'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f"' in source
-    assert 'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f" / "archive"' not in source
-    assert 'STAGE2_V7_ROOT = DRIVE_ROOT / "stage2_unified_v7"' in source
+    assert (
+        'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f" / "archive"'
+        not in source
+    )
+    assert 'OUTPUT_ROOT = DRIVE_ROOT / "UnifiedStage2_1ca2b4a_01"' in source
+    assert 'STAGE2_V7_ROOT = OUTPUT_ROOT / "stage2_unified_v7"' in source
     assert 'BANK_NAMESPACE = STAGE2_V7_ROOT / "bank_8081ce89a0ea"' in source
     assert 'TRAINING_NAMESPACE = BANK_NAMESPACE / "implementation_82633d66e5ea"' in source
+    assert 'BANK_ARCHIVE = OUTPUT_ROOT / "photometry_factored_latent_bank_v2.tar"' in source
+    assert (
+        'PAIR_FEASIBILITY = OUTPUT_ROOT / "stage2_retrospective_pair_feasibility_v2.json"'
+        in source
+    )
+    assert (
+        'UNRECEIPTED_BANK_DIRECTORY = OUTPUT_ROOT / "photometry_factored_latent_bank_v2"'
+        in source
+    )
+    assert 'STAGE2_V7_ROOT = DRIVE_ROOT / "stage2_unified_v7"' not in source
+    assert "unique_existing_directory" not in source
+    assert "unique_existing(" not in source
     assert "attempt-0001" in source
     assert "stage2_unified_full_selection_step000000200.json" in source
     assert "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828" in source
     assert "3afca2bab6a440529f88e7c8d9a9294fed9ecbf07eea1e308ed0910e2ba16421" in source
     assert "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6" in source
+
+
+def test_recovery_operator_pins_and_verifies_reviewed_bank_tar() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    for required in (
+        "78d323c02ceccdfcb054307da3c9e14575210869d22cade6c5ecd4afa4baf8d5",
+        "f9cb09bfa177a3e389f87f087b0d756a2709e2054559a39c85e8272d5e1cfaa3",
+        "8081ce89a0eac1522b4fb28cd7919de4a4ecf1d5af72552d141a0ee9b9944194",
+        "EXPECTED_BANK_FILE_COUNT = 3312",
+        "EXPECTED_BANK_TOTAL_BYTES = 12873486620",
+        "restore_verified_stage2_bank_tar",
+        "ignored_empty_unreceipted_bank_directory",
+        "resolve_stage2_recovery_drive_layout",
+    ):
+        assert required in source
 
 
 def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only() -> None:
@@ -115,8 +163,8 @@ def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only
     assert "cuda" not in source.casefold()
     assert '"pip"' not in source.casefold()
     assert "pip install" not in source.casefold()
-    assert "restore_bank_archive_to_scratch" in source
-    assert "tree_identity" in source
+    assert "restore_verified_stage2_bank_tar" in source
+    assert "restore_bank_archive_to_scratch" not in source
     assert "drive_retry" in source
     assert "archive_no_clobber" in source
     assert "refuse_existing=True" in source

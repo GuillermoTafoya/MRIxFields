@@ -131,7 +131,9 @@ $Gate01ScientificModules = @(
 )
 $Gate01ScientificModules | ForEach-Object {
   [pscustomobject]@{ module = $_; sha256 = (Get-FileHash -Algorithm SHA256 $_).Hash.ToLower() }
-} | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $Gate01External "reviewed-module-hashes.json")
+} | ConvertTo-Json | Set-Content -Encoding utf8 (
+  Join-Path $Gate01External "gate01-reviewed-module-sha256-8012a3f.json"
+)
 ```
 
 Transcribe those reviewed values into the exact module-keyed map in

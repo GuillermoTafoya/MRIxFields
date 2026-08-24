@@ -12,7 +12,10 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
+import tarfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -83,6 +86,21 @@ GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1 = (
 )
 GATE01_ARCHIVE_PREFLIGHT_CONTRACT = "gate01-p0006-metadata-preflight-v1"
 STAGE2_COMPLETED_PILOT_REUSE_CONTRACT = "stage2-completed-pilot-reuse-verification-v1"
+STAGE2_BANK_TAR_RESTORE_CONTRACT = "stage2-reviewed-bank-tar-restore-v1"
+STAGE2_BANK_MANIFEST_FILENAME = "photometry_factored_latent_bank_manifest.json"
+STAGE2_RECOVERY_DRIVE_LAYOUT_CONTRACT = "stage2-recovery-drive-layout-v1"
+STAGE2_RECOVERY_OUTPUT_ROOT_NAME = "UnifiedStage2_1ca2b4a_01"
+STAGE2_RECOVERY_V7_ROOT_NAME = "stage2_unified_v7"
+STAGE2_RECOVERY_BANK_NAMESPACE_NAME = "bank_8081ce89a0ea"
+STAGE2_RECOVERY_TRAINING_NAMESPACE_NAME = "implementation_82633d66e5ea"
+STAGE2_RECOVERY_BANK_TAR_NAME = "photometry_factored_latent_bank_v2.tar"
+STAGE2_RECOVERY_UNRECEIPTED_BANK_DIR_NAME = "photometry_factored_latent_bank_v2"
+STAGE2_RECOVERY_PAIR_FEASIBILITY_NAME = (
+    "stage2_retrospective_pair_feasibility_v2.json"
+)
+STAGE2_RECOVERY_SELECTION_RECEIPT_NAME = (
+    "stage2_unified_full_selection_step000000200.json"
+)
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 EXPECTED_STAGE2_SELECTION_RECEIPT_FILE_SHA256 = (
     "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828"
@@ -120,7 +138,7 @@ _GATE01_REQUIRED_BY_LAYOUT = {
     GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1: _GATE01_REQUIRED_COMMON
     | {
         "colab-operational-source-split.json",
-        "reviewed-module-hashes.json",
+        "gate01-reviewed-module-sha256-8012a3f.json",
     },
 }
 P0006_SUBJECT_GROUP = "P:0006"
@@ -197,6 +215,419 @@ class Gate01ArchiveLayout:
             "stored_inventory_paths_trusted_for_file_access": False,
             "file_access_derivation": "verified_basename_as_direct_logical_root_child",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedStage2BankRestore:
+    """Identity of a safely restored immutable Stage-2 bank tar."""
+
+    archive_path: Path
+    archive_file_sha256: str
+    bank_root: Path
+    tree_sha256: str
+    file_count: int
+    total_bytes: int
+    bank_artifact_sha256: str
+    restored_from_tar: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": STAGE2_BANK_TAR_RESTORE_CONTRACT,
+            "archive_path": str(self.archive_path),
+            "archive_file_sha256": self.archive_file_sha256,
+            "bank_root": str(self.bank_root),
+            "tree_sha256": self.tree_sha256,
+            "file_count": self.file_count,
+            "total_bytes": self.total_bytes,
+            "bank_artifact_sha256": self.bank_artifact_sha256,
+            "restored_from_tar": self.restored_from_tar,
+            "safe_extraction": True,
+            "links_or_special_members_accepted": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Stage2RecoveryDriveLayout:
+    """Exact reviewed Drive topology for the completed Stage-2 v7 evidence."""
+
+    drive_root: Path
+    output_root: Path
+    stage2_v7_root: Path
+    bank_namespace: Path
+    training_namespace: Path
+    bank_archive: Path
+    pair_feasibility: Path
+    selection_receipt: Path
+    ignored_empty_unreceipted_bank_directory: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": STAGE2_RECOVERY_DRIVE_LAYOUT_CONTRACT,
+            "drive_root": str(self.drive_root),
+            "output_root": str(self.output_root),
+            "stage2_v7_root": str(self.stage2_v7_root),
+            "bank_namespace": str(self.bank_namespace),
+            "training_namespace": str(self.training_namespace),
+            "bank_archive": str(self.bank_archive),
+            "pair_feasibility": str(self.pair_feasibility),
+            "selection_receipt": str(self.selection_receipt),
+            "ignored_empty_unreceipted_bank_directory": (
+                self.ignored_empty_unreceipted_bank_directory
+            ),
+        }
+
+
+def resolve_stage2_recovery_drive_layout(
+    drive_root: str | Path,
+) -> Stage2RecoveryDriveLayout:
+    """Resolve only the exact reviewed output, evidence, tar, and receipt topology."""
+
+    root = _stage2_recovery_directory(Path(drive_root), label="Drive root")
+    output_root = _stage2_recovery_direct_directory(
+        root, STAGE2_RECOVERY_OUTPUT_ROOT_NAME, label="output root"
+    )
+    stage2_v7_root = _stage2_recovery_direct_directory(
+        output_root, STAGE2_RECOVERY_V7_ROOT_NAME, label="Stage-2 v7 root"
+    )
+    bank_namespace = _stage2_recovery_direct_directory(
+        stage2_v7_root,
+        STAGE2_RECOVERY_BANK_NAMESPACE_NAME,
+        label="bank namespace",
+    )
+    training_namespace = _stage2_recovery_direct_directory(
+        bank_namespace,
+        STAGE2_RECOVERY_TRAINING_NAMESPACE_NAME,
+        label="training namespace",
+    )
+    bank_archive = _stage2_recovery_direct_file(
+        output_root, STAGE2_RECOVERY_BANK_TAR_NAME, label="reviewed bank tar"
+    )
+    pair_feasibility = _stage2_recovery_direct_file(
+        output_root,
+        STAGE2_RECOVERY_PAIR_FEASIBILITY_NAME,
+        label="pair-feasibility receipt",
+    )
+    pilot_root = _stage2_recovery_direct_directory(
+        training_namespace,
+        "unified_full_objective_pilot_200",
+        label="step-200 pilot root",
+    )
+    attempts_root = _stage2_recovery_direct_directory(
+        pilot_root, "scientific_attempts", label="scientific attempts root"
+    )
+    attempt_root = _stage2_recovery_direct_directory(
+        attempts_root, "attempt-0001", label="completed scientific attempt"
+    )
+    checkpoint_root = _stage2_recovery_direct_directory(
+        attempt_root, "checkpoints", label="completed checkpoint root"
+    )
+    selection_receipt = _stage2_recovery_direct_file(
+        checkpoint_root,
+        STAGE2_RECOVERY_SELECTION_RECEIPT_NAME,
+        label="step-200 selection receipt",
+    )
+
+    unreceipted = output_root / STAGE2_RECOVERY_UNRECEIPTED_BANK_DIR_NAME
+    ignored_empty = False
+    if unreceipted.exists() or unreceipted.is_symlink():
+        empty_root = _stage2_recovery_directory(
+            unreceipted, label="unreceipted bank directory"
+        )
+        if any(empty_root.iterdir()):
+            raise ValueError(
+                "The unreceipted bank directory is not empty; refusing archive ambiguity."
+            )
+        ignored_empty = True
+    return Stage2RecoveryDriveLayout(
+        drive_root=root,
+        output_root=output_root,
+        stage2_v7_root=stage2_v7_root,
+        bank_namespace=bank_namespace,
+        training_namespace=training_namespace,
+        bank_archive=bank_archive,
+        pair_feasibility=pair_feasibility,
+        selection_receipt=selection_receipt,
+        ignored_empty_unreceipted_bank_directory=ignored_empty,
+    )
+
+
+def _stage2_recovery_directory(path: Path, *, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"Stage-2 recovery {label} may not be a symlink.")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Stage-2 recovery {label} is missing: {path}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"Stage-2 recovery {label} is not a directory: {path}")
+    return resolved
+
+
+def _stage2_recovery_direct_directory(
+    parent: Path, name: str, *, label: str
+) -> Path:
+    candidate = _stage2_recovery_directory(parent / name, label=label)
+    if candidate.parent != parent:
+        raise ValueError(f"Stage-2 recovery {label} is not the expected direct child.")
+    return candidate
+
+
+def _stage2_recovery_direct_file(parent: Path, name: str, *, label: str) -> Path:
+    raw = parent / name
+    if raw.is_symlink():
+        raise ValueError(f"Stage-2 recovery {label} may not be a symlink.")
+    try:
+        candidate = raw.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Stage-2 recovery {label} is missing: {raw}") from exc
+    if candidate.parent != parent or not candidate.is_file():
+        raise ValueError(
+            f"Stage-2 recovery {label} is not the expected direct regular file."
+        )
+    return candidate
+
+
+def stage2_bank_tree_identity(root: str | Path) -> dict[str, Any]:
+    """Hash the complete bank tree using the reviewed v7 identity contract."""
+
+    raw_root = Path(root)
+    if raw_root.is_symlink():
+        raise ValueError("Stage-2 bank root may not be a symlink.")
+    resolved_root = raw_root.resolve()
+    if not resolved_root.is_dir():
+        raise FileNotFoundError(f"Stage-2 bank root is missing: {resolved_root}")
+    rows: list[dict[str, Any]] = []
+    for path in sorted(resolved_root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Stage-2 bank tree contains a symlink: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"Stage-2 bank tree contains a special entry: {path}")
+        resolved = path.resolve(strict=True)
+        try:
+            relative = resolved.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError("Stage-2 bank file escapes the restored root.") from exc
+        rows.append(
+            {
+                "path": relative.as_posix(),
+                "bytes": resolved.stat().st_size,
+                "sha256": sha256_file(resolved),
+            }
+        )
+    if not rows:
+        raise ValueError("Stage-2 bank tree is empty.")
+    return {
+        "file_count": len(rows),
+        "total_bytes": sum(int(row["bytes"]) for row in rows),
+        "tree_sha256": sha256_json(rows),
+    }
+
+
+def restore_verified_stage2_bank_tar(
+    archive_path: str | Path,
+    destination: str | Path,
+    *,
+    expected_archive_sha256: str,
+    expected_tree_sha256: str,
+    expected_bank_artifact_sha256: str,
+    expected_file_count: int,
+    expected_total_bytes: int,
+) -> VerifiedStage2BankRestore:
+    """Safely restore the exact reviewed bank tar into an immutable local root."""
+
+    for label, digest in {
+        "archive": expected_archive_sha256,
+        "tree": expected_tree_sha256,
+        "bank artifact": expected_bank_artifact_sha256,
+    }.items():
+        if _SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"Expected Stage-2 {label} identity must be lowercase SHA-256.")
+    if type(expected_file_count) is not int or expected_file_count <= 0:
+        raise ValueError("Expected Stage-2 bank file count must be a positive integer.")
+    if type(expected_total_bytes) is not int or expected_total_bytes <= 0:
+        raise ValueError("Expected Stage-2 bank byte count must be a positive integer.")
+
+    raw_archive = Path(archive_path)
+    if raw_archive.is_symlink():
+        raise ValueError("Reviewed Stage-2 bank archive may not be a symlink.")
+    try:
+        archive = raw_archive.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Reviewed Stage-2 bank tar is missing: {raw_archive}"
+        ) from exc
+    if not archive.is_file() or archive.suffix != ".tar":
+        raise ValueError("Reviewed Stage-2 bank archive must be a regular .tar file.")
+    if sha256_file(archive) != expected_archive_sha256:
+        raise ValueError("Reviewed Stage-2 bank tar SHA-256 mismatch.")
+
+    bank_root = Path(destination).resolve()
+    if bank_root.exists():
+        identity = _verify_restored_stage2_bank(
+            bank_root,
+            expected_tree_sha256=expected_tree_sha256,
+            expected_bank_artifact_sha256=expected_bank_artifact_sha256,
+            expected_file_count=expected_file_count,
+            expected_total_bytes=expected_total_bytes,
+        )
+        return VerifiedStage2BankRestore(
+            archive_path=archive,
+            archive_file_sha256=expected_archive_sha256,
+            bank_root=bank_root,
+            tree_sha256=identity["tree_sha256"],
+            file_count=identity["file_count"],
+            total_bytes=identity["total_bytes"],
+            bank_artifact_sha256=expected_bank_artifact_sha256,
+            restored_from_tar=False,
+        )
+
+    bank_root.parent.mkdir(parents=True, exist_ok=True)
+    attempt = 1
+    while True:
+        staging = bank_root.parent / (
+            f"{bank_root.name}.restore-attempt-{attempt:04d}.partial"
+        )
+        if not staging.exists():
+            staging.mkdir()
+            break
+        attempt += 1
+    _safe_extract_reviewed_stage2_bank_tar(archive, staging)
+    extracted_root = _resolve_extracted_stage2_bank_root(staging)
+    identity = _verify_restored_stage2_bank(
+        extracted_root,
+        expected_tree_sha256=expected_tree_sha256,
+        expected_bank_artifact_sha256=expected_bank_artifact_sha256,
+        expected_file_count=expected_file_count,
+        expected_total_bytes=expected_total_bytes,
+    )
+    if bank_root.exists():
+        raise FileExistsError(
+            "Concurrent Stage-2 bank restore created the final local destination."
+        )
+    os.rename(extracted_root, bank_root)
+    if staging.exists():
+        staging.rmdir()
+    return VerifiedStage2BankRestore(
+        archive_path=archive,
+        archive_file_sha256=expected_archive_sha256,
+        bank_root=bank_root,
+        tree_sha256=identity["tree_sha256"],
+        file_count=identity["file_count"],
+        total_bytes=identity["total_bytes"],
+        bank_artifact_sha256=expected_bank_artifact_sha256,
+        restored_from_tar=True,
+    )
+
+
+def _safe_extract_reviewed_stage2_bank_tar(archive: Path, staging: Path) -> None:
+    seen: set[str] = set()
+    regular_file_count = 0
+    with tarfile.open(archive, mode="r:") as bundle:
+        members = bundle.getmembers()
+        if not members:
+            raise ValueError("Reviewed Stage-2 bank tar is empty.")
+        for member in members:
+            relative = _safe_stage2_tar_member_path(member)
+            if relative is None:
+                continue
+            folded = relative.as_posix().casefold()
+            if folded in seen:
+                raise ValueError("Reviewed Stage-2 bank tar has duplicate member paths.")
+            seen.add(folded)
+            target = (staging / Path(*relative.parts)).resolve()
+            try:
+                target.relative_to(staging.resolve())
+            except ValueError as exc:
+                raise ValueError("Reviewed Stage-2 bank tar member escapes staging.") from exc
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isreg() or member.size < 0:
+                raise ValueError(
+                    "Reviewed Stage-2 bank tar contains a link or special member."
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise ValueError("Reviewed Stage-2 bank tar would overwrite a member.")
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ValueError("Reviewed Stage-2 bank tar regular member is unreadable.")
+            with source, target.open("xb") as destination_handle:
+                shutil.copyfileobj(source, destination_handle)
+            if target.stat().st_size != member.size:
+                raise ValueError("Reviewed Stage-2 bank tar member size changed on extract.")
+            regular_file_count += 1
+    if regular_file_count == 0:
+        raise ValueError("Reviewed Stage-2 bank tar contains no regular files.")
+
+
+def _safe_stage2_tar_member_path(member: tarfile.TarInfo) -> PurePosixPath | None:
+    name = member.name
+    if (
+        not isinstance(name, str)
+        or not name
+        or "\x00" in name
+        or chr(92) in name
+        or name.startswith("/")
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise ValueError("Reviewed Stage-2 bank tar contains a malformed member path.")
+    while name.startswith("./"):
+        name = name[2:]
+    if member.isdir():
+        name = name.rstrip("/")
+    if name in {"", "."}:
+        if member.isdir():
+            return None
+        raise ValueError("Reviewed Stage-2 bank tar has an empty file basename.")
+    if "//" in name:
+        raise ValueError("Reviewed Stage-2 bank tar contains an ambiguous member path.")
+    parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Reviewed Stage-2 bank tar contains path traversal.")
+    if re.fullmatch(r"[A-Za-z]:", parts[0]) or any(":" in part for part in parts):
+        raise ValueError("Reviewed Stage-2 bank tar contains a drive-qualified path.")
+    return PurePosixPath(*parts)
+
+
+def _resolve_extracted_stage2_bank_root(staging: Path) -> Path:
+    direct_manifest = staging / STAGE2_BANK_MANIFEST_FILENAME
+    if direct_manifest.is_file():
+        return staging
+    children = list(staging.iterdir())
+    directories = [child for child in children if child.is_dir() and not child.is_symlink()]
+    if len(children) == 1 and len(directories) == 1:
+        nested = directories[0]
+        if (nested / STAGE2_BANK_MANIFEST_FILENAME).is_file():
+            return nested
+    raise ValueError(
+        "Reviewed Stage-2 bank tar has an ambiguous root or lacks the bank manifest."
+    )
+
+
+def _verify_restored_stage2_bank(
+    root: Path,
+    *,
+    expected_tree_sha256: str,
+    expected_bank_artifact_sha256: str,
+    expected_file_count: int,
+    expected_total_bytes: int,
+) -> dict[str, Any]:
+    identity = stage2_bank_tree_identity(root)
+    if identity != {
+        "file_count": expected_file_count,
+        "total_bytes": expected_total_bytes,
+        "tree_sha256": expected_tree_sha256,
+    }:
+        raise ValueError(
+            "Restored Stage-2 bank tree count, byte total, or SHA-256 mismatch."
+        )
+    manifest = _read_json(root / STAGE2_BANK_MANIFEST_FILENAME)
+    if manifest.get("artifact_sha256") != expected_bank_artifact_sha256:
+        raise ValueError("Restored Stage-2 bank artifact SHA-256 mismatch.")
+    return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -1716,12 +2147,20 @@ __all__ = [
     "P0006_IDENTITY_SHA256",
     "P0006_SUBJECT_GROUP",
     "P0009_CONFIRMATION_STATUS",
+    "STAGE2_BANK_MANIFEST_FILENAME",
+    "STAGE2_BANK_TAR_RESTORE_CONTRACT",
     "STAGE2_COMPLETED_PILOT_REUSE_CONTRACT",
+    "STAGE2_RECOVERY_DRIVE_LAYOUT_CONTRACT",
+    "STAGE2_RECOVERY_OUTPUT_ROOT_NAME",
+    "Stage2RecoveryDriveLayout",
     "SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS",
     "TRAINING_EVIDENCE_COMMIT",
     "import_gate01_p0006_evaluation_protocol",
     "load_gate01_p0006_evaluation_protocol",
     "preflight_gate01_p0006_archive",
+    "resolve_stage2_recovery_drive_layout",
+    "restore_verified_stage2_bank_tar",
     "resolve_gate01_p0006_archive_layout",
+    "stage2_bank_tree_identity",
     "verify_completed_stage2_pilot_evidence",
 ]

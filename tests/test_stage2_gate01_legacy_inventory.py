@@ -23,11 +23,14 @@ LEGACY_REQUIRED = {
     "gate01-prospective-selection.json",
     "frozen-scientific-resplit.json",
     "colab-operational-source-split.json",
-    "reviewed-module-hashes.json",
+    "gate01-reviewed-module-sha256-8012a3f.json",
 }
 MODERN_REQUIRED = (
     LEGACY_REQUIRED
-    - {"colab-operational-source-split.json", "reviewed-module-hashes.json"}
+    - {
+        "colab-operational-source-split.json",
+        "gate01-reviewed-module-sha256-8012a3f.json",
+    }
     | {
         "original-split-v3.json",
         "producer-state.json",
@@ -136,7 +139,7 @@ def test_every_legacy_inventory_row_is_size_and_hash_verified(
     tmp_path: Path, tamper: str
 ) -> None:
     root, rows = _legacy_bundle(tmp_path)
-    target = root / "reviewed-module-hashes.json"
+    target = root / "gate01-reviewed-module-sha256-8012a3f.json"
     if tamper == "bytes":
         target.write_bytes(target.read_bytes() + b"tamper")
     else:
@@ -201,7 +204,7 @@ def test_legacy_inventory_rejects_malformed_stored_paths(
 
 def test_missing_inventoried_file_or_required_dependency_fails(tmp_path: Path) -> None:
     root, rows = _legacy_bundle(tmp_path)
-    missing = root / "reviewed-module-hashes.json"
+    missing = root / "gate01-reviewed-module-sha256-8012a3f.json"
     missing.unlink()
     with pytest.raises(FileNotFoundError, match="missing"):
         p0006.resolve_gate01_p0006_archive_layout(root)
@@ -227,7 +230,7 @@ def test_dot_traversal_is_rejected_but_absolute_label_is_not_opened(
 
 def test_symlink_escape_fails_where_supported(tmp_path: Path) -> None:
     root, rows = _legacy_bundle(tmp_path)
-    name = "reviewed-module-hashes.json"
+    name = "gate01-reviewed-module-sha256-8012a3f.json"
     target = tmp_path / "outside.json"
     target.write_text("{}", encoding="utf-8")
     (root / name).unlink()

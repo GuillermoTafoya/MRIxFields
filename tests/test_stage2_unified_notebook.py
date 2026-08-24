@@ -12,220 +12,145 @@ from fieldbridge.data.domains import Contrast, Domain
 from fieldbridge.data.photometry_factorization import sha256_json
 from fieldbridge.evaluation.stage2_photometry_baseline import PairedEvaluationCase
 from fieldbridge.evaluation.stage2_unified import _load_baseline_predictions
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+    P0006_EVIDENCE_LIMITATION,
+    P0009_CONFIRMATION_STATUS,
+)
 from fieldbridge.training.stage2_unified import UnifiedStage2Config
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "stage2_unified_retrospective_full_model_colab.ipynb"
+OPERATOR = ROOT / "notebooks" / "stage2_gate01_legacy_recovery_operator.py"
 
 
-def _load_notebook_functions(*names: str, namespace: dict) -> dict:
-    payload = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
-    source = next(
-        ''.join(cell['source'])
-        for cell in payload['cells']
-        if cell['cell_type'] == 'code'
-        and ''.join(cell['source']).startswith(
-            '# Visible attempt-based execution:'
-        )
-    )
-    tree = ast.parse(source)
-    selected = [
-        node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in names
-    ]
-    assert {node.name for node in selected} == set(names)
-    scope = dict(namespace)
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), str(NOTEBOOK), 'exec'),
-        scope,
-    )
-    return scope
-
-
-def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
+def _notebook_source() -> tuple[dict, str]:
     payload = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in payload["cells"])
+    return payload, source
+
+
+def test_recovery_notebook_is_unexecuted_output_free_and_ast_valid() -> None:
+    payload, source = _notebook_source()
     code_cells = [cell for cell in payload["cells"] if cell["cell_type"] == "code"]
     assert code_cells
-    assert all(cell["execution_count"] is None and cell["outputs"] == [] for cell in code_cells)
+    assert all(
+        cell["execution_count"] is None and cell["outputs"] == [] for cell in code_cells
+    )
     for cell in code_cells:
         ast.parse("".join(cell["source"]))
-    source = "\n".join("".join(cell["source"]) for cell in payload["cells"])
-    for identity in (
-        "f6a19d7a31c4c3bb73edd92088ea078192e88ee4b276309bad81c548ab7f94d5",
-        "cbe885f73a307065418ea80296d6cfd6d634edeb3281f503cf90e149800409e7",
-        "569a17b1316a47a0c95c42c649f4aab61f8fe8c9cf7d0582c411f544c9b23173",
-        "454747cd3e4b1376855915244a7c40fe281b758150e86f584fbea96f94d531f5",
+    assert "TRAINING_EVIDENCE_COMMIT = '82633d66e5ea47f96b149ea22cc192fcf4526f06'" in source
+    pin = re.search(r"OPERATOR_IMPLEMENTATION_COMMIT = '([^']+)'", source)
+    assert pin
+    assert pin.group(1) == "__OPERATOR_IMPLEMENTATION_COMMIT__" or re.fullmatch(
+        r"[0-9a-f]{40}", pin.group(1)
+    )
+    assert "input(" not in source
+    assert "drive.mount" not in source
+    assert "stage2_gate01_legacy_recovery_operator.py" in source
+
+
+def test_operator_scope_guard_separates_commits_and_rejects_training_diff() -> None:
+    _, source = _notebook_source()
+    for required in (
+        "merge-base",
+        "--is-ancestor",
+        "TRAINING_EVIDENCE_COMMIT",
+        "OPERATOR_IMPLEMENTATION_COMMIT",
+        "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py",
+        "src/fieldbridge/evaluation/stage2_unified_preflight.py",
+        "src/fieldbridge/models/",
+        "src/fieldbridge/training/",
+        "configs/",
+        "operator_diff_touches_training_critical_code",
+        "training_critical_code_byte_identical",
     ):
-        assert identity in source
-    required = [
-        "fit-stage2-photometry",
-        "audit-stage2-photometry",
-        "preflight-photometry-factored-latent-bank",
-        "build-photometry-factored-latent-bank",
-        "audit-photometry-factored-latent-bank",
-        "preflight-stage2-factored-domain-separability",
-        "audit-stage2-retrospective-pair-feasibility",
-        "train-stage2-unified",
-        "eval-stage2-unified",
-    ]
-    positions = [source.index(value) for value in required]
-    assert positions == sorted(positions)
-    assert source.count("AUTHORIZE_LONG_FULL_MODEL = False") == 1
-    assert source.count("AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False") == 1
-    assert "RUN_LONG_FULL_AND_BACKWARD_ABLATIONS" not in source
-    assert "a100-full-objective-gate-1" in source
-    assert "full-objective-pilot-20" in source
-    assert "full-objective-pilot-200" in source
-    assert source.index("a100-full-objective-gate-1") < source.index(
-        "full-objective-pilot-20"
-    ) < source.index("full-objective-pilot-200")
-    assert "a100_peak_allocated_limit_bytes': 72 * 1024**3" in source
-    assert "stage2-unified-a100-one-step-memory-gate-v1" in source
-    assert "stage2-unified-a100-qualification-only-exit-v1" in source
-    assert "--qualification-only" in source
-    assert "complete_validation_executed') is not False" in source
-    assert "a100_gate_checkpoint" not in source
-    assert "stage2-unified-term-wise-recomputation-v6" in source
-    assert "immediate_without_retain_graph" in source
-    assert "non_reentrant_rng_preserving_every_differentiable_call" in source
-    assert "saved_tensor_policy': 'save_on_cpu'" in source
-    assert "gradient_measurement_scope': 'pilot_steps_only'" in source
-    assert "long_run_hook_measurement': 'disabled_after_pilot'" in source
-    assert "run_resumable_training" in source
-    assert "stage2-colab-attempt-recovery-v1" in source
-    assert "stage2-colab-scientific-attempt-recovery-v2" in source
-    assert "scientific_attempts/attempt-" in source
-    assert "poisoned_without_checkpoint" in source
-    assert "not candidates and attempt_dir.exists() and any(attempt_dir.iterdir())" in source
-    assert "LOCAL_SCRATCH_ROOT = Path('/content/stage2_unified_v7_scratch')" in source
-    assert "drive_file_held_open_during_process': False" in source
-    assert "drive.mount('/content/drive', force_remount=True)" in source
-    assert "BANK_DIR = LOCAL_BANK_ROOT" in source
-    assert "BANK_DIR = output_root / 'photometry_factored_latent_bank_v2'" not in source
-    assert "stage2-colab-local-bank-staging-v1" in source
-    assert "drive_used_for_training_reads': False" in source
-    assert "publish_local_bank_no_clobber" in source
-    assert "tree_identity(BANK_ARCHIVE_DIR)" in source
-    assert ".open('a'" not in source
-    assert "No ablation is launched by this flag" in source
-    assert "Complete paired R/validation manifest with Stage-1 ceilings" not in source
-    assert "AUTHORIZE_FIT_AFTER" not in source
-    assert "AUTHORIZE_QUALIFICATION_AFTER" not in source
-    assert "descriptor_coupling': False" in source
-    assert "Path outside reviewed Windows root" in source
-    assert "classification_before_array_load" in source
-    assert "StarGAN_control_claim': False" in source
-    assert "learned_disentanglement_claim': False" in source
-    assert source.index("seal-stage2-long-run-evaluation-readiness") < source.index(
-        "AUTHORIZE_LONG_FULL_MODEL = False"
-    )
-    assert "find_latest_stage2_selection_receipt" in source
-    assert "--selection-receipt" in source
-    assert "FROZEN_VALIDATION_PLAN_SHA256" in source
-    assert "selected_best_checkpoint" in source
-    assert "final_checkpoint_diagnostic_only" in source
-    assert "import-stage2-gate01-p0006-evaluation" in source
-    assert "import-stage2-retrospective-paired-evaluation" in source
-    assert "Gate01Private_8012a3f" in source
-    assert "stage2_unified_validation_plan_v2.json" in source
-    assert "required_directed_domain_cell_count" in source
-    assert "validation_directed_domain_cell_count': 60" in source
-    assert "prospective_training_or_model_selection': False" in source
-    assert "development_validation_P0006_evaluation_only" in source
-    assert "development/model assessment only; cannot support population or generalization claims" in source
-    assert "frozen_and_unused_for_possible_later_confirmation" in source
-    assert "'P0009_executed': False" in source
-    assert "projected_training_plus_complete_validation" in source
-    assert "planned_validation_run_count" in source
-    assert "projected_validation_seconds" in source
-    assert "measured_complete_validation_directed_domain_cell_count" in source
-    assert "projected_total_hours" in source
-    assert "projected_total_gpu_cost_usd" in source
-    assert "peak_cuda_bytes_across_training_and_validation" in source
-    assert source.index("LONG_RUN_AUTHORIZATION_RESOURCE_ESTIMATE") < source.index(
-        "AUTHORIZE_LONG_FULL_MODEL = False"
-    )
-    prohibited_p0006_claims = re.compile(
-        r"(?:P:0006|P0006).{0,80}(?:held.?out|final|blind|independent.?test|definitive)"
-        r"|(?:held.?out|final|blind|independent.?test|definitive).{0,80}(?:P:0006|P0006)",
-        re.IGNORECASE,
-    )
-    assert prohibited_p0006_claims.search(source) is None
-    assert "MATERIALIZED_VALIDATION_ARRAYS_RAW" not in source
-    assert "BASELINE_SOURCE_ARTIFACT_RAW" not in source
-    assert "stage2_unified_full_retrospective_v2.yaml" not in source
-    assert 'stage2_unified_full_retrospective_v7.yaml' in source
-    assert "output_root / 'stage2_unified_v7'" in source
-    assert 'fine_grained_full_volume_v1' in source
-    assert 'outer_full_decoder_checkpoint' in source
-    assert 'one_step_anatomy_memory_qualification' in source
-    assert 'anatomy_cuda_peak_memory' in source
-    assert 'generator_optimizer_updates_per_step' in source
-    assert '_memory_checkpointed_decode' not in source
+        assert required in source
 
 
-def test_notebook_rotates_nonempty_precheckpoint_attempt_and_resumes_checkpoint(
-    tmp_path: Path,
-) -> None:
-    captured: list[list[str]] = []
+def test_gate01_metadata_preflight_precedes_every_expensive_recovery_operation() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    ast.parse(source)
+    preflight = source.index("gate01_preflight = drive_retry")
+    assert source.index("preflight_gate01_p0006_archive(", preflight) > preflight
+    for operation in (
+        "BANK_ARCHIVE_DIR = unique_existing_directory",
+        "restore_bank_archive_to_scratch(BANK_ARCHIVE_DIR)",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "subprocess.Popen",
+        "import-stage2-gate01-p0006-evaluation",
+        "seal-stage2-long-run-evaluation-readiness",
+    ):
+        assert preflight < source.index(operation)
+    assert source.index("drive.mount") < preflight
+    assert "private_array_payloads_opened" in source
+    assert "early_gate01_metadata_preflight" in source
 
-    def run_logged(command, log_path, operation):
-        del log_path, operation
-        captured.append(list(command))
-        return {'return_code': 0}
 
-    scope = _load_notebook_functions(
-        'replace_flag_value',
-        'run_resumable_training',
-        namespace={
-            'drive_retry': lambda label, operation: operation(),
-            'run_logged': run_logged,
-        },
-    )
-    run_dir = tmp_path / 'run'
-    failed = run_dir / 'scientific_attempts' / 'attempt-0001'
-    failed.mkdir(parents=True)
-    (failed / 'history.jsonl').write_text('{"event":"oom_hard_stop"}\n')
-    command = [
-        'fieldbridge',
-        'train-stage2-unified',
-        '--checkpoint-dir',
-        str(run_dir / 'checkpoints'),
-        '--history-jsonl',
-        str(run_dir / 'history.jsonl'),
-    ]
-    first = scope['run_resumable_training'](
-        command,
-        run_dir / 'checkpoints',
-        'stage2_unified_full_step*.pt',
-        run_dir / 'diagnostic.log',
-        'synthetic',
-    )
-    assert first['attempt'] == 2
-    assert Path(first['checkpoint_dir']).parent.name == 'attempt-0002'
-    assert '--resume-from' not in captured[-1]
-    assert captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
-        'attempt-0002\\history.jsonl'
-    ) or captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
-        'attempt-0002/history.jsonl'
-    )
+def test_recovery_operator_uses_parent_gate_root_and_exact_completed_namespace() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert 'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f"' in source
+    assert 'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f" / "archive"' not in source
+    assert 'STAGE2_V7_ROOT = DRIVE_ROOT / "stage2_unified_v7"' in source
+    assert 'BANK_NAMESPACE = STAGE2_V7_ROOT / "bank_8081ce89a0ea"' in source
+    assert 'TRAINING_NAMESPACE = BANK_NAMESPACE / "implementation_82633d66e5ea"' in source
+    assert "attempt-0001" in source
+    assert "stage2_unified_full_selection_step000000200.json" in source
+    assert "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828" in source
+    assert "3afca2bab6a440529f88e7c8d9a9294fed9ecbf07eea1e308ed0910e2ba16421" in source
+    assert "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6" in source
 
-    checkpoint_dir = Path(first['checkpoint_dir'])
-    checkpoint_dir.mkdir(parents=True)
-    checkpoint = checkpoint_dir / 'stage2_unified_full_step000000010.pt'
-    checkpoint.write_bytes(b'synthetic')
-    second = scope['run_resumable_training'](
-        command,
-        run_dir / 'checkpoints',
-        'stage2_unified_full_step*.pt',
-        run_dir / 'diagnostic.log',
-        'synthetic',
+
+def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert "verify_completed_stage2_pilot_evidence" in source
+    assert '"training_reused": True' in source
+    assert '"training_invoked": False' in source
+    assert "recovery_training_" in source
+    assert '"training_namespace_read_only": True' in source
+    assert "TRAINING_NAMESPACE.mkdir" not in source
+    assert "train-stage2-unified" not in source
+    assert "--device" not in source
+    assert "cuda" not in source.casefold()
+    assert '"pip"' not in source.casefold()
+    assert "pip install" not in source.casefold()
+    assert "restore_bank_archive_to_scratch" in source
+    assert "tree_identity" in source
+    assert "drive_retry" in source
+    assert "archive_no_clobber" in source
+    assert "refuse_existing=True" in source
+    assert "Existing recovery receipt changed" in source
+
+
+def test_recovery_operator_preserves_scientific_role_and_stops_before_long_run() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    for required in (
+        "P0006_DEVELOPMENT_VALIDATION_DATA_ROLE",
+        "P0006_EVIDENCE_LIMITATION",
+        "population_or_generalization_claims_authorized",
+        '"P0009_executed": False',
+        '"descriptor_coupling": False',
+        '"learned_disentanglement_claim": False',
+        '"StarGAN_control_claim": False',
+        "AUTHORIZE_100K_TRAINING = False",
+        "AUTHORIZE_LONG_FULL_MODEL = False",
+        "AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False",
+        "STOP_FOR_RESOURCE_BOUNDED_TRAINING_DESIGN_REVIEW",
+    ):
+        assert required in source
+    assert (
+        P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+        == "development_validation_P0006_evaluation_only"
     )
-    assert second['attempt'] == 2
-    assert captured[-1][-2:] == ['--resume-from', str(checkpoint)]
+    assert P0006_EVIDENCE_LIMITATION == (
+        "development/model assessment only; cannot support population or "
+        "generalization claims"
+    )
+    assert (
+        P0009_CONFIRMATION_STATUS
+        == "frozen_and_unused_for_possible_later_confirmation"
+    )
 
 
 def test_full_config_uses_reviewed_initial_weights() -> None:
@@ -244,24 +169,24 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         "domain": 0.1,
     }
     assert config.batch_size == 1
-    assert config.precision == 'bf16'
+    assert config.precision == "bf16"
     assert config.integration_steps == 4
-    assert config.integration_solver == 'heun'
-    assert config.decoder_activation_checkpoint_mode == 'fine_grained_full_volume_v1'
-    assert payload['training']['decoder_activation_checkpoint'][
-        'outer_full_decoder_checkpoint'
-    ] == 'forbidden'
-    assert payload['training']['generator_gradient_accumulation'][
-        'optimizer_updates_per_step'
+    assert config.integration_solver == "heun"
+    assert config.decoder_activation_checkpoint_mode == "fine_grained_full_volume_v1"
+    assert payload["training"]["decoder_activation_checkpoint"][
+        "outer_full_decoder_checkpoint"
+    ] == "forbidden"
+    assert payload["training"]["generator_gradient_accumulation"][
+        "optimizer_updates_per_step"
     ] == 1
-    accumulation = payload['training']['generator_gradient_accumulation']
-    assert accumulation['contract'] == 'stage2-unified-term-wise-recomputation-v6'
-    assert accumulation['graph_construction'] == 'one_term_at_a_time'
-    assert accumulation['backward'] == 'immediate_without_retain_graph'
-    assert accumulation['saved_tensor_policy'] == 'save_on_cpu'
-    assert accumulation['gradient_measurement_scope'] == 'pilot_steps_only'
-    assert accumulation['long_run_hook_measurement'] == 'disabled_after_pilot'
-    assert payload['training']['pilot']['a100_peak_allocated_limit_bytes'] == (
+    accumulation = payload["training"]["generator_gradient_accumulation"]
+    assert accumulation["contract"] == "stage2-unified-term-wise-recomputation-v6"
+    assert accumulation["graph_construction"] == "one_term_at_a_time"
+    assert accumulation["backward"] == "immediate_without_retain_graph"
+    assert accumulation["saved_tensor_policy"] == "save_on_cpu"
+    assert accumulation["gradient_measurement_scope"] == "pilot_steps_only"
+    assert accumulation["long_run_hook_measurement"] == "disabled_after_pilot"
+    assert payload["training"]["pilot"]["a100_peak_allocated_limit_bytes"] == (
         72 * 1024**3
     )
     assert config.critic_space == "latent"
@@ -290,7 +215,9 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         )
 
 
-def test_baseline_manifest_rejects_p_before_array_open(monkeypatch, tmp_path: Path) -> None:
+def test_baseline_manifest_rejects_p_before_array_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     case = PairedEvaluationCase(
         case_identity="R_case",
         source=torch.zeros(1, 2, 2, 2),

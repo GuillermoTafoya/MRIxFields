@@ -135,26 +135,72 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
+@pytest.mark.parametrize("inventory_format", ["csv", "reviewed_legacy_json"])
 def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inventory_format: str
 ) -> None:
     archive = tmp_path / "Gate01Private_8012a3f"
     archive.mkdir()
     result_body = {"contract_version": GATE01_CONTRACT_VERSION, "value": 1}
     result = {**result_body, "result_sha256": sha256_json(result_body)}
-    result_path = archive / "result.json"
-    manifest_path = archive / "manifest.json"
-    lock_path = archive / "lock.json"
-    calibrator_path = archive / "calibrator.json"
+    result_path = archive / "gate01-results.json"
+    manifest_path = archive / "gate01-private-manifest.json"
+    lock_path = archive / "gate01-protocol-lock.json"
+    calibrator_path = archive / "gate01-target-calibrator.json"
     _write_json(result_path, result)
     _write_json(manifest_path, {"contract_version": p0006.GATE01_INPUT_CONTRACT_VERSION})
     _write_json(lock_path, {"contract_version": p0006.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION})
     _write_json(calibrator_path, {"contract_version": p0006.GATE01_CALIBRATOR_CONTRACT_VERSION})
-    with (archive / "sha256-inventory.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("Algorithm", "Hash", "Path"))
-        writer.writeheader()
-        for path in (result_path, manifest_path, lock_path, calibrator_path):
-            writer.writerow({"Algorithm": "SHA256", "Hash": sha256_file(path), "Path": str(path)})
+    additional = {
+        "gate01-private-build-state.json",
+        "gate01-result-contract.json",
+        "gate01-protocol-spec.json",
+        "gate01-producer-spec.json",
+        "gate01-prospective-selection.json",
+        "frozen-scientific-resplit.json",
+    }
+    if inventory_format == "csv":
+        additional |= {
+            "original-split-v3.json",
+            "producer-state.json",
+            "private-build-plan.json",
+        }
+    else:
+        additional |= {
+            "colab-operational-source-split.json",
+            "reviewed-module-hashes.json",
+        }
+    for name in additional:
+        _write_json(archive / name, {"synthetic_dependency": name})
+    if inventory_format == "csv":
+        (archive / "gate01-report.md").write_text("synthetic", encoding="utf-8")
+    inventoried = sorted(
+        path for path in archive.iterdir() if path.is_file()
+    )
+    if inventory_format == "csv":
+        with (archive / "sha256-inventory.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=("Algorithm", "Hash", "Path"))
+            writer.writeheader()
+            for path in inventoried:
+                writer.writerow(
+                    {"Algorithm": "SHA256", "Hash": sha256_file(path), "Path": str(path)}
+                )
+    else:
+        nested = archive / "archive"
+        nested.mkdir()
+        rows = [
+            {
+                "path": f"/content/historical/Gate01Private_8012a3f/{path.name}",
+                "sha256": sha256_file(path),
+                "size_bytes": path.stat().st_size,
+            }
+            for path in inventoried
+        ]
+        (nested / "sha256-inventory.json").write_text(
+            json.dumps(rows), encoding="utf-8"
+        )
 
     indexes = {"train": _Index("train"), "validation": _Index("validation")}
     plan = build_unified_validation_plan(indexes["validation"], validation_seed=20260818)  # type: ignore[arg-type]
@@ -222,12 +268,35 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert protocol["P0009_confirmation_status"] == p0006.P0009_CONFIRMATION_STATUS
     assert protocol["P0009_executed"] is False
     assert len(protocol["case_receipts"]) == 60
+    assert protocol["contract_version"].endswith("protocol-v3")
+    expected_layout = (
+        p0006.GATE01_ARCHIVE_LAYOUT_MODERN_FLAT_V1
+        if inventory_format == "csv"
+        else p0006.GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1
+    )
+    assert protocol["archive_identity"]["layout_contract"] == expected_layout
+    assert protocol["archive_identity"]["inventory_format"] == inventory_format
+    assert protocol["archive_inventory"][
+        "stored_absolute_paths_trusted_for_file_access"
+    ] is False
+    assert protocol["archive_inventory"]["verified_entries"]
 
     reloaded, paired_cases, baselines = p0006.load_gate01_p0006_evaluation_protocol(output)
     assert reloaded["protocol_sha256"] == protocol["protocol_sha256"]
     assert len(paired_cases) == len(baselines) == 60
     assert {case.subject_group_identity for case in paired_cases} == {"P:0006"}
     assert all(case.source_provenance["data_role"] == protocol["data_role"] for case in paired_cases)
+
+    v2_body = dict(protocol)
+    v2_body.pop("protocol_sha256")
+    v2_body["contract_version"] = p0006.GATE01_P0006_EVALUATION_PROTOCOL_V2
+    v2_path = tmp_path / "compatible-v2-p0006-protocol.json"
+    _write_json(v2_path, {**v2_body, "protocol_sha256": sha256_json(v2_body)})
+    compatible, compatible_cases, _ = p0006.load_gate01_p0006_evaluation_protocol(
+        v2_path
+    )
+    assert compatible["contract_version"] == p0006.GATE01_P0006_EVALUATION_PROTOCOL_V2
+    assert len(compatible_cases) == 60
 
     obsolete_body = dict(protocol)
     obsolete_body.pop("protocol_sha256")

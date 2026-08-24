@@ -44,11 +44,11 @@ from fieldbridge.evaluation.stage2_photometry_protocol import (
 )
 from fieldbridge.evaluation.stage2_unified import BASELINE_PREDICTIONS_CONTRACT
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
-    GATE01_P0006_EVALUATION_PROTOCOL,
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
     P0006_EVIDENCE_LIMITATION,
     P0006_IDENTITY_SHA256,
     P0009_CONFIRMATION_STATUS,
+    SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS,
 )
 
 DOMAIN_SEPARABILITY_CONTRACT = "stage2-factored-latent-domain-separability-v1"
@@ -533,7 +533,8 @@ def seal_long_run_evaluation_readiness(
             p0006_evaluation_protocol_path, "protocol_sha256"
         )
         if (
-            protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL
+            protocol.get("contract_version")
+            not in SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS
             or protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
             or protocol.get("evidence_interpretation") != P0006_EVIDENCE_LIMITATION
             or protocol.get("population_or_generalization_claims_authorized") is not False

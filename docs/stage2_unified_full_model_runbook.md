@@ -117,6 +117,15 @@ When the feasibility audit proves that no genuine R pair exists, import the alre
 development, so this protocol supports development/model assessment only and cannot support
 population or generalization claims. It is not a training or model-selection input:
 
+Before any photometry, bank, checkpoint, private-array, or GPU operation, run the metadata-only
+Gate 0.1 preflight against the logical bundle root. The importer recognizes exactly two layouts:
+the modern flat root with `sha256-inventory.csv`, or the reviewed legacy parent root with
+`archive/sha256-inventory.json`. In both cases all required artifacts are direct children of the
+logical root. Supplying the legacy `archive/` child as the logical root is invalid. Simultaneous
+inventories are ambiguous and fail closed. The legacy inventory's historical absolute paths are
+provenance labels only; file access is derived solely from a validated basename at the logical
+root, with containment, regular-file, exact-size, and SHA-256 checks applied to every row.
+
 ```bash
 fieldbridge import-stage2-gate01-p0006-evaluation \
   --archive-root "$GATE01_PRIVATE_8012A3F" \
@@ -140,6 +149,13 @@ proves the factored train/validation bank contains only R, and proves the frozen
 validation plan contains no P endpoint. Original SB-v2 arrays are imported; calibrated identity
 is deterministically re-derived from the existing raw identity, source support, and frozen Gate
 0.1 calibrator and its tensor identity is sealed. No baseline model is rerun.
+
+New imports use the explicit P:0006 protocol v3, which seals the logical-root identity, layout
+contract, inventory format/path/file hash, normalized entry count and identity, and every verified
+basename/hash/size. Its loader retains validation compatibility for already-valid v2 protocols;
+the scientific data role is unchanged. The recovery notebook described in
+`stage2_gate01_legacy_inventory_recovery.md` must be used for the completed v7 pilot. It reads the
+immutable `implementation_82633d66e5ea` evidence and must never launch a replacement pilot.
 
 Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
 exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records

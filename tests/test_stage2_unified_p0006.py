@@ -281,6 +281,41 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     ] is False
     assert protocol["archive_inventory"]["verified_entries"]
 
+    progress_events: list[dict[str, object]] = []
+    progress_output = tmp_path / "p0006-protocol-with-progress.json"
+    protocol_with_progress = p0006.import_gate01_p0006_evaluation_protocol(
+        archive,
+        expected_gate01_result_sha256=sha256_file(result_path),
+        bank_dir=tmp_path / "bank",
+        validation_plan_path=plan_path,
+        output_path=progress_output,
+        progress_callback=progress_events.append,
+    )
+    assert protocol_with_progress == protocol
+    assert sha256_file(progress_output) == sha256_file(output)
+    assert progress_events[0]["status"] == "start"
+    assert any(event["status"] == "periodic" for event in progress_events)
+    assert progress_events[-1]["status"] == "end"
+    allowed_progress_fields = {
+        "stage",
+        "status",
+        "verified_inventory_entry_count",
+        "train_record_count",
+        "validation_record_count",
+        "case_count",
+        "expected_case_count",
+        "acquisition_node_count",
+    }
+    assert all(set(event) <= allowed_progress_fields for event in progress_events)
+    assert all(
+        not any(
+            token in key
+            for key in event
+            for token in ("path", "sha", "identity", "subject")
+        )
+        for event in progress_events
+    )
+
     reloaded, paired_cases, baselines = p0006.load_gate01_p0006_evaluation_protocol(output)
     assert reloaded["protocol_sha256"] == protocol["protocol_sha256"]
     assert len(paired_cases) == len(baselines) == 60

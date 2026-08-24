@@ -63,6 +63,7 @@ RECOVERY_NAMESPACE = BANK_NAMESPACE / (
     + OPERATOR_IMPLEMENTATION_COMMIT[:12]
 )
 LOCAL_SCRATCH_ROOT = Path("/content/stage2_gate01_recovery_v8_scratch")
+LOCAL_BANK_ARCHIVE = LOCAL_SCRATCH_ROOT / "photometry_factored_latent_bank_v2.tar"
 LOCAL_BANK_ROOT = LOCAL_SCRATCH_ROOT / "photometry_factored_latent_bank_v2"
 LOCAL_LOG_ROOT = LOCAL_SCRATCH_ROOT / "logs"
 
@@ -152,15 +153,38 @@ from fieldbridge.data.photometry_factorization import (
 )
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     GATE01_P0006_EVALUATION_PROTOCOL,
+    P0006_COUNT_PROGRESS_ENV,
+    P0006_COUNT_PROGRESS_VALUE,
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
     P0006_EVIDENCE_LIMITATION,
     P0009_CONFIRMATION_STATUS,
+    copy_verified_stage2_bank_tar_to_local,
     load_gate01_p0006_evaluation_protocol,
     preflight_gate01_p0006_archive,
+    preflight_stage2_local_disk_capacity,
     resolve_stage2_recovery_drive_layout,
     restore_verified_stage2_bank_tar,
     verify_completed_stage2_pilot_evidence,
 )
+
+
+def emit_recovery_progress(payload):
+    allowed = {
+        "stage",
+        "status",
+        "mode",
+        "bytes_processed",
+        "total_bytes",
+        "files_processed",
+        "total_files",
+    }
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise ValueError(f"Recovery progress contains forbidden fields: {unexpected}")
+    print(
+        json.dumps({"recovery_progress": payload}, sort_keys=True),
+        flush=True,
+    )
 
 
 def load_self_hashed_json(path, hash_key):
@@ -193,6 +217,28 @@ if sha256_file(stage2_drive_layout.selection_receipt) != (
     EXPECTED_SELECTION_RECEIPT_FILE_SHA256
 ):
     raise RuntimeError("Early step-200 selection-receipt file SHA-256 mismatch.")
+
+
+local_disk_capacity = preflight_stage2_local_disk_capacity(
+    stage2_drive_layout.bank_archive,
+    LOCAL_SCRATCH_ROOT,
+    local_archive_path=LOCAL_BANK_ARCHIVE,
+    local_bank_root=LOCAL_BANK_ROOT,
+    expected_extracted_bytes=EXPECTED_BANK_TOTAL_BYTES,
+)
+print(
+    json.dumps(
+        {
+            "stage": "early_local_disk_capacity_preflight",
+            **local_disk_capacity.to_dict(),
+            "runtime_recommendation": "CPU High-RAM",
+            "gpu_required": False,
+            "gpu_used": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
 
 
 # First Drive artifact check: metadata-only, before bank/checkpoint/private-array work.
@@ -268,7 +314,7 @@ for environment_name in ("TMPDIR", "TEMP", "TMP", "TORCH_HOME"):
     Path(CLI_ENV[environment_name]).mkdir(parents=True, exist_ok=True)
 
 
-def run_logged(command, operation):
+def run_logged(command, operation, *, visible_count_progress_only=False):
     attempt_root = RECOVERY_NAMESPACE / "operation_attempts" / operation
     drive_retry(
         "create-operation-attempt-root",
@@ -306,7 +352,11 @@ def run_logged(command, operation):
         )
         assert process.stdout is not None
         for line in process.stdout:
-            print(line, end="", flush=True)
+            if (
+                not visible_count_progress_only
+                or '"p0006_import_progress"' in line
+            ):
+                print(line, end="", flush=True)
             log.write(line)
             log.flush()
         return_code = process.wait()
@@ -366,16 +416,27 @@ def seal_or_verify_exact_json(path, payload, hash_key):
     return payload
 
 
+local_bank_archive = drive_retry(
+    "copy-and-verify-reviewed-bank-tar-to-local-scratch",
+    lambda: copy_verified_stage2_bank_tar_to_local(
+        stage2_drive_layout.bank_archive,
+        LOCAL_BANK_ARCHIVE,
+        expected_archive_sha256=EXPECTED_BANK_ARCHIVE_SHA256,
+        progress_callback=emit_recovery_progress,
+    ),
+)
+local_bank_archive_identity = local_bank_archive.to_dict()
 bank_restore = drive_retry(
     "verify-and-restore-reviewed-bank-tar",
     lambda: restore_verified_stage2_bank_tar(
-        stage2_drive_layout.bank_archive,
+        local_bank_archive,
         LOCAL_BANK_ROOT,
         expected_archive_sha256=EXPECTED_BANK_ARCHIVE_SHA256,
         expected_tree_sha256=EXPECTED_BANK_TREE_SHA256,
         expected_bank_artifact_sha256=EXPECTED_BANK_ARTIFACT_SHA256,
         expected_file_count=EXPECTED_BANK_FILE_COUNT,
         expected_total_bytes=EXPECTED_BANK_TOTAL_BYTES,
+        progress_callback=emit_recovery_progress,
     ),
 )
 bank_archive_identity = bank_restore.to_dict()
@@ -384,6 +445,12 @@ print(
         {
             "stage": "reviewed_bank_tar_restore",
             "archive_sha256": bank_archive_identity["archive_file_sha256"],
+            "archive_copied_to_local_scratch": local_bank_archive_identity[
+                "copied_from_source"
+            ],
+            "archive_copy_and_sha256_same_pass": local_bank_archive_identity[
+                "copy_and_sha256_same_pass"
+            ],
             "tree_sha256": bank_archive_identity["tree_sha256"],
             "bank_artifact_sha256": bank_archive_identity[
                 "bank_artifact_sha256"
@@ -454,13 +521,40 @@ LONG_RUN_EVALUATION_READINESS = (
 FROZEN_VALIDATION_PLAN = Path(
     completed_evidence["pilot_200"]["selection_receipt"]
 ).parent / "stage2_unified_validation_plan_v2.json"
+CLI_ENV[P0006_COUNT_PROGRESS_ENV] = P0006_COUNT_PROGRESS_VALUE
 
 if P0006_EVALUATION_PROTOCOL.exists():
+    print(
+        json.dumps(
+            {
+                "p0006_import_progress": {
+                    "stage": "p0006_import_exact_resume",
+                    "status": "start",
+                    "case_count": 0,
+                }
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
         P0006_EVALUATION_PROTOCOL
     )
     if len(cases) != 60:
         raise RuntimeError("Existing P:0006 recovery protocol is incomplete.")
+    print(
+        json.dumps(
+            {
+                "p0006_import_progress": {
+                    "stage": "p0006_import_exact_resume",
+                    "status": "end",
+                    "case_count": len(cases),
+                }
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 else:
     run_logged(
         [
@@ -480,6 +574,7 @@ else:
             str(P0006_EVALUATION_PROTOCOL),
         ],
         "import-P0006-development-validation-evaluation-only",
+        visible_count_progress_only=True,
     )
     protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
         P0006_EVALUATION_PROTOCOL
@@ -541,6 +636,30 @@ if any(
 ):
     raise RuntimeError("Recovery notebook cannot authorize long-run training.")
 
+stable_local_capacity_receipt = {
+    "contract_version": local_disk_capacity.to_dict()["contract_version"],
+    "archive_bytes": local_disk_capacity.archive_bytes,
+    "extracted_bytes": local_disk_capacity.extracted_bytes,
+    "reserve_bytes": local_disk_capacity.reserve_bytes,
+    "status": "pass",
+}
+stable_local_archive_receipt = {
+    key: value
+    for key, value in local_bank_archive_identity.items()
+    if key
+    not in {
+        "copied_from_source",
+        "copy_and_sha256_same_pass",
+        "exact_local_resume_verified",
+    }
+}
+stable_local_archive_receipt["local_archive_sha256_verified"] = True
+stable_bank_tree_receipt = {
+    key: value
+    for key, value in bank_archive_identity.items()
+    if key != "restored_from_tar"
+}
+
 recovery_receipt = {
     "contract": "stage2-gate01-legacy-inventory-recovery-v1",
     "status": "evaluation_readiness_sealed_stop_before_long_run",
@@ -551,9 +670,14 @@ recovery_receipt = {
     "recovery_namespace": str(RECOVERY_NAMESPACE),
     "fresh_colab_dependency_versions": dependency_versions,
     "packages_installed_or_downloaded": False,
+    "runtime_recommendation": "CPU High-RAM",
+    "gpu_required": False,
+    "gpu_used": False,
     "output_root": str(OUTPUT_ROOT),
     "bank_archive": str(BANK_ARCHIVE),
-    "bank_archive_tree": bank_archive_identity,
+    "local_disk_capacity_preflight": stable_local_capacity_receipt,
+    "local_bank_archive": stable_local_archive_receipt,
+    "bank_archive_tree": stable_bank_tree_receipt,
     "ignored_empty_unreceipted_bank_directory": (
         ignored_empty_unreceipted_bank_directory
     ),
@@ -610,6 +734,8 @@ print(
             ],
             "training_reused": True,
             "training_invoked": False,
+            "runtime_recommendation": "CPU High-RAM",
+            "gpu_used": False,
             "long_run_training_authorized": False,
             "next_action": "STOP_FOR_RESOURCE_BOUNDED_TRAINING_DESIGN_REVIEW",
         },

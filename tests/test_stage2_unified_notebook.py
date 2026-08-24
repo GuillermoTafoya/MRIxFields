@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +32,81 @@ def _notebook_source() -> tuple[dict, str]:
     payload = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in payload["cells"])
     return payload, source
+
+
+def _checkout_validator():
+    payload, _ = _notebook_source()
+    code = "\n".join(
+        "".join(cell["source"])
+        for cell in payload["cells"]
+        if cell["cell_type"] == "code"
+    )
+    tree = ast.parse(code)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"git_probe", "validate_existing_operator_checkout"}
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
+    namespace = {"Path": Path, "os": os, "subprocess": subprocess}
+    exec(compile(module, str(NOTEBOOK), "exec"), namespace)
+    return namespace["validate_existing_operator_checkout"]
+
+
+def _fake_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[object, dict[str, str], list[tuple[str, ...]], Path, str, str, str]:
+    validate = _checkout_validator()
+    repo = tmp_path / "operator-checkout"
+    repo.mkdir()
+    repository_url = "https://github.com/GuillermoTafoya/MRIxFields.git"
+    operator_commit = "b" * 40
+    training_commit = "a" * 40
+    state = {
+        "origin": repository_url,
+        "head": operator_commit,
+        "status": "",
+        "changed": "docs/recovery.md",
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "git"
+        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        args = tuple(command[1:])
+        calls.append(args)
+        responses = {
+            ("rev-parse", "--is-inside-work-tree"): (0, "true\n"),
+            ("rev-parse", "--show-toplevel"): (0, str(repo.resolve()) + "\n"),
+            ("remote",): (0, "origin\n"),
+            ("remote", "get-url", "--all", "origin"): (0, state["origin"] + "\n"),
+            ("rev-parse", "HEAD"): (0, state["head"] + "\n"),
+            ("symbolic-ref", "-q", "HEAD"): (1, ""),
+            ("status", "--porcelain=v1", "--untracked-files=all"): (
+                0,
+                state["status"],
+            ),
+            ("merge-base", "--is-ancestor", training_commit, "HEAD"): (0, ""),
+            ("diff", "--name-only", training_commit, "HEAD"): (
+                0,
+                state["changed"] + "\n",
+            ),
+        }
+        return_code, stdout = responses[args]
+        return SimpleNamespace(returncode=return_code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return (
+        validate,
+        state,
+        calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
+    )
 
 
 def test_recovery_notebook_is_unexecuted_output_free_and_ast_valid() -> None:
@@ -73,6 +151,7 @@ def test_gate01_metadata_preflight_precedes_every_expensive_recovery_operation()
     source = OPERATOR.read_text(encoding="utf-8")
     ast.parse(source)
     topology_preflight = source.index("stage2_drive_layout = drive_retry")
+    disk_preflight = source.index("local_disk_capacity =")
     preflight = source.index("gate01_preflight = drive_retry")
     pair_preflight = source.index("pair_feasibility = drive_retry")
     assert source.index("preflight_gate01_p0006_archive(", preflight) > preflight
@@ -84,7 +163,13 @@ def test_gate01_metadata_preflight_precedes_every_expensive_recovery_operation()
         "seal-stage2-long-run-evaluation-readiness",
     ):
         assert preflight < source.index(operation)
-    assert source.index("drive.mount") < topology_preflight < preflight < pair_preflight
+    assert (
+        source.index("drive.mount")
+        < topology_preflight
+        < disk_preflight
+        < preflight
+        < pair_preflight
+    )
     assert pair_preflight < source.index("bank_restore = drive_retry")
     assert "resolve-exact-stage2-drive-layout" in source
     assert "Early step-200 selection-receipt file SHA-256 mismatch" in source
@@ -144,10 +229,140 @@ def test_recovery_operator_pins_and_verifies_reviewed_bank_tar() -> None:
         "EXPECTED_BANK_FILE_COUNT = 3312",
         "EXPECTED_BANK_TOTAL_BYTES = 12873486620",
         "restore_verified_stage2_bank_tar",
+        "copy_verified_stage2_bank_tar_to_local",
+        "preflight_stage2_local_disk_capacity",
+        "LOCAL_BANK_ARCHIVE",
+        "CPU High-RAM",
+        '"gpu_used": False',
+        "progress_callback=emit_recovery_progress",
         "ignored_empty_unreceipted_bank_directory",
         "resolve_stage2_recovery_drive_layout",
     ):
         assert required in source
+    assert source.index("copy_verified_stage2_bank_tar_to_local(") < source.index(
+        "restore_verified_stage2_bank_tar("
+    )
+    assert (
+        "restore_verified_stage2_bank_tar(\n"
+        "        stage2_drive_layout.bank_archive"
+        not in source
+    )
+
+
+def test_existing_checkout_is_reused_only_through_read_only_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        validate,
+        _state,
+        calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
+    ) = _fake_checkout(monkeypatch, tmp_path)
+    first = validate(repo, repository_url, operator_commit, training_commit)
+    second = validate(repo, repository_url, operator_commit, training_commit)
+    assert first == second == {"changed_path_count": 1, "checkout_reused": True}
+    assert calls
+    assert not any(
+        args and args[0] in {"clone", "fetch", "checkout", "reset", "clean"}
+        for args in calls
+    )
+
+    _, source = _notebook_source()
+    reuse_start = source.index("if checkout_reused:")
+    reuse_end = source.index("\nelse:", reuse_start)
+    reuse_branch = source[reuse_start:reuse_end]
+    for forbidden in ("git', 'clone", "git', 'fetch", "git', 'checkout", "rmtree"):
+        assert forbidden not in reuse_branch
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("status", "?? changed.py\n", "dirty"),
+        ("head", "c" * 40, "wrong commit"),
+        (
+            "origin",
+            "https://example.invalid/wrong.git",
+            "origin differs",
+        ),
+        ("changed", "src/fieldbridge/training/stage2_unified.py", "training_critical"),
+    ],
+)
+def test_existing_checkout_rejects_dirty_wrong_or_training_changed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    (
+        validate,
+        state,
+        _calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
+    ) = _fake_checkout(monkeypatch, tmp_path)
+    state[field] = value
+    with pytest.raises(RuntimeError, match=message):
+        validate(repo, repository_url, operator_commit, training_commit)
+
+
+def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    for progress_stage in (
+        "bank_archive_local_copy",
+        "bank_archive_extraction",
+        "bank_tree_verification",
+    ):
+        assert progress_stage in importer_source
+    for required in (
+        "P0006_COUNT_PROGRESS_ENV",
+        "P0006_COUNT_PROGRESS_VALUE",
+        "p0006_import_exact_resume",
+        "visible_count_progress_only=True",
+        "early_local_disk_capacity_preflight",
+        "runtime_recommendation",
+        '"gpu_required": False',
+        '"gpu_used": False',
+    ):
+        assert required in source
+    progress_block = source[
+        source.index("def emit_recovery_progress"):
+        source.index("def load_self_hashed_json")
+    ]
+    for forbidden in ("path", "sha256", "identity", "subject", "fingerprint"):
+        assert f'"{forbidden}"' not in progress_block
+
+
+def test_same_runtime_receipt_excludes_transient_resume_observations() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert '"local_disk_capacity_preflight": stable_local_capacity_receipt' in source
+    assert '"local_bank_archive": stable_local_archive_receipt' in source
+    assert '"bank_archive_tree": stable_bank_tree_receipt' in source
+    normalization = source[
+        source.index("stable_local_capacity_receipt ="):
+        source.index("recovery_receipt =")
+    ]
+    for transient in (
+        "copied_from_source",
+        "copy_and_sha256_same_pass",
+        "exact_local_resume_verified",
+        "restored_from_tar",
+    ):
+        assert transient in normalization
+    receipt = source[source.index("recovery_receipt ="):]
+    assert '"local_disk_capacity_preflight": local_disk_capacity.to_dict()' not in receipt
+    assert '"local_bank_archive": local_bank_archive_identity' not in receipt
+    assert '"bank_archive_tree": bank_archive_identity' not in receipt
 
 
 def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only() -> None:

@@ -161,6 +161,12 @@ That recovery resolves the evidence beneath the exact
 `photometry_factored_latent_bank_v2.tar`. The archive, extracted tree, manifest artifact, file
 count, and byte count are all pinned; the empty unreceipted bank directory is never selected as a
 source. The exact pair-feasibility receipt is also resolved directly beneath that output root.
+The recovery first checks local capacity, streams the Drive tar to local scratch while hashing
+that same copy pass, and extracts only the verified local file. Copy, extraction, tree
+verification, and P:0006 import emit count-only progress. CPU High-RAM is recommended; no GPU is
+used. A same-runtime rerun reuses an existing checkout only after read-only proof that its origin,
+detached commit, cleanliness, ancestry, and operator-only diff are exact; otherwise it fails
+without mutating that checkout.
 
 Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
 exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records

@@ -16,7 +16,8 @@ import os
 import re
 import shutil
 import tarfile
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -87,6 +88,8 @@ GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1 = (
 GATE01_ARCHIVE_PREFLIGHT_CONTRACT = "gate01-p0006-metadata-preflight-v1"
 STAGE2_COMPLETED_PILOT_REUSE_CONTRACT = "stage2-completed-pilot-reuse-verification-v1"
 STAGE2_BANK_TAR_RESTORE_CONTRACT = "stage2-reviewed-bank-tar-restore-v1"
+STAGE2_LOCAL_ARCHIVE_COPY_CONTRACT = "stage2-reviewed-bank-local-copy-v1"
+STAGE2_LOCAL_DISK_PREFLIGHT_CONTRACT = "stage2-recovery-local-disk-preflight-v1"
 STAGE2_BANK_MANIFEST_FILENAME = "photometry_factored_latent_bank_manifest.json"
 STAGE2_RECOVERY_DRIVE_LAYOUT_CONTRACT = "stage2-recovery-drive-layout-v1"
 STAGE2_RECOVERY_OUTPUT_ROOT_NAME = "UnifiedStage2_1ca2b4a_01"
@@ -101,6 +104,12 @@ STAGE2_RECOVERY_PAIR_FEASIBILITY_NAME = (
 STAGE2_RECOVERY_SELECTION_RECEIPT_NAME = (
     "stage2_unified_full_selection_step000000200.json"
 )
+STAGE2_PROGRESS_MAX_INTERVAL_SECONDS = 30.0
+STAGE2_PROGRESS_MAX_INTERVAL_BYTES = 512 * 1024**2
+STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES = 256
+STAGE2_LOCAL_DISK_RESERVE_BYTES = 2 * 1024**3
+P0006_COUNT_PROGRESS_ENV = "FIELDBRIDGE_STAGE2_P0006_COUNT_PROGRESS"
+P0006_COUNT_PROGRESS_VALUE = "count-only-json-v1"
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 EXPECTED_STAGE2_SELECTION_RECEIPT_FILE_SHA256 = (
     "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828"
@@ -247,6 +256,60 @@ class VerifiedStage2BankRestore:
 
 
 @dataclass(frozen=True, slots=True)
+class Stage2LocalDiskCapacityPreflight:
+    """Count-only local capacity proof before copying or extracting the bank."""
+
+    archive_bytes: int
+    extracted_bytes: int
+    reserve_bytes: int
+    additional_archive_bytes: int
+    additional_extracted_bytes: int
+    required_available_bytes: int
+    free_bytes: int
+    local_archive_already_present: bool
+    local_bank_already_present: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": STAGE2_LOCAL_DISK_PREFLIGHT_CONTRACT,
+            "archive_bytes": self.archive_bytes,
+            "extracted_bytes": self.extracted_bytes,
+            "reserve_bytes": self.reserve_bytes,
+            "additional_archive_bytes": self.additional_archive_bytes,
+            "additional_extracted_bytes": self.additional_extracted_bytes,
+            "required_available_bytes": self.required_available_bytes,
+            "free_bytes": self.free_bytes,
+            "local_archive_already_present": self.local_archive_already_present,
+            "local_bank_already_present": self.local_bank_already_present,
+            "status": "pass",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedStage2LocalArchive:
+    """A reviewed Drive tar copied and SHA-verified in one streaming pass."""
+
+    source_archive_path: Path
+    local_archive_path: Path
+    archive_file_sha256: str
+    archive_bytes: int
+    local_mtime_ns: int
+    copied_from_source: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": STAGE2_LOCAL_ARCHIVE_COPY_CONTRACT,
+            "source_archive_path": str(self.source_archive_path),
+            "local_archive_path": str(self.local_archive_path),
+            "archive_file_sha256": self.archive_file_sha256,
+            "archive_bytes": self.archive_bytes,
+            "copied_from_source": self.copied_from_source,
+            "copy_and_sha256_same_pass": self.copied_from_source,
+            "exact_local_resume_verified": not self.copied_from_source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Stage2RecoveryDriveLayout:
     """Exact reviewed Drive topology for the completed Stage-2 v7 evidence."""
 
@@ -387,16 +450,307 @@ def _stage2_recovery_direct_file(parent: Path, name: str, *, label: str) -> Path
     return candidate
 
 
-def stage2_bank_tree_identity(root: str | Path) -> dict[str, Any]:
+def preflight_stage2_local_disk_capacity(
+    source_archive_path: str | Path,
+    scratch_root: str | Path,
+    *,
+    local_archive_path: str | Path,
+    local_bank_root: str | Path,
+    expected_extracted_bytes: int,
+    reserve_bytes: int = STAGE2_LOCAL_DISK_RESERVE_BYTES,
+) -> Stage2LocalDiskCapacityPreflight:
+    """Fail before large I/O unless local scratch can hold the tar and bank."""
+
+    if type(expected_extracted_bytes) is not int or expected_extracted_bytes <= 0:
+        raise ValueError("Expected extracted byte count must be a positive integer.")
+    if type(reserve_bytes) is not int or reserve_bytes < 0:
+        raise ValueError("Local disk reserve must be a nonnegative integer.")
+    source = _validated_stage2_archive_file(
+        source_archive_path, label="reviewed Drive bank archive"
+    )
+    archive_bytes = source.stat().st_size
+    if archive_bytes <= 0:
+        raise ValueError("Reviewed Stage-2 bank archive is empty.")
+
+    local_archive = Path(local_archive_path)
+    archive_present = local_archive.exists() or local_archive.is_symlink()
+    if archive_present:
+        verified_local = _validated_stage2_archive_file(
+            local_archive, label="existing local bank archive"
+        )
+        if verified_local.stat().st_size != archive_bytes:
+            raise ValueError("Existing local bank archive byte count differs from Drive.")
+
+    local_bank = Path(local_bank_root)
+    bank_present = local_bank.exists() or local_bank.is_symlink()
+    if bank_present and (local_bank.is_symlink() or not local_bank.is_dir()):
+        raise ValueError("Existing local bank root must be a nonsymlink directory.")
+
+    probe = Path(scratch_root)
+    while not probe.exists():
+        if probe.parent == probe:
+            raise FileNotFoundError("No existing parent is available for local scratch.")
+        probe = probe.parent
+    if probe.is_symlink():
+        raise ValueError("Local scratch capacity probe may not be a symlink.")
+    usage = shutil.disk_usage(probe.resolve(strict=True))
+    additional_archive_bytes = 0 if archive_present else archive_bytes
+    additional_extracted_bytes = 0 if bank_present else expected_extracted_bytes
+    required = additional_archive_bytes + additional_extracted_bytes + reserve_bytes
+    if usage.free < required:
+        raise OSError(
+            "Insufficient local disk for reviewed Stage-2 recovery: "
+            f"required_available_bytes={required}, free_bytes={usage.free}."
+        )
+    return Stage2LocalDiskCapacityPreflight(
+        archive_bytes=archive_bytes,
+        extracted_bytes=expected_extracted_bytes,
+        reserve_bytes=reserve_bytes,
+        additional_archive_bytes=additional_archive_bytes,
+        additional_extracted_bytes=additional_extracted_bytes,
+        required_available_bytes=required,
+        free_bytes=usage.free,
+        local_archive_already_present=archive_present,
+        local_bank_already_present=bank_present,
+    )
+
+
+def copy_verified_stage2_bank_tar_to_local(
+    source_archive_path: str | Path,
+    local_archive_path: str | Path,
+    *,
+    expected_archive_sha256: str,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_interval_seconds: float = STAGE2_PROGRESS_MAX_INTERVAL_SECONDS,
+    progress_interval_bytes: int = STAGE2_PROGRESS_MAX_INTERVAL_BYTES,
+) -> VerifiedStage2LocalArchive:
+    """Copy Drive tar to local scratch while hashing the single read stream."""
+
+    if _SHA256_RE.fullmatch(expected_archive_sha256) is None:
+        raise ValueError("Expected Stage-2 archive identity must be lowercase SHA-256.")
+    _validate_progress_intervals(
+        seconds=progress_interval_seconds,
+        byte_interval=progress_interval_bytes,
+    )
+    source = _validated_stage2_archive_file(
+        source_archive_path, label="reviewed Drive bank archive"
+    )
+    source_stat = source.stat()
+    if source_stat.st_size <= 0:
+        raise ValueError("Reviewed Stage-2 bank archive is empty.")
+
+    raw_destination = Path(local_archive_path)
+    if raw_destination.is_symlink():
+        raise ValueError("Local Stage-2 bank archive may not be a symlink.")
+    raw_destination.parent.mkdir(parents=True, exist_ok=True)
+    destination_parent = raw_destination.parent.resolve(strict=True)
+    destination = destination_parent / raw_destination.name
+    if source == destination:
+        raise ValueError("Drive source and local Stage-2 archive must differ.")
+
+    if destination.exists():
+        existing = _validated_stage2_archive_file(
+            destination, label="existing local bank archive"
+        )
+        if existing.stat().st_size != source_stat.st_size:
+            raise ValueError("Existing local bank archive byte count differs from Drive.")
+        digest, copied_bytes = _stream_stage2_archive(
+            existing,
+            destination_handle=None,
+            mode="verify_existing",
+            progress_callback=progress_callback,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_interval_bytes=progress_interval_bytes,
+        )
+        if digest != expected_archive_sha256:
+            raise ValueError("Existing local Stage-2 bank tar SHA-256 mismatch.")
+        final_stat = existing.stat()
+        return VerifiedStage2LocalArchive(
+            source_archive_path=source,
+            local_archive_path=existing,
+            archive_file_sha256=digest,
+            archive_bytes=copied_bytes,
+            local_mtime_ns=final_stat.st_mtime_ns,
+            copied_from_source=False,
+        )
+
+    attempt = 1
+    while True:
+        staging = destination_parent / (
+            f"{destination.name}.copy-attempt-{attempt:04d}.partial"
+        )
+        if not staging.exists() and not staging.is_symlink():
+            break
+        attempt += 1
+    with staging.open("xb") as destination_handle:
+        digest, copied_bytes = _stream_stage2_archive(
+            source,
+            destination_handle=destination_handle,
+            mode="copy",
+            progress_callback=progress_callback,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_interval_bytes=progress_interval_bytes,
+        )
+        destination_handle.flush()
+        os.fsync(destination_handle.fileno())
+    source_after = source.stat()
+    if (
+        source_after.st_size != source_stat.st_size
+        or source_after.st_mtime_ns != source_stat.st_mtime_ns
+        or copied_bytes != source_stat.st_size
+    ):
+        raise ValueError("Reviewed Drive bank archive changed during local copy.")
+    if digest != expected_archive_sha256:
+        raise ValueError("Reviewed Stage-2 bank tar SHA-256 mismatch during local copy.")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("Concurrent Stage-2 archive copy created the final path.")
+    try:
+        os.link(staging, destination)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            "Concurrent Stage-2 archive copy created the final path."
+        ) from exc
+    staging.unlink()
+    final_stat = destination.stat()
+    return VerifiedStage2LocalArchive(
+        source_archive_path=source,
+        local_archive_path=destination,
+        archive_file_sha256=digest,
+        archive_bytes=copied_bytes,
+        local_mtime_ns=final_stat.st_mtime_ns,
+        copied_from_source=True,
+    )
+
+
+def _validated_stage2_archive_file(path: str | Path, *, label: str) -> Path:
+    raw = Path(path)
+    if raw.is_symlink():
+        raise ValueError(f"{label} may not be a symlink.")
+    try:
+        resolved = raw.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} is missing: {raw}") from exc
+    if not resolved.is_file() or resolved.suffix != ".tar":
+        raise ValueError(f"{label} must be a regular .tar file.")
+    return resolved
+
+
+def _validate_progress_intervals(
+    *,
+    seconds: float,
+    byte_interval: int | None = None,
+    file_interval: int | None = None,
+) -> None:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not 0 < float(seconds) <= STAGE2_PROGRESS_MAX_INTERVAL_SECONDS
+    ):
+        raise ValueError("Progress seconds must be greater than zero and at most 30.")
+    if byte_interval is not None and (
+        type(byte_interval) is not int
+        or not 0 < byte_interval <= STAGE2_PROGRESS_MAX_INTERVAL_BYTES
+    ):
+        raise ValueError("Progress byte interval must be at most 512 MiB.")
+    if file_interval is not None and (
+        type(file_interval) is not int
+        or not 0 < file_interval <= STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES
+    ):
+        raise ValueError("Tree progress file interval must be at most 256 files.")
+
+
+def _stream_stage2_archive(
+    source: Path,
+    *,
+    destination_handle: Any | None,
+    mode: Literal["copy", "verify_existing"],
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    progress_interval_seconds: float,
+    progress_interval_bytes: int,
+) -> tuple[str, int]:
+    total_bytes = source.stat().st_size
+    processed = 0
+    digest = hashlib.sha256()
+    start = time.monotonic()
+    last_time = start
+    last_bytes = 0
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "bank_archive_local_copy",
+            "status": "start",
+            "mode": mode,
+            "bytes_processed": 0,
+            "total_bytes": total_bytes,
+        },
+    )
+    with source.open("rb") as source_handle:
+        while True:
+            chunk = source_handle.read(8 * 1024**2)
+            if not chunk:
+                break
+            if destination_handle is not None:
+                destination_handle.write(chunk)
+            digest.update(chunk)
+            processed += len(chunk)
+            now = time.monotonic()
+            if (
+                now - last_time >= progress_interval_seconds
+                or processed - last_bytes >= progress_interval_bytes
+            ):
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "stage": "bank_archive_local_copy",
+                        "status": "periodic",
+                        "mode": mode,
+                        "bytes_processed": processed,
+                        "total_bytes": total_bytes,
+                    },
+                )
+                last_time = now
+                last_bytes = processed
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "bank_archive_local_copy",
+            "status": "end",
+            "mode": mode,
+            "bytes_processed": processed,
+            "total_bytes": total_bytes,
+        },
+    )
+    return digest.hexdigest(), processed
+
+
+def _emit_progress(
+    callback: Callable[[dict[str, Any]], None] | None,
+    payload: dict[str, Any],
+) -> None:
+    if callback is not None:
+        callback(dict(payload))
+
+
+def stage2_bank_tree_identity(
+    root: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_interval_seconds: float = STAGE2_PROGRESS_MAX_INTERVAL_SECONDS,
+    progress_interval_files: int = STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES,
+) -> dict[str, Any]:
     """Hash the complete bank tree using the reviewed v7 identity contract."""
 
+    _validate_progress_intervals(
+        seconds=progress_interval_seconds,
+        file_interval=progress_interval_files,
+    )
     raw_root = Path(root)
     if raw_root.is_symlink():
         raise ValueError("Stage-2 bank root may not be a symlink.")
     resolved_root = raw_root.resolve()
     if not resolved_root.is_dir():
         raise FileNotFoundError(f"Stage-2 bank root is missing: {resolved_root}")
-    rows: list[dict[str, Any]] = []
+    file_paths: list[Path] = []
     for path in sorted(resolved_root.rglob("*")):
         if path.is_symlink():
             raise ValueError(f"Stage-2 bank tree contains a symlink: {path}")
@@ -404,20 +758,67 @@ def stage2_bank_tree_identity(root: str | Path) -> dict[str, Any]:
             continue
         if not path.is_file():
             raise ValueError(f"Stage-2 bank tree contains a special entry: {path}")
+        file_paths.append(path)
+    if not file_paths:
+        raise ValueError("Stage-2 bank tree is empty.")
+
+    rows: list[dict[str, Any]] = []
+    processed_bytes = 0
+    start = time.monotonic()
+    last_time = start
+    last_files = 0
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "bank_tree_verification",
+            "status": "start",
+            "files_processed": 0,
+            "total_files": len(file_paths),
+            "bytes_processed": 0,
+        },
+    )
+    for file_count, path in enumerate(file_paths, start=1):
         resolved = path.resolve(strict=True)
         try:
             relative = resolved.relative_to(resolved_root)
         except ValueError as exc:
             raise ValueError("Stage-2 bank file escapes the restored root.") from exc
+        size = resolved.stat().st_size
         rows.append(
             {
                 "path": relative.as_posix(),
-                "bytes": resolved.stat().st_size,
+                "bytes": size,
                 "sha256": sha256_file(resolved),
             }
         )
-    if not rows:
-        raise ValueError("Stage-2 bank tree is empty.")
+        processed_bytes += size
+        now = time.monotonic()
+        if (
+            now - last_time >= progress_interval_seconds
+            or file_count - last_files >= progress_interval_files
+        ):
+            _emit_progress(
+                progress_callback,
+                {
+                    "stage": "bank_tree_verification",
+                    "status": "periodic",
+                    "files_processed": file_count,
+                    "total_files": len(file_paths),
+                    "bytes_processed": processed_bytes,
+                },
+            )
+            last_time = now
+            last_files = file_count
+    _emit_progress(
+        progress_callback,
+        {
+            "stage": "bank_tree_verification",
+            "status": "end",
+            "files_processed": len(rows),
+            "total_files": len(file_paths),
+            "bytes_processed": processed_bytes,
+        },
+    )
     return {
         "file_count": len(rows),
         "total_bytes": sum(int(row["bytes"]) for row in rows),
@@ -426,7 +827,7 @@ def stage2_bank_tree_identity(root: str | Path) -> dict[str, Any]:
 
 
 def restore_verified_stage2_bank_tar(
-    archive_path: str | Path,
+    archive_path: str | Path | VerifiedStage2LocalArchive,
     destination: str | Path,
     *,
     expected_archive_sha256: str,
@@ -434,6 +835,10 @@ def restore_verified_stage2_bank_tar(
     expected_bank_artifact_sha256: str,
     expected_file_count: int,
     expected_total_bytes: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_interval_seconds: float = STAGE2_PROGRESS_MAX_INTERVAL_SECONDS,
+    progress_interval_bytes: int = STAGE2_PROGRESS_MAX_INTERVAL_BYTES,
+    tree_progress_interval_files: int = STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES,
 ) -> VerifiedStage2BankRestore:
     """Safely restore the exact reviewed bank tar into an immutable local root."""
 
@@ -448,22 +853,36 @@ def restore_verified_stage2_bank_tar(
         raise ValueError("Expected Stage-2 bank file count must be a positive integer.")
     if type(expected_total_bytes) is not int or expected_total_bytes <= 0:
         raise ValueError("Expected Stage-2 bank byte count must be a positive integer.")
+    _validate_progress_intervals(
+        seconds=progress_interval_seconds,
+        byte_interval=progress_interval_bytes,
+        file_interval=tree_progress_interval_files,
+    )
 
-    raw_archive = Path(archive_path)
-    if raw_archive.is_symlink():
-        raise ValueError("Reviewed Stage-2 bank archive may not be a symlink.")
-    try:
-        archive = raw_archive.resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"Reviewed Stage-2 bank tar is missing: {raw_archive}"
-        ) from exc
-    if not archive.is_file() or archive.suffix != ".tar":
-        raise ValueError("Reviewed Stage-2 bank archive must be a regular .tar file.")
-    if sha256_file(archive) != expected_archive_sha256:
-        raise ValueError("Reviewed Stage-2 bank tar SHA-256 mismatch.")
+    if isinstance(archive_path, VerifiedStage2LocalArchive):
+        verified_archive = archive_path
+        archive = _validated_stage2_archive_file(
+            verified_archive.local_archive_path,
+            label="verified local Stage-2 bank archive",
+        )
+        current_stat = archive.stat()
+        if (
+            verified_archive.archive_file_sha256 != expected_archive_sha256
+            or verified_archive.archive_bytes != current_stat.st_size
+            or verified_archive.local_mtime_ns != current_stat.st_mtime_ns
+        ):
+            raise ValueError("Verified local Stage-2 bank archive receipt changed.")
+    else:
+        archive = _validated_stage2_archive_file(
+            archive_path, label="reviewed Stage-2 bank archive"
+        )
+        if sha256_file(archive) != expected_archive_sha256:
+            raise ValueError("Reviewed Stage-2 bank tar SHA-256 mismatch.")
 
-    bank_root = Path(destination).resolve()
+    raw_bank_root = Path(destination)
+    if raw_bank_root.is_symlink():
+        raise ValueError("Local Stage-2 bank root may not be a symlink.")
+    bank_root = raw_bank_root.resolve()
     if bank_root.exists():
         identity = _verify_restored_stage2_bank(
             bank_root,
@@ -471,6 +890,9 @@ def restore_verified_stage2_bank_tar(
             expected_bank_artifact_sha256=expected_bank_artifact_sha256,
             expected_file_count=expected_file_count,
             expected_total_bytes=expected_total_bytes,
+            progress_callback=progress_callback,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_interval_files=tree_progress_interval_files,
         )
         return VerifiedStage2BankRestore(
             archive_path=archive,
@@ -489,11 +911,17 @@ def restore_verified_stage2_bank_tar(
         staging = bank_root.parent / (
             f"{bank_root.name}.restore-attempt-{attempt:04d}.partial"
         )
-        if not staging.exists():
+        if not staging.exists() and not staging.is_symlink():
             staging.mkdir()
             break
         attempt += 1
-    _safe_extract_reviewed_stage2_bank_tar(archive, staging)
+    _safe_extract_reviewed_stage2_bank_tar(
+        archive,
+        staging,
+        progress_callback=progress_callback,
+        progress_interval_seconds=progress_interval_seconds,
+        progress_interval_bytes=progress_interval_bytes,
+    )
     extracted_root = _resolve_extracted_stage2_bank_root(staging)
     identity = _verify_restored_stage2_bank(
         extracted_root,
@@ -501,6 +929,9 @@ def restore_verified_stage2_bank_tar(
         expected_bank_artifact_sha256=expected_bank_artifact_sha256,
         expected_file_count=expected_file_count,
         expected_total_bytes=expected_total_bytes,
+        progress_callback=progress_callback,
+        progress_interval_seconds=progress_interval_seconds,
+        progress_interval_files=tree_progress_interval_files,
     )
     if bank_root.exists():
         raise FileExistsError(
@@ -521,13 +952,20 @@ def restore_verified_stage2_bank_tar(
     )
 
 
-def _safe_extract_reviewed_stage2_bank_tar(archive: Path, staging: Path) -> None:
+def _safe_extract_reviewed_stage2_bank_tar(
+    archive: Path,
+    staging: Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    progress_interval_seconds: float,
+    progress_interval_bytes: int,
+) -> None:
     seen: set[str] = set()
-    regular_file_count = 0
     with tarfile.open(archive, mode="r:") as bundle:
         members = bundle.getmembers()
         if not members:
             raise ValueError("Reviewed Stage-2 bank tar is empty.")
+        planned: list[tuple[tarfile.TarInfo, PurePosixPath]] = []
         for member in members:
             relative = _safe_stage2_tar_member_path(member)
             if relative is None:
@@ -536,6 +974,34 @@ def _safe_extract_reviewed_stage2_bank_tar(archive: Path, staging: Path) -> None
             if folded in seen:
                 raise ValueError("Reviewed Stage-2 bank tar has duplicate member paths.")
             seen.add(folded)
+            if not member.isdir() and (not member.isreg() or member.size < 0):
+                raise ValueError(
+                    "Reviewed Stage-2 bank tar contains a link or special member."
+                )
+            planned.append((member, relative))
+
+        total_files = sum(1 for member, _ in planned if member.isreg())
+        total_bytes = sum(member.size for member, _ in planned if member.isreg())
+        if total_files == 0:
+            raise ValueError("Reviewed Stage-2 bank tar contains no regular files.")
+        processed_files = 0
+        processed_bytes = 0
+        start = time.monotonic()
+        last_time = start
+        last_bytes = 0
+        last_files = 0
+        _emit_progress(
+            progress_callback,
+            {
+                "stage": "bank_archive_extraction",
+                "status": "start",
+                "files_processed": 0,
+                "total_files": total_files,
+                "bytes_processed": 0,
+                "total_bytes": total_bytes,
+            },
+        )
+        for member, relative in planned:
             target = (staging / Path(*relative.parts)).resolve()
             try:
                 target.relative_to(staging.resolve())
@@ -544,23 +1010,75 @@ def _safe_extract_reviewed_stage2_bank_tar(archive: Path, staging: Path) -> None
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
-            if not member.isreg() or member.size < 0:
-                raise ValueError(
-                    "Reviewed Stage-2 bank tar contains a link or special member."
-                )
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 raise ValueError("Reviewed Stage-2 bank tar would overwrite a member.")
             source = bundle.extractfile(member)
             if source is None:
                 raise ValueError("Reviewed Stage-2 bank tar regular member is unreadable.")
+            member_bytes = 0
             with source, target.open("xb") as destination_handle:
-                shutil.copyfileobj(source, destination_handle)
-            if target.stat().st_size != member.size:
+                while True:
+                    chunk = source.read(8 * 1024**2)
+                    if not chunk:
+                        break
+                    destination_handle.write(chunk)
+                    member_bytes += len(chunk)
+                    processed_bytes += len(chunk)
+                    now = time.monotonic()
+                    if (
+                        now - last_time >= progress_interval_seconds
+                        or processed_bytes - last_bytes >= progress_interval_bytes
+                    ):
+                        _emit_progress(
+                            progress_callback,
+                            {
+                                "stage": "bank_archive_extraction",
+                                "status": "periodic",
+                                "files_processed": processed_files,
+                                "total_files": total_files,
+                                "bytes_processed": processed_bytes,
+                                "total_bytes": total_bytes,
+                            },
+                        )
+                        last_time = now
+                        last_bytes = processed_bytes
+                        last_files = processed_files
+            if member_bytes != member.size or target.stat().st_size != member.size:
                 raise ValueError("Reviewed Stage-2 bank tar member size changed on extract.")
-            regular_file_count += 1
-    if regular_file_count == 0:
-        raise ValueError("Reviewed Stage-2 bank tar contains no regular files.")
+            processed_files += 1
+            now = time.monotonic()
+            if (
+                now - last_time >= progress_interval_seconds
+                or processed_bytes - last_bytes >= progress_interval_bytes
+                or processed_files - last_files
+                >= STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES
+            ):
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "stage": "bank_archive_extraction",
+                        "status": "periodic",
+                        "files_processed": processed_files,
+                        "total_files": total_files,
+                        "bytes_processed": processed_bytes,
+                        "total_bytes": total_bytes,
+                    },
+                )
+                last_time = now
+                last_bytes = processed_bytes
+                last_files = processed_files
+        _emit_progress(
+            progress_callback,
+            {
+                "stage": "bank_archive_extraction",
+                "status": "end",
+                "files_processed": processed_files,
+                "total_files": total_files,
+                "bytes_processed": processed_bytes,
+                "total_bytes": total_bytes,
+            },
+        )
 
 
 def _safe_stage2_tar_member_path(member: tarfile.TarInfo) -> PurePosixPath | None:
@@ -614,8 +1132,16 @@ def _verify_restored_stage2_bank(
     expected_bank_artifact_sha256: str,
     expected_file_count: int,
     expected_total_bytes: int,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    progress_interval_seconds: float,
+    progress_interval_files: int,
 ) -> dict[str, Any]:
-    identity = stage2_bank_tree_identity(root)
+    identity = stage2_bank_tree_identity(
+        root,
+        progress_callback=progress_callback,
+        progress_interval_seconds=progress_interval_seconds,
+        progress_interval_files=progress_interval_files,
+    )
     if identity != {
         "file_count": expected_file_count,
         "total_bytes": expected_total_bytes,
@@ -972,6 +1498,23 @@ def _single_inventory_json_contract(
     return candidates[0]
 
 
+def _resolve_p0006_count_progress_callback(
+    callback: Callable[[dict[str, Any]], None] | None,
+) -> Callable[[dict[str, Any]], None] | None:
+    if callback is not None:
+        return callback
+    if os.environ.get(P0006_COUNT_PROGRESS_ENV) != P0006_COUNT_PROGRESS_VALUE:
+        return None
+
+    def emit(payload: dict[str, Any]) -> None:
+        print(
+            json.dumps({"p0006_import_progress": payload}, sort_keys=True),
+            flush=True,
+        )
+
+    return emit
+
+
 def import_gate01_p0006_evaluation_protocol(
     archive_root: str | Path,
     *,
@@ -979,9 +1522,20 @@ def import_gate01_p0006_evaluation_protocol(
     bank_dir: str | Path,
     validation_plan_path: str | Path,
     output_path: str | Path,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Seal Gate01Private_8012a3f for P:0006 development/model assessment only."""
 
+    progress = _resolve_p0006_count_progress_callback(progress_callback)
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_import",
+            "status": "start",
+            "verified_inventory_entry_count": 0,
+            "case_count": 0,
+        },
+    )
     metadata = _preflight_gate01_p0006_archive(
         archive_root,
         expected_gate01_result_sha256=expected_gate01_result_sha256,
@@ -997,6 +1551,15 @@ def import_gate01_p0006_evaluation_protocol(
     calibrator = metadata.calibrator
     gate_manifest = metadata.gate_manifest
     gate_metadata = metadata.gate_metadata
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_import",
+            "status": "periodic",
+            "verified_inventory_entry_count": len(layout.entries),
+            "case_count": 0,
+        },
+    )
 
     train_index = PhotometryFactoredLatentBankIndex(bank_dir, "train")
     validation_index = PhotometryFactoredLatentBankIndex(bank_dir, "validation")
@@ -1024,9 +1587,31 @@ def import_gate01_p0006_evaluation_protocol(
         )
     ):
         raise ValueError("A P endpoint entered the frozen unpaired validation plan.")
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_import",
+            "status": "periodic",
+            "train_record_count": len(train_index.records),
+            "validation_record_count": len(validation_index.records),
+            "case_count": 0,
+        },
+    )
 
     cases = list(gate_manifest)
-    case_receipts = [_case_receipt(case, calibrator) for case in cases]
+    case_receipts = []
+    for case_count, case in enumerate(cases, start=1):
+        case_receipts.append(_case_receipt(case, calibrator))
+        if case_count % 10 == 0 or case_count == len(cases):
+            _emit_progress(
+                progress,
+                {
+                    "stage": "p0006_import",
+                    "status": "periodic",
+                    "case_count": case_count,
+                    "expected_case_count": len(cases),
+                },
+            )
     directed_cells = {
         (
             case.source_domain.contrast.value,
@@ -1141,6 +1726,18 @@ def import_gate01_p0006_evaluation_protocol(
     }
     body["protocol_sha256"] = sha256_json(body)
     write_json_atomic(output_path, body, refuse_existing=True)
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_import",
+            "status": "end",
+            "verified_inventory_entry_count": len(layout.entries),
+            "train_record_count": len(train_index.records),
+            "validation_record_count": len(validation_index.records),
+            "case_count": len(cases),
+            "acquisition_node_count": len(acquisition_nodes),
+        },
+    )
     return body
 
 
@@ -2146,17 +2743,26 @@ __all__ = [
     "P0006_EVIDENCE_LIMITATION",
     "P0006_IDENTITY_SHA256",
     "P0006_SUBJECT_GROUP",
+    "P0006_COUNT_PROGRESS_ENV",
+    "P0006_COUNT_PROGRESS_VALUE",
     "P0009_CONFIRMATION_STATUS",
     "STAGE2_BANK_MANIFEST_FILENAME",
     "STAGE2_BANK_TAR_RESTORE_CONTRACT",
     "STAGE2_COMPLETED_PILOT_REUSE_CONTRACT",
+    "STAGE2_LOCAL_ARCHIVE_COPY_CONTRACT",
+    "STAGE2_LOCAL_DISK_PREFLIGHT_CONTRACT",
+    "STAGE2_LOCAL_DISK_RESERVE_BYTES",
     "STAGE2_RECOVERY_DRIVE_LAYOUT_CONTRACT",
     "STAGE2_RECOVERY_OUTPUT_ROOT_NAME",
+    "Stage2LocalDiskCapacityPreflight",
     "Stage2RecoveryDriveLayout",
     "SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS",
     "TRAINING_EVIDENCE_COMMIT",
+    "VerifiedStage2LocalArchive",
+    "copy_verified_stage2_bank_tar_to_local",
     "import_gate01_p0006_evaluation_protocol",
     "load_gate01_p0006_evaluation_protocol",
+    "preflight_stage2_local_disk_capacity",
     "preflight_gate01_p0006_archive",
     "resolve_stage2_recovery_drive_layout",
     "restore_verified_stage2_bank_tar",

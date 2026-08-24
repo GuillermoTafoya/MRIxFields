@@ -37,11 +37,17 @@ its `stage2_unified_v7/` child, and the pair-feasibility receipt is the direct c
 `stage2_retrospective_pair_feasibility_v2.json`. No alternate locations are searched.
 
 The reusable bank is the direct child `photometry_factored_latent_bank_v2.tar`, not a Drive
-directory. Before extraction its SHA-256 must be
+directory. An early local-capacity preflight reserves space for the tar, the 12.8 GB extracted
+tree, and a fixed safety margin. A CPU High-RAM runtime is recommended and the GPU is never used.
+The Drive tar is streamed once into a unique local no-clobber attempt while its SHA-256 is
+calculated from that same read stream. Copy progress is flushed at least every 30 seconds or
+512 MiB. Before extraction its SHA-256 must be
 `78d323c02ceccdfcb054307da3c9e14575210869d22cade6c5ecd4afa4baf8d5`. Safe extraction to a unique
-local partial attempt rejects absolute paths, traversal, links, special members, duplicates,
-overwrites, and ambiguous archive roots. Publication to the local final directory occurs only
-after the complete extracted identity matches all of:
+local partial attempt uses only that verified local tar and rejects absolute paths, traversal,
+links, special members, duplicates, overwrites, and ambiguous archive roots. Extraction and
+complete-tree verification emit flushed byte/file counts without private identities or paths.
+Publication to the local final directory occurs only after the complete extracted identity
+matches all of:
 
 - tree SHA-256 `f9cb09bfa177a3e389f87f087b0d756a2709e2054559a39c85e8272d5e1cfaa3`;
 - bank artifact SHA-256 `8081ce89a0eac1522b4fb28cd7919de4a4ecf1d5af72552d141a0ee9b9944194`;
@@ -52,6 +58,15 @@ The sibling `photometry_factored_latent_bank_v2/` directory is ignored only when
 nonempty, linked, or non-directory entry at that unreceipted path is an ambiguity and fails
 closed. A fresh-Colab import preflight verifies NumPy, SciPy, PyTorch, PyYAML, the pinned
 FieldBridge checkout, and its CLI before Drive mount; the notebook never installs packages.
+P:0006 import prints start, periodic, and end receipts containing counts only.
+
+`Runtime -> Run all` is safely repeatable in the same runtime. An existing checkout is reused
+only when read-only Git probes prove that it is the exact clean detached operator commit, has
+only the pinned `origin`, descends from the training-evidence commit, and retains the restricted
+operator-only diff. The rerun never fetches, checks out, deletes, resets, cleans, or otherwise
+mutates an existing checkout. Any mismatch fails closed. Exact local tar/bank and published
+recovery artifacts are reverified; partial copy/extraction attempts remain immutable, and
+transient copy/free-space observations are excluded from the exact sealed recovery receipt.
 
 ## Completed-evidence reuse
 

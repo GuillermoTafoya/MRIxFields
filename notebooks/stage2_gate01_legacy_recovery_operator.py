@@ -543,6 +543,12 @@ print(
             ],
             "checkpoint_sha256": completed_evidence["checkpoint_file_sha256"],
             "run_fingerprint": completed_evidence["run_fingerprint"],
+            "declared_device": completed_evidence[
+                "configuration_override_provenance"
+            ]["declared_device"],
+            "effective_device": completed_evidence[
+                "configuration_override_provenance"
+            ]["effective_device"],
             "latest_step": 200,
             "status": "pass",
             "training_invoked": False,
@@ -702,7 +708,7 @@ stable_bank_tree_receipt = {
 }
 
 recovery_receipt = {
-    "contract": "stage2-gate01-legacy-inventory-recovery-v1",
+    "contract": "stage2-gate01-legacy-inventory-recovery-v2",
     "status": "evaluation_readiness_sealed_stop_before_long_run",
     "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
     "operator_implementation_commit": OPERATOR_IMPLEMENTATION_COMMIT,
@@ -731,6 +737,15 @@ recovery_receipt = {
     "completed_evidence_reuse_sha256": completed_evidence[
         "reuse_verification_sha256"
     ],
+    "completed_evidence_configuration_override": completed_evidence[
+        "configuration_override_provenance"
+    ],
+    "completed_evidence_resolved_config_file_sha256": completed_evidence[
+        "resolved_config_file_sha256"
+    ],
+    "completed_evidence_effective_normalized_config_sha256": completed_evidence[
+        "effective_normalized_config_sha256"
+    ],
     "selection_receipt_file_sha256": EXPECTED_SELECTION_RECEIPT_FILE_SHA256,
     "checkpoint_file_sha256": completed_evidence["checkpoint_file_sha256"],
     "run_fingerprint": completed_evidence["run_fingerprint"],
@@ -754,7 +769,7 @@ recovery_receipt = {
     "long_run_training_authorized": False,
 }
 recovery_receipt["receipt_sha256"] = sha256_json(recovery_receipt)
-RECOVERY_RECEIPT = RECOVERY_NAMESPACE / "stage2_gate01_recovery_receipt_v1.json"
+RECOVERY_RECEIPT = RECOVERY_NAMESPACE / "stage2_gate01_recovery_receipt_v2.json"
 seal_or_verify_exact_json(RECOVERY_RECEIPT, recovery_receipt, "receipt_sha256")
 
 print(

@@ -11,6 +11,16 @@ from fieldbridge.data.photometry_factorization import sha256_file
 
 
 AUTHENTIC_TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
+CONFIGURATION_OVERRIDE_PROVENANCE = {
+    "contract_version": (
+        p0006.STAGE2_COMPLETED_EVIDENCE_CONFIG_RECONSTRUCTION_CONTRACT
+    ),
+    "declared_device": "auto",
+    "effective_device": "cuda",
+    "override_source": p0006.STAGE2_COMPLETED_EVIDENCE_DEVICE_OVERRIDE_SOURCE,
+    "normalized_changed_fields": ["device"],
+    "no_other_normalized_configuration_field_changed": True,
+}
 
 
 class _Index:
@@ -53,10 +63,14 @@ def _pilot_summary(steps: int) -> dict[str, object]:
         "latest_checkpoint_file_sha256": "e" * 64,
         "run_fingerprint": ("f" if steps == 200 else "1") * 64,
         "resolved_config_sha256": "2" * 64,
+        "resolved_config_file_sha256": "6" * 64,
+        "declared_normalized_config_sha256": "7" * 64,
+        "effective_normalized_config_sha256": "2" * 64,
         "bank_artifact_sha256": "a" * 64,
         "validation_bank_artifact_sha256": "b" * 64,
         "frozen_decoder_state_sha256": "3" * 64,
         "decoder_activation_checkpoint_sha256": "4" * 64,
+        "configuration_override_provenance": CONFIGURATION_OVERRIDE_PROVENANCE,
         "complete_r_validation_inventory": True,
         "paired_targets_used": False,
     }
@@ -67,6 +81,7 @@ def _qualification_summary() -> dict[str, object]:
         "status": "pass",
         "frozen_decoder_state_sha256": "3" * 64,
         "decoder_activation_checkpoint_sha256": "4" * 64,
+        "configuration_override_provenance": CONFIGURATION_OVERRIDE_PROVENANCE,
     }
 
 

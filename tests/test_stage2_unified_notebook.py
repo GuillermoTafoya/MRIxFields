@@ -611,6 +611,10 @@ def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only
     assert '"archive_copied_to_local_scratch"' in source
     assert '"bank_extracted_from_tar"' in source
     assert '"local_bank_reused"' in source
+    assert '"completed_evidence_configuration_override"' in source
+    assert '"completed_evidence_resolved_config_file_sha256"' in source
+    assert '"completed_evidence_effective_normalized_config_sha256"' in source
+    assert '"stage2_gate01_recovery_receipt_v2.json"' in source
     assert "drive_retry" in source
     assert "archive_no_clobber" in source
     assert "refuse_existing=True" in source

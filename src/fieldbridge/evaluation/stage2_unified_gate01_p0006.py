@@ -98,7 +98,7 @@ GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2 = (
     "gate01-archive-reviewed-legacy-path-aware-json-v2"
 )
 GATE01_ARCHIVE_PREFLIGHT_CONTRACT = "gate01-p0006-metadata-preflight-v2"
-STAGE2_COMPLETED_PILOT_REUSE_CONTRACT = "stage2-completed-pilot-reuse-verification-v1"
+STAGE2_COMPLETED_PILOT_REUSE_CONTRACT = "stage2-completed-pilot-reuse-verification-v2"
 STAGE2_BANK_TAR_RESTORE_CONTRACT = "stage2-reviewed-bank-tar-restore-v1"
 STAGE2_LOCAL_ARCHIVE_COPY_CONTRACT = "stage2-reviewed-bank-local-copy-v1"
 STAGE2_LOCAL_DISK_PREFLIGHT_CONTRACT = "stage2-recovery-local-disk-preflight-v1"
@@ -120,6 +120,14 @@ STAGE2_PROGRESS_MAX_INTERVAL_SECONDS = 30.0
 STAGE2_PROGRESS_MAX_INTERVAL_BYTES = 512 * 1024**2
 STAGE2_TREE_PROGRESS_MAX_INTERVAL_FILES = 256
 STAGE2_LOCAL_DISK_RESERVE_BYTES = 2 * 1024**3
+STAGE2_COMPLETED_EVIDENCE_CONFIG_RECONSTRUCTION_CONTRACT = (
+    "stage2-completed-evidence-effective-config-reconstruction-v1"
+)
+STAGE2_COMPLETED_EVIDENCE_DECLARED_DEVICE = "auto"
+STAGE2_COMPLETED_EVIDENCE_EFFECTIVE_DEVICE = "cuda"
+STAGE2_COMPLETED_EVIDENCE_DEVICE_OVERRIDE_SOURCE = (
+    "sealed train-stage2-unified --device cuda launch contract"
+)
 P0006_COUNT_PROGRESS_ENV = "FIELDBRIDGE_STAGE2_P0006_COUNT_PROGRESS"
 P0006_COUNT_PROGRESS_VALUE = "count-only-json-v1"
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
@@ -483,6 +491,36 @@ class Stage2RecoveryDriveLayout:
                 self.ignored_empty_unreceipted_bank_directory
             ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedStage2ConfigReconstruction:
+    """Declared config plus the single sealed CLI placement override."""
+
+    resolved_config_path: Path
+    declared_config: dict[str, Any]
+    effective_config: dict[str, Any]
+
+    @property
+    def override_provenance(self) -> dict[str, Any]:
+        return {
+            "contract_version": (
+                STAGE2_COMPLETED_EVIDENCE_CONFIG_RECONSTRUCTION_CONTRACT
+            ),
+            "declared_device": STAGE2_COMPLETED_EVIDENCE_DECLARED_DEVICE,
+            "effective_device": STAGE2_COMPLETED_EVIDENCE_EFFECTIVE_DEVICE,
+            "override_source": STAGE2_COMPLETED_EVIDENCE_DEVICE_OVERRIDE_SOURCE,
+            "normalized_changed_fields": ["device"],
+            "no_other_normalized_configuration_field_changed": True,
+        }
+
+    @property
+    def declared_normalized_sha256(self) -> str:
+        return sha256_json(self.declared_config)
+
+    @property
+    def effective_normalized_sha256(self) -> str:
+        return sha256_json(self.effective_config)
 
 
 def resolve_stage2_recovery_drive_layout(
@@ -2832,6 +2870,16 @@ def verify_completed_stage2_pilot_evidence(
         train_index.artifact_sha256,
     } != {train_index.artifact_sha256}:
         raise ValueError("Completed pilots do not share the restored bank identity.")
+    configuration_override_provenance = full["configuration_override_provenance"]
+    if any(
+        item["configuration_override_provenance"]
+        != configuration_override_provenance
+        for item in (short, qualification)
+    ):
+        raise ValueError(
+            "Qualification and pilots used different effective configuration "
+            "reconstruction contracts."
+        )
 
     receipt: dict[str, Any] = {
         "contract_version": STAGE2_COMPLETED_PILOT_REUSE_CONTRACT,
@@ -2846,7 +2894,15 @@ def verify_completed_stage2_pilot_evidence(
         "latest_completed_step": 200,
         "checkpoint_file_sha256": full["latest_checkpoint_file_sha256"],
         "run_fingerprint": full["run_fingerprint"],
-        "resolved_config_sha256": full["resolved_config_sha256"],
+        "resolved_config_file_sha256": full["resolved_config_file_sha256"],
+        "resolved_config_sha256": full["effective_normalized_config_sha256"],
+        "declared_normalized_config_sha256": full[
+            "declared_normalized_config_sha256"
+        ],
+        "effective_normalized_config_sha256": full[
+            "effective_normalized_config_sha256"
+        ],
+        "configuration_override_provenance": configuration_override_provenance,
         "bank_artifact_sha256": train_index.artifact_sha256,
         "validation_bank_artifact_sha256": validation_index.artifact_sha256,
         "latent_statistics_sha256": stats.artifact_sha256,
@@ -2901,12 +2957,14 @@ def _verify_completed_pilot_attempt(
         validation_index=validation_index,
         expected_validation_plan_sha256=expected_validation_plan_sha256,
     )
-    resolved_config, config_dict = _load_completed_stage2_config(run_dir)
+    config_reconstruction = _load_completed_stage2_config(run_dir)
+    declared_config = config_reconstruction.declared_config
+    effective_config = config_reconstruction.effective_config
     if (
-        config_dict.get("steps") != steps
-        or config_dict.get("pilot_steps") != steps
-        or config_dict.get("variant") != "full"
-        or config_dict.get("loss_weights") != DEFAULT_UNIFIED_WEIGHTS
+        declared_config.get("steps") != steps
+        or declared_config.get("pilot_steps") != steps
+        or declared_config.get("variant") != "full"
+        or declared_config.get("loss_weights") != DEFAULT_UNIFIED_WEIGHTS
     ):
         raise ValueError(f"Step-{steps} resolved pilot configuration changed.")
 
@@ -2941,15 +2999,20 @@ def _verify_completed_pilot_attempt(
     for checkpoint_path in sorted(unique_checkpoints):
         state = load_checkpoint(checkpoint_path, map_location="cpu")
         meta = state.get("_meta")
-        if (
-            state.get("contract_version") != UNIFIED_RESUME_CONTRACT
-            or not isinstance(meta, Mapping)
-            or meta.get("git_commit") != training_evidence_commit
-            or meta.get("config") != config_dict
-            or state.get("validation_plan_sha256") != expected_validation_plan_sha256
-            or state.get("selection_rule_sha256") != expected_selection_rule_sha256
-        ):
-            raise ValueError(f"Step-{steps} checkpoint metadata or identity changed.")
+        if state.get("contract_version") != UNIFIED_RESUME_CONTRACT:
+            raise ValueError(f"Step-{steps} checkpoint resume contract changed.")
+        if not isinstance(meta, Mapping):
+            raise ValueError(f"Step-{steps} checkpoint _meta mapping changed.")
+        if meta.get("git_commit") != training_evidence_commit:
+            raise ValueError(f"Step-{steps} checkpoint Git commit changed.")
+        if meta.get("config") != effective_config:
+            raise ValueError(
+                f"Step-{steps} checkpoint effective normalized configuration changed."
+            )
+        if state.get("validation_plan_sha256") != expected_validation_plan_sha256:
+            raise ValueError(f"Step-{steps} checkpoint validation-plan SHA changed.")
+        if state.get("selection_rule_sha256") != expected_selection_rule_sha256:
+            raise ValueError(f"Step-{steps} checkpoint selection-rule SHA changed.")
         run_fingerprint = state.get("run_fingerprint")
         if not isinstance(run_fingerprint, str) or _SHA256_RE.fullmatch(run_fingerprint) is None:
             raise ValueError(f"Step-{steps} checkpoint run fingerprint is invalid.")
@@ -2996,7 +3059,7 @@ def _verify_completed_pilot_attempt(
     anatomy = pilot["one_step_anatomy_memory_qualification"]
     decoder_checkpoint_evidence = anatomy["checkpoint_evidence"]
     rebuilt_fingerprint = _rebuild_stage2_run_fingerprint(
-        config_dict,
+        effective_config,
         train_index=train_index,
         validation_index=validation_index,
         stats=stats,
@@ -3041,8 +3104,19 @@ def _verify_completed_pilot_attempt(
         "history_file_sha256": sha256_file(history_path),
         "history_training_row_count": history["training_row_count"],
         "run_fingerprint": run_fingerprint,
-        "resolved_config_file_sha256": sha256_file(resolved_config),
-        "resolved_config_sha256": sha256_json(config_dict),
+        "resolved_config_file_sha256": sha256_file(
+            config_reconstruction.resolved_config_path
+        ),
+        "resolved_config_sha256": config_reconstruction.effective_normalized_sha256,
+        "declared_normalized_config_sha256": (
+            config_reconstruction.declared_normalized_sha256
+        ),
+        "effective_normalized_config_sha256": (
+            config_reconstruction.effective_normalized_sha256
+        ),
+        "configuration_override_provenance": (
+            config_reconstruction.override_provenance
+        ),
         "bank_artifact_sha256": train_index.artifact_sha256,
         "validation_bank_artifact_sha256": validation_index.artifact_sha256,
         "validation_plan_sha256": expected_validation_plan_sha256,
@@ -3095,11 +3169,12 @@ def _verify_completed_a100_qualification(
         validation_index=validation_index,
         expected_validation_plan_sha256=expected_validation_plan_sha256,
     )
-    resolved_config, config_dict = _load_completed_stage2_config(run_dir)
-    if config_dict.get("steps") != 1 or config_dict.get("pilot_steps") != 0:
+    config_reconstruction = _load_completed_stage2_config(run_dir)
+    declared_config = config_reconstruction.declared_config
+    if declared_config.get("steps") != 1 or declared_config.get("pilot_steps") != 0:
         raise ValueError("A100 qualification resolved configuration changed.")
     expected_fingerprint = _rebuild_stage2_run_fingerprint(
-        config_dict,
+        config_reconstruction.effective_config,
         train_index=train_index,
         validation_index=validation_index,
         stats=stats,
@@ -3126,7 +3201,19 @@ def _verify_completed_a100_qualification(
         "receipt": str(receipt_path),
         "receipt_file_sha256": sha256_file(receipt_path),
         "run_fingerprint": expected_fingerprint,
-        "resolved_config_file_sha256": sha256_file(resolved_config),
+        "resolved_config_file_sha256": sha256_file(
+            config_reconstruction.resolved_config_path
+        ),
+        "resolved_config_sha256": config_reconstruction.effective_normalized_sha256,
+        "declared_normalized_config_sha256": (
+            config_reconstruction.declared_normalized_sha256
+        ),
+        "effective_normalized_config_sha256": (
+            config_reconstruction.effective_normalized_sha256
+        ),
+        "configuration_override_provenance": (
+            config_reconstruction.override_provenance
+        ),
         "frozen_decoder_state_sha256": receipt["frozen_decoder_state_sha256"],
         "decoder_activation_checkpoint_sha256": receipt[
             "decoder_activation_checkpoint_sha256"
@@ -3171,13 +3258,53 @@ def _verify_completed_validation_plan(
     return plan
 
 
-def _load_completed_stage2_config(run_dir: Path) -> tuple[Path, dict[str, Any]]:
+def _load_completed_stage2_config(
+    run_dir: Path,
+) -> _CompletedStage2ConfigReconstruction:
     path = _assert_path_inside(
         run_dir, run_dir / "resolved_config.json", label="resolved config"
     )
     payload = _read_json(path)
-    config = UnifiedStage2Config.from_mapping(payload).to_dict()
-    return path, config
+    if not isinstance(payload, Mapping):
+        raise ValueError("Completed Stage-2 resolved configuration must be a mapping.")
+    training = payload.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError(
+            "Completed Stage-2 resolved configuration lacks its training mapping."
+        )
+    if training.get("device") != STAGE2_COMPLETED_EVIDENCE_DECLARED_DEVICE:
+        raise ValueError(
+            "Completed Stage-2 resolved configuration must declare device='auto'."
+        )
+
+    declared_config = UnifiedStage2Config.from_mapping(payload).to_dict()
+    if declared_config.get("device") != STAGE2_COMPLETED_EVIDENCE_DECLARED_DEVICE:
+        raise ValueError("Completed Stage-2 declared device normalization changed.")
+
+    effective_payload = dict(payload)
+    effective_training = dict(training)
+    effective_training["device"] = STAGE2_COMPLETED_EVIDENCE_EFFECTIVE_DEVICE
+    effective_payload["training"] = effective_training
+    effective_config = UnifiedStage2Config.from_mapping(effective_payload).to_dict()
+    differing_keys = sorted(
+        key
+        for key in set(declared_config) | set(effective_config)
+        if declared_config.get(key) != effective_config.get(key)
+    )
+    if (
+        differing_keys != ["device"]
+        or effective_config.get("device")
+        != STAGE2_COMPLETED_EVIDENCE_EFFECTIVE_DEVICE
+    ):
+        raise ValueError(
+            "Completed Stage-2 effective configuration replay changed fields other "
+            "than device='auto' to device='cuda'."
+        )
+    return _CompletedStage2ConfigReconstruction(
+        resolved_config_path=path,
+        declared_config=declared_config,
+        effective_config=effective_config,
+    )
 
 
 def _rebuild_stage2_run_fingerprint(
@@ -3193,6 +3320,11 @@ def _rebuild_stage2_run_fingerprint(
     execution_mode: str,
     accumulation: Mapping[str, Any] | None,
 ) -> str:
+    if config.get("device") != STAGE2_COMPLETED_EVIDENCE_EFFECTIVE_DEVICE:
+        raise ValueError(
+            "Completed evidence run fingerprint requires the pinned effective "
+            "device='cuda' configuration."
+        )
     if _SHA256_RE.fullmatch(frozen_decoder_state_sha256) is None:
         raise ValueError("Frozen decoder state identity is invalid.")
     if accumulation is None:

@@ -10,6 +10,9 @@ import fieldbridge.evaluation.stage2_unified_gate01_p0006 as p0006
 from fieldbridge.data.photometry_factorization import sha256_file
 
 
+AUTHENTIC_TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
+
+
 class _Index:
     def __init__(self, split: str) -> None:
         self.split = split
@@ -78,7 +81,7 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 def test_compatible_step200_evidence_is_reused_without_training_or_namespace_write(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    training_commit = "9" * 64
+    training_commit = AUTHENTIC_TRAINING_EVIDENCE_COMMIT
     root = tmp_path / f"implementation_{training_commit[:12]}"
     full_receipt = _selection_path(root, 200)
     _selection_path(root, 20)
@@ -119,13 +122,120 @@ def test_compatible_step200_evidence_is_reused_without_training_or_namespace_wri
     assert result["latest_completed_step"] == 200
     assert result["complete_r_validation_inventory"] is True
     assert result["paired_targets_used"] is False
+    assert result["training_evidence_commit"] == AUTHENTIC_TRAINING_EVIDENCE_COMMIT
+    assert Path(result["training_namespace"]).name == (
+        "implementation_" + AUTHENTIC_TRAINING_EVIDENCE_COMMIT[:12]
+    )
+    serialized = json.dumps(result, sort_keys=True)
+    assert json.loads(serialized)["training_evidence_commit"] == (
+        AUTHENTIC_TRAINING_EVIDENCE_COMMIT
+    )
     assert _tree_bytes(root) == before
+
+
+@pytest.mark.parametrize(
+    "training_commit",
+    [
+        "a" * 39,
+        "a" * 41,
+        "a" * 64,
+        "A" * 40,
+        "g" * 40,
+    ],
+)
+def test_training_evidence_commit_rejects_non_git_identities(
+    tmp_path: Path, training_commit: str
+) -> None:
+    with pytest.raises(ValueError, match="lowercase Git commit identity"):
+        p0006.verify_completed_stage2_pilot_evidence(
+            tmp_path / "missing",
+            bank_dir=tmp_path / "bank",
+            training_evidence_commit=training_commit,
+        )
+
+
+@pytest.mark.parametrize(
+    "training_commit",
+    [AUTHENTIC_TRAINING_EVIDENCE_COMMIT, "a" * 40],
+)
+def test_valid_lowercase_git_commit_identity_reaches_evidence_resolution(
+    tmp_path: Path, training_commit: str
+) -> None:
+    missing = tmp_path / f"implementation_{training_commit[:12]}"
+    with pytest.raises(FileNotFoundError, match="Completed training namespace is missing"):
+        p0006.verify_completed_stage2_pilot_evidence(
+            missing,
+            bank_dir=tmp_path / "bank",
+            training_evidence_commit=training_commit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("parameter", "valid_sha256"),
+    [
+        ("expected_selection_receipt_file_sha256", "a" * 64),
+        ("expected_validation_plan_sha256", "b" * 64),
+        ("expected_selection_rule_sha256", p0006.UNIFIED_SELECTION_RULE_SHA256),
+    ],
+)
+def test_sha256_parameters_accept_64_character_lowercase_identities(
+    tmp_path: Path, parameter: str, valid_sha256: str
+) -> None:
+    kwargs = {
+        "expected_selection_receipt_file_sha256": "a" * 64,
+        "expected_validation_plan_sha256": "b" * 64,
+        "expected_selection_rule_sha256": p0006.UNIFIED_SELECTION_RULE_SHA256,
+        parameter: valid_sha256,
+    }
+    with pytest.raises(FileNotFoundError, match="Completed training namespace is missing"):
+        p0006.verify_completed_stage2_pilot_evidence(
+            tmp_path / f"implementation_{AUTHENTIC_TRAINING_EVIDENCE_COMMIT[:12]}",
+            bank_dir=tmp_path / "bank",
+            training_evidence_commit=AUTHENTIC_TRAINING_EVIDENCE_COMMIT,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "expected_selection_receipt_file_sha256",
+        "expected_validation_plan_sha256",
+        "expected_selection_rule_sha256",
+    ],
+)
+def test_sha256_parameters_reject_40_character_git_identity(
+    tmp_path: Path, parameter: str
+) -> None:
+    kwargs = {
+        "expected_selection_receipt_file_sha256": "a" * 64,
+        "expected_validation_plan_sha256": "b" * 64,
+        "expected_selection_rule_sha256": p0006.UNIFIED_SELECTION_RULE_SHA256,
+        parameter: AUTHENTIC_TRAINING_EVIDENCE_COMMIT,
+    }
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        p0006.verify_completed_stage2_pilot_evidence(
+            tmp_path / f"implementation_{AUTHENTIC_TRAINING_EVIDENCE_COMMIT[:12]}",
+            bank_dir=tmp_path / "bank",
+            training_evidence_commit=AUTHENTIC_TRAINING_EVIDENCE_COMMIT,
+            **kwargs,
+        )
+
+
+def test_completed_evidence_uses_distinct_git_and_sha_identity_contracts() -> None:
+    source = Path(p0006.__file__).read_text(encoding="utf-8")
+    verifier = source[
+        source.index("def verify_completed_stage2_pilot_evidence(") : source.index(
+            "def _verify_completed_pilot_attempt(")
+    ]
+    assert "_GIT_COMMIT_RE.fullmatch(training_evidence_commit)" in verifier
+    assert "_SHA256_RE.fullmatch(training_evidence_commit)" not in verifier
 
 
 def test_incompatible_completed_evidence_fails_without_retraining_or_writes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    training_commit = "8" * 64
+    training_commit = "8" * 40
     root = tmp_path / f"implementation_{training_commit[:12]}"
     full_receipt = _selection_path(root, 200)
     _selection_path(root, 20)

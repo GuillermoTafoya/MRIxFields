@@ -607,6 +607,10 @@ def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only
     assert "pip install" not in source.casefold()
     assert "restore_verified_stage2_bank_tar" in source
     assert "restore_bank_archive_to_scratch" not in source
+    assert 'LOCAL_SCRATCH_ROOT = Path("/content/stage2_gate01_recovery_v8_scratch")' in source
+    assert '"archive_copied_to_local_scratch"' in source
+    assert '"bank_extracted_from_tar"' in source
+    assert '"local_bank_reused"' in source
     assert "drive_retry" in source
     assert "archive_no_clobber" in source
     assert "refuse_existing=True" in source

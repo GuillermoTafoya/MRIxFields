@@ -2721,13 +2721,20 @@ def verify_completed_stage2_pilot_evidence(
 ) -> dict[str, Any]:
     """Verify the completed v7 qualification and pilots without invoking training."""
 
+    if (
+        not isinstance(training_evidence_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(training_evidence_commit) is None
+    ):
+        raise ValueError(
+            "Expected training evidence commit identity must be a lowercase Git commit "
+            "identity."
+        )
     for label, digest in {
-        "training evidence commit": training_evidence_commit,
         "selection receipt file": expected_selection_receipt_file_sha256,
         "validation plan": expected_validation_plan_sha256,
         "selection rule": expected_selection_rule_sha256,
     }.items():
-        if _SHA256_RE.fullmatch(digest) is None:
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
             raise ValueError(f"Expected {label} identity must be lowercase SHA-256.")
     if expected_selection_rule_sha256 != UNIFIED_SELECTION_RULE_SHA256:
         raise ValueError("Pinned selection-rule SHA differs from the v7 implementation.")

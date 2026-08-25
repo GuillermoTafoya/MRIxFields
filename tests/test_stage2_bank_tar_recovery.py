@@ -323,6 +323,15 @@ def test_local_copy_hash_progress_extract_progress_and_identity_are_exact(
             for token in ("path", "sha", "identity", "subject")
         )
 
+    archive_before = (local_archive.read_bytes(), local_archive.stat().st_mtime_ns)
+    bank_before = {
+        path.relative_to(local_bank).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in sorted(local_bank.rglob("*"))
+        if path.is_file()
+    }
     resume_events: list[dict[str, object]] = []
     resumed = p0006.copy_verified_stage2_bank_tar_to_local(
         drive_archive,
@@ -335,6 +344,39 @@ def test_local_copy_hash_progress_extract_progress_and_identity_are_exact(
     assert resumed.archive_file_sha256 == verified.archive_file_sha256
     assert resume_events[0]["mode"] == "verify_existing"
     assert resume_events[-1]["status"] == "end"
+    assert (local_archive.read_bytes(), local_archive.stat().st_mtime_ns) == archive_before
+
+    bank_resume_events: list[dict[str, object]] = []
+    resumed_bank = p0006.restore_verified_stage2_bank_tar(
+        resumed,
+        local_bank,
+        expected_archive_sha256=archive_sha,
+        expected_tree_sha256=str(identity["tree_sha256"]),
+        expected_bank_artifact_sha256=BANK_ARTIFACT_SHA256,
+        expected_file_count=int(identity["file_count"]),
+        expected_total_bytes=int(identity["total_bytes"]),
+        progress_callback=bank_resume_events.append,
+        tree_progress_interval_files=1,
+    )
+    assert resumed_bank.restored_from_tar is False
+    assert not any(
+        event["stage"] == "bank_archive_extraction" for event in bank_resume_events
+    )
+    tree_events = [
+        event
+        for event in bank_resume_events
+        if event["stage"] == "bank_tree_verification"
+    ]
+    assert tree_events[0]["status"] == "start"
+    assert tree_events[-1]["status"] == "end"
+    assert {
+        path.relative_to(local_bank).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in sorted(local_bank.rglob("*"))
+        if path.is_file()
+    } == bank_before
 
 
 def test_local_archive_copy_preserves_attempts_and_rejects_tampered_resume(

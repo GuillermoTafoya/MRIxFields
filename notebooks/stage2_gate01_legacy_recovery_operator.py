@@ -495,6 +495,8 @@ print(
             "archive_copy_and_sha256_same_pass": local_bank_archive_identity[
                 "copy_and_sha256_same_pass"
             ],
+            "bank_extracted_from_tar": bank_archive_identity["restored_from_tar"],
+            "local_bank_reused": not bank_archive_identity["restored_from_tar"],
             "tree_sha256": bank_archive_identity["tree_sha256"],
             "bank_artifact_sha256": bank_archive_identity[
                 "bank_artifact_sha256"

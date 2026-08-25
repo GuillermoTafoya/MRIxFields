@@ -129,16 +129,45 @@ $Gate01ScientificModules = @(
   "src/fieldbridge/models/translators/flow_transport.py",
   "src/fieldbridge/training/checkpoints.py"
 )
+$Gate01CurrentModuleSha256 = [ordered]@{}
 $Gate01ScientificModules | ForEach-Object {
-  [pscustomobject]@{ module = $_; sha256 = (Get-FileHash -Algorithm SHA256 $_).Hash.ToLower() }
-} | ConvertTo-Json | Set-Content -Encoding utf8 (
-  Join-Path $Gate01External "gate01-reviewed-module-sha256-8012a3f.json"
-)
+  $Gate01CurrentModuleSha256[$_] = (
+    Get-FileHash -Algorithm SHA256 $_
+  ).Hash.ToLower()
+}
 ```
 
-Transcribe those reviewed values into the exact module-keyed map in
-`$Gate01ProtocolSpec`; do not source expected values from a prediction manifest or from
-runtime evaluator output. The specification contains exactly:
+The separately reviewed module comparison evidence is an object, never a list of
+`{module, sha256}` rows. Its exact shape is:
+
+```json
+{
+  "changed_modules": ["src/fieldbridge/models/translators/flow_transport.py"],
+  "evaluation_git_commit": "<current-lowercase-40-hex-commit>",
+  "evaluation_module_sha256": {
+    "<each-of-the-exact-31-scientific-module-paths>": "<lowercase-sha256>"
+  },
+  "previous_evaluation_git_commit": "<distinct-previous-lowercase-40-hex-commit>",
+  "previous_evaluation_module_sha256": {
+    "<the-same-exact-31-scientific-module-paths>": "<lowercase-sha256>"
+  }
+}
+```
+
+Both maps must contain exactly the same 31 keys listed above. `changed_modules` must be
+the unique, canonical module paths whose current and previous digests differ; for the
+reviewed `8012a3f` comparison it is exactly
+`src/fieldbridge/models/translators/flow_transport.py`. The current commit and map are
+authoritative and must exactly match the protocol lock. The distinct previous commit and
+map are provenance only and can never authorize evaluation. An old module list cannot
+substitute for this five-field object. Write the object only from both independently
+reviewed maps and their commits to
+`gate01-reviewed-module-sha256-8012a3f.json`; do not derive the previous map from the
+current checkout or from runtime evaluator output.
+
+Transcribe the current reviewed values into the exact module-keyed map in
+`$Gate01ProtocolSpec`; do not source expected values from a prediction manifest or runtime
+evaluator output. The specification contains exactly:
 
 - the hash-only traveller and 60-direction fingerprint from `$Gate01Selection`;
 - `evaluation_split_file_sha256` plus `split_fingerprint` for the scientific

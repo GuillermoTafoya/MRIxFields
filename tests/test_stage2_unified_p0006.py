@@ -157,19 +157,51 @@ def _pad_json(path: Path, size_bytes: int) -> None:
     path.write_bytes(payload + b" " * (size_bytes - len(payload)))
 
 
+def _authentic_gate01_result() -> dict[str, object]:
+    result: dict[str, object] = {
+        "contract_version": GATE01_CONTRACT_VERSION,
+        "evidence_scope": {"synthetic": True},
+        "scientific_status": {"synthetic": True},
+        "central_question": "synthetic-only",
+        "metric_roles": {},
+        "method_roles": {},
+        "num_pairs": 0,
+        "methods": [],
+        "overall": {},
+        "strata": {},
+        "raw_pre_mask_background_leakage": {},
+        "by_contrast": {},
+        "directed_pair_results": {},
+        "directed_pair_matrices": {},
+        "central_paired_deltas_and_wins": {},
+        "requested_vs_wrong_target_diagnostic": {},
+        "montage_specifications": {},
+        "pairs": [],
+        "contract": {},
+        "montage_rendering": {},
+    }
+    assert len(result) == 20
+    return result
+
+
 @pytest.mark.parametrize("inventory_format", ["csv", "reviewed_legacy_json"])
 def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inventory_format: str
 ) -> None:
     archive = tmp_path / "Gate01Private_8012a3f"
     archive.mkdir()
-    result_body = {"contract_version": GATE01_CONTRACT_VERSION, "value": 1}
-    result = {**result_body, "result_sha256": sha256_json(result_body)}
+    result = _authentic_gate01_result()
     result_path = archive / "gate01-results.json"
     manifest_path = archive / "gate01-private-manifest.json"
     lock_path = archive / "gate01-protocol-lock.json"
     calibrator_path = archive / "gate01-target-calibrator.json"
     _write_json(result_path, result)
+    result_file_sha256 = sha256_file(result_path)
+    monkeypatch.setattr(
+        p0006,
+        "REVIEWED_GATE01_RESULT_FILE_SHA256",
+        result_file_sha256,
+    )
     _write_json(manifest_path, {"contract_version": p0006.GATE01_INPUT_CONTRACT_VERSION})
     _write_json(lock_path, {"contract_version": p0006.GATE01_PROTOCOL_LOCK_CONTRACT_VERSION})
     _write_json(calibrator_path, {"contract_version": p0006.GATE01_CALIBRATOR_CONTRACT_VERSION})
@@ -359,6 +391,8 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
         expected_gate01_result_sha256=sha256_file(result_path),
     )
     assert preflight["private_array_payloads_opened"] == 0
+    assert preflight["verified_gate01_result_file_sha256"] == result_file_sha256
+    assert "result_sha256" not in result
     manifest_for_load[0] = gate_manifest
     output = tmp_path / "p0006-protocol.json"
     protocol = p0006.import_gate01_p0006_evaluation_protocol(
@@ -379,6 +413,12 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert protocol["population_or_generalization_claims_authorized"] is False
     assert protocol["P0009_confirmation_status"] == p0006.P0009_CONFIRMATION_STATUS
     assert protocol["P0009_executed"] is False
+    assert protocol["gate01_result"] == {
+        "path": str(result_path.resolve()),
+        "file_sha256": result_file_sha256,
+        "internal_self_hash_defined": False,
+    }
+    assert "result_sha256" not in json.dumps(protocol, sort_keys=True)
     assert len(protocol["case_receipts"]) == 60
     assert protocol["contract_version"].endswith("protocol-v4")
     expected_layout = (
@@ -457,6 +497,8 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
         v3_body = copy.deepcopy(protocol)
         v3_body.pop("protocol_sha256")
         v3_body["contract_version"] = p0006.GATE01_P0006_EVALUATION_PROTOCOL_V3
+        v3_body["gate01_result"].pop("internal_self_hash_defined")
+        v3_body["gate01_result"]["result_sha256"] = "0" * 64
         old_entries = sorted(
             [
                 {
@@ -491,6 +533,9 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     v2_body = dict(protocol)
     v2_body.pop("protocol_sha256")
     v2_body["contract_version"] = p0006.GATE01_P0006_EVALUATION_PROTOCOL_V2
+    v2_body["gate01_result"] = dict(v2_body["gate01_result"])
+    v2_body["gate01_result"].pop("internal_self_hash_defined")
+    v2_body["gate01_result"]["result_sha256"] = "0" * 64
     v2_path = tmp_path / "compatible-v2-p0006-protocol.json"
     _write_json(v2_path, {**v2_body, "protocol_sha256": sha256_json(v2_body)})
     compatible, compatible_cases, _ = p0006.load_gate01_p0006_evaluation_protocol(
@@ -498,6 +543,17 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     )
     assert compatible["contract_version"] == p0006.GATE01_P0006_EVALUATION_PROTOCOL_V2
     assert len(compatible_cases) == 60
+
+    malformed_v4 = copy.deepcopy(protocol)
+    malformed_v4.pop("protocol_sha256")
+    malformed_v4["gate01_result"]["result_sha256"] = "0" * 64
+    malformed_v4_path = tmp_path / "malformed-v4-result-provenance.json"
+    _write_json(
+        malformed_v4_path,
+        {**malformed_v4, "protocol_sha256": sha256_json(malformed_v4)},
+    )
+    with pytest.raises(ValueError, match="result provenance is malformed"):
+        p0006.load_gate01_p0006_evaluation_protocol(malformed_v4_path)
 
     obsolete_body = dict(protocol)
     obsolete_body.pop("protocol_sha256")

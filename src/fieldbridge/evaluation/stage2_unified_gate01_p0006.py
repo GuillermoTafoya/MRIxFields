@@ -123,6 +123,9 @@ STAGE2_LOCAL_DISK_RESERVE_BYTES = 2 * 1024**3
 P0006_COUNT_PROGRESS_ENV = "FIELDBRIDGE_STAGE2_P0006_COUNT_PROGRESS"
 P0006_COUNT_PROGRESS_VALUE = "count-only-json-v1"
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
+REVIEWED_GATE01_RESULT_FILE_SHA256 = (
+    "454747cd3e4b1376855915244a7c40fe281b758150e86f584fbea96f94d531f5"
+)
 EXPECTED_STAGE2_SELECTION_RECEIPT_FILE_SHA256 = (
     "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828"
 )
@@ -1303,7 +1306,7 @@ class _Gate01MetadataPreflight:
     layout: Gate01ArchiveLayout
     result_path: Path
     result: dict[str, Any]
-    stored_result_hash: str
+    verified_result_file_sha256: str
     manifest_path: Path
     lock_path: Path
     calibrator_path: Path
@@ -1417,6 +1420,9 @@ def preflight_gate01_p0006_archive(
         ],
         "expected_gate01_result_sha256": expected_gate01_result_sha256,
         "expected_gate01_result_match": True,
+        "verified_gate01_result_file_sha256": (
+            metadata.verified_result_file_sha256
+        ),
         "stored_absolute_inventory_paths_trusted_for_file_access": False,
         "private_array_payloads_opened": 0,
         "required_scientific_contracts_unique": True,
@@ -1424,6 +1430,50 @@ def preflight_gate01_p0006_archive(
     }
     receipt["preflight_sha256"] = sha256_json(receipt)
     return receipt
+
+
+def _load_verified_gate01_result_snapshot(
+    result_path: Path,
+    result_entry: VerifiedGate01InventoryEntry,
+    *,
+    expected_gate01_result_sha256: str,
+) -> tuple[dict[str, Any], str]:
+    snapshot = result_path.read_bytes()
+    snapshot_sha256 = hashlib.sha256(snapshot).hexdigest()
+    if len(snapshot) != result_entry.size_bytes:
+        raise ValueError(
+            "Gate 0.1 result byte snapshot size differs from the reviewed "
+            "inventory row."
+        )
+    if result_entry.sha256 != expected_gate01_result_sha256:
+        raise ValueError(
+            "Expected Gate 0.1 result SHA-256 does not match the exact reviewed "
+            "result path."
+        )
+    if expected_gate01_result_sha256 != REVIEWED_GATE01_RESULT_FILE_SHA256:
+        raise ValueError(
+            "Expected Gate 0.1 result SHA-256 differs from the pinned authentic "
+            "result file identity."
+        )
+    if snapshot_sha256 != result_entry.sha256:
+        raise ValueError(
+            "Gate 0.1 result byte snapshot SHA-256 differs from the reviewed "
+            "inventory row."
+        )
+    try:
+        decoded = snapshot.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Gate 0.1 result byte snapshot is not UTF-8 JSON.") from exc
+    payload = _json_loads_without_duplicate_keys(
+        decoded,
+        label="Gate 0.1 result byte snapshot",
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("Gate 0.1 result byte snapshot must be a JSON object.")
+    result = dict(payload)
+    if result.get("contract_version") != GATE01_CONTRACT_VERSION:
+        raise ValueError("Expected Gate 0.1 result has an incompatible contract.")
+    return result, snapshot_sha256
 
 
 def _preflight_gate01_p0006_archive(
@@ -1443,29 +1493,34 @@ def _preflight_gate01_p0006_archive(
         ),
         None,
     )
-    if result_entry is None or result_entry.sha256 != expected_gate01_result_sha256:
+    if result_entry is None:
         raise ValueError(
-            "Expected Gate 0.1 result SHA-256 does not match the exact reviewed result path."
+            "Gate 0.1 inventory lacks the exact reviewed result path."
         )
     result_path = layout.path_for("gate01-results.json")
     if result_path.name != "gate01-results.json":
         raise ValueError("Expected Gate 0.1 result SHA resolved to the wrong dependency.")
-    result = _read_json(result_path)
-    if result.get("contract_version") != GATE01_CONTRACT_VERSION:
-        raise ValueError("Expected Gate 0.1 result has an incompatible contract.")
-    result_body = dict(result)
-    stored_result_hash = result_body.pop("result_sha256", None)
-    if stored_result_hash != sha256_json(result_body):
-        raise ValueError("Gate 0.1 result self-hash mismatch.")
+    result, verified_result_file_sha256 = _load_verified_gate01_result_snapshot(
+        result_path,
+        result_entry,
+        expected_gate01_result_sha256=expected_gate01_result_sha256,
+    )
+    verified_payloads = {"gate01-results.json": result}
 
     manifest_path = _single_inventory_json_contract(
-        layout, GATE01_INPUT_CONTRACT_VERSION
+        layout,
+        GATE01_INPUT_CONTRACT_VERSION,
+        verified_payloads=verified_payloads,
     )
     lock_path = _single_inventory_json_contract(
-        layout, GATE01_PROTOCOL_LOCK_CONTRACT_VERSION
+        layout,
+        GATE01_PROTOCOL_LOCK_CONTRACT_VERSION,
+        verified_payloads=verified_payloads,
     )
     calibrator_path = _single_inventory_json_contract(
-        layout, GATE01_CALIBRATOR_CONTRACT_VERSION
+        layout,
+        GATE01_CALIBRATOR_CONTRACT_VERSION,
+        verified_payloads=verified_payloads,
     )
     expected_names = {
         manifest_path.name: "gate01-private-manifest.json",
@@ -1477,7 +1532,8 @@ def _preflight_gate01_p0006_archive(
     for relative_path in _GATE01_REQUIRED_BY_LAYOUT[layout.layout_contract]:
         candidate = layout.path_for(relative_path)
         if candidate.suffix == ".json":
-            _read_json(candidate)
+            if relative_path not in verified_payloads:
+                _read_json(candidate)
 
     lock = Gate01ProtocolLock.load(lock_path)
     if layout.layout_contract == GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2:
@@ -1497,7 +1553,7 @@ def _preflight_gate01_p0006_archive(
         layout=layout,
         result_path=result_path,
         result=result,
-        stored_result_hash=str(stored_result_hash),
+        verified_result_file_sha256=verified_result_file_sha256,
         manifest_path=manifest_path,
         lock_path=lock_path,
         calibrator_path=calibrator_path,
@@ -2019,15 +2075,21 @@ def _verified_relative_child(root: Path, relative_path: str) -> Path:
 
 
 def _single_inventory_json_contract(
-    layout: Gate01ArchiveLayout, contract: str
+    layout: Gate01ArchiveLayout,
+    contract: str,
+    *,
+    verified_payloads: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Path:
     candidates: list[Path] = []
+    trusted_payloads = verified_payloads or {}
     for entry in layout.entries:
         if not entry.basename.endswith(".json"):
             continue
         path = layout.path_for(entry.relative_path)
         try:
-            payload = _read_json(path)
+            payload = trusted_payloads.get(entry.relative_path)
+            if payload is None:
+                payload = _read_json(path)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if payload.get("contract_version") == contract:
@@ -2084,7 +2146,7 @@ def import_gate01_p0006_evaluation_protocol(
     layout = metadata.layout
     root = layout.logical_root
     result_path = metadata.result_path
-    stored_result_hash = metadata.stored_result_hash
+    verified_result_file_sha256 = metadata.verified_result_file_sha256
     manifest_path = metadata.manifest_path
     lock_path = metadata.lock_path
     calibrator_path = metadata.calibrator_path
@@ -2235,8 +2297,8 @@ def import_gate01_p0006_evaluation_protocol(
         },
         "gate01_result": {
             "path": str(result_path),
-            "file_sha256": expected_gate01_result_sha256,
-            "result_sha256": stored_result_hash,
+            "file_sha256": verified_result_file_sha256,
+            "internal_self_hash_defined": False,
         },
         "gate01_manifest": {
             "path": str(manifest_path),
@@ -2523,6 +2585,16 @@ def _reverify_v4_archive_provenance(protocol: Mapping[str, Any]) -> Path:
         "calibrator": "gate01-target-calibrator.json",
     }
     entry_map = {entry.relative_path: entry.sha256 for entry in layout.entries}
+    gate01_result = protocol.get("gate01_result")
+    if (
+        not isinstance(gate01_result, Mapping)
+        or set(gate01_result)
+        != {"path", "file_sha256", "internal_self_hash_defined"}
+        or gate01_result.get("file_sha256")
+        != REVIEWED_GATE01_RESULT_FILE_SHA256
+        or gate01_result.get("internal_self_hash_defined") is not False
+    ):
+        raise ValueError("P:0006 v4 Gate 0.1 result provenance is malformed.")
     for key, relative_path in expected_dependencies.items():
         spec = protocol.get(key)
         if not isinstance(spec, Mapping):
@@ -3482,6 +3554,7 @@ __all__ = [
     "P0006_COUNT_PROGRESS_ENV",
     "P0006_COUNT_PROGRESS_VALUE",
     "P0009_CONFIRMATION_STATUS",
+    "REVIEWED_GATE01_RESULT_FILE_SHA256",
     "STAGE2_BANK_MANIFEST_FILENAME",
     "STAGE2_BANK_TAR_RESTORE_CONTRACT",
     "STAGE2_COMPLETED_PILOT_REUSE_CONTRACT",

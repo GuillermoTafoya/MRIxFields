@@ -426,6 +426,50 @@ def test_drive_retry_does_not_retry_reviewed_module_schema_failure() -> None:
     assert remounts == 0
 
 
+def test_drive_retry_does_not_retry_gate01_result_integrity_failure() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def invalid_result():
+        nonlocal calls
+        calls += 1
+        raise ValueError("Gate 0.1 result byte snapshot SHA-256 differs")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(ValueError, match="byte snapshot"):
+        namespace["drive_retry"]("gate01-metadata-preflight", invalid_result)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_result_snapshot_validation_precedes_private_or_expensive_work() -> None:
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    preflight = importer_source[
+        importer_source.index("def _preflight_gate01_p0006_archive") :
+        importer_source.index("def _assert_p0006_metadata")
+    ]
+    snapshot_check = preflight.index("_load_verified_gate01_result_snapshot")
+    assert snapshot_check < preflight.index("load_gate01_input_manifest")
+    assert snapshot_check < preflight.index("_assert_gate_arrays_inside_archive")
+
+    operator_source = OPERATOR.read_text(encoding="utf-8")
+    preflight_call = operator_source.index("gate01_preflight = drive_retry")
+    for later_operation in (
+        "bank_restore = drive_retry",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "subprocess.Popen",
+        "import-stage2-gate01-p0006-evaluation",
+    ):
+        assert preflight_call < operator_source.index(later_operation)
+
+
 def test_reviewed_module_schema_check_is_inside_early_metadata_preflight() -> None:
     operator_source = OPERATOR.read_text(encoding="utf-8")
     importer_source = (

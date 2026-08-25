@@ -13,21 +13,33 @@ Pass `/content/drive/MyDrive/MRIxFields2026/Gate01Private_8012a3f` as the logica
 its `archive/` child. Exactly one of these layouts is accepted:
 
 - Modern flat: `sha256-inventory.csv` and all required artifacts are direct root children.
-- Reviewed legacy: `archive/sha256-inventory.json` is the inventory, while all required artifacts
-  remain direct root children. This reviewed layout requires the actual
-  `gate01-reviewed-module-sha256-8012a3f.json` dependency.
+- Reviewed legacy: `archive/sha256-inventory.json` contains exactly 14 reviewed rows. Normal rows
+  resolve only to the lexical suffix after their single `Gate01Private_8012a3f` path component.
+  The sole exception is the exactly pinned historical `split_v3.json` row, which resolves only to
+  `archive/split_v3.json`.
 
 The legacy inventory must be a nonempty JSON list of exact `path`, `sha256`, and `size_bytes`
 records. Digests are lowercase SHA-256 and sizes are nonnegative JSON integers, excluding
-booleans. Every row is verified. Stored absolute paths are never opened; only a unique validated
-basename may identify a regular, nonsymlink direct child of the logical root. Duplicate entries,
-duplicate basenames, traversal, missing files, size/hash changes, missing scientific contracts,
-ambiguous layouts, and the wrong Gate 0.1 result identity all stop the recovery.
+booleans. Every row is verified. Stored absolute paths are never opened or searched. The exact
+validated root-relative suffix is the inventory identity, so duplicate basenames in different
+directories are legitimate and cannot substitute for one another. Duplicate or case-colliding
+relative paths, traversal, ambiguous separators, symlinked files or parents, special files,
+missing files, size/hash changes, missing scientific contracts, ambiguous layouts, and the wrong
+Gate 0.1 result identity all stop the recovery.
+
+`colab-operational-source-split.json` and
+`gate01-reviewed-module-sha256-8012a3f.json` are not inventory members. They are separately pinned
+direct-root supplemental dependencies, with their exact observed sizes and SHA-256 values. The
+canonical split loader verifies the operational split and its frozen bank-membership linkage; the
+reviewed module document must contain the exact unique module-keyed SHA-256 map in the Gate lock.
+Their identities are recorded separately and never enter normalized inventory arithmetic.
 
 The metadata-only preflight validates this graph immediately after Drive mount. It opens no
 patient array payload and runs before bank restoration, checkpoint loading, any subprocess, and
-any GPU work. The resulting P:0006 protocol v3 records the layout and normalized inventory
-provenance without changing the existing development/model-assessment-only meaning.
+any GPU work. The resulting P:0006 protocol v4 records exact relative paths, resolution rules,
+normalized inventory provenance, and separate supplemental identities without changing the
+existing development/model-assessment-only meaning. Valid v2 and v3 protocols retain their
+published loading semantics.
 
 ## Persisted Stage-2 topology and bank restore
 
@@ -58,15 +70,22 @@ The sibling `photometry_factored_latent_bank_v2/` directory is ignored only when
 nonempty, linked, or non-directory entry at that unreceipted path is an ambiguity and fails
 closed. A fresh-Colab import preflight verifies NumPy, SciPy, PyTorch, PyYAML, the pinned
 FieldBridge checkout, and its CLI before Drive mount; the notebook never installs packages.
-P:0006 import prints start, periodic, and end receipts containing counts only.
+P:0006 import and both subsequent full-array reloads print start, periodic, and end receipts
+containing counts only. A filtered subprocess failure prints only its operation, return code, and
+the immutable archived log path and SHA-256.
 
-`Runtime -> Run all` is safely repeatable in the same runtime. An existing checkout is reused
+`Runtime -> Run all` is safely repeatable in the same runtime. Each seal uses an
+implementation-commit-scoped checkout directory, so a new seal can clone beside an older exact
+checkout without touching it. An existing checkout for the current seal is reused
 only when read-only Git probes prove that it is the exact clean detached operator commit, has
 only the pinned `origin`, descends from the training-evidence commit, and retains the restricted
 operator-only diff. The rerun never fetches, checks out, deletes, resets, cleans, or otherwise
 mutates an existing checkout. Any mismatch fails closed. Exact local tar/bank and published
 recovery artifacts are reverified; partial copy/extraction attempts remain immutable, and
 transient copy/free-space observations are excluded from the exact sealed recovery receipt.
+Deterministic missing-path, hash, size, schema, containment, ambiguity, and scientific-contract
+failures execute once. Only genuine Drive/FUSE I/O, stale-mount, disconnected-transport, and
+timeout failures receive bounded retry/remount handling.
 
 ## Completed-evidence reuse
 

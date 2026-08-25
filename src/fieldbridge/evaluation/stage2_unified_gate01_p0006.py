@@ -35,6 +35,7 @@ from fieldbridge.data.photometry_factorization import (
     sha256_text,
     write_json_atomic,
 )
+from fieldbridge.data.vae_splits import load_vae_splits, vae_splits_fingerprint
 from fieldbridge.evaluation.stage2_gate01 import (
     GATE01_CONTRACT_VERSION,
     GATE01_INPUT_CONTRACT_VERSION,
@@ -46,6 +47,7 @@ from fieldbridge.evaluation.stage2_gate01_calibration import (
     PosthocTargetCalibrator,
 )
 from fieldbridge.evaluation.stage2_gate01_protocol import (
+    GATE01_SCIENTIFIC_MODULES,
     GATE01_PROTOCOL_LOCK_CONTRACT_VERSION,
     Gate01ProtocolLock,
 )
@@ -75,17 +77,27 @@ from fieldbridge.training.checkpoints import load_checkpoint
 GATE01_P0006_EVALUATION_PROTOCOL_V2 = (
     "stage2-unified-gate01-p0006-development-validation-evaluation-only-protocol-v2"
 )
-GATE01_P0006_EVALUATION_PROTOCOL = (
+GATE01_P0006_EVALUATION_PROTOCOL_V3 = (
     "stage2-unified-gate01-p0006-development-validation-evaluation-only-protocol-v3"
 )
+GATE01_P0006_EVALUATION_PROTOCOL = (
+    "stage2-unified-gate01-p0006-development-validation-evaluation-only-protocol-v4"
+)
 SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS = frozenset(
-    {GATE01_P0006_EVALUATION_PROTOCOL_V2, GATE01_P0006_EVALUATION_PROTOCOL}
+    {
+        GATE01_P0006_EVALUATION_PROTOCOL_V2,
+        GATE01_P0006_EVALUATION_PROTOCOL_V3,
+        GATE01_P0006_EVALUATION_PROTOCOL,
+    }
 )
 GATE01_ARCHIVE_LAYOUT_MODERN_FLAT_V1 = "gate01-archive-modern-flat-csv-v1"
 GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1 = (
     "gate01-archive-reviewed-legacy-parent-json-v1"
 )
-GATE01_ARCHIVE_PREFLIGHT_CONTRACT = "gate01-p0006-metadata-preflight-v1"
+GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2 = (
+    "gate01-archive-reviewed-legacy-path-aware-json-v2"
+)
+GATE01_ARCHIVE_PREFLIGHT_CONTRACT = "gate01-p0006-metadata-preflight-v2"
 STAGE2_COMPLETED_PILOT_REUSE_CONTRACT = "stage2-completed-pilot-reuse-verification-v1"
 STAGE2_BANK_TAR_RESTORE_CONTRACT = "stage2-reviewed-bank-tar-restore-v1"
 STAGE2_LOCAL_ARCHIVE_COPY_CONTRACT = "stage2-reviewed-bank-local-copy-v1"
@@ -122,6 +134,46 @@ EXPECTED_STAGE2_SELECTION_RULE_SHA256 = (
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
+_GATE01_LEGACY_ROOT_MARKER = "Gate01Private_8012a3f"
+_GATE01_LEGACY_SPLIT_STORED_PATH = (
+    "/content/drive/MyDrive/MRIxFields2026/split_v3.json"
+)
+_GATE01_LEGACY_SPLIT_RELATIVE_PATH = "archive/split_v3.json"
+_GATE01_LEGACY_SPLIT_SHA256 = (
+    "f6a19d7a31c4c3bb73edd92088ea078192e88ee4b276309bad81c548ab7f94d5"
+)
+_GATE01_LEGACY_SPLIT_SIZE_BYTES = 798444
+_GATE01_LEGACY_REQUIRED_RELATIVE_PATHS = frozenset(
+    {
+        "frozen-scientific-resplit.json",
+        _GATE01_LEGACY_SPLIT_RELATIVE_PATH,
+        "gate01-target-calibrator.json",
+        "gate01-prospective-selection.json",
+        "gate01-protocol-spec.json",
+        "gate01-protocol-lock.json",
+        "gate01-producer-spec.json",
+        "producer-state/producer-state.json",
+        "producer-output/private-build-plan.json",
+        "gate01-private-manifest.json",
+        "gate01-private-build-state.json",
+        "gate01-results.json",
+        "gate01-report.md",
+        "gate01-result-contract.json",
+    }
+)
+_GATE01_LEGACY_SUPPLEMENTAL_SPECS = {
+    "colab-operational-source-split.json": (
+        "972e497e2d29755e928414a4aa51f906951674ec0a950b0e9ac73881fffd0c54",
+        799986,
+        "canonical_vae_split_with_gate_bank_membership_linkage",
+    ),
+    "gate01-reviewed-module-sha256-8012a3f.json": (
+        "ea5f40b580cbba26766ee60ce243d466ab93d32b1856125c067eace9a7d1ed36",
+        7634,
+        "reviewed_scientific_module_sha256_map",
+    ),
+}
+
 _GATE01_REQUIRED_COMMON = frozenset(
     {
         "gate01-private-manifest.json",
@@ -144,11 +196,9 @@ _GATE01_REQUIRED_BY_LAYOUT = {
         "private-build-plan.json",
         "gate01-report.md",
     },
-    GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1: _GATE01_REQUIRED_COMMON
-    | {
-        "colab-operational-source-split.json",
-        "gate01-reviewed-module-sha256-8012a3f.json",
-    },
+    GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2: (
+        _GATE01_LEGACY_REQUIRED_RELATIVE_PATHS
+    ),
 }
 P0006_SUBJECT_GROUP = "P:0006"
 P0006_IDENTITY_SHA256 = sha256_text(P0006_SUBJECT_GROUP)
@@ -167,17 +217,53 @@ FORBIDDEN_OTHER_TRAVELLER_HASHES = {
 
 @dataclass(frozen=True, slots=True)
 class VerifiedGate01InventoryEntry:
-    """One inventory row verified against a direct logical-root child."""
+    """One inventory row verified at an exact logical-root-relative path."""
 
-    basename: str
+    relative_path: str
     sha256: str
     size_bytes: int
+    resolution_rule: str
+    stored_path_label_sha256: str
+
+    @property
+    def basename(self) -> str:
+        return PurePosixPath(self.relative_path).name
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "relative_path": self.relative_path,
             "basename": self.basename,
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
+            "resolution_rule": self.resolution_rule,
+            "stored_path_label_sha256": self.stored_path_label_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedGate01SupplementalDependency:
+    """Separately pinned metadata dependency outside the legacy inventory."""
+
+    relative_path: str
+    sha256: str
+    size_bytes: int
+    semantic_contract: str
+    semantic_identity_sha256: str
+    semantic_entry_count: int
+
+    @property
+    def basename(self) -> str:
+        return PurePosixPath(self.relative_path).name
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "basename": self.basename,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "semantic_contract": self.semantic_contract,
+            "semantic_identity_sha256": self.semantic_identity_sha256,
+            "semantic_entry_count": self.semantic_entry_count,
         }
 
 
@@ -190,16 +276,33 @@ class Gate01ArchiveLayout:
     layout_contract: str
     inventory_format: Literal["csv", "reviewed_legacy_json"]
     entries: tuple[VerifiedGate01InventoryEntry, ...]
+    supplemental_dependencies: tuple[VerifiedGate01SupplementalDependency, ...]
     inventory_file_sha256: str
     normalized_inventory_sha256: str
 
-    def path_for(self, basename: str) -> Path:
-        matches = [entry for entry in self.entries if entry.basename == basename]
+    def path_for(self, relative_path: str) -> Path:
+        matches = [
+            entry for entry in self.entries if entry.relative_path == relative_path
+        ]
         if len(matches) != 1:
             raise ValueError(
-                f"Gate 0.1 inventory requires exactly one {basename!r}; found {len(matches)}."
+                "Gate 0.1 inventory requires exactly one verified relative path "
+                f"{relative_path!r}; found {len(matches)}."
             )
-        return _verified_direct_child(self.logical_root, basename)
+        return _verified_relative_child(self.logical_root, relative_path)
+
+    def supplemental_path_for(self, relative_path: str) -> Path:
+        matches = [
+            dependency
+            for dependency in self.supplemental_dependencies
+            if dependency.relative_path == relative_path
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Gate 0.1 requires exactly one verified supplemental dependency "
+                f"{relative_path!r}; found {len(matches)}."
+            )
+        return _verified_relative_child(self.logical_root, relative_path)
 
     def file_with_sha256(self, digest: str) -> Path:
         matches = [entry for entry in self.entries if entry.sha256 == digest]
@@ -208,7 +311,7 @@ class Gate01ArchiveLayout:
                 "Gate 0.1 inventory must identify exactly one file with the expected "
                 "result SHA-256."
             )
-        return _verified_direct_child(self.logical_root, matches[0].basename)
+        return _verified_relative_child(self.logical_root, matches[0].relative_path)
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -221,8 +324,14 @@ class Gate01ArchiveLayout:
             "normalized_inventory_entry_count": len(self.entries),
             "normalized_inventory_sha256": self.normalized_inventory_sha256,
             "verified_entries": [entry.to_dict() for entry in self.entries],
+            "supplemental_dependencies": [
+                dependency.to_dict()
+                for dependency in self.supplemental_dependencies
+            ],
             "stored_inventory_paths_trusted_for_file_access": False,
-            "file_access_derivation": "verified_basename_as_direct_logical_root_child",
+            "file_access_derivation": (
+                "verified_exact_root_relative_path_from_layout_resolution_rule"
+            ),
         }
 
 
@@ -1176,7 +1285,10 @@ def resolve_gate01_p0006_archive_layout(
 ) -> Gate01ArchiveLayout:
     """Resolve only the modern flat CSV or reviewed parent-root legacy JSON layout."""
 
-    root = Path(archive_root).resolve()
+    supplied_root = Path(archive_root)
+    if supplied_root.is_symlink():
+        raise ValueError("Gate 0.1 logical archive root may not be a symlink.")
+    root = supplied_root.resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"Gate 0.1 archive root does not exist: {root}")
     modern = root / "sha256-inventory.csv"
@@ -1187,7 +1299,7 @@ def resolve_gate01_p0006_archive_layout(
     if legacy.exists():
         matches.append(
             (
-                GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1,
+                GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2,
                 "reviewed_legacy_json",
                 legacy,
             )
@@ -1206,15 +1318,29 @@ def resolve_gate01_p0006_archive_layout(
     _assert_contained_regular_file(root, inventory_path, label="inventory")
     if inventory_format == "csv":
         entries = _verify_csv_archive_inventory(root, inventory_path)
+        supplemental_dependencies: tuple[
+            VerifiedGate01SupplementalDependency, ...
+        ] = ()
     else:
         entries = _verify_legacy_json_archive_inventory(root, inventory_path)
+        supplemental_dependencies = _verify_legacy_supplemental_dependencies(root)
     required = _GATE01_REQUIRED_BY_LAYOUT[layout_contract]
-    observed = {entry.basename for entry in entries}
+    observed = {entry.relative_path for entry in entries}
     missing = sorted(required - observed)
-    if missing:
+    unexpected = (
+        sorted(observed - required)
+        if layout_contract == GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2
+        else []
+    )
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing=" + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ", ".join(unexpected))
         raise ValueError(
             "Gate 0.1 inventory lacks required scientific dependencies: "
-            + ", ".join(missing)
+            + "; ".join(details)
         )
     normalized = [entry.to_dict() for entry in entries]
     return Gate01ArchiveLayout(
@@ -1223,6 +1349,7 @@ def resolve_gate01_p0006_archive_layout(
         layout_contract=layout_contract,
         inventory_format=inventory_format,
         entries=entries,
+        supplemental_dependencies=supplemental_dependencies,
         inventory_file_sha256=sha256_file(inventory_path),
         normalized_inventory_sha256=sha256_json(normalized),
     )
@@ -1251,6 +1378,10 @@ def preflight_gate01_p0006_archive(
         "inventory_file_sha256": layout.inventory_file_sha256,
         "normalized_inventory_entry_count": len(layout.entries),
         "normalized_inventory_sha256": layout.normalized_inventory_sha256,
+        "supplemental_dependencies": [
+            dependency.to_dict()
+            for dependency in layout.supplemental_dependencies
+        ],
         "expected_gate01_result_sha256": expected_gate01_result_sha256,
         "expected_gate01_result_match": True,
         "stored_absolute_inventory_paths_trusted_for_file_access": False,
@@ -1271,7 +1402,19 @@ def _preflight_gate01_p0006_archive(
         raise ValueError("Expected Gate 0.1 result identity must be lowercase SHA-256.")
     layout = resolve_gate01_p0006_archive_layout(archive_root)
     root = layout.logical_root
-    result_path = layout.file_with_sha256(expected_gate01_result_sha256)
+    result_entry = next(
+        (
+            entry
+            for entry in layout.entries
+            if entry.relative_path == "gate01-results.json"
+        ),
+        None,
+    )
+    if result_entry is None or result_entry.sha256 != expected_gate01_result_sha256:
+        raise ValueError(
+            "Expected Gate 0.1 result SHA-256 does not match the exact reviewed result path."
+        )
+    result_path = layout.path_for("gate01-results.json")
     if result_path.name != "gate01-results.json":
         raise ValueError("Expected Gate 0.1 result SHA resolved to the wrong dependency.")
     result = _read_json(result_path)
@@ -1298,12 +1441,14 @@ def _preflight_gate01_p0006_archive(
     }
     if any(observed != expected for observed, expected in expected_names.items()):
         raise ValueError("Gate 0.1 required contract resolved to an unexpected basename.")
-    for basename in _GATE01_REQUIRED_BY_LAYOUT[layout.layout_contract]:
-        candidate = layout.path_for(basename)
+    for relative_path in _GATE01_REQUIRED_BY_LAYOUT[layout.layout_contract]:
+        candidate = layout.path_for(relative_path)
         if candidate.suffix == ".json":
             _read_json(candidate)
 
     lock = Gate01ProtocolLock.load(lock_path)
+    if layout.layout_contract == GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2:
+        _verify_supplemental_linkage(layout, lock)
     calibrator = PosthocTargetCalibrator.load(
         calibrator_path,
         expected_split_fingerprint=lock.split_fingerprint,
@@ -1390,16 +1535,31 @@ def _verify_csv_archive_inventory(
                 raise ValueError(
                     f"Gate 0.1 archived file is missing or changed: {basename}"
                 )
-            rows.append(VerifiedGate01InventoryEntry(basename, digest, size))
+            rows.append(
+                VerifiedGate01InventoryEntry(
+                    relative_path=basename,
+                    sha256=digest,
+                    size_bytes=size,
+                    resolution_rule="modern_flat_direct_logical_root_child",
+                    stored_path_label_sha256=sha256_text(source_path),
+                )
+            )
     return _normalize_inventory_rows(rows)
 
 
 def _verify_legacy_json_archive_inventory(
     root: Path, path: Path
 ) -> tuple[VerifiedGate01InventoryEntry, ...]:
-    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    payload = _json_loads_without_duplicate_keys(
+        path.read_text(encoding="utf-8-sig"),
+        label="reviewed legacy Gate 0.1 inventory",
+    )
     if not isinstance(payload, list):
         raise ValueError("Reviewed legacy Gate 0.1 inventory must be a top-level JSON list.")
+    if len(payload) != len(_GATE01_LEGACY_REQUIRED_RELATIVE_PATHS):
+        raise ValueError(
+            "Reviewed legacy Gate 0.1 inventory must contain exactly 14 rows."
+        )
     rows: list[VerifiedGate01InventoryEntry] = []
     seen_records: set[tuple[str, str, int]] = set()
     for index, raw in enumerate(payload):
@@ -1418,13 +1578,29 @@ def _verify_legacy_json_archive_inventory(
         if record in seen_records:
             raise ValueError("Reviewed legacy inventory contains a duplicate entry.")
         seen_records.add(record)
-        basename = _inventory_basename(stored_path)
-        candidate = _verified_direct_child(root, basename)
+        relative_path, resolution_rule, normalized_label = _legacy_relative_path(
+            stored_path,
+            digest=digest,
+            size_bytes=size,
+        )
+        candidate = _verified_relative_child(root, relative_path)
         if candidate.stat().st_size != size:
-            raise ValueError(f"Gate 0.1 archived file size mismatch: {basename}")
+            raise ValueError(
+                f"Gate 0.1 archived file size mismatch: {relative_path}"
+            )
         if sha256_file(candidate) != digest:
-            raise ValueError(f"Gate 0.1 archived file hash mismatch: {basename}")
-        rows.append(VerifiedGate01InventoryEntry(basename, digest, size))
+            raise ValueError(
+                f"Gate 0.1 archived file hash mismatch: {relative_path}"
+            )
+        rows.append(
+            VerifiedGate01InventoryEntry(
+                relative_path=relative_path,
+                sha256=digest,
+                size_bytes=size,
+                resolution_rule=resolution_rule,
+                stored_path_label_sha256=sha256_text(normalized_label),
+            )
+        )
     return _normalize_inventory_rows(rows)
 
 
@@ -1433,10 +1609,216 @@ def _normalize_inventory_rows(
 ) -> tuple[VerifiedGate01InventoryEntry, ...]:
     if not rows:
         raise ValueError("Gate 0.1 archive inventory is empty.")
-    folded = [entry.basename.casefold() for entry in rows]
+    folded = [entry.relative_path.casefold() for entry in rows]
     if len(set(folded)) != len(folded):
-        raise ValueError("Gate 0.1 archive inventory has duplicate basenames.")
-    return tuple(sorted(rows, key=lambda item: item.basename))
+        raise ValueError(
+            "Gate 0.1 archive inventory has duplicate or case-colliding relative paths."
+        )
+    return tuple(sorted(rows, key=lambda item: item.relative_path))
+
+
+def _legacy_relative_path(
+    stored_path: str,
+    *,
+    digest: str,
+    size_bytes: int,
+) -> tuple[str, str, str]:
+    normalized = _normalize_legacy_path_label(stored_path)
+    if normalized == _GATE01_LEGACY_SPLIT_STORED_PATH:
+        if (
+            PurePosixPath(normalized).name != "split_v3.json"
+            or digest != _GATE01_LEGACY_SPLIT_SHA256
+            or size_bytes != _GATE01_LEGACY_SPLIT_SIZE_BYTES
+        ):
+            raise ValueError(
+                "Reviewed legacy split relocation identity is not exactly pinned."
+            )
+        return (
+            _GATE01_LEGACY_SPLIT_RELATIVE_PATH,
+            "reviewed_pinned_external_split_relocation",
+            normalized,
+        )
+
+    parts = PurePosixPath(normalized).parts
+    marker_indexes = [
+        index for index, part in enumerate(parts) if part == _GATE01_LEGACY_ROOT_MARKER
+    ]
+    if len(marker_indexes) != 1:
+        raise ValueError(
+            "Reviewed legacy stored path must contain exactly one bundle-root marker."
+        )
+    suffix = parts[marker_indexes[0] + 1 :]
+    relative_path = _validated_relative_path_parts(suffix)
+    return relative_path, "anchored_suffix_after_reviewed_bundle_root", normalized
+
+
+def _normalize_legacy_path_label(stored_path: str) -> str:
+    if (
+        not isinstance(stored_path, str)
+        or not stored_path
+        or stored_path != stored_path.strip()
+        or not stored_path.startswith("/")
+        or chr(92) in stored_path
+        or "//" in stored_path
+        or stored_path.endswith("/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in stored_path)
+    ):
+        raise ValueError("Reviewed legacy inventory contains a malformed stored path label.")
+    parts = PurePosixPath(stored_path).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Reviewed legacy inventory stored path contains dot traversal.")
+    normalized = "/" + "/".join(parts[1:])
+    if normalized != stored_path:
+        raise ValueError("Reviewed legacy inventory stored path is ambiguously normalized.")
+    return normalized
+
+
+def _validated_relative_path_parts(parts: tuple[str, ...]) -> str:
+    if not parts:
+        raise ValueError("Reviewed legacy inventory has an empty anchored suffix.")
+    if any(
+        not part
+        or part in {".", ".."}
+        or "/" in part
+        or chr(92) in part
+        or any(ord(character) < 32 or ord(character) == 127 for character in part)
+        for part in parts
+    ):
+        raise ValueError("Reviewed legacy inventory has a malformed anchored suffix.")
+    if re.fullmatch(r"[A-Za-z]:", parts[0]) is not None:
+        raise ValueError("Reviewed legacy inventory suffix may not be drive-qualified.")
+    relative_path = PurePosixPath(*parts)
+    if relative_path.is_absolute():
+        raise ValueError("Reviewed legacy inventory suffix must be relative.")
+    return relative_path.as_posix()
+
+
+def _verify_legacy_supplemental_dependencies(
+    root: Path,
+) -> tuple[VerifiedGate01SupplementalDependency, ...]:
+    verified: list[VerifiedGate01SupplementalDependency] = []
+    for relative_path, (digest, size_bytes, semantic_contract) in sorted(
+        _GATE01_LEGACY_SUPPLEMENTAL_SPECS.items()
+    ):
+        candidate = _verified_direct_child(root, relative_path)
+        if candidate.stat().st_size != size_bytes:
+            raise ValueError(
+                f"Gate 0.1 supplemental dependency size mismatch: {relative_path}"
+            )
+        if sha256_file(candidate) != digest:
+            raise ValueError(
+                f"Gate 0.1 supplemental dependency hash mismatch: {relative_path}"
+            )
+        if relative_path == "colab-operational-source-split.json":
+            operational_payload = _json_loads_without_duplicate_keys(
+                candidate.read_text(encoding="utf-8-sig"),
+                label="Gate 0.1 operational source split",
+            )
+            if not isinstance(operational_payload, Mapping):
+                raise ValueError(
+                    "Gate 0.1 operational source split must be a JSON object."
+                )
+            split = load_vae_splits(candidate)
+            semantic_identity_sha256 = vae_splits_fingerprint(split)
+            semantic_entry_count = sum(
+                len(split.records_for(name))
+                for name in ("train", "validation", "test")
+            )
+        else:
+            module_hashes = _load_reviewed_module_hashes(candidate)
+            semantic_identity_sha256 = sha256_json(module_hashes)
+            semantic_entry_count = len(module_hashes)
+        verified.append(
+            VerifiedGate01SupplementalDependency(
+                relative_path=relative_path,
+                sha256=digest,
+                size_bytes=size_bytes,
+                semantic_contract=semantic_contract,
+                semantic_identity_sha256=semantic_identity_sha256,
+                semantic_entry_count=semantic_entry_count,
+            )
+        )
+    return tuple(verified)
+
+
+def _load_reviewed_module_hashes(path: Path) -> dict[str, str]:
+    payload = _json_loads_without_duplicate_keys(
+        path.read_text(encoding="utf-8-sig"),
+        label="reviewed Gate 0.1 module-hash document",
+    )
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(
+            "Reviewed Gate 0.1 module-hash document must be a nonempty module-keyed list."
+        )
+    module_hashes: dict[str, str] = {}
+    folded_modules: set[str] = set()
+    for index, row in enumerate(payload):
+        if not isinstance(row, Mapping) or set(row) != {"module", "sha256"}:
+            raise ValueError(
+                f"Reviewed Gate 0.1 module-hash row {index} is malformed."
+            )
+        module = row["module"]
+        digest = row["sha256"]
+        if (
+            not isinstance(module, str)
+            or not module
+            or module != module.strip()
+            or chr(92) in module
+            or module.startswith("/")
+            or any(part in {"", ".", ".."} for part in PurePosixPath(module).parts)
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+        ):
+            raise ValueError(
+                f"Reviewed Gate 0.1 module-hash row {index} is malformed."
+            )
+        folded = module.casefold()
+        if folded in folded_modules:
+            raise ValueError(
+                "Reviewed Gate 0.1 module-hash document has duplicate module keys."
+            )
+        folded_modules.add(folded)
+        module_hashes[module] = digest
+    if set(module_hashes) != set(GATE01_SCIENTIFIC_MODULES):
+        raise ValueError(
+            "Reviewed Gate 0.1 module-hash document has missing or unexpected modules."
+        )
+    return dict(sorted(module_hashes.items()))
+
+
+def _verify_supplemental_linkage(layout: Gate01ArchiveLayout, lock: Any) -> None:
+    split_path = layout.supplemental_path_for(
+        "colab-operational-source-split.json"
+    )
+    operational_split = load_vae_splits(split_path)
+    if vae_splits_fingerprint(operational_split) != lock.bank_source_split_fingerprint:
+        raise ValueError(
+            "Gate 0.1 operational source split is not linked to the frozen bank split."
+        )
+    reviewed_module_path = layout.supplemental_path_for(
+        "gate01-reviewed-module-sha256-8012a3f.json"
+    )
+    if _load_reviewed_module_hashes(reviewed_module_path) != dict(
+        lock.evaluation_module_sha256
+    ):
+        raise ValueError(
+            "Gate 0.1 reviewed module identities differ from the protocol lock."
+        )
+
+
+def _json_loads_without_duplicate_keys(text: str, *, label: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate JSON key: {key!r}.")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is malformed JSON.") from exc
 
 
 def _inventory_basename(stored_path: str) -> str:
@@ -1455,8 +1837,17 @@ def _inventory_basename(stored_path: str) -> str:
 
 
 def _assert_contained_regular_file(root: Path, path: Path, *, label: str) -> Path:
-    if path.is_symlink():
-        raise ValueError(f"Gate 0.1 {label} may not be a symlink.")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Gate 0.1 {label} escapes the logical archive root.") from exc
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(
+                f"Gate 0.1 {label} may not use a symlinked file or parent directory."
+            )
     try:
         resolved = path.resolve(strict=True)
     except FileNotFoundError as exc:
@@ -1477,6 +1868,17 @@ def _verified_direct_child(root: Path, basename: str) -> Path:
     return _assert_contained_regular_file(root, candidate, label=f"artifact {basename!r}")
 
 
+def _verified_relative_child(root: Path, relative_path: str) -> Path:
+    parts = PurePosixPath(relative_path).parts
+    normalized = _validated_relative_path_parts(parts)
+    candidate = root.joinpath(*PurePosixPath(normalized).parts)
+    return _assert_contained_regular_file(
+        root,
+        candidate,
+        label=f"artifact {normalized!r}",
+    )
+
+
 def _single_inventory_json_contract(
     layout: Gate01ArchiveLayout, contract: str
 ) -> Path:
@@ -1484,7 +1886,7 @@ def _single_inventory_json_contract(
     for entry in layout.entries:
         if not entry.basename.endswith(".json"):
             continue
-        path = _verified_direct_child(layout.logical_root, entry.basename)
+        path = layout.path_for(entry.relative_path)
         try:
             payload = _read_json(path)
         except (OSError, ValueError, json.JSONDecodeError):
@@ -1654,6 +2056,15 @@ def import_gate01_p0006_evaluation_protocol(
             "inventory_file_sha256": layout.inventory_file_sha256,
             "verified_inventory_entry_count": len(layout.entries),
             "normalized_inventory_sha256": layout.normalized_inventory_sha256,
+            "supplemental_dependency_count": len(
+                layout.supplemental_dependencies
+            ),
+            "supplemental_dependencies_sha256": sha256_json(
+                [
+                    dependency.to_dict()
+                    for dependency in layout.supplemental_dependencies
+                ]
+            ),
             "stored_inventory_paths_trusted_for_file_access": False,
         },
         "archive_inventory": {
@@ -1665,7 +2076,23 @@ def import_gate01_p0006_evaluation_protocol(
             "normalized_inventory_sha256": layout.normalized_inventory_sha256,
             "verified_entries": [entry.to_dict() for entry in layout.entries],
             "stored_absolute_paths_trusted_for_file_access": False,
-            "file_access_derivation": "verified_basename_as_direct_logical_root_child",
+            "file_access_derivation": (
+                "verified_exact_root_relative_path_from_layout_resolution_rule"
+            ),
+        },
+        "supplemental_dependencies": {
+            "included_in_archive_inventory": False,
+            "normalized_dependency_count": len(layout.supplemental_dependencies),
+            "normalized_dependencies_sha256": sha256_json(
+                [
+                    dependency.to_dict()
+                    for dependency in layout.supplemental_dependencies
+                ]
+            ),
+            "verified_dependencies": [
+                dependency.to_dict()
+                for dependency in layout.supplemental_dependencies
+            ],
         },
         "gate01_result": {
             "path": str(result_path),
@@ -1743,6 +2170,8 @@ def import_gate01_p0006_evaluation_protocol(
 
 def load_gate01_p0006_evaluation_protocol(
     path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
     dict[str, Any],
     tuple[PairedEvaluationCase, ...],
@@ -1750,14 +2179,20 @@ def load_gate01_p0006_evaluation_protocol(
 ]:
     """Revalidate the sealed P:0006 graph and stream its full-volume arrays."""
 
+    progress = _resolve_p0006_count_progress_callback(progress_callback)
+    _emit_progress(
+        progress,
+        {"stage": "p0006_load", "status": "start", "case_count": 0},
+    )
     protocol = _load_self_hashed(path, "protocol_sha256")
     if protocol.get("contract_version") not in SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS:
         raise ValueError("Unsupported P:0006 evaluation-only protocol contract.")
-    archive_root = (
-        _reverify_v3_archive_provenance(protocol)
-        if protocol["contract_version"] == GATE01_P0006_EVALUATION_PROTOCOL
-        else None
-    )
+    if protocol["contract_version"] == GATE01_P0006_EVALUATION_PROTOCOL:
+        archive_root = _reverify_v4_archive_provenance(protocol)
+    elif protocol["contract_version"] == GATE01_P0006_EVALUATION_PROTOCOL_V3:
+        archive_root = _reverify_v3_archive_provenance(protocol)
+    else:
+        archive_root = None
     if (
         protocol.get("subject_group_identity") != P0006_SUBJECT_GROUP
         or protocol.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256
@@ -1776,6 +2211,15 @@ def load_gate01_p0006_evaluation_protocol(
     calibrator_path = _verified_protocol_file(protocol, "calibrator")
     _verified_protocol_file(protocol, "gate01_result")
     lock = Gate01ProtocolLock.load(lock_path)
+    if protocol["contract_version"] == GATE01_P0006_EVALUATION_PROTOCOL:
+        if archive_root is None:
+            raise ValueError("P:0006 v4 archive root was not reverified.")
+        reverified_layout = resolve_gate01_p0006_archive_layout(archive_root)
+        if (
+            reverified_layout.layout_contract
+            == GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2
+        ):
+            _verify_supplemental_linkage(reverified_layout, lock)
     calibrator = PosthocTargetCalibrator.load(
         calibrator_path,
         expected_split_fingerprint=lock.split_fingerprint,
@@ -1784,6 +2228,17 @@ def load_gate01_p0006_evaluation_protocol(
     )
     gate_manifest, metadata = load_gate01_input_manifest(
         manifest_path, protocol_lock=lock, calibrator=calibrator
+    )
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_load",
+            "status": "periodic",
+            "verified_inventory_entry_count": len(
+                protocol.get("archive_inventory", {}).get("verified_entries", [])
+            ),
+            "case_count": 0,
+        },
     )
     _assert_gate_arrays_inside_archive(
         gate_manifest,
@@ -1796,7 +2251,7 @@ def load_gate01_p0006_evaluation_protocol(
     }
     cases: list[PairedEvaluationCase] = []
     baselines: dict[str, dict[str, torch.Tensor]] = {}
-    for gate_case in gate_manifest:
+    for case_count, gate_case in enumerate(gate_manifest, start=1):
         receipt = _case_receipt(gate_case, calibrator)
         expected = expected_receipts.pop(gate_case.case_id, None)
         if expected != receipt:
@@ -1846,22 +2301,50 @@ def load_gate01_p0006_evaluation_protocol(
             ),
             "original_sb_v2": _as_channel_volume(gate_case.raw_sb_v2),
         }
+        if case_count % 10 == 0 or case_count == 60:
+            _emit_progress(
+                progress,
+                {
+                    "stage": "p0006_load",
+                    "status": "periodic",
+                    "case_count": case_count,
+                    "expected_case_count": 60,
+                },
+            )
     if expected_receipts or len(cases) != 60:
         raise ValueError("P:0006 evaluation case inventory is incomplete or changed.")
+    _emit_progress(
+        progress,
+        {
+            "stage": "p0006_load",
+            "status": "end",
+            "case_count": len(cases),
+            "expected_case_count": 60,
+        },
+    )
     return protocol, tuple(cases), baselines
 
 
-def _reverify_v3_archive_provenance(protocol: Mapping[str, Any]) -> Path:
+def _reverify_v4_archive_provenance(protocol: Mapping[str, Any]) -> Path:
     identity = protocol.get("archive_identity")
     inventory = protocol.get("archive_inventory")
-    if not isinstance(identity, Mapping) or not isinstance(inventory, Mapping):
-        raise ValueError("P:0006 v3 protocol lacks archive-layout provenance.")
+    supplemental = protocol.get("supplemental_dependencies")
+    if (
+        not isinstance(identity, Mapping)
+        or not isinstance(inventory, Mapping)
+        or not isinstance(supplemental, Mapping)
+    ):
+        raise ValueError("P:0006 v4 protocol lacks archive-layout provenance.")
     root_text = identity.get("logical_root")
     if not isinstance(root_text, str) or not root_text:
-        raise ValueError("P:0006 v3 protocol lacks the logical archive root.")
+        raise ValueError("P:0006 v4 protocol lacks the logical archive root.")
     root = Path(root_text).resolve()
     layout = resolve_gate01_p0006_archive_layout(root)
     entries = [entry.to_dict() for entry in layout.entries]
+    supplemental_entries = [
+        dependency.to_dict() for dependency in layout.supplemental_dependencies
+    ]
+    supplemental_sha256 = sha256_json(supplemental_entries)
     if (
         identity.get("root_path_identity_sha256") != sha256_text(str(root))
         or identity.get("layout_contract") != layout.layout_contract
@@ -1870,6 +2353,10 @@ def _reverify_v3_archive_provenance(protocol: Mapping[str, Any]) -> Path:
         or identity.get("verified_inventory_entry_count") != len(layout.entries)
         or identity.get("normalized_inventory_sha256")
         != layout.normalized_inventory_sha256
+        or identity.get("supplemental_dependency_count")
+        != len(layout.supplemental_dependencies)
+        or identity.get("supplemental_dependencies_sha256")
+        != supplemental_sha256
         or identity.get("stored_inventory_paths_trusted_for_file_access") is not False
         or Path(str(inventory.get("path", ""))).resolve() != layout.inventory_path
         or inventory.get("file_sha256") != layout.inventory_file_sha256
@@ -1881,23 +2368,131 @@ def _reverify_v3_archive_provenance(protocol: Mapping[str, Any]) -> Path:
         or inventory.get("verified_entries") != entries
         or inventory.get("stored_absolute_paths_trusted_for_file_access") is not False
         or inventory.get("file_access_derivation")
+        != "verified_exact_root_relative_path_from_layout_resolution_rule"
+        or supplemental.get("included_in_archive_inventory") is not False
+        or supplemental.get("normalized_dependency_count")
+        != len(layout.supplemental_dependencies)
+        or supplemental.get("normalized_dependencies_sha256")
+        != supplemental_sha256
+        or supplemental.get("verified_dependencies") != supplemental_entries
+    ):
+        raise ValueError("P:0006 v4 archive-layout provenance changed or is incomplete.")
+    expected_dependencies = {
+        "gate01_result": "gate01-results.json",
+        "gate01_manifest": "gate01-private-manifest.json",
+        "protocol_lock": "gate01-protocol-lock.json",
+        "calibrator": "gate01-target-calibrator.json",
+    }
+    entry_map = {entry.relative_path: entry.sha256 for entry in layout.entries}
+    for key, relative_path in expected_dependencies.items():
+        spec = protocol.get(key)
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"P:0006 v4 protocol lacks {key} provenance.")
+        dependency = Path(str(spec.get("path", ""))).resolve()
+        if (
+            dependency != layout.path_for(relative_path)
+            or entry_map.get(relative_path) != spec.get("file_sha256")
+        ):
+            raise ValueError(
+                f"P:0006 v4 dependency is not the exact inventoried path: {key}."
+            )
+    return root
+
+
+def _reverify_v3_archive_provenance(protocol: Mapping[str, Any]) -> Path:
+    """Safely retain the already-published direct-child v3 receipt semantics."""
+
+    identity = protocol.get("archive_identity")
+    inventory = protocol.get("archive_inventory")
+    if not isinstance(identity, Mapping) or not isinstance(inventory, Mapping):
+        raise ValueError("P:0006 v3 protocol lacks archive-layout provenance.")
+    root_text = identity.get("logical_root")
+    if not isinstance(root_text, str) or not root_text:
+        raise ValueError("P:0006 v3 protocol lacks the logical archive root.")
+    root = Path(root_text).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError("P:0006 v3 logical archive root is missing.")
+    layout_contract = identity.get("layout_contract")
+    inventory_format = identity.get("inventory_format")
+    if layout_contract == GATE01_ARCHIVE_LAYOUT_MODERN_FLAT_V1:
+        expected_inventory_path = root / "sha256-inventory.csv"
+        expected_format = "csv"
+    elif layout_contract == GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1:
+        expected_inventory_path = root / "archive" / "sha256-inventory.json"
+        expected_format = "reviewed_legacy_json"
+    else:
+        raise ValueError("P:0006 v3 archive layout contract is unsupported.")
+    if inventory_format != expected_format:
+        raise ValueError("P:0006 v3 archive inventory format changed.")
+    inventory_path = _assert_contained_regular_file(
+        root, expected_inventory_path, label="v3 archive inventory"
+    )
+    raw_entries = inventory.get("verified_entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ValueError("P:0006 v3 archive inventory entries are missing.")
+    entries: list[dict[str, Any]] = []
+    folded: set[str] = set()
+    for index, raw in enumerate(raw_entries):
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "basename",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ValueError(f"P:0006 v3 archive entry {index} is malformed.")
+        basename = raw["basename"]
+        digest = raw["sha256"]
+        size_bytes = raw["size_bytes"]
+        if (
+            not isinstance(basename, str)
+            or _inventory_basename(basename) != basename
+            or basename.casefold() in folded
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            or type(size_bytes) is not int
+            or size_bytes < 0
+        ):
+            raise ValueError(f"P:0006 v3 archive entry {index} is malformed.")
+        folded.add(basename.casefold())
+        dependency = _verified_direct_child(root, basename)
+        if dependency.stat().st_size != size_bytes or sha256_file(dependency) != digest:
+            raise ValueError(f"P:0006 v3 archive entry changed: {basename}.")
+        entries.append(
+            {"basename": basename, "sha256": digest, "size_bytes": size_bytes}
+        )
+    entries.sort(key=lambda item: str(item["basename"]))
+    normalized_sha256 = sha256_json(entries)
+    if (
+        identity.get("root_path_identity_sha256") != sha256_text(str(root))
+        or identity.get("inventory_file_sha256") != sha256_file(inventory_path)
+        or identity.get("verified_inventory_entry_count") != len(entries)
+        or identity.get("normalized_inventory_sha256") != normalized_sha256
+        or identity.get("stored_inventory_paths_trusted_for_file_access") is not False
+        or Path(str(inventory.get("path", ""))).resolve() != inventory_path
+        or inventory.get("file_sha256") != sha256_file(inventory_path)
+        or inventory.get("layout_contract") != layout_contract
+        or inventory.get("format") != expected_format
+        or inventory.get("normalized_entry_count") != len(entries)
+        or inventory.get("normalized_inventory_sha256") != normalized_sha256
+        or raw_entries != entries
+        or inventory.get("stored_absolute_paths_trusted_for_file_access") is not False
+        or inventory.get("file_access_derivation")
         != "verified_basename_as_direct_logical_root_child"
     ):
         raise ValueError("P:0006 v3 archive-layout provenance changed or is incomplete.")
-    entry_map = {entry.basename: entry.sha256 for entry in layout.entries}
+    entry_map = {str(entry["basename"]): str(entry["sha256"]) for entry in entries}
     for key in ("gate01_result", "gate01_manifest", "protocol_lock", "calibrator"):
         spec = protocol.get(key)
         if not isinstance(spec, Mapping):
             raise ValueError(f"P:0006 v3 protocol lacks {key} provenance.")
         dependency = Path(str(spec.get("path", ""))).resolve()
-        try:
-            dependency.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"P:0006 v3 dependency escapes logical root: {key}.") from exc
-        if dependency.parent != root or entry_map.get(dependency.name) != spec.get(
-            "file_sha256"
+        if (
+            dependency.parent != root
+            or entry_map.get(dependency.name) != spec.get("file_sha256")
+            or dependency != _verified_direct_child(root, dependency.name)
         ):
-            raise ValueError(f"P:0006 v3 dependency is not the inventoried root child: {key}.")
+            raise ValueError(
+                f"P:0006 v3 dependency is not the inventoried root child: {key}."
+            )
     return root
 
 
@@ -2736,9 +3331,11 @@ __all__ = [
     "EXPECTED_STAGE2_VALIDATION_PLAN_SHA256",
     "GATE01_ARCHIVE_LAYOUT_MODERN_FLAT_V1",
     "GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V1",
+    "GATE01_ARCHIVE_LAYOUT_REVIEWED_LEGACY_JSON_V2",
     "GATE01_ARCHIVE_PREFLIGHT_CONTRACT",
     "GATE01_P0006_EVALUATION_PROTOCOL",
     "GATE01_P0006_EVALUATION_PROTOCOL_V2",
+    "GATE01_P0006_EVALUATION_PROTOCOL_V3",
     "P0006_DEVELOPMENT_VALIDATION_DATA_ROLE",
     "P0006_EVIDENCE_LIMITATION",
     "P0006_IDENTITY_SHA256",

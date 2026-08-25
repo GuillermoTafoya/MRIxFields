@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import os
 import re
@@ -69,6 +70,7 @@ def _fake_checkout(
         "head": operator_commit,
         "status": "",
         "changed": "docs/recovery.md",
+        "attached": False,
     }
     calls: list[tuple[str, ...]] = []
 
@@ -83,7 +85,9 @@ def _fake_checkout(
             ("remote",): (0, "origin\n"),
             ("remote", "get-url", "--all", "origin"): (0, state["origin"] + "\n"),
             ("rev-parse", "HEAD"): (0, state["head"] + "\n"),
-            ("symbolic-ref", "-q", "HEAD"): (1, ""),
+            ("symbolic-ref", "-q", "HEAD"): (
+                (0, "refs/heads/unsafe\n") if state["attached"] else (1, "")
+            ),
             ("status", "--porcelain=v1", "--untracked-files=all"): (
                 0,
                 state["status"],
@@ -290,6 +294,7 @@ def test_existing_checkout_is_reused_only_through_read_only_validation(
             "origin differs",
         ),
         ("changed", "src/fieldbridge/training/stage2_unified.py", "training_critical"),
+        ("attached", True, "detached HEAD"),
     ],
 )
 def test_existing_checkout_rejects_dirty_wrong_or_training_changed_state(
@@ -327,7 +332,8 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
     for required in (
         "P0006_COUNT_PROGRESS_ENV",
         "P0006_COUNT_PROGRESS_VALUE",
-        "p0006_import_exact_resume",
+        "emit_p0006_load_progress",
+        "progress_callback=emit_p0006_load_progress",
         "visible_count_progress_only=True",
         "early_local_disk_capacity_preflight",
         "runtime_recommendation",
@@ -335,12 +341,144 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
         '"gpu_used": False',
     ):
         assert required in source
+    assert '"stage": "p0006_load"' in importer_source
+    assert "sanitized_operation_failure" in source
+    assert '"archived_log_path"' in source
+    assert '"archived_log_sha256"' in source
     progress_block = source[
         source.index("def emit_recovery_progress"):
         source.index("def load_self_hashed_json")
     ]
     for forbidden in ("path", "sha256", "identity", "subject", "fingerprint"):
         assert f'"{forbidden}"' not in progress_block
+
+
+def _operator_retry_functions():
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "_RETRYABLE_DRIVE_ERRNOS"
+            for target in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in {
+            "is_retryable_drive_transport_failure",
+            "drive_retry",
+        }:
+            selected.append(node)
+    namespace = {
+        "errno": errno,
+        "time": SimpleNamespace(sleep=lambda _seconds: None),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+def test_drive_retry_does_not_retry_deterministic_missing_artifact() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def missing():
+        nonlocal calls
+        calls += 1
+        raise FileNotFoundError("deterministic reviewed artifact is missing")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(FileNotFoundError, match="deterministic"):
+        namespace["drive_retry"]("missing", missing)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_drive_retry_keeps_bounded_transport_retry_and_remount() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def transient_then_pass():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise OSError(errno.EIO, "mock Drive transport failure")
+        return "pass"
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    assert namespace["drive_retry"]("transport", transient_then_pass) == "pass"
+    assert calls == 3
+    assert remounts == 2
+
+
+def test_old_and_new_implementation_scoped_checkouts_can_coexist_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    validate = _checkout_validator()
+    training_commit = "a" * 40
+    repository_url = "https://github.com/GuillermoTafoya/MRIxFields.git"
+    commits = ("c26df4ca" + "1" * 32, "d" * 40)
+    checkouts = {
+        (tmp_path / f"recovery-v8-{commit[:12]}").resolve(): commit
+        for commit in commits
+    }
+    for checkout in checkouts:
+        checkout.mkdir()
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    def fake_run(command, **kwargs):
+        cwd = Path(kwargs["cwd"]).resolve()
+        args = tuple(command[1:])
+        calls.append((cwd, args))
+        responses = {
+            ("rev-parse", "--is-inside-work-tree"): (0, "true\n"),
+            ("rev-parse", "--show-toplevel"): (0, str(cwd) + "\n"),
+            ("remote",): (0, "origin\n"),
+            ("remote", "get-url", "--all", "origin"): (0, repository_url + "\n"),
+            ("rev-parse", "HEAD"): (0, checkouts[cwd] + "\n"),
+            ("symbolic-ref", "-q", "HEAD"): (1, ""),
+            ("status", "--porcelain=v1", "--untracked-files=all"): (0, ""),
+            ("merge-base", "--is-ancestor", training_commit, "HEAD"): (0, ""),
+            ("diff", "--name-only", training_commit, "HEAD"): (
+                0,
+                "docs/recovery.md\n",
+            ),
+        }
+        return_code, stdout = responses[args]
+        return SimpleNamespace(returncode=return_code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    for checkout, commit in checkouts.items():
+        assert validate(checkout, repository_url, commit, training_commit) == {
+            "changed_path_count": 1,
+            "checkout_reused": True,
+        }
+    assert all(checkout.is_dir() for checkout in checkouts)
+    assert not any(
+        args and args[0] in {"fetch", "checkout", "reset", "clean"}
+        for _, args in calls
+    )
+    _, source = _notebook_source()
+    assert (
+        "MRIxFields-stage2-gate01-recovery-v8-' + "
+        "OPERATOR_IMPLEMENTATION_COMMIT[:12]"
+    ) in source
 
 
 def test_same_runtime_receipt_excludes_transient_resume_observations() -> None:

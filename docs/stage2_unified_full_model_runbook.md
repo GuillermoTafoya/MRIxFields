@@ -120,11 +120,16 @@ population or generalization claims. It is not a training or model-selection inp
 Before any photometry, bank, checkpoint, private-array, or GPU operation, run the metadata-only
 Gate 0.1 preflight against the logical bundle root. The importer recognizes exactly two layouts:
 the modern flat root with `sha256-inventory.csv`, or the reviewed legacy parent root with
-`archive/sha256-inventory.json`. In both cases all required artifacts are direct children of the
-logical root. Supplying the legacy `archive/` child as the logical root is invalid. Simultaneous
-inventories are ambiguous and fail closed. The legacy inventory's historical absolute paths are
-provenance labels only; file access is derived solely from a validated basename at the logical
-root, with containment, regular-file, exact-size, and SHA-256 checks applied to every row.
+`archive/sha256-inventory.json`. Modern CSV artifacts remain direct root children. The reviewed
+legacy JSON inventory has exactly 14 rows: normal rows resolve only through the exact lexical
+suffix after one `Gate01Private_8012a3f` marker, and the single pinned external `split_v3.json`
+label resolves only to `archive/split_v3.json`. Supplying the legacy `archive/` child as the
+logical root is invalid. Simultaneous inventories are ambiguous and fail closed. Historical
+absolute paths are provenance labels only; no basename search or fallback is allowed. Exact
+root-relative paths, containment, nonsymlink parents, regular-file type, byte size, and SHA-256
+are verified for every row. The separately pinned operational split and reviewed-module document
+remain outside inventory arithmetic and are linked back to the existing split and protocol-lock
+contracts.
 
 ```bash
 fieldbridge import-stage2-gate01-p0006-evaluation \
@@ -150,10 +155,11 @@ validation plan contains no P endpoint. Original SB-v2 arrays are imported; cali
 is deterministically re-derived from the existing raw identity, source support, and frozen Gate
 0.1 calibrator and its tensor identity is sealed. No baseline model is rerun.
 
-New imports use the explicit P:0006 protocol v3, which seals the logical-root identity, layout
-contract, inventory format/path/file hash, normalized entry count and identity, and every verified
-basename/hash/size. Its loader retains validation compatibility for already-valid v2 protocols;
-the scientific data role is unchanged. The recovery notebook described in
+New imports use the explicit P:0006 protocol v4, which seals the logical-root identity, layout
+contract, inventory format/path/file hash, normalized entry count and identity, every verified
+relative path/resolution-rule/hash/size, and the separate supplemental identities. Basenames are
+informational only. Its loader retains validation compatibility for already-valid v2 and v3
+protocols; the scientific data role is unchanged. The recovery notebook described in
 `stage2_gate01_legacy_inventory_recovery.md` must be used for the completed v7 pilot. It reads the
 immutable `implementation_82633d66e5ea` evidence and must never launch a replacement pilot.
 That recovery resolves the evidence beneath the exact
@@ -163,10 +169,13 @@ count, and byte count are all pinned; the empty unreceipted bank directory is ne
 source. The exact pair-feasibility receipt is also resolved directly beneath that output root.
 The recovery first checks local capacity, streams the Drive tar to local scratch while hashing
 that same copy pass, and extracts only the verified local file. Copy, extraction, tree
-verification, and P:0006 import emit count-only progress. CPU High-RAM is recommended; no GPU is
-used. A same-runtime rerun reuses an existing checkout only after read-only proof that its origin,
-detached commit, cleanliness, ancestry, and operator-only diff are exact; otherwise it fails
-without mutating that checkout.
+verification, P:0006 import, post-import load, and exact-resume load emit count-only progress. CPU
+High-RAM is recommended; no GPU is used. The checkout directory includes the implementation
+commit prefix, so an old exact seal and a new seal can coexist. A same-seal rerun reuses its
+checkout only after read-only proof that its origin, detached commit, cleanliness, ancestry, and
+operator-only diff are exact; otherwise it fails without mutating either checkout. Deterministic
+artifact/contract failures do not trigger Drive remounts; bounded retries are reserved for actual
+Drive/FUSE transport failures.
 
 Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
 exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records

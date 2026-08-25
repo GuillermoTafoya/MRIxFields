@@ -6,6 +6,7 @@ TRAINING_EVIDENCE_COMMIT, CLI_ENV, and git_text before executing this file.
 
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 import os
@@ -124,6 +125,33 @@ from google.colab import drive
 drive.mount("/content/drive")
 
 
+_RETRYABLE_DRIVE_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.EIO,
+        getattr(errno, "ESTALE", None),
+        getattr(errno, "ENOTCONN", None),
+        getattr(errno, "ETIMEDOUT", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "EHOSTUNREACH", None),
+    )
+    if value is not None
+)
+
+
+def is_retryable_drive_transport_failure(error):
+    return (
+        isinstance(error, TimeoutError)
+        or (
+            isinstance(error, OSError)
+            and not isinstance(error, (FileNotFoundError, PermissionError))
+            and error.errno in _RETRYABLE_DRIVE_ERRNOS
+        )
+    )
+
+
 def drive_retry(label, operation, attempts=3):
     last_error = None
     for attempt in range(1, attempts + 1):
@@ -131,6 +159,8 @@ def drive_retry(label, operation, attempts=3):
             return operation()
         except (OSError, IOError) as error:
             last_error = error
+            if not is_retryable_drive_transport_failure(error):
+                raise
             if attempt == attempts:
                 break
             print(
@@ -398,6 +428,20 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
         ),
     )
     if return_code:
+        print(
+            json.dumps(
+                {
+                    "sanitized_operation_failure": {
+                        "operation": operation,
+                        "return_code": return_code,
+                        "archived_log_path": str(archived_log),
+                        "archived_log_sha256": receipt["archived_log_sha256"],
+                    }
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         raise subprocess.CalledProcessError(return_code, command)
     return receipt
 
@@ -513,48 +557,42 @@ drive_retry(
 )
 P0006_EVALUATION_PROTOCOL = (
     RECOVERY_NAMESPACE
-    / "stage2_gate01_p0006_development_validation_evaluation_only_protocol_v3.json"
+    / "stage2_gate01_p0006_development_validation_evaluation_only_protocol_v4.json"
 )
 LONG_RUN_EVALUATION_READINESS = (
-    RECOVERY_NAMESPACE / "stage2_long_run_evaluation_readiness_v3.json"
+    RECOVERY_NAMESPACE / "stage2_long_run_evaluation_readiness_v4.json"
 )
 FROZEN_VALIDATION_PLAN = Path(
     completed_evidence["pilot_200"]["selection_receipt"]
 ).parent / "stage2_unified_validation_plan_v2.json"
 CLI_ENV[P0006_COUNT_PROGRESS_ENV] = P0006_COUNT_PROGRESS_VALUE
 
-if P0006_EVALUATION_PROTOCOL.exists():
+
+def emit_p0006_load_progress(payload):
+    allowed = {
+        "stage",
+        "status",
+        "verified_inventory_entry_count",
+        "case_count",
+        "expected_case_count",
+    }
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise ValueError(
+            f"P:0006 load progress contains forbidden fields: {sorted(unexpected)}"
+        )
     print(
-        json.dumps(
-            {
-                "p0006_import_progress": {
-                    "stage": "p0006_import_exact_resume",
-                    "status": "start",
-                    "case_count": 0,
-                }
-            },
-            sort_keys=True,
-        ),
+        json.dumps({"p0006_import_progress": payload}, sort_keys=True),
         flush=True,
     )
+
+if P0006_EVALUATION_PROTOCOL.exists():
     protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
-        P0006_EVALUATION_PROTOCOL
+        P0006_EVALUATION_PROTOCOL,
+        progress_callback=emit_p0006_load_progress,
     )
     if len(cases) != 60:
         raise RuntimeError("Existing P:0006 recovery protocol is incomplete.")
-    print(
-        json.dumps(
-            {
-                "p0006_import_progress": {
-                    "stage": "p0006_import_exact_resume",
-                    "status": "end",
-                    "case_count": len(cases),
-                }
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
 else:
     run_logged(
         [
@@ -577,7 +615,8 @@ else:
         visible_count_progress_only=True,
     )
     protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
-        P0006_EVALUATION_PROTOCOL
+        P0006_EVALUATION_PROTOCOL,
+        progress_callback=emit_p0006_load_progress,
     )
 if (
     protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL

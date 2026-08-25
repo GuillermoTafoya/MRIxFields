@@ -2156,6 +2156,82 @@ def _resolve_p0006_count_progress_callback(
     return emit
 
 
+@dataclass(frozen=True, slots=True)
+class _P0006StreamInventory:
+    case_receipts: tuple[dict[str, Any], ...]
+    case_count: int
+    directed_cell_count: int
+    acquisition_node_count: int
+
+
+def _stream_gate01_case_receipts(
+    gate_manifest: Any,
+    calibrator: PosthocTargetCalibrator,
+    *,
+    progress: Callable[[dict[str, Any]], None] | None,
+    progress_stage: str,
+) -> _P0006StreamInventory:
+    """Validate one tensor-bearing Gate 0.1 case at a time and retain metadata only."""
+
+    case_receipts: list[dict[str, Any]] = []
+    case_identities: set[str] = set()
+    directed_cells: set[tuple[str, float, float]] = set()
+    acquisition_nodes: set[tuple[str, str]] = set()
+    case_count = 0
+    iterator = iter(gate_manifest)
+    while True:
+        try:
+            gate_case = next(iterator)
+        except StopIteration:
+            break
+        try:
+            receipt = _case_receipt(gate_case, calibrator)
+            directed_cell = (
+                gate_case.source_domain.contrast.value,
+                float(gate_case.source_domain.field_strength_t),
+                float(gate_case.target_domain.field_strength_t),
+            )
+            source_node = (
+                gate_case.source_domain.label,
+                gate_case.array_sha256["source_image"],
+            )
+            target_node = (
+                gate_case.target_domain.label,
+                gate_case.array_sha256["target"],
+            )
+            if gate_case.case_id in case_identities:
+                raise ValueError("P:0006 protocol contains a duplicate case identity.")
+            case_receipts.append(receipt)
+            case_identities.add(gate_case.case_id)
+            directed_cells.add(directed_cell)
+            acquisition_nodes.update((source_node, target_node))
+            case_count += 1
+        finally:
+            # The manifest loads a full-volume case for each yield. Keep no
+            # tensor-bearing reference alive when requesting the next yield.
+            del gate_case
+        _emit_progress(
+            progress,
+            {
+                "stage": progress_stage,
+                "status": "periodic",
+                "case_count": case_count,
+                "expected_case_count": 60,
+            },
+        )
+
+    if case_count != 60 or len(directed_cells) != 60:
+        raise ValueError("P:0006 protocol requires exactly 60 directed field cases.")
+    if len(acquisition_nodes) != 15:
+        raise ValueError("P:0006 protocol requires exactly 15 acquisition nodes.")
+    return _P0006StreamInventory(
+        case_receipts=tuple(case_receipts),
+        case_count=case_count,
+        directed_cell_count=len(directed_cells),
+        acquisition_node_count=len(acquisition_nodes),
+    )
+
+
 def import_gate01_p0006_evaluation_protocol(
     archive_root: str | Path,
     *,
@@ -2239,39 +2315,12 @@ def import_gate01_p0006_evaluation_protocol(
         },
     )
 
-    cases = list(gate_manifest)
-    case_receipts = []
-    for case_count, case in enumerate(cases, start=1):
-        case_receipts.append(_case_receipt(case, calibrator))
-        if case_count % 10 == 0 or case_count == len(cases):
-            _emit_progress(
-                progress,
-                {
-                    "stage": "p0006_import",
-                    "status": "periodic",
-                    "case_count": case_count,
-                    "expected_case_count": len(cases),
-                },
-            )
-    directed_cells = {
-        (
-            case.source_domain.contrast.value,
-            float(case.source_domain.field_strength_t),
-            float(case.target_domain.field_strength_t),
-        )
-        for case in cases
-    }
-    if len(cases) != 60 or len(directed_cells) != 60:
-        raise ValueError("P:0006 protocol requires exactly 60 directed field cases.")
-    acquisition_nodes = {
-        (case.source_domain.label, case.array_sha256["source_image"])
-        for case in cases
-    } | {
-        (case.target_domain.label, case.array_sha256["target"])
-        for case in cases
-    }
-    if len(acquisition_nodes) != 15:
-        raise ValueError("P:0006 protocol requires exactly 15 acquisition nodes.")
+    streamed_inventory = _stream_gate01_case_receipts(
+        gate_manifest,
+        calibrator,
+        progress=progress,
+        progress_stage="p0006_import",
+    )
     producer = gate_metadata.get("producer_receipt")
     sealed_producer = producer.get("producer_receipt") if isinstance(producer, Mapping) else None
     if not isinstance(sealed_producer, Mapping) or (
@@ -2379,7 +2428,7 @@ def import_gate01_p0006_evaluation_protocol(
             "contract_version": validation_plan["contract_version"],
             "P_endpoint_count": 0,
         },
-        "case_receipts": case_receipts,
+        "case_receipts": list(streamed_inventory.case_receipts),
         "private_arrays_validated": True,
         "baseline_predictions_recomputed": False,
         "calibrated_identity_derivation": (
@@ -2400,29 +2449,24 @@ def import_gate01_p0006_evaluation_protocol(
             "verified_inventory_entry_count": len(layout.entries),
             "train_record_count": len(train_index.records),
             "validation_record_count": len(validation_index.records),
-            "case_count": len(cases),
-            "acquisition_node_count": len(acquisition_nodes),
+            "case_count": streamed_inventory.case_count,
+            "acquisition_node_count": streamed_inventory.acquisition_node_count,
         },
     )
     return body
 
 
-def load_gate01_p0006_evaluation_protocol(
-    path: str | Path,
-    *,
-    progress_callback: Callable[[dict[str, Any]], None] | None = None,
-) -> tuple[
-    dict[str, Any],
-    tuple[PairedEvaluationCase, ...],
-    dict[str, dict[str, torch.Tensor]],
-]:
-    """Revalidate the sealed P:0006 graph and stream its full-volume arrays."""
+@dataclass(frozen=True, slots=True)
+class _VerifiedP0006ProtocolContext:
+    protocol: dict[str, Any]
+    archive_root: Path | None
+    gate_manifest: Any
+    calibrator: PosthocTargetCalibrator
 
-    progress = _resolve_p0006_count_progress_callback(progress_callback)
-    _emit_progress(
-        progress,
-        {"stage": "p0006_load", "status": "start", "case_count": 0},
-    )
+
+def _load_verified_p0006_protocol_context(
+    path: str | Path,
+) -> _VerifiedP0006ProtocolContext:
     protocol = _load_self_hashed(path, "protocol_sha256")
     if protocol.get("contract_version") not in SUPPORTED_GATE01_P0006_EVALUATION_PROTOCOLS:
         raise ValueError("Unsupported P:0006 evaluation-only protocol contract.")
@@ -2468,6 +2512,103 @@ def load_gate01_p0006_evaluation_protocol(
     gate_manifest, metadata = load_gate01_input_manifest(
         manifest_path, protocol_lock=lock, calibrator=calibrator
     )
+    _assert_gate_arrays_inside_archive(
+        gate_manifest,
+        archive_root if archive_root is not None else manifest_path.resolve().parent,
+    )
+    if metadata["evidence_scope"]["traveller_identity_sha256"] != P0006_IDENTITY_SHA256:
+        raise ValueError("P:0006 evaluation manifest identity changed.")
+    return _VerifiedP0006ProtocolContext(
+        protocol=protocol,
+        archive_root=archive_root,
+        gate_manifest=gate_manifest,
+        calibrator=calibrator,
+    )
+
+
+def verify_gate01_p0006_evaluation_protocol_streaming(
+    path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reverify P:0006 one full-volume case at a time without returning tensors."""
+
+    progress = _resolve_p0006_count_progress_callback(progress_callback)
+    stage = "p0006_streaming_verification"
+    _emit_progress(progress, {"stage": stage, "status": "start", "case_count": 0})
+    context = _load_verified_p0006_protocol_context(path)
+    protocol = context.protocol
+    _emit_progress(
+        progress,
+        {
+            "stage": stage,
+            "status": "periodic",
+            "verified_inventory_entry_count": len(
+                protocol.get("archive_inventory", {}).get("verified_entries", [])
+            ),
+            "case_count": 0,
+        },
+    )
+    streamed_inventory = _stream_gate01_case_receipts(
+        context.gate_manifest,
+        context.calibrator,
+        progress=progress,
+        progress_stage=stage,
+    )
+    expected_receipts = protocol.get("case_receipts")
+    if (
+        not isinstance(expected_receipts, list)
+        or expected_receipts != list(streamed_inventory.case_receipts)
+    ):
+        raise ValueError("P:0006 case receipt inventory is incomplete or changed.")
+    if (
+        protocol.get("acquisition_count") != streamed_inventory.acquisition_node_count
+        or protocol.get("directed_pair_count") != streamed_inventory.directed_cell_count
+        or protocol.get("wrong_target_reference_count") != 180
+    ):
+        raise ValueError("P:0006 protocol graph counts are incomplete or changed.")
+    summary: dict[str, Any] = {
+        "contract_version": "stage2-gate01-p0006-streaming-verification-v1",
+        "protocol_sha256": protocol["protocol_sha256"],
+        "protocol_file_sha256": sha256_file(path),
+        "case_count": streamed_inventory.case_count,
+        "directed_cell_count": streamed_inventory.directed_cell_count,
+        "acquisition_node_count": streamed_inventory.acquisition_node_count,
+        "tensor_bearing_cases_returned": 0,
+        "baseline_tensor_mappings_returned": 0,
+    }
+    summary["verification_sha256"] = sha256_json(summary)
+    _emit_progress(
+        progress,
+        {
+            "stage": stage,
+            "status": "end",
+            "case_count": streamed_inventory.case_count,
+            "expected_case_count": 60,
+            "acquisition_node_count": streamed_inventory.acquisition_node_count,
+        },
+    )
+    return protocol, summary
+
+
+def load_gate01_p0006_evaluation_protocol(
+    path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[
+    dict[str, Any],
+    tuple[PairedEvaluationCase, ...],
+    dict[str, dict[str, torch.Tensor]],
+]:
+    """Revalidate the sealed P:0006 graph and stream its full-volume arrays."""
+
+    progress = _resolve_p0006_count_progress_callback(progress_callback)
+    _emit_progress(
+        progress,
+        {"stage": "p0006_load", "status": "start", "case_count": 0},
+    )
+    context = _load_verified_p0006_protocol_context(path)
+    protocol = context.protocol
     _emit_progress(
         progress,
         {
@@ -2479,12 +2620,8 @@ def load_gate01_p0006_evaluation_protocol(
             "case_count": 0,
         },
     )
-    _assert_gate_arrays_inside_archive(
-        gate_manifest,
-        archive_root if archive_root is not None else manifest_path.resolve().parent,
-    )
-    if metadata["evidence_scope"]["traveller_identity_sha256"] != P0006_IDENTITY_SHA256:
-        raise ValueError("P:0006 evaluation manifest identity changed.")
+    gate_manifest = context.gate_manifest
+    calibrator = context.calibrator
     expected_receipts = {
         str(item["case_identity"]): item for item in protocol["case_receipts"]
     }
@@ -3584,6 +3721,12 @@ def _case_receipt(
     }
     if len(wrong) != 3:
         raise ValueError("Each P:0006 edge requires all three wrong-target references.")
+    try:
+        calibrated_identity_sha256 = canonical_tensor_sha256(calibrated)
+    finally:
+        # The calibrated full volume is case-local verification state, never
+        # protocol state. Release it before the manifest advances.
+        del calibrated
     return {
         "case_identity": case.case_id,
         "source_domain": case.source_domain.to_dict(),
@@ -3592,7 +3735,7 @@ def _case_receipt(
         "source_support_sha256": case.array_sha256["source_support_mask"],
         "target_sha256": case.array_sha256["target"],
         "raw_identity_sha256": case.array_sha256["raw_identity"],
-        "calibrated_identity_sha256": canonical_tensor_sha256(calibrated),
+        "calibrated_identity_sha256": calibrated_identity_sha256,
         "original_sb_v2_sha256": case.array_sha256["raw_sb_v2"],
         "stage1_reconstruction_ceiling_sha256": case.array_sha256[
             "stage1_reconstruction_ceiling"
@@ -3717,4 +3860,5 @@ __all__ = [
     "resolve_gate01_p0006_archive_layout",
     "stage2_bank_tree_identity",
     "verify_completed_stage2_pilot_evidence",
+    "verify_gate01_p0006_evaluation_protocol_streaming",
 ]

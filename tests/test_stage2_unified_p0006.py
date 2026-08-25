@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import copy
+import gc
 import json
+import weakref
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,10 @@ from fieldbridge.data.photometry_factorization import sha256_file, sha256_json, 
 from fieldbridge.data.vae_splits import VaeSplits, save_vae_splits, vae_splits_fingerprint
 from fieldbridge.evaluation.stage2_gate01 import GATE01_CONTRACT_VERSION, Gate01Case
 from fieldbridge.evaluation.stage2_gate01_protocol import GATE01_SCIENTIFIC_MODULES
+from fieldbridge.evaluation.stage2_unified_preflight import (
+    PAIRED_FEASIBILITY_CONTRACT,
+    seal_long_run_evaluation_readiness,
+)
 from fieldbridge.training.stage2_unified import build_unified_validation_plan
 
 
@@ -94,56 +101,154 @@ class _MetadataOnlyGateManifest(_GateManifest):
         raise AssertionError("metadata preflight must not open private arrays")
 
 
-def _gate_cases() -> list[Gate01Case]:
-    result = []
+def _make_gate_case(
+    contrast: Contrast, source_field: float, target_field: float
+) -> Gate01Case:
     volume = torch.ones(1, 3, 3, 3)
     support = torch.ones_like(volume, dtype=torch.bool)
+    source_domain = Domain(source_field, contrast)
+    target_domain = Domain(target_field, contrast)
+    case_identity = f"P_0006_{contrast.value}_{source_field:g}_{target_field:g}"
+    wrong_labels = [
+        f"{field:g}T"
+        for field in FIELD_STRENGTHS_T
+        if field not in {source_field, target_field}
+    ]
+    hashes = {
+        "source_image": sha256_text(f"acquisition:{source_domain.label}"),
+        "source_support_mask": sha256_text(f"support:{source_domain.label}"),
+        "target": sha256_text(f"acquisition:{target_domain.label}"),
+        "raw_identity": sha256_text(f"identity:{source_domain.label}"),
+        "raw_sb_v2": sha256_text(f"sb:{case_identity}"),
+        "stage1_reconstruction_ceiling": sha256_text(f"stage1:{target_domain.label}"),
+        **{
+            f"wrong_target_sb_v2[{label}]": sha256_text(
+                f"wrong:{case_identity}:{label}"
+            )
+            for label in wrong_labels
+        },
+    }
+    return Gate01Case(
+        case_id=case_identity,
+        source_domain=source_domain,
+        target_domain=target_domain,
+        target=volume * target_field,
+        raw_identity=volume * source_field,
+        raw_sb_v2=volume * (source_field + target_field),
+        stage1_reconstruction_ceiling=volume * target_field,
+        support_mask=support,
+        traveller_identity_sha256=p0006.P0006_IDENTITY_SHA256,
+        array_sha256=hashes,
+        wrong_target_sb_v2={label: volume for label in wrong_labels},
+        source_image=volume * source_field,
+    )
+
+
+def _iter_gate_cases():
     for contrast in Contrast:
         for source_field in FIELD_STRENGTHS_T:
-            source_domain = Domain(source_field, contrast)
             for target_field in FIELD_STRENGTHS_T:
                 if target_field == source_field:
                     continue
-                target_domain = Domain(target_field, contrast)
-                case_identity = f"P_0006_{contrast.value}_{source_field:g}_{target_field:g}"
-                wrong_labels = [
-                    f"{field:g}T"
-                    for field in FIELD_STRENGTHS_T
-                    if field not in {source_field, target_field}
-                ]
-                hashes = {
-                    "source_image": sha256_text(f"acquisition:{source_domain.label}"),
-                    "source_support_mask": sha256_text(f"support:{source_domain.label}"),
-                    "target": sha256_text(f"acquisition:{target_domain.label}"),
-                    "raw_identity": sha256_text(f"identity:{source_domain.label}"),
-                    "raw_sb_v2": sha256_text(f"sb:{case_identity}"),
-                    "stage1_reconstruction_ceiling": sha256_text(
-                        f"stage1:{target_domain.label}"
-                    ),
-                    **{
-                        f"wrong_target_sb_v2[{label}]": sha256_text(
-                            f"wrong:{case_identity}:{label}"
-                        )
-                        for label in wrong_labels
-                    },
-                }
-                result.append(
-                    Gate01Case(
-                        case_id=case_identity,
-                        source_domain=source_domain,
-                        target_domain=target_domain,
-                        target=volume * target_field,
-                        raw_identity=volume * source_field,
-                        raw_sb_v2=volume * (source_field + target_field),
-                        stage1_reconstruction_ceiling=volume * target_field,
-                        support_mask=support,
-                        traveller_identity_sha256=p0006.P0006_IDENTITY_SHA256,
-                        array_sha256=hashes,
-                        wrong_target_sb_v2={label: volume for label in wrong_labels},
-                        source_image=volume * source_field,
-                    )
+                yield _make_gate_case(contrast, source_field, target_field)
+
+
+def _gate_cases() -> list[Gate01Case]:
+    return list(_iter_gate_cases())
+
+
+class _OneLiveCaseManifest:
+    def __init__(self) -> None:
+        self.max_live_case_count = 0
+        self.completed_case_count = 0
+
+    def __iter__(self):
+        for case in _iter_gate_cases():
+            tensor_reference = weakref.ref(case.target)
+            self.max_live_case_count = max(self.max_live_case_count, 1)
+            yield case
+            del case
+            gc.collect()
+            if tensor_reference() is not None:
+                raise AssertionError(
+                    "importer requested the next case while retaining the previous case"
                 )
-    return result
+            self.completed_case_count += 1
+
+
+class _OneLiveCalibrator(_Calibrator):
+    def __init__(self) -> None:
+        self.previous_result: weakref.ReferenceType[torch.Tensor] | None = None
+        self.max_live_result_count = 0
+
+    def apply(self, prediction, requested_target, *, support_mask):
+        if self.previous_result is not None and self.previous_result() is not None:
+            raise AssertionError("previous calibrated tensor remains live")
+        result = super().apply(
+            prediction, requested_target, support_mask=support_mask
+        )
+        self.previous_result = weakref.ref(result)
+        self.max_live_result_count = max(self.max_live_result_count, 1)
+        return result
+
+
+def test_streaming_case_inventory_retains_at_most_one_tensor_case() -> None:
+    manifest = _OneLiveCaseManifest()
+    calibrator = _OneLiveCalibrator()
+    progress: list[dict[str, object]] = []
+
+    inventory = p0006._stream_gate01_case_receipts(
+        manifest,
+        calibrator,
+        progress=progress.append,
+        progress_stage="p0006_import",
+    )
+
+    assert inventory.case_count == 60
+    assert inventory.directed_cell_count == 60
+    assert inventory.acquisition_node_count == 15
+    assert manifest.completed_case_count == 60
+    assert manifest.max_live_case_count == 1
+    assert calibrator.max_live_result_count == 1
+    assert calibrator.previous_result is not None
+    assert calibrator.previous_result() is None
+    assert [event["case_count"] for event in progress] == list(range(1, 61))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "exactly 60 directed"),
+        ("duplicate", "duplicate case identity"),
+        ("wrong_traveller", "exclusively the reviewed P:0006"),
+        ("wrong_directed_cell_count", "exactly 60 directed"),
+        ("wrong_acquisition_node_count", "exactly 15 acquisition"),
+    ],
+)
+def test_streaming_case_inventory_fails_closed_on_graph_tampering(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    cases = _gate_cases()
+    if mutation == "missing":
+        cases.pop()
+    elif mutation == "duplicate":
+        cases[-1] = cases[0]
+    elif mutation == "wrong_directed_cell_count":
+        cases[-1] = replace(cases[0], case_id=cases[-1].case_id)
+    elif mutation == "wrong_traveller":
+        cases[0] = replace(cases[0], traveller_identity_sha256="0" * 64)
+    elif mutation == "wrong_acquisition_node_count":
+        changed_hashes = dict(cases[0].array_sha256)
+        changed_hashes["source_image"] = sha256_text("unexpected acquisition node")
+        cases[0] = replace(cases[0], array_sha256=changed_hashes)
+
+    with pytest.raises(ValueError, match=message):
+        p0006._stream_gate01_case_receipts(
+            _GateManifest(tmp_path, cases),
+            _Calibrator(),
+            progress=None,
+            progress_stage="p0006_streaming_verification",
+        )
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -394,6 +499,7 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert preflight["verified_gate01_result_file_sha256"] == result_file_sha256
     assert "result_sha256" not in result
     manifest_for_load[0] = gate_manifest
+    eager_case_receipts = [p0006._case_receipt(case, calibrator) for case in cases]
     output = tmp_path / "p0006-protocol.json"
     protocol = p0006.import_gate01_p0006_evaluation_protocol(
         archive,
@@ -420,6 +526,10 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     }
     assert "result_sha256" not in json.dumps(protocol, sort_keys=True)
     assert len(protocol["case_receipts"]) == 60
+    assert protocol["case_receipts"] == eager_case_receipts
+    unhashed_protocol = dict(protocol)
+    unhashed_protocol.pop("protocol_sha256")
+    assert protocol["protocol_sha256"] == sha256_json(unhashed_protocol)
     assert protocol["contract_version"].endswith("protocol-v4")
     expected_layout = (
         p0006.GATE01_ARCHIVE_LAYOUT_MODERN_FLAT_V1
@@ -470,6 +580,73 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
         )
         for event in progress_events
     )
+    completed_case_progress = [
+        int(event["case_count"])
+        for event in progress_events
+        if event.get("expected_case_count") == 60
+    ]
+    assert completed_case_progress == list(range(1, 61))
+
+    streaming_progress: list[dict[str, object]] = []
+    streamed_protocol, streaming_summary = (
+        p0006.verify_gate01_p0006_evaluation_protocol_streaming(
+            output, progress_callback=streaming_progress.append
+        )
+    )
+    assert streamed_protocol == protocol
+    assert streaming_summary["case_count"] == 60
+    assert streaming_summary["directed_cell_count"] == 60
+    assert streaming_summary["acquisition_node_count"] == 15
+    assert streaming_summary["tensor_bearing_cases_returned"] == 0
+    assert streaming_summary["baseline_tensor_mappings_returned"] == 0
+    assert streaming_progress[0]["status"] == "start"
+    assert streaming_progress[-1]["status"] == "end"
+    assert [
+        int(event["case_count"])
+        for event in streaming_progress
+        if event.get("expected_case_count") == 60
+        and event.get("status") == "periodic"
+    ] == list(range(1, 61))
+
+    feasibility_body = {
+        "contract_version": PAIRED_FEASIBILITY_CONTRACT,
+        "complete_inventory_no_selection": True,
+        "paired_evaluation_possible": False,
+    }
+    feasibility = {
+        **feasibility_body,
+        "result_sha256": sha256_json(feasibility_body),
+    }
+    feasibility_path = tmp_path / "synthetic-pair-feasibility.json"
+    _write_json(feasibility_path, feasibility)
+    readiness_path = tmp_path / "synthetic-evaluation-readiness.json"
+    readiness = seal_long_run_evaluation_readiness(
+        feasibility_path,
+        p0006_evaluation_protocol_path=output,
+        output_path=readiness_path,
+    )
+    assert readiness["p0006_evaluation_protocol_sha256"] == protocol[
+        "protocol_sha256"
+    ]
+    assert readiness["long_run_authorized_by_evaluation_path"] is True
+    assert readiness["population_or_generalization_claims_authorized"] is False
+    assert readiness["prospective_training_or_model_selection_use"] is False
+
+    tampered_receipt_protocol = copy.deepcopy(protocol)
+    tampered_receipt_protocol.pop("protocol_sha256")
+    tampered_receipt_protocol["case_receipts"][0]["target_sha256"] = "0" * 64
+    tampered_receipt_path = tmp_path / "tampered-case-receipt-p0006.json"
+    _write_json(
+        tampered_receipt_path,
+        {
+            **tampered_receipt_protocol,
+            "protocol_sha256": sha256_json(tampered_receipt_protocol),
+        },
+    )
+    with pytest.raises(ValueError, match="receipt inventory"):
+        p0006.verify_gate01_p0006_evaluation_protocol_streaming(
+            tampered_receipt_path
+        )
 
     load_progress: list[dict[str, object]] = []
     reloaded, paired_cases, baselines = p0006.load_gate01_p0006_evaluation_protocol(
@@ -571,3 +748,5 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     cases[0].array_sha256["target"] = "0" * 64  # type: ignore[index]
     with pytest.raises(ValueError, match="changed"):
         p0006.load_gate01_p0006_evaluation_protocol(output)
+    with pytest.raises(ValueError, match="changed|15 acquisition"):
+        p0006.verify_gate01_p0006_evaluation_protocol_streaming(output)

@@ -7,9 +7,11 @@ TRAINING_EVIDENCE_COMMIT, CLI_ENV, and git_text before executing this file.
 from __future__ import annotations
 
 import errno
+import gc
 import importlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -189,12 +191,12 @@ from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     P0006_EVIDENCE_LIMITATION,
     P0009_CONFIRMATION_STATUS,
     copy_verified_stage2_bank_tar_to_local,
-    load_gate01_p0006_evaluation_protocol,
     preflight_gate01_p0006_archive,
     preflight_stage2_local_disk_capacity,
     resolve_stage2_recovery_drive_layout,
     restore_verified_stage2_bank_tar,
     verify_completed_stage2_pilot_evidence,
+    verify_gate01_p0006_evaluation_protocol_streaming,
 )
 
 
@@ -418,6 +420,25 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
         "drive_file_held_open_during_process": False,
         "archive_no_clobber": True,
     }
+    if return_code < 0:
+        termination_signal_number = -return_code
+        try:
+            termination_signal_name = signal.Signals(termination_signal_number).name
+        except ValueError:
+            termination_signal_name = {9: "SIGKILL"}.get(
+                termination_signal_number, "UNKNOWN"
+            )
+        receipt.update(
+            {
+                "termination_signal_number": termination_signal_number,
+                "termination_signal_name": termination_signal_name,
+                "termination_classification": (
+                    "external_process_termination_or_resource_kill_candidate"
+                ),
+                "oom_claimed": False,
+                "automatic_retry_performed": False,
+            }
+        )
     receipt["receipt_sha256"] = sha256_json(receipt)
     drive_retry(
         "publish-operation-receipt",
@@ -428,16 +449,24 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
         ),
     )
     if return_code:
+        failure = {
+            "operation": operation,
+            "return_code": return_code,
+            "archived_log_path": str(archived_log),
+            "archived_log_sha256": receipt["archived_log_sha256"],
+        }
+        for key in (
+            "termination_signal_number",
+            "termination_signal_name",
+            "termination_classification",
+            "oom_claimed",
+            "automatic_retry_performed",
+        ):
+            if key in receipt:
+                failure[key] = receipt[key]
         print(
             json.dumps(
-                {
-                    "sanitized_operation_failure": {
-                        "operation": operation,
-                        "return_code": return_code,
-                        "archived_log_path": str(archived_log),
-                        "archived_log_sha256": receipt["archived_log_sha256"],
-                    }
-                },
+                {"sanitized_operation_failure": failure},
                 sort_keys=True,
             ),
             flush=True,
@@ -576,7 +605,7 @@ FROZEN_VALIDATION_PLAN = Path(
 CLI_ENV[P0006_COUNT_PROGRESS_ENV] = P0006_COUNT_PROGRESS_VALUE
 
 
-def emit_p0006_load_progress(payload):
+def emit_p0006_verification_progress(payload):
     allowed = {
         "stage",
         "status",
@@ -587,19 +616,35 @@ def emit_p0006_load_progress(payload):
     unexpected = set(payload) - allowed
     if unexpected:
         raise ValueError(
-            f"P:0006 load progress contains forbidden fields: {sorted(unexpected)}"
+            f"P:0006 verification progress contains forbidden fields: {sorted(unexpected)}"
         )
     print(
         json.dumps({"p0006_import_progress": payload}, sort_keys=True),
         flush=True,
     )
 
+released_object_count = gc.collect()
+print(
+    json.dumps(
+        {
+            "stage": "pre_p0006_parent_memory_release",
+            "status": "pass",
+            "unreachable_object_count_reclaimed": released_object_count,
+            "tensor_bearing_checkpoint_objects_retained": 0,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
 if P0006_EVALUATION_PROTOCOL.exists():
-    protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
-        P0006_EVALUATION_PROTOCOL,
-        progress_callback=emit_p0006_load_progress,
+    protocol, p0006_streaming_verification = (
+        verify_gate01_p0006_evaluation_protocol_streaming(
+            P0006_EVALUATION_PROTOCOL,
+            progress_callback=emit_p0006_verification_progress,
+        )
     )
-    if len(cases) != 60:
+    if p0006_streaming_verification["case_count"] != 60:
         raise RuntimeError("Existing P:0006 recovery protocol is incomplete.")
 else:
     run_logged(
@@ -622,9 +667,11 @@ else:
         "import-P0006-development-validation-evaluation-only",
         visible_count_progress_only=True,
     )
-    protocol, cases, _baselines = load_gate01_p0006_evaluation_protocol(
-        P0006_EVALUATION_PROTOCOL,
-        progress_callback=emit_p0006_load_progress,
+    protocol, p0006_streaming_verification = (
+        verify_gate01_p0006_evaluation_protocol_streaming(
+            P0006_EVALUATION_PROTOCOL,
+            progress_callback=emit_p0006_verification_progress,
+        )
     )
 if (
     protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL
@@ -753,6 +800,7 @@ recovery_receipt = {
     "selection_rule_sha256": EXPECTED_SELECTION_RULE_SHA256,
     "p0006_protocol_path": str(P0006_EVALUATION_PROTOCOL),
     "p0006_protocol_file_sha256": sha256_file(P0006_EVALUATION_PROTOCOL),
+    "p0006_streaming_verification": p0006_streaming_verification,
     "evaluation_readiness_path": str(LONG_RUN_EVALUATION_READINESS),
     "evaluation_readiness_file_sha256": sha256_file(
         LONG_RUN_EVALUATION_READINESS

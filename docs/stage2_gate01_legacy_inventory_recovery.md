@@ -74,9 +74,16 @@ The sibling `photometry_factored_latent_bank_v2/` directory is ignored only when
 nonempty, linked, or non-directory entry at that unreceipted path is an ambiguity and fails
 closed. A fresh-Colab import preflight verifies NumPy, SciPy, PyTorch, PyYAML, the pinned
 FieldBridge checkout, and its CLI before Drive mount; the notebook never installs packages.
-P:0006 import and both subsequent full-array reloads print start, periodic, and end receipts
-containing counts only. A filtered subprocess failure prints only its operation, return code, and
-the immutable archived log path and SHA-256.
+P:0006 import streams one full-volume case at a time, retains only hashes and graph counts, and
+releases the case and calibrated tensor before advancing the manifest. Recovery re-verification
+uses the same one-case streaming contract and returns no evaluation or baseline tensors; the
+public materializing loader remains available only to later evaluation consumers. Import and
+re-verification print start, per-case, and end receipts containing counts only. Before the import
+subprocess starts, the parent performs ordinary Python garbage collection after completed-evidence
+verification. A filtered subprocess failure prints only its operation, return code, and the
+immutable archived log path and SHA-256. A negative return code is recorded as a signal number and
+name; signal 9 is classified only as an external termination/resource-kill candidate, never as an
+OOM without kernel evidence, and is not retried automatically.
 
 `Runtime -> Run all` is safely repeatable in the same runtime. Each seal uses an
 implementation-commit-scoped checkout directory, so a new seal can clone beside an older exact

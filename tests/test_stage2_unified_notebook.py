@@ -5,6 +5,8 @@ import errno
 import json
 import os
 import re
+import signal
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +15,11 @@ import pytest
 import torch
 
 from fieldbridge.data.domains import Contrast, Domain
-from fieldbridge.data.photometry_factorization import sha256_json
+from fieldbridge.data.photometry_factorization import (
+    sha256_file,
+    sha256_json,
+    write_json_atomic,
+)
 from fieldbridge.evaluation.stage2_photometry_baseline import PairedEvaluationCase
 from fieldbridge.evaluation.stage2_unified import _load_baseline_predictions
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
@@ -332,8 +338,9 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
     for required in (
         "P0006_COUNT_PROGRESS_ENV",
         "P0006_COUNT_PROGRESS_VALUE",
-        "emit_p0006_load_progress",
-        "progress_callback=emit_p0006_load_progress",
+        "emit_p0006_verification_progress",
+        "progress_callback=emit_p0006_verification_progress",
+        "verify_gate01_p0006_evaluation_protocol_streaming",
         "visible_count_progress_only=True",
         "early_local_disk_capacity_preflight",
         "runtime_recommendation",
@@ -341,16 +348,120 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
         '"gpu_used": False',
     ):
         assert required in source
-    assert '"stage": "p0006_load"' in importer_source
+    assert 'stage = "p0006_streaming_verification"' in importer_source
+    assert "cases = list(gate_manifest)" not in importer_source
+    assert "load_gate01_p0006_evaluation_protocol" not in source
+    streaming_verifier = importer_source[
+        importer_source.index(
+            "def verify_gate01_p0006_evaluation_protocol_streaming"
+        ) : importer_source.index("def load_gate01_p0006_evaluation_protocol")
+    ]
+    assert "PairedEvaluationCase" not in streaming_verifier
+    assert "baselines" not in streaming_verifier
+    assert "torch.Tensor" not in streaming_verifier
+    evidence_check = source.index("completed_evidence = verify_completed_stage2_pilot_evidence")
+    memory_release = source.index("released_object_count = gc.collect()")
+    import_subprocess = source.index('"import-stage2-gate01-p0006-evaluation"')
+    assert evidence_check < memory_release < import_subprocess
     assert "sanitized_operation_failure" in source
     assert '"archived_log_path"' in source
     assert '"archived_log_sha256"' in source
+    assert '"termination_signal_number"' in source
+    assert '"termination_signal_name"' in source
+    assert '"external_process_termination_or_resource_kill_candidate"' in source
+    assert '"oom_claimed": False' in source
+    assert '"automatic_retry_performed": False' in source
     progress_block = source[
         source.index("def emit_recovery_progress"):
         source.index("def load_self_hashed_json")
     ]
     for forbidden in ("path", "sha256", "identity", "subject", "fingerprint"):
         assert f'"{forbidden}"' not in progress_block
+
+
+def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_logged"
+    )
+    popen_calls = 0
+
+    class KilledProcess:
+        stdout = iter(["synthetic private log payload must stay archived\n"])
+
+        @staticmethod
+        def wait() -> int:
+            return -9
+
+    def popen(*_args, **_kwargs):
+        nonlocal popen_calls
+        popen_calls += 1
+        return KilledProcess()
+
+    subprocess_namespace = SimpleNamespace(
+        Popen=popen,
+        PIPE=subprocess.PIPE,
+        STDOUT=subprocess.STDOUT,
+        CalledProcessError=subprocess.CalledProcessError,
+    )
+    local_logs = tmp_path / "local-logs"
+    local_logs.mkdir()
+    namespace = {
+        "json": json,
+        "os": os,
+        "Path": Path,
+        "shutil": shutil,
+        "signal": signal,
+        "subprocess": subprocess_namespace,
+        "RECOVERY_NAMESPACE": tmp_path / "recovery",
+        "LOCAL_LOG_ROOT": local_logs,
+        "TRAINING_EVIDENCE_COMMIT": "8" * 40,
+        "OPERATOR_IMPLEMENTATION_COMMIT": "9" * 40,
+        "REPO_DIR": tmp_path,
+        "CLI_ENV": {},
+        "drive_retry": lambda _label, operation: operation(),
+        "sha256_file": sha256_file,
+        "sha256_json": sha256_json,
+        "write_json_atomic": write_json_atomic,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        namespace["run_logged"](
+            ["python", "synthetic-import"],
+            "synthetic-p0006-import",
+            visible_count_progress_only=True,
+        )
+    assert caught.value.returncode == -9
+    assert popen_calls == 1
+    receipt_path = (
+        tmp_path
+        / "recovery/operation_attempts/synthetic-p0006-import/attempt-0001.receipt.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["termination_signal_number"] == 9
+    assert receipt["termination_signal_name"] == "SIGKILL"
+    assert receipt["termination_classification"] == (
+        "external_process_termination_or_resource_kill_candidate"
+    )
+    assert receipt["oom_claimed"] is False
+    assert receipt["automatic_retry_performed"] is False
+    captured = capsys.readouterr().out
+    assert "synthetic private log payload" not in captured
+    assert '"termination_signal_number": 9' in captured
+    assert '"termination_signal_name": "SIGKILL"' in captured
 
 
 def _operator_retry_functions():

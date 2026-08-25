@@ -133,6 +133,7 @@ EXPECTED_STAGE2_SELECTION_RULE_SHA256 = (
     "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6"
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 _GATE01_LEGACY_ROOT_MARKER = "Gate01Private_8012a3f"
 _GATE01_LEGACY_SPLIT_STORED_PATH = (
@@ -173,6 +174,19 @@ _GATE01_LEGACY_SUPPLEMENTAL_SPECS = {
         "reviewed_scientific_module_sha256_map",
     ),
 }
+_GATE01_REVIEWED_MODULE_COMPARISON_KEYS = frozenset(
+    {
+        "changed_modules",
+        "evaluation_git_commit",
+        "evaluation_module_sha256",
+        "previous_evaluation_git_commit",
+        "previous_evaluation_module_sha256",
+    }
+)
+_GATE01_REVIEWED_CHANGED_MODULES = (
+    "src/fieldbridge/models/translators/flow_transport.py",
+)
+_GATE01_REVIEWED_MODULE_COUNT = 31
 
 _GATE01_REQUIRED_COMMON = frozenset(
     {
@@ -265,6 +279,25 @@ class VerifiedGate01SupplementalDependency:
             "semantic_identity_sha256": self.semantic_identity_sha256,
             "semantic_entry_count": self.semantic_entry_count,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedGate01ModuleComparisonEvidence:
+    """Strict current-versus-previous module evidence from the reviewed supplement."""
+
+    evaluation_git_commit: str
+    evaluation_module_sha256: tuple[tuple[str, str], ...]
+    previous_evaluation_git_commit: str
+    previous_evaluation_module_sha256: tuple[tuple[str, str], ...]
+    changed_modules: tuple[str, ...]
+
+    @property
+    def current_module_hashes(self) -> dict[str, str]:
+        return dict(self.evaluation_module_sha256)
+
+    @property
+    def previous_module_hashes(self) -> dict[str, str]:
+        return dict(self.previous_evaluation_module_sha256)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1725,9 +1758,11 @@ def _verify_legacy_supplemental_dependencies(
                 for name in ("train", "validation", "test")
             )
         else:
-            module_hashes = _load_reviewed_module_hashes(candidate)
-            semantic_identity_sha256 = sha256_json(module_hashes)
-            semantic_entry_count = len(module_hashes)
+            module_evidence = _load_reviewed_module_comparison_evidence(candidate)
+            semantic_identity_sha256 = sha256_json(
+                module_evidence.current_module_hashes
+            )
+            semantic_entry_count = len(module_evidence.evaluation_module_sha256)
         verified.append(
             VerifiedGate01SupplementalDependency(
                 relative_path=relative_path,
@@ -1741,49 +1776,137 @@ def _verify_legacy_supplemental_dependencies(
     return tuple(verified)
 
 
-def _load_reviewed_module_hashes(path: Path) -> dict[str, str]:
-    payload = _json_loads_without_duplicate_keys(
-        path.read_text(encoding="utf-8-sig"),
-        label="reviewed Gate 0.1 module-hash document",
-    )
-    if not isinstance(payload, list) or not payload:
-        raise ValueError(
-            "Reviewed Gate 0.1 module-hash document must be a nonempty module-keyed list."
-        )
+def _canonical_scientific_module_path(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} is not a canonical module path.")
+    if (
+        chr(92) in value
+        or value.startswith("/")
+        or "//" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{label} is not a canonical module path.")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or re.match(r"[A-Za-z]:", value) is not None
+    ):
+        raise ValueError(f"{label} is not a canonical module path.")
+    return value
+
+
+def _validated_reviewed_module_map(
+    value: Any, *, label: str
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a module-keyed JSON object.")
     module_hashes: dict[str, str] = {}
     folded_modules: set[str] = set()
-    for index, row in enumerate(payload):
-        if not isinstance(row, Mapping) or set(row) != {"module", "sha256"}:
-            raise ValueError(
-                f"Reviewed Gate 0.1 module-hash row {index} is malformed."
-            )
-        module = row["module"]
-        digest = row["sha256"]
-        if (
-            not isinstance(module, str)
-            or not module
-            or module != module.strip()
-            or chr(92) in module
-            or module.startswith("/")
-            or any(part in {"", ".", ".."} for part in PurePosixPath(module).parts)
-            or not isinstance(digest, str)
-            or _SHA256_RE.fullmatch(digest) is None
-        ):
-            raise ValueError(
-                f"Reviewed Gate 0.1 module-hash row {index} is malformed."
-            )
-        folded = module.casefold()
+    for module, digest in value.items():
+        canonical_module = _canonical_scientific_module_path(module, label=label)
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"{label} contains a malformed SHA-256 digest.")
+        folded = canonical_module.casefold()
         if folded in folded_modules:
-            raise ValueError(
-                "Reviewed Gate 0.1 module-hash document has duplicate module keys."
-            )
+            raise ValueError(f"{label} contains case-fold-colliding module keys.")
         folded_modules.add(folded)
-        module_hashes[module] = digest
-    if set(module_hashes) != set(GATE01_SCIENTIFIC_MODULES):
+        module_hashes[canonical_module] = digest
+    if (
+        len(module_hashes) != _GATE01_REVIEWED_MODULE_COUNT
+        or set(module_hashes) != set(GATE01_SCIENTIFIC_MODULES)
+    ):
+        raise ValueError(f"{label} has missing or unexpected scientific modules.")
+    return tuple(sorted(module_hashes.items()))
+
+
+def _load_reviewed_module_comparison_evidence(
+    path: Path,
+) -> ReviewedGate01ModuleComparisonEvidence:
+    payload = _json_loads_without_duplicate_keys(
+        path.read_text(encoding="utf-8-sig"),
+        label="reviewed Gate 0.1 module comparison evidence",
+    )
+    if not isinstance(payload, Mapping):
         raise ValueError(
-            "Reviewed Gate 0.1 module-hash document has missing or unexpected modules."
+            "Reviewed Gate 0.1 module comparison evidence must be a JSON object."
         )
-    return dict(sorted(module_hashes.items()))
+    if set(payload) != _GATE01_REVIEWED_MODULE_COMPARISON_KEYS:
+        raise ValueError(
+            "Reviewed Gate 0.1 module comparison evidence has an incorrect "
+            "top-level key set."
+        )
+    evaluation_git_commit = payload["evaluation_git_commit"]
+    previous_evaluation_git_commit = payload["previous_evaluation_git_commit"]
+    if (
+        not isinstance(evaluation_git_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(evaluation_git_commit) is None
+        or not isinstance(previous_evaluation_git_commit, str)
+        or _GIT_COMMIT_RE.fullmatch(previous_evaluation_git_commit) is None
+    ):
+        raise ValueError(
+            "Reviewed Gate 0.1 module comparison evidence has a malformed "
+            "Git commit identity."
+        )
+    if evaluation_git_commit == previous_evaluation_git_commit:
+        raise ValueError(
+            "Reviewed Gate 0.1 current and previous evaluation commits must "
+            "be distinct."
+        )
+    current = _validated_reviewed_module_map(
+        payload["evaluation_module_sha256"],
+        label="Reviewed Gate 0.1 current module map",
+    )
+    previous = _validated_reviewed_module_map(
+        payload["previous_evaluation_module_sha256"],
+        label="Reviewed Gate 0.1 previous module map",
+    )
+    changed_payload = payload["changed_modules"]
+    if not isinstance(changed_payload, list):
+        raise ValueError(
+            "Reviewed Gate 0.1 changed_modules must be a JSON list."
+        )
+    changed_modules = tuple(
+        _canonical_scientific_module_path(
+            module, label="Reviewed Gate 0.1 changed_modules entry"
+        )
+        for module in changed_payload
+    )
+    if len(set(changed_modules)) != len(changed_modules):
+        raise ValueError("Reviewed Gate 0.1 changed_modules contains duplicates.")
+    if any(module not in GATE01_SCIENTIFIC_MODULES for module in changed_modules):
+        raise ValueError(
+            "Reviewed Gate 0.1 changed_modules contains an unexpected "
+            "scientific module."
+        )
+    current_map = dict(current)
+    previous_map = dict(previous)
+    computed_changes = tuple(
+        sorted(
+            module
+            for module in GATE01_SCIENTIFIC_MODULES
+            if current_map[module] != previous_map[module]
+        )
+    )
+    if changed_modules != computed_changes:
+        raise ValueError(
+            "Reviewed Gate 0.1 changed_modules differs from the computed "
+            "module-map changes."
+        )
+    if changed_modules != _GATE01_REVIEWED_CHANGED_MODULES:
+        raise ValueError(
+            "Reviewed Gate 0.1 module comparison evidence has an unexpected "
+            "reviewed change set."
+        )
+    return ReviewedGate01ModuleComparisonEvidence(
+        evaluation_git_commit=evaluation_git_commit,
+        evaluation_module_sha256=current,
+        previous_evaluation_git_commit=previous_evaluation_git_commit,
+        previous_evaluation_module_sha256=previous,
+        changed_modules=changed_modules,
+    )
 
 
 def _verify_supplemental_linkage(layout: Gate01ArchiveLayout, lock: Any) -> None:
@@ -1791,18 +1914,34 @@ def _verify_supplemental_linkage(layout: Gate01ArchiveLayout, lock: Any) -> None
         "colab-operational-source-split.json"
     )
     operational_split = load_vae_splits(split_path)
-    if vae_splits_fingerprint(operational_split) != lock.bank_source_split_fingerprint:
+    if (
+        vae_splits_fingerprint(operational_split)
+        != lock.bank_source_split_fingerprint
+    ):
         raise ValueError(
             "Gate 0.1 operational source split is not linked to the frozen bank split."
         )
     reviewed_module_path = layout.supplemental_path_for(
         "gate01-reviewed-module-sha256-8012a3f.json"
     )
-    if _load_reviewed_module_hashes(reviewed_module_path) != dict(
+    module_evidence = _load_reviewed_module_comparison_evidence(reviewed_module_path)
+    if module_evidence.evaluation_git_commit != lock.evaluation_git_commit:
+        raise ValueError(
+            "Gate 0.1 reviewed current evaluation commit differs from the protocol lock."
+        )
+    if module_evidence.current_module_hashes != dict(
         lock.evaluation_module_sha256
     ):
         raise ValueError(
-            "Gate 0.1 reviewed module identities differ from the protocol lock."
+            "Gate 0.1 reviewed current module identities differ from the protocol lock."
+        )
+    if (
+        module_evidence.previous_evaluation_git_commit == lock.evaluation_git_commit
+        or module_evidence.previous_module_hashes
+        == dict(lock.evaluation_module_sha256)
+    ):
+        raise ValueError(
+            "Gate 0.1 previous module provenance cannot authorize current evaluation."
         )
 
 

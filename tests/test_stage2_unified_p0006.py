@@ -51,6 +51,7 @@ class _Lock:
     bank_source_split_fingerprint = vae_splits_fingerprint(
         VaeSplits((), (), (), 8012, (1.0, 0.0, 0.0), {"synthetic": True})
     )
+    evaluation_git_commit = "c" * 40
     evaluation_module_sha256 = {
         module: sha256_text(module) for module in GATE01_SCIENTIFIC_MODULES
     }
@@ -234,12 +235,21 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
         )
         _pad_json(operational_split, 799986)
         reviewed_modules = archive / "gate01-reviewed-module-sha256-8012a3f.json"
+        previous_modules = dict(_Lock.evaluation_module_sha256)
+        previous_modules[
+            "src/fieldbridge/models/translators/flow_transport.py"
+        ] = sha256_text("previous:flow_transport")
         reviewed_modules.write_text(
             json.dumps(
-                [
-                    {"module": module, "sha256": sha256_text(module)}
-                    for module in GATE01_SCIENTIFIC_MODULES
-                ]
+                {
+                    "changed_modules": [
+                        "src/fieldbridge/models/translators/flow_transport.py"
+                    ],
+                    "evaluation_git_commit": _Lock.evaluation_git_commit,
+                    "evaluation_module_sha256": _Lock.evaluation_module_sha256,
+                    "previous_evaluation_git_commit": "b" * 40,
+                    "previous_evaluation_module_sha256": previous_modules,
+                }
             ),
             encoding="utf-8",
         )

@@ -405,6 +405,51 @@ def test_drive_retry_does_not_retry_deterministic_missing_artifact() -> None:
     assert remounts == 0
 
 
+def test_drive_retry_does_not_retry_reviewed_module_schema_failure() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def invalid_schema():
+        nonlocal calls
+        calls += 1
+        raise ValueError("reviewed module comparison evidence has an incorrect key set")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(ValueError, match="comparison evidence"):
+        namespace["drive_retry"]("gate01-metadata-preflight", invalid_schema)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_reviewed_module_schema_check_is_inside_early_metadata_preflight() -> None:
+    operator_source = OPERATOR.read_text(encoding="utf-8")
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    preflight_definition = importer_source[
+        importer_source.index("def preflight_gate01_p0006_archive") :
+        importer_source.index("def import_gate01_p0006_evaluation_protocol")
+    ]
+    linkage_definition = importer_source[
+        importer_source.index("def _verify_supplemental_linkage") :
+        importer_source.index("def _json_loads_without_duplicate_keys")
+    ]
+    assert "_verify_supplemental_linkage(layout, lock)" in preflight_definition
+    assert "_load_reviewed_module_comparison_evidence" in linkage_definition
+    preflight_call = operator_source.index("gate01_preflight = drive_retry")
+    for later_operation in (
+        "bank_restore = drive_retry",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "import-stage2-gate01-p0006-evaluation",
+    ):
+        assert preflight_call < operator_source.index(later_operation)
+
+
 def test_drive_retry_keeps_bounded_transport_retry_and_remount() -> None:
     namespace = _operator_retry_functions()
     calls = 0

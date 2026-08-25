@@ -57,12 +57,32 @@ PINNED_MODULE_SHA256 = (
     "ea5f40b580cbba26766ee60ce243d466ab93d32b1856125c067eace9a7d1ed36"
 )
 PINNED_MODULE_SIZE = 7634
+CURRENT_EVALUATION_COMMIT = "c" * 40
+PREVIOUS_EVALUATION_COMMIT = "b" * 40
+REVIEWED_CHANGED_MODULE = "src/fieldbridge/models/translators/flow_transport.py"
 
 
 def _pad_json_file(path: Path, size_bytes: int) -> None:
     payload = path.read_bytes()
     assert len(payload) <= size_bytes
     path.write_bytes(payload + b" " * (size_bytes - len(payload)))
+
+
+def _module_comparison_evidence() -> dict[str, object]:
+    current = {
+        module: sha256_text(module) for module in GATE01_SCIENTIFIC_MODULES
+    }
+    previous = dict(current)
+    previous[REVIEWED_CHANGED_MODULE] = sha256_text(
+        "previous:" + REVIEWED_CHANGED_MODULE
+    )
+    return {
+        "changed_modules": [REVIEWED_CHANGED_MODULE],
+        "evaluation_git_commit": CURRENT_EVALUATION_COMMIT,
+        "evaluation_module_sha256": current,
+        "previous_evaluation_git_commit": PREVIOUS_EVALUATION_COMMIT,
+        "previous_evaluation_module_sha256": previous,
+    }
 
 
 def _write_normal_dependency(path: Path, index: int) -> None:
@@ -139,12 +159,7 @@ def _legacy_bundle(
     _pad_json_file(operational, PINNED_OPERATIONAL_SIZE)
     modules = root / "gate01-reviewed-module-sha256-8012a3f.json"
     modules.write_text(
-        json.dumps(
-            [
-                {"module": module, "sha256": sha256_text(module)}
-                for module in GATE01_SCIENTIFIC_MODULES
-            ]
-        ),
+        json.dumps(_module_comparison_evidence()),
         encoding="utf-8",
     )
     _pad_json_file(modules, PINNED_MODULE_SIZE)
@@ -410,7 +425,7 @@ def test_malformed_module_supplemental_fails_schema(
     target = root / "gate01-reviewed-module-sha256-8012a3f.json"
     target.write_text(json.dumps([{"module": "wrong", "sha256": "0" * 64}]))
     _pad_json_file(target, PINNED_MODULE_SIZE)
-    with pytest.raises(ValueError, match="missing or unexpected modules"):
+    with pytest.raises(ValueError, match="must be a JSON object"):
         p0006.resolve_gate01_p0006_archive_layout(root)
 
 

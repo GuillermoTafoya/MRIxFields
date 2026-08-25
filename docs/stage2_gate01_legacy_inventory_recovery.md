@@ -31,7 +31,11 @@ Gate 0.1 result identity all stop the recovery.
 `gate01-reviewed-module-sha256-8012a3f.json` are not inventory members. They are separately pinned
 direct-root supplemental dependencies, with their exact observed sizes and SHA-256 values. The
 canonical split loader verifies the operational split and its frozen bank-membership linkage; the
-reviewed module document must contain the exact unique module-keyed SHA-256 map in the Gate lock.
+reviewed module document must be the exact five-field current-versus-previous comparison object.
+Both maps cover the same 31 scientific modules, the declared change set must equal the computed
+digest differences and the sole reviewed change is `flow_transport.py`. Only the current commit
+and current map may match and authorize the Gate lock; the previous commit and map are provenance
+only.
 Their identities are recorded separately and never enter normalized inventory arithmetic.
 
 The metadata-only preflight validates this graph immediately after Drive mount. It opens no

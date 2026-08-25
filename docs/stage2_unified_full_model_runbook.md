@@ -129,7 +129,10 @@ absolute paths are provenance labels only; no basename search or fallback is all
 root-relative paths, containment, nonsymlink parents, regular-file type, byte size, and SHA-256
 are verified for every row. The separately pinned operational split and reviewed-module document
 remain outside inventory arithmetic and are linked back to the existing split and protocol-lock
-contracts.
+contracts. The reviewed-module supplemental is a strict five-field comparison-evidence object:
+its current commit and 31-entry module map must exactly equal the protocol lock, while its distinct
+previous commit/map are provenance only and its sole declared `flow_transport.py` change must equal
+the computed map diff. Arbitrary list/object variants cannot substitute for this pinned contract.
 
 ```bash
 fieldbridge import-stage2-gate01-p0006-evaluation \

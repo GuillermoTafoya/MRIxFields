@@ -75,16 +75,50 @@ def test_inference_notebook_is_a100_streaming_recovery_only():
     assert "/content/stage2_gate01_recovery_v8_scratch" in operator
     assert "P0007" not in operator
     assert "P0009" not in operator
+    assert "pip', 'install', '-q', '-e'" not in notebook
+    assert "stage2_step200_inference_audit_dependency_lock.json" in notebook
+    assert "standard_library_a100_gate" in notebook
+    assert "initialize_sealed_official_lpips" in operator
+    assert "cached_official_gate01_metric_fn" in operator
+    assert "A100_QUALIFICATION_RUN_FINGERPRINT" in operator
 
 
 def test_a100_gate_precedes_large_bank_copy_and_private_streaming():
+    notebook = _source(GPU_NOTEBOOK)
     operator = GPU_OPERATOR.read_text(encoding="utf-8")
+    hardware_gate = notebook.index("A100_HARDWARE_GATE = standard_library_a100_gate()")
+    clone = notebook.index("git', 'clone")
+    dependency_prepare = notebook.index("prepare_locked_environment")
+    operator_exec = notebook.index("exec(compile(operator")
+    assert hardware_gate < clone < dependency_prepare < operator_exec
+    assert operator.index("initialize_sealed_official_lpips") < operator.index(
+        "from google.colab import drive"
+    )
+    assert operator.index("from google.colab import drive") < operator.index(
+        'drive.mount("/content/drive")'
+    )
     gpu_gate = operator.index("torch.cuda.get_device_properties")
     bank_copy = operator.index("copy_verified_stage2_bank_tar_to_local(")
     runtime_load = operator.index("load_unified_step200_inference_runtime(")
     audit_run = operator.index("run_step200_p0006_inference_audit(")
     assert gpu_gate < bank_copy < runtime_load < audit_run
     assert operator.index("preflight_gate01_p0006_archive(") < bank_copy
+
+
+def test_inference_case_loop_has_sealed_lpips_and_no_network_access():
+    source = (
+        ROOT
+        / "src/fieldbridge/evaluation/stage2_step200_inference_audit.py"
+    ).read_text(encoding="utf-8")
+    lpips = (
+        ROOT
+        / "src/fieldbridge/evaluation/stage2_step200_lpips_audit.py"
+    ).read_text(encoding="utf-8")
+    assert "with forbid_network_access():" in source
+    assert "lpips_integrity_verifier" in source
+    assert "lpips.LPIPS(" in lpips
+    assert '"lpips_construction_count": 1' in lpips
+    assert "socket.socket.connect = denied" in lpips
 
 
 def test_audit_namespaces_are_new_and_identity_keyed():

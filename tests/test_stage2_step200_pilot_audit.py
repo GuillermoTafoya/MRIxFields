@@ -30,7 +30,7 @@ AUDIT_COMMIT = "a" * 40
 TRAINING_COMMIT = audit.TRAINING_EVIDENCE_COMMIT
 RUN_FINGERPRINT = "b" * 64
 PLAN_SHA = "c" * 64
-QUALIFICATION_RUN_FINGERPRINT = "d" * 64
+QUALIFICATION_RUN_FINGERPRINT = audit.A100_QUALIFICATION_RUN_FINGERPRINT
 DECODER_STATE_SHA256 = "1" * 64
 
 
@@ -360,6 +360,10 @@ def test_authentic_producer_qualification_receipt_passes_without_selection_rule(
     )
     assert set(qualification) == audit._A100_QUALIFICATION_RECEIPT_KEYS
     assert "selection_rule_sha256" not in qualification
+    assert (
+        qualification["run_fingerprint"]
+        == "502a0989591cad3d09841d7deec841d41ac000d4c9e4ff314b53a8d4067ba5d7"
+    )
 
     verified = audit.verify_step200_pilot_evidence(
         inputs, audit_implementation_commit=AUDIT_COMMIT

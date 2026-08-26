@@ -45,7 +45,29 @@ verified exactly and reused; incompatible or partial output fails closed.
 
 Open `notebooks/stage2_step200_inference_audit_colab.ipynb`, attach an **NVIDIA A100
 80 GB** runtime, then choose **Runtime → Run all** and authorize Drive. The notebook
-checks the GPU identity before the reviewed bank copy/restore. It uses the stable
+starts with a standard-library-only `nvidia-smi` gate. It requires one visible NVIDIA
+A100, at least 79 GiB total and 75 GiB free memory, and an exact sealed implementation
+pin before it can clone code, invoke pip, download weights, mount Drive, inspect the
+bank, or load any evidence. A failed gate prints a no-action receipt and stops.
+
+The CUDA stack is not reinstalled. The sealed environment requires Python 3.12.13,
+PyTorch 2.8.0+cu126, torchvision 0.23.0+cu126, and the PyTorch CUDA 12.6 runtime. This
+pair follows the PyTorch 2.8/torchvision 0.23 compatibility release and the Colab
+Python-3.12/PyTorch-2.8 runtime announcement. Every smaller notebook-installed package
+is exact-version locked in
+`notebooks/stage2_step200_inference_audit_dependency_lock.json`; installation uses
+`--no-deps` so dependency solving cannot expand beyond that closed inventory. The
+complete resolved distribution environment and lock-file SHA-256 are sealed.
+
+After those gates, but still before Drive access, the notebook constructs exactly one
+frozen AlexNet LPIPS evaluator. The torchvision
+`AlexNet_Weights.IMAGENET1K_V1` URL and full file SHA-256, the packaged LPIPS-v0.1
+learned linear-weight SHA-256, and a canonical hash over every final parameter/buffer
+name, shape, dtype, and raw byte are recorded. The evaluator must remain in evaluation
+mode, is reused by all seven methods and all 60 cases, and is authenticated again at
+the end. Network access is blocked throughout the one-case gate and 60-case loop.
+
+Only then does the notebook mount Drive. It uses the stable
 `/content/stage2_gate01_recovery_v8_scratch` cache and therefore verifies and reuses an
 exact existing archive/bank when present.
 
@@ -54,6 +76,12 @@ the frozen Stage-1 VAE, the R-only photometry/bank identities, the P:0006 protoc
 evaluation-readiness evidence. It then performs an exact one-case inference memory and
 runtime gate. Any incompatible identity or a peak allocation above the sealed gate
 limit aborts before the 60-case audit.
+
+The authentic A100 qualification receipt retains its producer-defined 15-field schema;
+it does not contain a selection-rule field. Its run fingerprint is independently pinned
+to `502a0989591cad3d09841d7deec841d41ac000d4c9e4ff314b53a8d4067ba5d7`.
+The selection rule remains independently checked against the step-200 selection receipt
+and checkpoint.
 
 The audit constructs only the unified generator and frozen VAE encoder/decoder. It
 does not construct a critic, optimizer, scheduler, or scaler. Execution uses
@@ -77,6 +105,12 @@ Reports contain descriptive per-case, by-contrast, by-directed-field-pair, and o
 metrics plus paired descriptive differences and win/tie/loss counts. They do not report
 population p-values or confidence claims because all 60 directions belong to one
 prospective traveller protocol.
+
+Visible progress is count-only. The final receipt reports LPIPS initialization time,
+one-case wall time, the projected 60-case inference time, peak allocated/reserved CUDA
+memory, whether a dependency or AlexNet weight download was observed, and
+`training_invoked: false`. Resume reauthenticates and skips immutable case receipts;
+runtime provenance observations from the first sealed attempt remain byte-identical.
 
 The final line is always:
 

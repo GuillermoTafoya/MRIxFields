@@ -53,6 +53,9 @@ STEP200_CHECKPOINT_SHA256 = (
 STEP200_RUN_FINGERPRINT = (
     "c814c948a5b85bd3a694db7c8e074894e97c16a96a36acbfa6f370faf2dac0aa"
 )
+A100_QUALIFICATION_RUN_FINGERPRINT = (
+    "502a0989591cad3d09841d7deec841d41ac000d4c9e4ff314b53a8d4067ba5d7"
+)
 STEP200_SELECTION_RECEIPT_FILE_SHA256 = (
     "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828"
 )
@@ -687,8 +690,7 @@ def _validate_a100_qualification_receipt(
         or qualification.get("generator_optimizer_updates") != 1
         or qualification.get("validation_plan_sha256") != STEP200_VALIDATION_PLAN_SHA256
         or not isinstance(run_fingerprint, str)
-        or _SHA256_RE.fullmatch(run_fingerprint) is None
-        or run_fingerprint == STEP200_RUN_FINGERPRINT
+        or run_fingerprint != A100_QUALIFICATION_RUN_FINGERPRINT
         or qualification.get("generator_gradient_accumulation_contract")
         != UNIFIED_GENERATOR_ACCUMULATION_CONTRACT
         or qualification.get("term_gradient_qualification_contract")
@@ -1149,6 +1151,7 @@ def _save_figure_no_clobber(fig: Any, path: Path, **kwargs: Any) -> None:
 
 
 __all__ = [
+    "A100_QUALIFICATION_RUN_FINGERPRINT",
     "PILOT_AUDIT_CONTRACT",
     "PILOT_AUDIT_MANIFEST_CONTRACT",
     "PILOT_AUDIT_SANITIZATION_CONTRACT",

@@ -51,7 +51,6 @@ from fieldbridge.evaluation.metrics import gradient_mae
 from fieldbridge.evaluation.stage2_gate01 import (
     Gate01Case,
     fixed_montage_specifications,
-    official_gate01_metric_fn,
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     STAGE1_RUN_C_CHECKPOINT_SHA256,
@@ -62,6 +61,7 @@ from fieldbridge.evaluation.stage2_gate01_montage import (
     _encode_grayscale_png,
     _normalize_panel,
 )
+from fieldbridge.evaluation.stage2_step200_lpips_audit import forbid_network_access
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     GATE01_P0006_EVALUATION_PROTOCOL,
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
@@ -80,12 +80,12 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v1"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v2"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
 CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
 MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v1"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v1"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v2"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
@@ -619,11 +619,24 @@ def run_step200_p0006_inference_audit(
     audit_implementation_commit: str,
     require_a100: bool = True,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    metric_fn: Callable[[torch.Tensor, torch.Tensor, Sequence[str], str], Mapping[str, float]] = official_gate01_metric_fn,
+    metric_fn: Callable[
+        [torch.Tensor, torch.Tensor, Sequence[str], str], Mapping[str, float]
+    ] | None = None,
+    dependency_provenance: Mapping[str, Any] | None = None,
+    lpips_provenance: Mapping[str, Any] | None = None,
+    lpips_integrity_verifier: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run or exactly resume the bounded-memory 60-case descriptive audit."""
 
     _require_git(audit_implementation_commit, "audit implementation commit")
+    if metric_fn is None:
+        raise ValueError("Inference audit requires one explicitly injected metric evaluator.")
+    if require_a100 and (
+        dependency_provenance is None
+        or lpips_provenance is None
+        or lpips_integrity_verifier is None
+    ):
+        raise ValueError("Production inference audit lacks sealed dependency/LPIPS provenance.")
     protocol_path = Path(protocol_path)
     readiness_path = Path(evaluation_readiness_path)
     if sha256_file(protocol_path) != P0006_PROTOCOL_FILE_SHA256:
@@ -642,6 +655,16 @@ def run_step200_p0006_inference_audit(
         _validate_a100_identity(runtime)
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    dependency_receipt = _seal_or_reuse_runtime_receipt(
+        root / "dependency_environment_receipt.json",
+        dependency_provenance or {"synthetic_test_environment": True},
+        label="dependency environment",
+    )
+    lpips_receipt = _seal_or_reuse_runtime_receipt(
+        root / "lpips_provenance_receipt.json",
+        lpips_provenance or {"synthetic_test_evaluator": True},
+        label="LPIPS provenance",
+    )
     receipt_dir = root / "stage2_step200_p0006_case_receipts"
     montage_dir = root / "montages"
     slice_dir = root / "predeclared_2d_slices"
@@ -650,56 +673,63 @@ def run_step200_p0006_inference_audit(
     plan_path = root / "frozen_inference_plan.json"
     _seal_or_verify_json(plan_path, plan.payload, "inference_plan_sha256")
     run_contract = _run_contract(
-        plan, runtime, audit_implementation_commit=audit_implementation_commit
+        plan,
+        runtime,
+        audit_implementation_commit=audit_implementation_commit,
+        dependency_receipt=dependency_receipt,
+        lpips_receipt=lpips_receipt,
     )
     _seal_or_verify_json(root / "run_contract.json", run_contract, "run_contract_sha256")
     initial_state = dict(runtime.state_identity())
-    gate = _run_or_verify_one_case_gate(
-        protocol_path,
-        runtime,
-        plan,
-        root / "one_case_inference_memory_gate.json",
-        initial_state=initial_state,
-        require_a100=require_a100,
-    )
-    if dict(runtime.state_identity()) != initial_state:
-        raise RuntimeError("Model state changed during the one-case inference gate.")
+    with forbid_network_access():
+        gate = _run_or_verify_one_case_gate(
+            protocol_path,
+            runtime,
+            plan,
+            root / "one_case_inference_memory_gate.json",
+            initial_state=initial_state,
+            require_a100=require_a100,
+        )
+        if dict(runtime.state_identity()) != initial_state:
+            raise RuntimeError("Model state changed during the one-case inference gate.")
 
-    emitted = 0
-    for streamed in iter_gate01_p0006_evaluation_cases(
-        protocol_path, progress_callback=progress_callback
-    ):
-        case = streamed.case
-        case_hash = hashlib.sha256(case.case_id.encode("utf-8")).hexdigest()
-        receipt_path = receipt_dir / f"case_{case_hash}.json"
-        if receipt_path.exists():
-            receipt = _load_self_hashed(receipt_path, "case_receipt_sha256")
-            _validate_case_receipt(
-                receipt,
-                expected_case_hash=case_hash,
-                expected_protocol_receipt=streamed.case_receipt,
-                run_contract_sha256=run_contract["run_contract_sha256"],
-                root=root,
-            )
-            streamed.release()
-            del case
-            emitted += 1
-            _emit_count(progress_callback, emitted, resumed=True)
-            continue
-        started = time.perf_counter()
-        outputs: InferenceCaseOutputs | None = None
-        try:
-            outputs = runtime.infer_case(case, streamed.calibrator, plan=plan)
-            metrics = _score_case(outputs, case, metric_fn=metric_fn, device=str(runtime.device))
-            slice_artifacts = _render_case_artifacts(
-                case,
-                outputs,
-                plan,
-                case_hash=case_hash,
-                montage_dir=montage_dir,
-                slice_dir=slice_dir,
-            )
-            receipt_body: dict[str, Any] = {
+        emitted = 0
+        for streamed in iter_gate01_p0006_evaluation_cases(
+            protocol_path, progress_callback=progress_callback
+        ):
+            case = streamed.case
+            case_hash = hashlib.sha256(case.case_id.encode("utf-8")).hexdigest()
+            receipt_path = receipt_dir / f"case_{case_hash}.json"
+            if receipt_path.exists():
+                receipt = _load_self_hashed(receipt_path, "case_receipt_sha256")
+                _validate_case_receipt(
+                    receipt,
+                    expected_case_hash=case_hash,
+                    expected_protocol_receipt=streamed.case_receipt,
+                    run_contract_sha256=run_contract["run_contract_sha256"],
+                    root=root,
+                )
+                streamed.release()
+                del case
+                emitted += 1
+                _emit_count(progress_callback, emitted, resumed=True)
+                continue
+            started = time.perf_counter()
+            outputs: InferenceCaseOutputs | None = None
+            try:
+                outputs = runtime.infer_case(case, streamed.calibrator, plan=plan)
+                metrics = _score_case(
+                    outputs, case, metric_fn=metric_fn, device=str(runtime.device)
+                )
+                slice_artifacts = _render_case_artifacts(
+                    case,
+                    outputs,
+                    plan,
+                    case_hash=case_hash,
+                    montage_dir=montage_dir,
+                    slice_dir=slice_dir,
+                )
+                receipt_body: dict[str, Any] = {
                 "contract_version": CASE_RECEIPT_CONTRACT,
                 "run_contract_sha256": run_contract["run_contract_sha256"],
                 "case_ordinal": streamed.index,
@@ -722,22 +752,29 @@ def run_step200_p0006_inference_audit(
                 "gradients_enabled": False,
                 "optimizer_loaded": False,
                 "P0006_training_or_model_selection_use": False,
-            }
-            receipt_body["case_receipt_sha256"] = sha256_json(receipt_body)
-            _write_json_atomic(receipt_path, receipt_body)
-        finally:
-            if outputs is not None:
-                _release_case_outputs(outputs)
-            del outputs
-            streamed.release()
-            del case
-            gc.collect()
-        emitted += 1
-        _emit_count(progress_callback, emitted, resumed=False)
+                }
+                receipt_body["case_receipt_sha256"] = sha256_json(receipt_body)
+                _write_json_atomic(receipt_path, receipt_body)
+            finally:
+                if outputs is not None:
+                    _release_case_outputs(outputs)
+                del outputs
+                streamed.release()
+                del case
+                gc.collect()
+            emitted += 1
+            _emit_count(progress_callback, emitted, resumed=False)
     if emitted != 60:
         raise ValueError("Inference audit did not process exactly 60 P:0006 cases.")
     if dict(runtime.state_identity()) != initial_state:
         raise RuntimeError("Model state changed during the 60-case inference audit.")
+    lpips_post_audit = (
+        dict(lpips_integrity_verifier())
+        if lpips_integrity_verifier is not None
+        else {"unchanged": True, "synthetic_test_evaluator": True}
+    )
+    if lpips_post_audit.get("unchanged") is not True:
+        raise RuntimeError("LPIPS integrity verifier did not seal an unchanged evaluator.")
 
     receipts = _load_complete_case_receipts(
         receipt_dir, run_contract_sha256=run_contract["run_contract_sha256"], root=root
@@ -754,6 +791,9 @@ def run_step200_p0006_inference_audit(
         runtime,
         audit_implementation_commit=audit_implementation_commit,
         montage_manifest=montage_manifest,
+        dependency_receipt=dependency_receipt,
+        lpips_receipt=lpips_receipt,
+        lpips_post_audit=lpips_post_audit,
     )
     summary_path = root / "stage2_step200_p0006_summary.json"
     _seal_or_verify_json(summary_path, summary, "summary_sha256")
@@ -768,6 +808,9 @@ def run_step200_p0006_inference_audit(
         runtime=runtime,
         gate=gate,
         run_contract=run_contract,
+        dependency_receipt=dependency_receipt,
+        lpips_receipt=lpips_receipt,
+        lpips_post_audit=lpips_post_audit,
     )
     return {
         **summary,
@@ -1101,6 +1144,9 @@ def _build_inference_summary(
     *,
     audit_implementation_commit: str,
     montage_manifest: Mapping[str, Any],
+    dependency_receipt: Mapping[str, Any],
+    lpips_receipt: Mapping[str, Any],
+    lpips_post_audit: Mapping[str, Any],
 ) -> dict[str, Any]:
     def reduce(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         return {
@@ -1169,6 +1215,20 @@ def _build_inference_summary(
         "peak_allocated_bytes": gate["peak_allocated_bytes"],
         "peak_reserved_bytes": gate["peak_reserved_bytes"],
         "one_case_inference_seconds": gate["elapsed_seconds"],
+        "projected_60_case_inference_seconds": float(gate["elapsed_seconds"]) * 60.0,
+        "lpips_initialization_seconds": lpips_receipt.get("initialization_seconds"),
+        "dependency_download_observed": dependency_receipt.get(
+            "dependency_download_observed", False
+        ),
+        "alexnet_weight_downloaded": lpips_receipt.get(
+            "alexnet_weight_downloaded", False
+        ),
+        "lpips_linear_weight_downloaded": lpips_receipt.get(
+            "lpips_linear_weight_downloaded", False
+        ),
+        "dependency_environment_sha256": sha256_json(dependency_receipt),
+        "lpips_provenance_sha256": sha256_json(lpips_receipt),
+        "lpips_post_audit": dict(lpips_post_audit),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
@@ -1294,6 +1354,9 @@ def _seal_artifact_manifest(
     runtime: Step200CaseInferenceRuntime,
     gate: Mapping[str, Any],
     run_contract: Mapping[str, Any],
+    dependency_receipt: Mapping[str, Any],
+    lpips_receipt: Mapping[str, Any],
+    lpips_post_audit: Mapping[str, Any],
 ) -> dict[str, Any]:
     outputs = {}
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
@@ -1316,6 +1379,10 @@ def _seal_artifact_manifest(
         "peak_allocated_bytes": gate["peak_allocated_bytes"],
         "peak_reserved_bytes": gate["peak_reserved_bytes"],
         "one_case_inference_seconds": gate["elapsed_seconds"],
+        "projected_60_case_inference_seconds": float(gate["elapsed_seconds"]) * 60.0,
+        "dependency_environment": dict(dependency_receipt),
+        "lpips_provenance": dict(lpips_receipt),
+        "lpips_post_audit": dict(lpips_post_audit),
         "run_contract_sha256": run_contract["run_contract_sha256"],
         "render_library_versions": {
             "python": platform.python_version(),
@@ -1344,9 +1411,11 @@ def _run_contract(
     runtime: Step200CaseInferenceRuntime,
     *,
     audit_implementation_commit: str,
+    dependency_receipt: Mapping[str, Any],
+    lpips_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v1",
+        "contract_version": "stage2-step200-p0006-inference-run-v2",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
@@ -1355,12 +1424,55 @@ def _run_contract(
         "inference_plan_sha256": plan.sha256,
         "model_state": dict(runtime.state_identity()),
         "GPU_identity": dict(runtime.gpu_identity),
+        "dependency_environment_sha256": sha256_json(dependency_receipt),
+        "lpips_provenance_sha256": sha256_json(lpips_receipt),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
     }
     body["run_contract_sha256"] = sha256_json(body)
     return body
+
+
+def _seal_or_reuse_runtime_receipt(
+    path: Path,
+    provenance: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    current = copy.deepcopy(dict(provenance))
+    if path.exists():
+        stored = _load_self_hashed(path, "receipt_sha256")
+        if (
+            stored.get("contract_version")
+            != "stage2-step200-inference-runtime-provenance-receipt-v1"
+            or stored.get("label") != label
+            or not isinstance(stored.get("provenance"), Mapping)
+            or _stable_runtime_provenance(stored["provenance"])
+            != _stable_runtime_provenance(current)
+        ):
+            raise ValueError(f"Existing {label} receipt is incompatible.")
+        return copy.deepcopy(dict(stored["provenance"]))
+    body: dict[str, Any] = {
+        "contract_version": "stage2-step200-inference-runtime-provenance-receipt-v1",
+        "label": label,
+        "provenance": current,
+    }
+    body["receipt_sha256"] = sha256_json(body)
+    _write_json_atomic(path, body)
+    return current
+
+
+def _stable_runtime_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(dict(value))
+    for key in (
+        "initialization_seconds",
+        "alexnet_weight_downloaded",
+        "dependency_download_observed",
+        "pip_install_invoked",
+    ):
+        result.pop(key, None)
+    return result
 
 
 def _validate_scientific_role(protocol: Mapping[str, Any], readiness: Mapping[str, Any]) -> None:

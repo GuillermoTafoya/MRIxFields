@@ -1,0 +1,23 @@
+{
+  "authoritative_compatibility_sources": {
+    "colab_python_torch_announcement": "https://github.com/googlecolab/colabtools/issues/5483",
+    "pytorch_version_pairing": "https://pytorch.org/get-started/previous-versions/",
+    "torchvision_alexnet_weights": "https://github.com/pytorch/vision/blob/main/torchvision/models/alexnet.py"
+  },
+  "contract_version": "stage2-step200-inference-audit-dependency-lock-v1",
+  "installed_by_notebook": {
+    "PyYAML": "6.0.2",
+    "lpips": "0.1.4",
+    "matplotlib": "3.10.0",
+    "nibabel": "5.3.2",
+    "numpy": "2.0.2",
+    "scikit-image": "0.25.2",
+    "scipy": "1.16.1"
+  },
+  "preinstalled_cuda_stack": {
+    "python": "3.12.13",
+    "torch": "2.8.0+cu126",
+    "torch_cuda": "12.6",
+    "torchvision": "0.23.0+cu126"
+  }
+}

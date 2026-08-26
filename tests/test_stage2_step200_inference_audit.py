@@ -376,6 +376,11 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
         assert np.load(path, allow_pickle=False).ndim < 4
 
     first_calls = runtime.calls
+    first_artifact_hashes = {
+        path.relative_to(output).as_posix(): sha256_file(path)
+        for path in sorted(output.rglob("*"))
+        if path.is_file()
+    }
     resumed = audit.run_step200_p0006_inference_audit(
         protocol_path=protocol_path,
         evaluation_readiness_path=readiness_path,
@@ -387,6 +392,11 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
     )
     assert resumed["summary_sha256"] == result["summary_sha256"]
     assert runtime.calls == first_calls
+    assert {
+        path.relative_to(output).as_posix(): sha256_file(path)
+        for path in sorted(output.rglob("*"))
+        if path.is_file()
+    } == first_artifact_hashes
 
     receipt = next((output / "stage2_step200_p0006_case_receipts").glob("*.json"))
     payload = json.loads(receipt.read_text(encoding="utf-8"))

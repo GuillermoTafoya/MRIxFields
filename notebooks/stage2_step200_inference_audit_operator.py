@@ -16,6 +16,9 @@ CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc137
 SELECTION_RECEIPT_FILE_SHA256 = "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828"
 VALIDATION_PLAN_SHA256 = "3afca2bab6a440529f88e7c8d9a9294fed9ecbf07eea1e308ed0910e2ba16421"
 SELECTION_RULE_SHA256 = "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6"
+A100_QUALIFICATION_RUN_FINGERPRINT = (
+    "502a0989591cad3d09841d7deec841d41ac000d4c9e4ff314b53a8d4067ba5d7"
+)
 PROTOCOL_FILE_SHA256 = "3c11092a4a5e5342726947d705eca8fd8c52a70b82b96892529fe564c5f5f809"
 PROTOCOL_SHA256 = "2cd8e17207175f6a8f1f11f8afd748beca11ae0f47a08a0b2e1529a2272274e4"
 READINESS_FILE_SHA256 = "dc6695d3a9d9f69749af1421e92a3b008f240e147a59619957cd4888af71d7d2"
@@ -66,21 +69,10 @@ for module_name in tuple(sys.modules):
     if module_name == "fieldbridge" or module_name.startswith("fieldbridge."):
         del sys.modules[module_name]
 importlib.invalidate_caches()
-dependency_versions = {}
-for dependency_name in (
-    "numpy",
-    "scipy",
-    "torch",
-    "yaml",
-    "matplotlib",
-    "nibabel",
-    "skimage",
-    "lpips",
-):
-    dependency = importlib.import_module(dependency_name)
-    dependency_versions[dependency_name] = str(
-        getattr(dependency, "__version__", "available")
-    )
+if not isinstance(AUDIT_DEPENDENCY_PROVENANCE, dict):
+    raise RuntimeError("Sealed dependency provenance is missing before Drive mount.")
+for dependency_name in ("numpy", "scipy", "torch", "yaml", "matplotlib", "nibabel", "skimage", "lpips"):
+    importlib.import_module(dependency_name)
 import fieldbridge
 
 if REPO_DIR not in Path(fieldbridge.__file__).resolve().parents:
@@ -94,17 +86,21 @@ print(
             "status": "pass",
             "runtime_requirement": "NVIDIA A100 80 GB",
             "training_authorized": False,
-            "dependencies": dependency_versions,
+            "dependency_lock_file_sha256": AUDIT_DEPENDENCY_PROVENANCE[
+                "lock_file_sha256"
+            ],
+            "pip_install_invoked": AUDIT_DEPENDENCY_PROVENANCE[
+                "pip_install_invoked"
+            ],
+            "dependency_download_observed": AUDIT_DEPENDENCY_PROVENANCE[
+                "dependency_download_observed"
+            ],
         },
         sort_keys=True,
     ),
     flush=True,
 )
 
-
-from google.colab import drive
-
-drive.mount("/content/drive")
 
 import torch
 
@@ -126,6 +122,47 @@ print(
     ),
     flush=True,
 )
+
+from fieldbridge.evaluation.stage2_step200_lpips_audit import (
+    cached_official_gate01_metric_fn,
+    initialize_sealed_official_lpips,
+)
+
+SEALED_LPIPS = initialize_sealed_official_lpips(device="cuda")
+LPIPS_METRIC_FN = cached_official_gate01_metric_fn(SEALED_LPIPS)
+print(
+    json.dumps(
+        {
+            "stage": "lpips_weight_and_state_preflight",
+            "status": "pass",
+            "lpips_construction_count": 1,
+            "lpips_initialization_seconds": SEALED_LPIPS.provenance[
+                "initialization_seconds"
+            ],
+            "alexnet_weight_downloaded": SEALED_LPIPS.provenance[
+                "alexnet_weight_downloaded"
+            ],
+            "lpips_linear_weight_downloaded": False,
+            "alexnet_weight_file_sha256": SEALED_LPIPS.provenance[
+                "alexnet_weight_file_sha256"
+            ],
+            "lpips_linear_weight_file_sha256": SEALED_LPIPS.provenance[
+                "lpips_linear_weight_file_sha256"
+            ],
+            "canonical_tensor_state_sha256": SEALED_LPIPS.provenance[
+                "canonical_tensor_state_sha256"
+            ],
+            "private_data_accessed": False,
+            "training_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
+from google.colab import drive
+
+drive.mount("/content/drive")
 
 from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.evaluation.stage2_step200_inference_audit import (
@@ -253,6 +290,9 @@ if (
     or completed.get("training_reused") is not True
     or completed.get("training_invoked") is not False
     or completed.get("checkpoint_file_sha256") != CHECKPOINT_SHA256
+    or not isinstance(completed.get("qualification"), dict)
+    or completed["qualification"].get("run_fingerprint")
+    != A100_QUALIFICATION_RUN_FINGERPRINT
 ):
     raise RuntimeError("Completed step-200 evidence is incompatible; inference is forbidden.")
 del completed
@@ -275,6 +315,10 @@ result = run_step200_p0006_inference_audit(
     audit_implementation_commit=AUDIT_IMPLEMENTATION_COMMIT,
     require_a100=True,
     progress_callback=count_progress,
+    metric_fn=LPIPS_METRIC_FN,
+    dependency_provenance=AUDIT_DEPENDENCY_PROVENANCE,
+    lpips_provenance=SEALED_LPIPS.provenance,
+    lpips_integrity_verifier=SEALED_LPIPS.verify_unchanged,
 )
 print(
     json.dumps(
@@ -288,6 +332,19 @@ print(
             "P0006_training_or_model_selection_use": False,
             "population_or_generalization_claims_authorized": False,
             "long_run_training_authorized": False,
+            "dependency_download_observed": result[
+                "dependency_download_observed"
+            ],
+            "alexnet_weight_downloaded": result["alexnet_weight_downloaded"],
+            "lpips_initialization_seconds": result[
+                "lpips_initialization_seconds"
+            ],
+            "one_case_inference_seconds": result["one_case_inference_seconds"],
+            "projected_60_case_inference_seconds": result[
+                "projected_60_case_inference_seconds"
+            ],
+            "peak_allocated_bytes": result["peak_allocated_bytes"],
+            "peak_reserved_bytes": result["peak_reserved_bytes"],
             "final_stop": "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION",
         },
         indent=2,

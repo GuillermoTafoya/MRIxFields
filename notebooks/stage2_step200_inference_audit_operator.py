@@ -48,7 +48,7 @@ EVALUATION_READINESS = RECOVERY_NAMESPACE / "stage2_long_run_evaluation_readines
 BANK_ARCHIVE = OUTPUT_ROOT / "photometry_factored_latent_bank_v2.tar"
 PHOTOMETRY_ARTIFACT = OUTPUT_ROOT / "stage2_photometry_factorization_v1.json"
 VAE_CHECKPOINT = DRIVE_ROOT / "vae_kl_vae_best.pt"
-VAE_CONFIG = REPO_DIR / "configs/experiment/stage1_vae_v2_fgw_freebits.yaml"
+VAE_CONFIG = GATE01_ROOT / "stage1-run-c.yaml"
 LOCAL_SCRATCH = Path("/content/stage2_gate01_recovery_v8_scratch")
 LOCAL_BANK_ARCHIVE = LOCAL_SCRATCH / "photometry_factored_latent_bank_v2.tar"
 LOCAL_BANK_ROOT = LOCAL_SCRATCH / "photometry_factored_latent_bank_v2"
@@ -200,7 +200,9 @@ drive.mount("/content/drive")
 from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.evaluation.stage2_step200_inference_audit import (
     load_unified_step200_inference_runtime,
+    preflight_frozen_stage1_run_c_config,
     run_step200_p0006_inference_audit,
+    verify_frozen_stage1_vae_bank_provenance,
 )
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     copy_verified_stage2_bank_tar_to_local,
@@ -236,6 +238,26 @@ def count_progress(payload):
         elif not isinstance(value, int) or value < 0:
             raise ValueError("Inference progress counts must be nonnegative integers.")
     print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+vae_config_preflight = preflight_frozen_stage1_run_c_config(VAE_CONFIG)
+print(
+    json.dumps(
+        {
+            "stage": "frozen_stage1_run_c_config_preflight",
+            "status": "pass",
+            **vae_config_preflight.sanitized_provenance(),
+            "bank_copy_invoked": False,
+            "bank_extraction_invoked": False,
+            "checkpoint_deserialized": False,
+            "model_constructed": False,
+            "private_array_opened": False,
+            "inference_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
 
 
 if sha256_file(P0006_PROTOCOL) != PROTOCOL_FILE_SHA256:
@@ -309,6 +331,27 @@ print(
     flush=True,
 )
 
+verified_vae_provenance = verify_frozen_stage1_vae_bank_provenance(
+    vae_config_preflight,
+    vae_checkpoint_path=VAE_CHECKPOINT,
+    bank_dir=LOCAL_BANK_ROOT,
+)
+print(
+    json.dumps(
+        {
+            "stage": "frozen_stage1_run_c_bank_provenance",
+            "status": "pass",
+            **verified_vae_provenance.sanitized_provenance(),
+            "checkpoint_deserialized": False,
+            "model_constructed": False,
+            "private_array_opened": False,
+            "inference_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
 completed = verify_completed_stage2_pilot_evidence(
     TRAINING_NAMESPACE,
     bank_dir=LOCAL_BANK_ROOT,
@@ -339,6 +382,7 @@ runtime = load_unified_step200_inference_runtime(
     photometry_artifact_path=PHOTOMETRY_ARTIFACT,
     bank_dir=LOCAL_BANK_ROOT,
     device="cuda",
+    verified_vae_provenance=verified_vae_provenance,
 )
 result = run_step200_p0006_inference_audit(
     protocol_path=P0006_PROTOCOL,

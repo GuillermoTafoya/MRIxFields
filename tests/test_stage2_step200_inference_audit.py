@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import json
 import weakref
-import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -425,7 +425,151 @@ def test_source_enforces_inference_only_generator_state_and_no_materializing_loa
     assert "generator_optimizer" in source  # verified as checkpoint container metadata only
     assert "load_state_dict(state[\"translator\"]" not in source
     assert "translator.load_state_dict(translator_state, strict=True)" in source
+    assert "sha256_json(vae_config) !=" not in source
     assert "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION" in source
+
+
+def _synthetic_frozen_vae_config(monkeypatch, tmp_path, payload: bytes):
+    path = tmp_path / "stage1-run-c.yaml"
+    path.write_bytes(payload)
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SHA256", sha256_file(path))
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SIZE_BYTES", len(payload))
+    return path, audit.preflight_frozen_stage1_run_c_config(path)
+
+
+def test_frozen_vae_config_authorizes_raw_bytes_not_parsed_equivalence(monkeypatch, tmp_path):
+    exact = b"model:\n  latent_channels: 2\n"
+    equivalent = b"model: {latent_channels: 2}\n"
+    exact_path, preflight = _synthetic_frozen_vae_config(monkeypatch, tmp_path, exact)
+    equivalent_path = tmp_path / "parsed-equivalent.yaml"
+    equivalent_path.write_bytes(equivalent)
+
+    parsed_equivalent = audit.load_yaml_config(equivalent_path)
+    assert sha256_json(preflight.parsed_config) == sha256_json(parsed_equivalent)
+    assert sha256_file(exact_path) != sha256_file(equivalent_path)
+    with pytest.raises(ValueError, match="config raw-file SHA-256 mismatch"):
+        audit.preflight_frozen_stage1_run_c_config(equivalent_path)
+
+
+def test_repository_vae_example_cannot_substitute_for_owner_stage1_run_c():
+    repository_example = (
+        Path(__file__).resolve().parents[1]
+        / "configs/experiment/stage1_vae_v2_fgw_freebits.yaml"
+    )
+    assert sha256_file(repository_example) != audit.STAGE1_RUN_C_CONFIG_SHA256
+    with pytest.raises(ValueError, match="config raw-file SHA-256 mismatch"):
+        audit.preflight_frozen_stage1_run_c_config(repository_example)
+
+
+def test_frozen_vae_config_preflight_has_field_specific_file_and_parse_failures(
+    monkeypatch, tmp_path
+):
+    missing = tmp_path / "missing-stage1-run-c.yaml"
+    with pytest.raises(FileNotFoundError, match="config is missing"):
+        audit.preflight_frozen_stage1_run_c_config(missing)
+
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+    with pytest.raises(ValueError, match="not a regular file"):
+        audit.preflight_frozen_stage1_run_c_config(directory)
+
+    malformed = tmp_path / "stage1-run-c.yaml"
+    malformed.write_bytes(b"model: [\n")
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SHA256", sha256_file(malformed))
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SIZE_BYTES", malformed.stat().st_size)
+    with pytest.raises(ValueError, match="model configuration is malformed"):
+        audit.preflight_frozen_stage1_run_c_config(malformed)
+
+
+def test_frozen_vae_config_failure_precedes_bank_checkpoint_model_and_tensor_work(
+    monkeypatch, tmp_path
+):
+    bad_config = tmp_path / "stage1-run-c.yaml"
+    bad_config.write_bytes(b"model: {latent_channels: 2}\n")
+    touched: list[str] = []
+
+    def forbidden(label):
+        def fail(*_args, **_kwargs):
+            touched.append(label)
+            raise AssertionError(label)
+
+        return fail
+
+    monkeypatch.setattr(audit, "PhotometryFactoredLatentBankIndex", forbidden("bank"))
+    monkeypatch.setattr(audit, "load_checkpoint", forbidden("checkpoint"))
+    monkeypatch.setattr(audit, "build_translator", forbidden("translator"))
+    monkeypatch.setattr(audit, "build_encoder", forbidden("encoder"))
+    monkeypatch.setattr(audit, "build_decoder", forbidden("decoder"))
+    with pytest.raises(ValueError, match="config raw-file SHA-256 mismatch"):
+        audit.load_unified_step200_inference_runtime(
+            checkpoint_path=tmp_path / "step200.pt",
+            resolved_config_path=tmp_path / "resolved.json",
+            vae_config_path=bad_config,
+            vae_checkpoint_path=tmp_path / "vae.pt",
+            photometry_artifact_path=tmp_path / "photometry.json",
+            bank_dir=tmp_path / "bank",
+        )
+    assert touched == []
+
+
+def test_frozen_vae_bank_manifest_and_checkpoint_raw_identities_are_field_specific(
+    monkeypatch, tmp_path
+):
+    config_path, config_preflight = _synthetic_frozen_vae_config(
+        monkeypatch, tmp_path, b"model:\n  latent_channels: 2\n"
+    )
+    checkpoint_path = tmp_path / "vae.pt"
+    checkpoint_path.write_bytes(b"synthetic frozen VAE checkpoint")
+    checkpoint_sha = sha256_file(checkpoint_path)
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CHECKPOINT_SHA256", checkpoint_sha)
+    manifest_vae = {
+        "config_sha256": sha256_file(config_path),
+        "checkpoint_sha256": checkpoint_sha,
+    }
+    monkeypatch.setattr(
+        audit,
+        "PhotometryFactoredLatentBankIndex",
+        lambda *_args: SimpleNamespace(manifest={"vae": dict(manifest_vae)}),
+    )
+
+    provenance = audit.verify_frozen_stage1_vae_bank_provenance(
+        config_preflight,
+        vae_checkpoint_path=checkpoint_path,
+        bank_dir=tmp_path / "bank",
+    )
+    receipt = provenance.sanitized_provenance()
+    assert receipt["config_role"] == "frozen_stage1_run_c"
+    assert receipt["raw_config_file_sha256"] == sha256_file(config_path)
+    assert receipt["bank_manifest_config_sha256"] == sha256_file(config_path)
+    assert receipt["parsed_canonical_config_sha256"] == sha256_json(
+        config_preflight.parsed_config
+    )
+    assert receipt["checkpoint_file_sha256"] == checkpoint_sha
+    assert receipt["bank_manifest_checkpoint_sha256"] == checkpoint_sha
+
+    manifest_vae["config_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="bank manifest VAE config SHA-256 mismatch"):
+        audit.verify_frozen_stage1_vae_bank_provenance(
+            config_preflight,
+            vae_checkpoint_path=checkpoint_path,
+            bank_dir=tmp_path / "bank",
+        )
+    manifest_vae["config_sha256"] = sha256_file(config_path)
+    manifest_vae["checkpoint_sha256"] = "1" * 64
+    with pytest.raises(ValueError, match="bank manifest VAE checkpoint SHA-256 mismatch"):
+        audit.verify_frozen_stage1_vae_bank_provenance(
+            config_preflight,
+            vae_checkpoint_path=checkpoint_path,
+            bank_dir=tmp_path / "bank",
+        )
+    manifest_vae["checkpoint_sha256"] = checkpoint_sha
+    checkpoint_path.write_bytes(b"changed checkpoint")
+    with pytest.raises(ValueError, match="checkpoint raw-file SHA-256 mismatch"):
+        audit.verify_frozen_stage1_vae_bank_provenance(
+            config_preflight,
+            vae_checkpoint_path=checkpoint_path,
+            bank_dir=tmp_path / "bank",
+        )
 
 
 def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_and_vae(
@@ -468,12 +612,12 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     vae_config = {"model": {"latent_channels": 2}}
     vae_state = {"encoder": {}, "decoder": {}}
     photo_sha = "5" * 64
-    config_sha = sha256_json(vae_config)
+    config_raw_sha = "4" * 64
     bank = SimpleNamespace(
         manifest={
             "vae": {
                 "checkpoint_sha256": audit.STAGE1_RUN_C_CHECKPOINT_SHA256,
-                "config_sha256": config_sha,
+                "config_sha256": config_raw_sha,
             },
             "photometry": {
                 "artifact_file_sha256": photo_sha,
@@ -496,6 +640,8 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     for path in (checkpoint_path, vae_path, config_path, vae_config_path, photo_path):
         path.write_bytes(b"synthetic")
 
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SHA256", config_raw_sha)
+    monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SIZE_BYTES", len(b"synthetic"))
     monkeypatch.setattr(audit, "_load_json", lambda _path: config)
     monkeypatch.setattr(audit, "load_yaml_config", lambda _path: vae_config)
     monkeypatch.setattr(
@@ -506,6 +652,8 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
             if Path(path) == checkpoint_path
             else audit.STAGE1_RUN_C_CHECKPOINT_SHA256
             if Path(path) == vae_path
+            else config_raw_sha
+            if Path(path) == vae_config_path
             else photo_sha
         ),
     )
@@ -550,6 +698,21 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     assert runtime.encoder.training is False
     assert runtime.decoder.training is False
     assert not any(parameter.requires_grad for parameter in runtime.translator.parameters())
+    assert runtime.frozen_stage1_vae_provenance["raw_config_file_sha256"] == config_raw_sha
+    assert runtime.frozen_stage1_vae_provenance["parsed_canonical_config_sha256"] == sha256_json(
+        vae_config
+    )
+    run_contract = audit._run_contract(
+        audit.FrozenStep200InferencePlan({"inference_plan_sha256": "9" * 64}),
+        runtime,
+        audit_implementation_commit=AUDIT_COMMIT,
+        dependency_receipt={"synthetic": True},
+        lpips_receipt={"synthetic": True},
+    )
+    sealed_vae = run_contract["frozen_stage1_vae_provenance"]
+    assert sealed_vae["raw_config_file_sha256"] == config_raw_sha
+    assert sealed_vae["parsed_canonical_config_sha256"] == sha256_json(vae_config)
+    assert "config_path" not in sealed_vae
 
     checkpoint_state["_meta"] = {
         "git_commit": audit.TRAINING_EVIDENCE_COMMIT,
@@ -565,7 +728,19 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
             bank_dir=tmp_path / "bank",
         )
 
-    monkeypatch.setattr(audit, "sha256_file", lambda _path: "0" * 64)
+    monkeypatch.setattr(
+        audit,
+        "sha256_file",
+        lambda path: (
+            "0" * 64
+            if Path(path) == checkpoint_path
+            else audit.STAGE1_RUN_C_CHECKPOINT_SHA256
+            if Path(path) == vae_path
+            else config_raw_sha
+            if Path(path) == vae_config_path
+            else photo_sha
+        ),
+    )
     with pytest.raises(ValueError, match="checkpoint file SHA-256"):
         audit.load_unified_step200_inference_runtime(
             checkpoint_path=checkpoint_path,

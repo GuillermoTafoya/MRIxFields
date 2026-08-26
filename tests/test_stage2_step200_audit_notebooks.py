@@ -103,6 +103,32 @@ def test_a100_gate_precedes_large_bank_copy_and_private_streaming():
     audit_run = operator.index("run_step200_p0006_inference_audit(")
     assert gpu_gate < bank_copy < runtime_load < audit_run
     assert operator.index("preflight_gate01_p0006_archive(") < bank_copy
+    vae_config_preflight = operator.index(
+        "vae_config_preflight = preflight_frozen_stage1_run_c_config(VAE_CONFIG)"
+    )
+    bank_restore = operator.index("bank_restore = restore_verified_stage2_bank_tar(")
+    bank_vae_crosscheck = operator.index(
+        "verified_vae_provenance = verify_frozen_stage1_vae_bank_provenance("
+    )
+    completed_evidence = operator.index(
+        "completed = verify_completed_stage2_pilot_evidence("
+    )
+    assert vae_config_preflight < bank_copy < bank_restore < bank_vae_crosscheck
+    assert bank_vae_crosscheck < completed_evidence < runtime_load < audit_run
+
+
+def test_inference_operator_uses_exact_owner_stage1_run_c_without_repository_fallback():
+    operator = GPU_OPERATOR.read_text(encoding="utf-8")
+    audit_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_step200_inference_audit.py"
+    ).read_text(encoding="utf-8")
+    assert 'VAE_CONFIG = GATE01_ROOT / "stage1-run-c.yaml"' in operator
+    assert "stage1_vae_v2_fgw_freebits.yaml" not in operator
+    assert "raw_config_file_sha256" in audit_source
+    assert "parsed_canonical_config_sha256" in audit_source
+    assert "bank_manifest_config_sha256" in audit_source
+    assert "bank_manifest_checkpoint_sha256" in audit_source
+    assert "verified_vae_provenance=verified_vae_provenance" in operator
 
 
 def test_inference_case_loop_has_sealed_lpips_and_no_network_access():

@@ -98,6 +98,21 @@ Only then does the notebook mount Drive. It uses the stable
 `/content/stage2_gate01_recovery_v8_scratch` cache and therefore verifies and reuses an
 exact existing archive/bank when present.
 
+Immediately after Drive mount and before any 12.9 GB bank copy or extraction, the
+operator authenticates the reviewed Gate01Private direct child `stage1-run-c.yaml` as
+the frozen Stage-1 Run C VAE configuration. Authorization uses its exact 4,290 raw bytes
+and raw-file SHA-256
+`55921ffc53bac074883b66d368051589dd3cc3f2ce5c8e2cc1d304be4245888f`;
+the similarly parsed repository example is not a substitute. Only after this raw-file
+gate passes is the YAML parsed. Its canonical parsed hash is recorded as derived
+provenance and never authorizes the configuration. After verified bank restoration, the
+operator independently requires the bank manifest to name that same raw config identity
+and requires both the VAE checkpoint file and manifest identity to equal
+`74132b9c514bb91b86d8eb43c63542780bce11304e31e67d3bf75c90ff5d4d79`
+before any checkpoint is deserialized or model is constructed. Audit protocol, run, and
+artifact-manifest contracts are v3 because no v2 owner audit output was produced before
+this provenance boundary was corrected.
+
 The operator revalidates the complete step-200 evidence, the full checkpoint container,
 the frozen Stage-1 VAE, the R-only photometry/bank identities, the P:0006 protocol, and
 evaluation-readiness evidence. It then performs an exact one-case inference memory and

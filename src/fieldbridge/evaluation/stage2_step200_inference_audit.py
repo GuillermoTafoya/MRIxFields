@@ -54,6 +54,7 @@ from fieldbridge.evaluation.stage2_gate01 import (
 )
 from fieldbridge.evaluation.stage2_gate01_calibration import (
     STAGE1_RUN_C_CHECKPOINT_SHA256,
+    STAGE1_RUN_C_CONFIG_SHA256,
     PosthocTargetCalibrator,
 )
 from fieldbridge.evaluation.stage2_gate01_montage import (
@@ -80,13 +81,14 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v2"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v3"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
 CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
 MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v1"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v2"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v3"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
+FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT = "stage2-step200-frozen-stage1-vae-provenance-v1"
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
 RUN_FINGERPRINT = "c814c948a5b85bd3a694db7c8e074894e97c16a96a36acbfa6f370faf2dac0aa"
@@ -96,6 +98,7 @@ EVALUATION_READINESS_FILE_SHA256 = "dc6695d3a9d9f69749af1421e92a3b008f240e147a59
 EVALUATION_READINESS_SHA256 = "ff5d4e8e80f48fecdf0e320fd56e9fd9431145798908b56d7e363b5760d8e0ec"
 INFERENCE_SEED = 20_260_825
 A100_MAX_PEAK_ALLOCATED_BYTES = 72 * 1024**3
+STAGE1_RUN_C_CONFIG_SIZE_BYTES = 4_290
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_RE = re.compile(r"[0-9a-f]{40}")
 _METHOD_ORDER = (
@@ -133,6 +136,48 @@ class InferenceCaseOutputs:
     decoded_canonical_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class FrozenStage1VAEConfigPreflight:
+    """Verified raw owner YAML plus separately derived parsed provenance."""
+
+    path: Path
+    raw_file_sha256: str
+    size_bytes: int
+    parsed_canonical_sha256: str
+    parsed_config: dict[str, Any]
+
+    def sanitized_provenance(self) -> dict[str, Any]:
+        return {
+            "config_role": "frozen_stage1_run_c",
+            "raw_config_file_sha256": self.raw_file_sha256,
+            "raw_config_file_size_bytes": self.size_bytes,
+            "parsed_canonical_config_sha256": self.parsed_canonical_sha256,
+            "raw_config_identity_match": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenStage1VAEProvenance:
+    """Raw-file identities cross-checked against the restored bank manifest."""
+
+    config: FrozenStage1VAEConfigPreflight
+    checkpoint_path: Path
+    bank_dir: Path
+    checkpoint_file_sha256: str
+    bank_manifest_config_sha256: str
+    bank_manifest_checkpoint_sha256: str
+
+    def sanitized_provenance(self) -> dict[str, Any]:
+        return {
+            "contract_version": FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT,
+            **self.config.sanitized_provenance(),
+            "bank_manifest_config_sha256": self.bank_manifest_config_sha256,
+            "checkpoint_file_sha256": self.checkpoint_file_sha256,
+            "bank_manifest_checkpoint_sha256": self.bank_manifest_checkpoint_sha256,
+            "checkpoint_identity_match": True,
+        }
+
+
 class Step200CaseInferenceRuntime(Protocol):
     device: torch.device
     gpu_identity: Mapping[str, Any]
@@ -160,6 +205,7 @@ class UnifiedStep200InferenceRuntime:
     support_rule_sha256: str
     device: torch.device
     gpu_identity: Mapping[str, Any]
+    frozen_stage1_vae_provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if self.device.type != "cuda":
@@ -474,6 +520,94 @@ def build_frozen_step200_inference_plan(protocol: Mapping[str, Any]) -> FrozenSt
     return FrozenStep200InferencePlan(body)
 
 
+def preflight_frozen_stage1_run_c_config(
+    vae_config_path: str | Path,
+) -> FrozenStage1VAEConfigPreflight:
+    """Authenticate the exact owner YAML bytes before any restored-bank I/O."""
+
+    path = Path(vae_config_path)
+    if not path.exists():
+        raise FileNotFoundError("Frozen Stage-1 Run C VAE config is missing.")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Frozen Stage-1 Run C VAE config is not a regular file.")
+    size_bytes = path.stat().st_size
+    raw_file_sha256 = sha256_file(path)
+    if (
+        size_bytes != STAGE1_RUN_C_CONFIG_SIZE_BYTES
+        or raw_file_sha256 != STAGE1_RUN_C_CONFIG_SHA256
+    ):
+        raise ValueError("Frozen Stage-1 Run C VAE config raw-file SHA-256 mismatch.")
+    try:
+        parsed = load_yaml_config(path)
+    except Exception as error:
+        raise ValueError("Frozen Stage-1 Run C VAE model configuration is malformed.") from error
+    if not isinstance(parsed, Mapping) or not isinstance(parsed.get("model"), Mapping):
+        raise ValueError("Frozen Stage-1 Run C VAE model configuration is malformed.")
+    # Detect a replacement between raw authentication and parsing.
+    if path.stat().st_size != size_bytes or sha256_file(path) != raw_file_sha256:
+        raise ValueError("Frozen Stage-1 Run C VAE config changed while being parsed.")
+    parsed_config = copy.deepcopy(dict(parsed))
+    return FrozenStage1VAEConfigPreflight(
+        path=path,
+        raw_file_sha256=raw_file_sha256,
+        size_bytes=size_bytes,
+        parsed_canonical_sha256=sha256_json(parsed_config),
+        parsed_config=parsed_config,
+    )
+
+
+def verify_frozen_stage1_vae_bank_provenance(
+    config_preflight: FrozenStage1VAEConfigPreflight,
+    *,
+    vae_checkpoint_path: str | Path,
+    bank_dir: str | Path,
+) -> FrozenStage1VAEProvenance:
+    """Cross-check raw frozen-VAE identities with a verified restored bank."""
+
+    if (
+        config_preflight.raw_file_sha256 != STAGE1_RUN_C_CONFIG_SHA256
+        or config_preflight.size_bytes != STAGE1_RUN_C_CONFIG_SIZE_BYTES
+        or sha256_file(config_preflight.path) != STAGE1_RUN_C_CONFIG_SHA256
+    ):
+        raise ValueError("Frozen Stage-1 Run C VAE config raw-file SHA-256 mismatch.")
+    if (
+        not isinstance(config_preflight.parsed_config.get("model"), Mapping)
+        or sha256_json(config_preflight.parsed_config)
+        != config_preflight.parsed_canonical_sha256
+    ):
+        raise ValueError("Frozen Stage-1 Run C VAE model configuration is malformed.")
+    bank_path = Path(bank_dir)
+    bank = PhotometryFactoredLatentBankIndex(bank_path, "validation")
+    manifest_vae = bank.manifest.get("vae")
+    if not isinstance(manifest_vae, Mapping):
+        raise ValueError("Restored bank manifest lacks frozen VAE provenance.")
+    bank_config_sha256 = str(manifest_vae.get("config_sha256", ""))
+    if bank_config_sha256 != config_preflight.raw_file_sha256:
+        raise ValueError("Restored bank manifest VAE config SHA-256 mismatch.")
+
+    checkpoint_path = Path(vae_checkpoint_path)
+    if (
+        not checkpoint_path.exists()
+        or checkpoint_path.is_symlink()
+        or not checkpoint_path.is_file()
+    ):
+        raise ValueError("Frozen Stage-1 Run C VAE checkpoint is missing or non-regular.")
+    checkpoint_file_sha256 = sha256_file(checkpoint_path)
+    if checkpoint_file_sha256 != STAGE1_RUN_C_CHECKPOINT_SHA256:
+        raise ValueError("Frozen Stage-1 Run C VAE checkpoint raw-file SHA-256 mismatch.")
+    bank_checkpoint_sha256 = str(manifest_vae.get("checkpoint_sha256", ""))
+    if bank_checkpoint_sha256 != checkpoint_file_sha256:
+        raise ValueError("Restored bank manifest VAE checkpoint SHA-256 mismatch.")
+    return FrozenStage1VAEProvenance(
+        config=config_preflight,
+        checkpoint_path=checkpoint_path,
+        bank_dir=bank_path,
+        checkpoint_file_sha256=checkpoint_file_sha256,
+        bank_manifest_config_sha256=bank_config_sha256,
+        bank_manifest_checkpoint_sha256=bank_checkpoint_sha256,
+    )
+
+
 def load_unified_step200_inference_runtime(
     *,
     checkpoint_path: str | Path,
@@ -483,8 +617,31 @@ def load_unified_step200_inference_runtime(
     photometry_artifact_path: str | Path,
     bank_dir: str | Path,
     device: str | torch.device = "cuda",
+    verified_vae_provenance: FrozenStage1VAEProvenance | None = None,
 ) -> UnifiedStep200InferenceRuntime:
-    """Verify the complete checkpoint, then extract only generator/frozen VAE state."""
+    """Authenticate frozen VAE inputs, then extract only verified inference state."""
+
+    vae_config_path = Path(vae_config_path)
+    vae_checkpoint_path = Path(vae_checkpoint_path)
+    bank_dir = Path(bank_dir)
+    config_preflight = preflight_frozen_stage1_run_c_config(vae_config_path)
+    current_vae_provenance = verify_frozen_stage1_vae_bank_provenance(
+        config_preflight,
+        vae_checkpoint_path=vae_checkpoint_path,
+        bank_dir=bank_dir,
+    )
+    if verified_vae_provenance is not None:
+        if (
+            verified_vae_provenance.config.path.resolve(strict=True)
+            != vae_config_path.resolve(strict=True)
+            or verified_vae_provenance.checkpoint_path.resolve(strict=True)
+            != vae_checkpoint_path.resolve(strict=True)
+            or verified_vae_provenance.bank_dir.resolve(strict=True)
+            != bank_dir.resolve(strict=True)
+            or verified_vae_provenance.sanitized_provenance()
+            != current_vae_provenance.sanitized_provenance()
+        ):
+            raise ValueError("Preflighted frozen Stage-1 VAE provenance changed before loading.")
 
     checkpoint_path = Path(checkpoint_path)
     if sha256_file(checkpoint_path) != CHECKPOINT_SHA256:
@@ -554,15 +711,26 @@ def load_unified_step200_inference_runtime(
 
     bank = PhotometryFactoredLatentBankIndex(bank_dir, "validation")
     stats = FactoredLatentStats.from_bank(bank_dir)
-    vae_path = Path(vae_checkpoint_path)
-    if sha256_file(vae_path) != STAGE1_RUN_C_CHECKPOINT_SHA256:
-        raise ValueError("Frozen Stage-1 VAE checkpoint identity changed.")
-    if bank.manifest.get("vae", {}).get("checkpoint_sha256") != STAGE1_RUN_C_CHECKPOINT_SHA256:
-        raise ValueError("Restored bank and frozen VAE checkpoint disagree.")
-    vae_config = load_yaml_config(Path(vae_config_path))
-    if sha256_json(vae_config) != bank.manifest.get("vae", {}).get("config_sha256"):
-        raise ValueError("Frozen VAE configuration and restored bank disagree.")
-    vae_state = load_checkpoint(vae_path, map_location="cpu")
+    runtime_manifest_vae = bank.manifest.get("vae")
+    if not isinstance(runtime_manifest_vae, Mapping):
+        raise ValueError("Restored bank manifest lacks frozen VAE provenance.")
+    if (
+        runtime_manifest_vae.get("config_sha256")
+        != current_vae_provenance.bank_manifest_config_sha256
+    ):
+        raise ValueError("Restored bank manifest VAE config SHA-256 mismatch.")
+    if (
+        runtime_manifest_vae.get("checkpoint_sha256")
+        != current_vae_provenance.bank_manifest_checkpoint_sha256
+    ):
+        raise ValueError("Restored bank manifest VAE checkpoint SHA-256 mismatch.")
+    if (
+        sha256_file(vae_checkpoint_path)
+        != current_vae_provenance.checkpoint_file_sha256
+    ):
+        raise ValueError("Frozen Stage-1 Run C VAE checkpoint raw-file SHA-256 mismatch.")
+    vae_config = current_vae_provenance.config.parsed_config
+    vae_state = load_checkpoint(vae_checkpoint_path, map_location="cpu")
     vae_model = vae_config.get("model") if isinstance(vae_config, Mapping) else None
     if not isinstance(vae_model, Mapping):
         raise ValueError("Frozen VAE checkpoint lacks its complete model configuration.")
@@ -607,6 +775,7 @@ def load_unified_step200_inference_runtime(
         support_rule_sha256=str(support_rule["rule_sha256"]),
         device=device_obj,
         gpu_identity=gpu_identity,
+        frozen_stage1_vae_provenance=current_vae_provenance.sanitized_provenance(),
     )
 
 
@@ -637,6 +806,10 @@ def run_step200_p0006_inference_audit(
         or lpips_integrity_verifier is None
     ):
         raise ValueError("Production inference audit lacks sealed dependency/LPIPS provenance.")
+    if require_a100 and _runtime_frozen_stage1_vae_provenance(runtime).get(
+        "synthetic_test_runtime"
+    ) is True:
+        raise ValueError("Production inference audit lacks frozen Stage-1 VAE provenance.")
     protocol_path = Path(protocol_path)
     readiness_path = Path(evaluation_readiness_path)
     if sha256_file(protocol_path) != P0006_PROTOCOL_FILE_SHA256:
@@ -1229,6 +1402,7 @@ def _build_inference_summary(
         "dependency_environment_sha256": sha256_json(dependency_receipt),
         "lpips_provenance_sha256": sha256_json(lpips_receipt),
         "lpips_post_audit": dict(lpips_post_audit),
+        "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
@@ -1383,6 +1557,7 @@ def _seal_artifact_manifest(
         "dependency_environment": dict(dependency_receipt),
         "lpips_provenance": dict(lpips_receipt),
         "lpips_post_audit": dict(lpips_post_audit),
+        "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
         "run_contract_sha256": run_contract["run_contract_sha256"],
         "render_library_versions": {
             "python": platform.python_version(),
@@ -1415,7 +1590,7 @@ def _run_contract(
     lpips_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v2",
+        "contract_version": "stage2-step200-p0006-inference-run-v3",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
@@ -1426,12 +1601,51 @@ def _run_contract(
         "GPU_identity": dict(runtime.gpu_identity),
         "dependency_environment_sha256": sha256_json(dependency_receipt),
         "lpips_provenance_sha256": sha256_json(lpips_receipt),
+        "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
     }
     body["run_contract_sha256"] = sha256_json(body)
     return body
+
+
+def _runtime_frozen_stage1_vae_provenance(
+    runtime: Step200CaseInferenceRuntime,
+) -> dict[str, Any]:
+    provenance = getattr(runtime, "frozen_stage1_vae_provenance", None)
+    if provenance is None:
+        return {"synthetic_test_runtime": True}
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Frozen Stage-1 VAE runtime provenance is malformed.")
+    body = dict(provenance)
+    if set(body) != {
+        "contract_version",
+        "config_role",
+        "raw_config_file_sha256",
+        "raw_config_file_size_bytes",
+        "parsed_canonical_config_sha256",
+        "raw_config_identity_match",
+        "bank_manifest_config_sha256",
+        "checkpoint_file_sha256",
+        "bank_manifest_checkpoint_sha256",
+        "checkpoint_identity_match",
+    }:
+        raise ValueError("Frozen Stage-1 VAE runtime provenance key inventory changed.")
+    if (
+        body["contract_version"] != FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT
+        or body["config_role"] != "frozen_stage1_run_c"
+        or body["raw_config_file_sha256"] != STAGE1_RUN_C_CONFIG_SHA256
+        or body["raw_config_file_size_bytes"] != STAGE1_RUN_C_CONFIG_SIZE_BYTES
+        or body["bank_manifest_config_sha256"] != STAGE1_RUN_C_CONFIG_SHA256
+        or body["raw_config_identity_match"] is not True
+        or body["checkpoint_file_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256
+        or body["bank_manifest_checkpoint_sha256"] != STAGE1_RUN_C_CHECKPOINT_SHA256
+        or body["checkpoint_identity_match"] is not True
+        or _SHA256_RE.fullmatch(str(body["parsed_canonical_config_sha256"])) is None
+    ):
+        raise ValueError("Frozen Stage-1 VAE runtime provenance identity changed.")
+    return copy.deepcopy(body)
 
 
 def _seal_or_reuse_runtime_receipt(
@@ -1719,6 +1933,9 @@ __all__ = [
     "ARTIFACT_MANIFEST_CONTRACT",
     "CASE_RECEIPT_CONTRACT",
     "CHECKPOINT_SHA256",
+    "FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT",
+    "FrozenStage1VAEConfigPreflight",
+    "FrozenStage1VAEProvenance",
     "FrozenStep200InferencePlan",
     "INFERENCE_AUDIT_CONTRACT",
     "INFERENCE_PLAN_CONTRACT",
@@ -1728,10 +1945,13 @@ __all__ = [
     "P0006_PROTOCOL_FILE_SHA256",
     "P0006_PROTOCOL_SHA256",
     "RUN_FINGERPRINT",
+    "STAGE1_RUN_C_CONFIG_SIZE_BYTES",
     "Step200CaseInferenceRuntime",
     "TRAINING_EVIDENCE_COMMIT",
     "UnifiedStep200InferenceRuntime",
     "build_frozen_step200_inference_plan",
     "load_unified_step200_inference_runtime",
+    "preflight_frozen_stage1_run_c_config",
     "run_step200_p0006_inference_audit",
+    "verify_frozen_stage1_vae_bank_provenance",
 ]

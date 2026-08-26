@@ -99,6 +99,7 @@ EVALUATION_READINESS_SHA256 = "ff5d4e8e80f48fecdf0e320fd56e9fd9431145798908b56d7
 INFERENCE_SEED = 20_260_825
 A100_MAX_PEAK_ALLOCATED_BYTES = 72 * 1024**3
 STAGE1_RUN_C_CONFIG_SIZE_BYTES = 4_290
+STAGE1_RUN_C_CONFIG_BASENAME = "stage1-run-c.yaml"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_RE = re.compile(r"[0-9a-f]{40}")
 _METHOD_ORDER = (
@@ -530,6 +531,8 @@ def preflight_frozen_stage1_run_c_config(
         raise FileNotFoundError("Frozen Stage-1 Run C VAE config is missing.")
     if path.is_symlink() or not path.is_file():
         raise ValueError("Frozen Stage-1 Run C VAE config is not a regular file.")
+    if path.name != STAGE1_RUN_C_CONFIG_BASENAME:
+        raise ValueError("Frozen Stage-1 Run C VAE config path role is incorrect.")
     size_bytes = path.stat().st_size
     raw_file_sha256 = sha256_file(path)
     if (
@@ -1946,6 +1949,7 @@ __all__ = [
     "P0006_PROTOCOL_SHA256",
     "RUN_FINGERPRINT",
     "STAGE1_RUN_C_CONFIG_SIZE_BYTES",
+    "STAGE1_RUN_C_CONFIG_BASENAME",
     "Step200CaseInferenceRuntime",
     "TRAINING_EVIDENCE_COMMIT",
     "UnifiedStep200InferenceRuntime",

@@ -441,7 +441,9 @@ def test_frozen_vae_config_authorizes_raw_bytes_not_parsed_equivalence(monkeypat
     exact = b"model:\n  latent_channels: 2\n"
     equivalent = b"model: {latent_channels: 2}\n"
     exact_path, preflight = _synthetic_frozen_vae_config(monkeypatch, tmp_path, exact)
-    equivalent_path = tmp_path / "parsed-equivalent.yaml"
+    equivalent_dir = tmp_path / "parsed-equivalent"
+    equivalent_dir.mkdir()
+    equivalent_path = equivalent_dir / "stage1-run-c.yaml"
     equivalent_path.write_bytes(equivalent)
 
     parsed_equivalent = audit.load_yaml_config(equivalent_path)
@@ -456,8 +458,9 @@ def test_repository_vae_example_cannot_substitute_for_owner_stage1_run_c():
         Path(__file__).resolve().parents[1]
         / "configs/experiment/stage1_vae_v2_fgw_freebits.yaml"
     )
-    assert sha256_file(repository_example) != audit.STAGE1_RUN_C_CONFIG_SHA256
-    with pytest.raises(ValueError, match="config raw-file SHA-256 mismatch"):
+    # Even when reviewed Git bytes match, the repository example is not the exact
+    # owner Drive role and cannot substitute operationally.
+    with pytest.raises(ValueError, match="config path role is incorrect"):
         audit.preflight_frozen_stage1_run_c_config(repository_example)
 
 
@@ -635,7 +638,7 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     checkpoint_path = tmp_path / "checkpoint.pt"
     vae_path = tmp_path / "vae.pt"
     config_path = tmp_path / "resolved.json"
-    vae_config_path = tmp_path / "vae.yaml"
+    vae_config_path = tmp_path / "stage1-run-c.yaml"
     photo_path = tmp_path / "photometry.json"
     for path in (checkpoint_path, vae_path, config_path, vae_config_path, photo_path):
         path.write_bytes(b"synthetic")

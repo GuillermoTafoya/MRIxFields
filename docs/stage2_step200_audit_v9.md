@@ -103,8 +103,9 @@ operator authenticates the reviewed Gate01Private direct child `stage1-run-c.yam
 the frozen Stage-1 Run C VAE configuration. Authorization uses its exact 4,290 raw bytes
 and raw-file SHA-256
 `55921ffc53bac074883b66d368051589dd3cc3f2ce5c8e2cc1d304be4245888f`;
-the similarly parsed repository example is not a substitute. Only after this raw-file
-gate passes is the YAML parsed. Its canonical parsed hash is recorded as derived
+the repository example is not an operational substitute even when its reviewed Git bytes
+are identical, because the exact `stage1-run-c.yaml` role basename is also required. Only
+after this role and raw-file gate passes is the YAML parsed. Its canonical hash is derived
 provenance and never authorizes the configuration. After verified bank restoration, the
 operator independently requires the bank manifest to name that same raw config identity
 and requires both the VAE checkpoint file and manifest identity to equal

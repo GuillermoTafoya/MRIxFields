@@ -31,9 +31,14 @@ from fieldbridge.training.checkpoints import load_checkpoint
 from fieldbridge.training.stage2_unified import (
     DEFAULT_UNIFIED_WEIGHTS,
     UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT,
+    UNIFIED_A100_GATE_CONTRACT,
+    UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES,
+    UNIFIED_ANATOMY_MEMORY_CONTRACT,
+    UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
     UNIFIED_HISTORY_CONTRACT,
     UNIFIED_RESUME_CONTRACT,
     UNIFIED_SELECTION_RULE_SHA256,
+    UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT,
     UNIFIED_VALIDATION_PLAN_CONTRACT,
 )
 
@@ -62,6 +67,79 @@ _GIT_RE = re.compile(r"[0-9a-f]{40}")
 _EXPECTED_STEPS = tuple(range(1, 201))
 _TERMS = tuple(DEFAULT_UNIFIED_WEIGHTS)
 _GRADIENT_EXPLOSION_MAX_NORM = 100.0
+_A100_QUALIFICATION_RECEIPT_KEYS = frozenset(
+    {
+        "contract_version",
+        "status",
+        "step",
+        "gate",
+        "anatomy_memory_qualification",
+        "run_fingerprint",
+        "validation_plan_sha256",
+        "complete_validation_executed",
+        "checkpoint_written",
+        "generator_optimizer_updates",
+        "generator_gradient_accumulation_contract",
+        "term_gradient_qualification_contract",
+        "frozen_decoder_state_sha256",
+        "decoder_activation_checkpoint_sha256",
+        "receipt_sha256",
+    }
+)
+_A100_GATE_KEYS = frozenset(
+    {
+        "contract_version",
+        "status",
+        "required_gpu",
+        "gpu_name",
+        "gpu_identity_matches",
+        "peak_allocated_limit_bytes",
+        "peak_allocated_bytes",
+        "within_allocated_limit",
+        "before_pilot_steps",
+        "full_objective",
+        "batch_size",
+        "precision",
+        "integration_steps",
+        "integration_solver",
+    }
+)
+_ANATOMY_QUALIFICATION_KEYS = frozenset(
+    {
+        "contract_version",
+        "status",
+        "full_volume",
+        "source_decode_checkpointed",
+        "generated_decode_checkpoint_mode",
+        "group_norm_scope",
+        "spatial_crop_or_tile",
+        "allocator_fallback",
+        "step",
+        "decoder_state_sha256_before",
+        "decoder_state_sha256_after",
+        "decoder_state_unchanged",
+        "checkpoint_evidence_sha256",
+        "checkpoint_evidence",
+    }
+)
+_DECODER_CHECKPOINT_EVIDENCE_KEYS = frozenset(
+    {
+        "contract_version",
+        "mode",
+        "spatial_dims",
+        "full_volume",
+        "group_norm_scope",
+        "upsample_regions",
+        "residual_branch_regions",
+        "residual_skip_checkpointed",
+        "residual_skip_evaluation_order",
+        "outer_full_decoder_checkpoint",
+        "checkpoint_use_reentrant",
+        "checkpoint_preserve_rng_state",
+        "source_no_grad_decode_checkpointed",
+        "state_dict_schema_changed",
+    }
+)
 
 _CORE_NUMERIC_FIELDS = (
     *(f"raw/{term}" for term in _TERMS),
@@ -266,28 +344,7 @@ def verify_step200_pilot_evidence(
     _validate_pilot_report(pilot)
 
     qualification = _load_self_hashed(inputs.a100_qualification_receipt, "receipt_sha256")
-    if (
-        qualification.get("contract_version") != UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT
-        or qualification.get("status") != "pass"
-        or qualification.get("step") != 1
-        or qualification.get("complete_validation_executed") is not False
-        or qualification.get("checkpoint_written") is not False
-        or qualification.get("generator_optimizer_updates") != 1
-        or qualification.get("validation_plan_sha256") != STEP200_VALIDATION_PLAN_SHA256
-        or qualification.get("selection_rule_sha256") != STEP200_SELECTION_RULE_SHA256
-        or not isinstance(qualification.get("run_fingerprint"), str)
-        or _SHA256_RE.fullmatch(str(qualification.get("run_fingerprint"))) is None
-    ):
-        raise ValueError("A100 qualification-only receipt is incomplete or changed.")
-    gate = qualification.get("gate")
-    if (
-        not isinstance(gate, Mapping)
-        or gate.get("status") != "pass"
-        or gate.get("gpu_identity_matches") is not True
-        or gate.get("within_allocated_limit") is not True
-        or gate.get("full_objective") is not True
-    ):
-        raise ValueError("A100 qualification gate did not pass exactly.")
+    _validate_a100_qualification_receipt(qualification, pilot=pilot)
 
     recovery = _load_self_hashed(inputs.recovery_receipt, "receipt_sha256")
     if (
@@ -606,6 +663,173 @@ def _load_history(
     if not isinstance(pilot, Mapping):
         raise ValueError("History terminal pilot report is malformed.")
     return training_rows, validations[0], dict(pilot)
+
+
+def _validate_a100_qualification_receipt(
+    qualification: Mapping[str, Any],
+    *,
+    pilot: Mapping[str, Any],
+) -> None:
+    _require_exact_keys(
+        qualification,
+        _A100_QUALIFICATION_RECEIPT_KEYS,
+        "A100 qualification-only receipt",
+    )
+    run_fingerprint = qualification.get("run_fingerprint")
+    if (
+        qualification.get("contract_version") != UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT
+        or qualification.get("status") != "pass"
+        or type(qualification.get("step")) is not int
+        or qualification.get("step") != 1
+        or qualification.get("complete_validation_executed") is not False
+        or qualification.get("checkpoint_written") is not False
+        or type(qualification.get("generator_optimizer_updates")) is not int
+        or qualification.get("generator_optimizer_updates") != 1
+        or qualification.get("validation_plan_sha256") != STEP200_VALIDATION_PLAN_SHA256
+        or not isinstance(run_fingerprint, str)
+        or _SHA256_RE.fullmatch(run_fingerprint) is None
+        or run_fingerprint == STEP200_RUN_FINGERPRINT
+        or qualification.get("generator_gradient_accumulation_contract")
+        != UNIFIED_GENERATOR_ACCUMULATION_CONTRACT
+        or qualification.get("term_gradient_qualification_contract")
+        != UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+        or _SHA256_RE.fullmatch(str(qualification.get("receipt_sha256"))) is None
+    ):
+        raise ValueError("A100 qualification-only receipt is incomplete or changed.")
+
+    gate = qualification.get("gate")
+    _validate_a100_gate(gate)
+    anatomy = qualification.get("anatomy_memory_qualification")
+    _validate_anatomy_qualification(anatomy, label="A100 qualification")
+    assert isinstance(anatomy, Mapping)
+    checkpoint_evidence = anatomy["checkpoint_evidence"]
+    assert isinstance(checkpoint_evidence, Mapping)
+
+    frozen_decoder_sha = qualification.get("frozen_decoder_state_sha256")
+    checkpoint_evidence_sha = qualification.get("decoder_activation_checkpoint_sha256")
+    if (
+        not isinstance(frozen_decoder_sha, str)
+        or _SHA256_RE.fullmatch(frozen_decoder_sha) is None
+        or frozen_decoder_sha != anatomy.get("decoder_state_sha256_before")
+        or not isinstance(checkpoint_evidence_sha, str)
+        or _SHA256_RE.fullmatch(checkpoint_evidence_sha) is None
+        or checkpoint_evidence_sha != sha256_json(checkpoint_evidence)
+        or checkpoint_evidence_sha != anatomy.get("checkpoint_evidence_sha256")
+    ):
+        raise ValueError("A100 qualification decoder identities changed.")
+
+    pilot_anatomy = pilot.get("one_step_anatomy_memory_qualification")
+    _validate_anatomy_qualification(pilot_anatomy, label="step-200 pilot")
+    assert isinstance(pilot_anatomy, Mapping)
+    pilot_checkpoint_evidence = pilot_anatomy["checkpoint_evidence"]
+    assert isinstance(pilot_checkpoint_evidence, Mapping)
+    if (
+        frozen_decoder_sha != pilot_anatomy.get("decoder_state_sha256_before")
+        or checkpoint_evidence_sha != sha256_json(pilot_checkpoint_evidence)
+    ):
+        raise ValueError(
+            "A100 qualification and step-200 pilot used different decoder identities."
+        )
+
+
+def _validate_a100_gate(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("A100 qualification gate is malformed.")
+    _require_exact_keys(value, _A100_GATE_KEYS, "A100 qualification gate")
+    peak = value.get("peak_allocated_bytes")
+    gpu_name = value.get("gpu_name")
+    if (
+        value.get("contract_version") != UNIFIED_A100_GATE_CONTRACT
+        or value.get("status") != "pass"
+        or value.get("required_gpu") != "NVIDIA A100"
+        or not isinstance(gpu_name, str)
+        or not gpu_name
+        or "A100" not in gpu_name.upper()
+        or value.get("gpu_identity_matches") is not True
+        or value.get("peak_allocated_limit_bytes")
+        != UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
+        or type(peak) is not int
+        or not 0 < peak <= UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES
+        or value.get("within_allocated_limit") is not True
+        or value.get("before_pilot_steps") != [20, 200]
+        or value.get("full_objective") is not True
+        or type(value.get("batch_size")) is not int
+        or value.get("batch_size") != 1
+        or value.get("precision") != "bf16"
+        or type(value.get("integration_steps")) is not int
+        or value.get("integration_steps") != 4
+        or value.get("integration_solver") != "heun"
+    ):
+        raise ValueError("A100 qualification gate did not pass exactly.")
+
+
+def _validate_anatomy_qualification(value: Any, *, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} anatomy-memory qualification is malformed.")
+    _require_exact_keys(value, _ANATOMY_QUALIFICATION_KEYS, f"{label} anatomy qualification")
+    before = value.get("decoder_state_sha256_before")
+    checkpoint = value.get("checkpoint_evidence")
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"{label} decoder checkpoint evidence is malformed.")
+    _require_exact_keys(
+        checkpoint,
+        _DECODER_CHECKPOINT_EVIDENCE_KEYS,
+        f"{label} decoder checkpoint evidence",
+    )
+    residual_regions = checkpoint.get("residual_branch_regions")
+    if (
+        value.get("contract_version") != UNIFIED_ANATOMY_MEMORY_CONTRACT
+        or value.get("status") != "pass"
+        or value.get("full_volume") is not True
+        or value.get("source_decode_checkpointed") is not False
+        or value.get("generated_decode_checkpoint_mode")
+        != "fine_grained_full_volume_v1"
+        or value.get("group_norm_scope") != "complete_spatial_volume"
+        or value.get("spatial_crop_or_tile") is not False
+        or value.get("allocator_fallback") is not False
+        or type(value.get("step")) is not int
+        or value.get("step") != 1
+        or not isinstance(before, str)
+        or _SHA256_RE.fullmatch(before) is None
+        or value.get("decoder_state_sha256_after") != before
+        or value.get("decoder_state_unchanged") is not True
+        or checkpoint.get("contract_version")
+        != "klvae3d-full-volume-fine-grained-activation-checkpoint-v1"
+        or checkpoint.get("mode") != "fine_grained_full_volume_v1"
+        or type(checkpoint.get("spatial_dims")) is not int
+        or checkpoint.get("spatial_dims") != 3
+        or checkpoint.get("full_volume") is not True
+        or checkpoint.get("group_norm_scope") != "complete_spatial_volume"
+        or checkpoint.get("upsample_regions") != ["up1", "up2"]
+        or not isinstance(residual_regions, list)
+        or not residual_regions
+        or len(residual_regions) != len(set(residual_regions))
+        or any(not isinstance(region, str) or not region for region in residual_regions)
+        or checkpoint.get("residual_skip_checkpointed") is not False
+        or checkpoint.get("residual_skip_evaluation_order")
+        != "after_branch2_before_add"
+        or checkpoint.get("outer_full_decoder_checkpoint") is not False
+        or checkpoint.get("checkpoint_use_reentrant") is not False
+        or checkpoint.get("checkpoint_preserve_rng_state") is not True
+        or checkpoint.get("source_no_grad_decode_checkpointed") is not False
+        or checkpoint.get("state_dict_schema_changed") is not False
+        or value.get("checkpoint_evidence_sha256") != sha256_json(checkpoint)
+    ):
+        raise ValueError(f"{label} anatomy-memory qualification changed.")
+
+
+def _require_exact_keys(
+    value: Mapping[str, Any],
+    expected: frozenset[str],
+    label: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            f"{label} key inventory changed; missing={missing}, unexpected={unexpected}."
+        )
 
 
 def _validate_pilot_report(pilot: Mapping[str, Any]) -> None:

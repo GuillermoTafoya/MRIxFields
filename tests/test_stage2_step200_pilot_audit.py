@@ -14,9 +14,14 @@ from fieldbridge.evaluation import stage2_step200_pilot_audit as audit
 from fieldbridge.training.stage2_unified import (
     DEFAULT_UNIFIED_WEIGHTS,
     UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT,
+    UNIFIED_A100_GATE_CONTRACT,
+    UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES,
+    UNIFIED_ANATOMY_MEMORY_CONTRACT,
+    UNIFIED_GENERATOR_ACCUMULATION_CONTRACT,
     UNIFIED_HISTORY_CONTRACT,
     UNIFIED_RESUME_CONTRACT,
     UNIFIED_SELECTION_RULE_SHA256,
+    UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT,
     UNIFIED_VALIDATION_PLAN_CONTRACT,
 )
 
@@ -25,6 +30,8 @@ AUDIT_COMMIT = "a" * 40
 TRAINING_COMMIT = audit.TRAINING_EVIDENCE_COMMIT
 RUN_FINGERPRINT = "b" * 64
 PLAN_SHA = "c" * 64
+QUALIFICATION_RUN_FINGERPRINT = "d" * 64
+DECODER_STATE_SHA256 = "1" * 64
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -38,6 +45,93 @@ def _write_self(path: Path, body: dict[str, Any], key: str) -> dict[str, Any]:
     return payload
 
 
+def _decoder_checkpoint_evidence() -> dict[str, Any]:
+    return {
+        "contract_version": "klvae3d-full-volume-fine-grained-activation-checkpoint-v1",
+        "mode": "fine_grained_full_volume_v1",
+        "spatial_dims": 3,
+        "full_volume": True,
+        "group_norm_scope": "complete_spatial_volume",
+        "upsample_regions": ["up1", "up2"],
+        "residual_branch_regions": [
+            "res1.0.norm1_silu_conv1",
+            "res1.0.norm2_silu_conv2",
+        ],
+        "residual_skip_checkpointed": False,
+        "residual_skip_evaluation_order": "after_branch2_before_add",
+        "outer_full_decoder_checkpoint": False,
+        "checkpoint_use_reentrant": False,
+        "checkpoint_preserve_rng_state": True,
+        "source_no_grad_decode_checkpointed": False,
+        "state_dict_schema_changed": False,
+    }
+
+
+def _anatomy_qualification() -> dict[str, Any]:
+    checkpoint = _decoder_checkpoint_evidence()
+    return {
+        "contract_version": UNIFIED_ANATOMY_MEMORY_CONTRACT,
+        "status": "pass",
+        "full_volume": True,
+        "source_decode_checkpointed": False,
+        "generated_decode_checkpoint_mode": "fine_grained_full_volume_v1",
+        "group_norm_scope": "complete_spatial_volume",
+        "spatial_crop_or_tile": False,
+        "allocator_fallback": False,
+        "step": 1,
+        "decoder_state_sha256_before": DECODER_STATE_SHA256,
+        "decoder_state_sha256_after": DECODER_STATE_SHA256,
+        "decoder_state_unchanged": True,
+        "checkpoint_evidence_sha256": sha256_json(checkpoint),
+        "checkpoint_evidence": checkpoint,
+    }
+
+
+def _a100_gate() -> dict[str, Any]:
+    return {
+        "contract_version": UNIFIED_A100_GATE_CONTRACT,
+        "status": "pass",
+        "required_gpu": "NVIDIA A100",
+        "gpu_name": "NVIDIA A100-SXM4-80GB",
+        "gpu_identity_matches": True,
+        "peak_allocated_limit_bytes": UNIFIED_A100_PEAK_ALLOCATED_LIMIT_BYTES,
+        "peak_allocated_bytes": 64 * 1024**3,
+        "within_allocated_limit": True,
+        "before_pilot_steps": [20, 200],
+        "full_objective": True,
+        "batch_size": 1,
+        "precision": "bf16",
+        "integration_steps": 4,
+        "integration_solver": "heun",
+    }
+
+
+def _qualification_body(plan_sha: str) -> dict[str, Any]:
+    anatomy = _anatomy_qualification()
+    return {
+        "contract_version": UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT,
+        "status": "pass",
+        "step": 1,
+        "gate": _a100_gate(),
+        "anatomy_memory_qualification": anatomy,
+        "run_fingerprint": QUALIFICATION_RUN_FINGERPRINT,
+        "validation_plan_sha256": plan_sha,
+        "complete_validation_executed": False,
+        "checkpoint_written": False,
+        "generator_optimizer_updates": 1,
+        "generator_gradient_accumulation_contract": (
+            UNIFIED_GENERATOR_ACCUMULATION_CONTRACT
+        ),
+        "term_gradient_qualification_contract": (
+            UNIFIED_TERM_GRADIENT_QUALIFICATION_CONTRACT
+        ),
+        "frozen_decoder_state_sha256": DECODER_STATE_SHA256,
+        "decoder_activation_checkpoint_sha256": sha256_json(
+            anatomy["checkpoint_evidence"]
+        ),
+    }
+
+
 def _pilot() -> dict[str, Any]:
     return {
         "status": "pass",
@@ -48,6 +142,8 @@ def _pilot() -> dict[str, Any]:
             term: {"enabled": True, "mean": 0.2, "minimum": 0.1, "maximum": 0.3}
             for term in DEFAULT_UNIFIED_WEIGHTS
         },
+        "one_step_a100_memory_gate": _a100_gate(),
+        "one_step_anatomy_memory_qualification": _anatomy_qualification(),
     }
 
 
@@ -194,23 +290,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> audit.Step200Pi
     qualification_path = tmp_path / "stage2_unified_a100_qualification_only_receipt_v1.json"
     _write_self(
         qualification_path,
-        {
-            "contract_version": UNIFIED_A100_QUALIFICATION_ONLY_CONTRACT,
-            "status": "pass",
-            "step": 1,
-            "complete_validation_executed": False,
-            "checkpoint_written": False,
-            "generator_optimizer_updates": 1,
-            "validation_plan_sha256": plan_sha,
-            "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
-            "run_fingerprint": "d" * 64,
-            "gate": {
-                "status": "pass",
-                "gpu_identity_matches": True,
-                "within_allocated_limit": True,
-                "full_objective": True,
-            },
-        },
+        _qualification_body(plan_sha),
         "receipt_sha256",
     )
     recovery_path = tmp_path / "stage2_gate01_recovery_receipt_v2.json"
@@ -246,6 +326,13 @@ def _rewrite_history(path: Path, mutate: Any) -> None:
     path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
 
 
+def _rewrite_self_hashed(path: Path, hash_key: str, mutate: Any) -> dict[str, Any]:
+    body = json.loads(path.read_text(encoding="utf-8"))
+    body.pop(hash_key)
+    mutate(body)
+    return _write_self(path, body, hash_key)
+
+
 def test_exact_200_row_evidence_verifies_and_sanitizes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -262,6 +349,124 @@ def test_exact_200_row_evidence_verifies_and_sanitizes(
     assert "source_records" not in serialized
     assert "target_records" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_authentic_producer_qualification_receipt_passes_without_selection_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _fixture(tmp_path, monkeypatch)
+    qualification = json.loads(
+        inputs.a100_qualification_receipt.read_text(encoding="utf-8")
+    )
+    assert set(qualification) == audit._A100_QUALIFICATION_RECEIPT_KEYS
+    assert "selection_rule_sha256" not in qualification
+
+    verified = audit.verify_step200_pilot_evidence(
+        inputs, audit_implementation_commit=AUDIT_COMMIT
+    )
+    assert verified.a100_qualification_receipt == qualification
+    assert (
+        verified.selection_receipt["selection_rule_sha256"]
+        == UNIFIED_SELECTION_RULE_SHA256
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda body: body.pop("status"), "key inventory"),
+        (lambda body: body.__setitem__("fabricated", True), "key inventory"),
+        (
+            lambda body: body.__setitem__(
+                "selection_rule_sha256", UNIFIED_SELECTION_RULE_SHA256
+            ),
+            "key inventory",
+        ),
+        (
+            lambda body: body.__setitem__("run_fingerprint", RUN_FINGERPRINT),
+            "incomplete or changed",
+        ),
+        (
+            lambda body: body.__setitem__(
+                "generator_gradient_accumulation_contract", "changed"
+            ),
+            "incomplete or changed",
+        ),
+        (
+            lambda body: body.__setitem__(
+                "term_gradient_qualification_contract", "changed"
+            ),
+            "incomplete or changed",
+        ),
+        (
+            lambda body: body["gate"].__setitem__("status", "fail"),
+            "gate did not pass",
+        ),
+        (
+            lambda body: body.__setitem__(
+                "frozen_decoder_state_sha256", "2" * 64
+            ),
+            "decoder identities changed",
+        ),
+        (
+            lambda body: body["anatomy_memory_qualification"].__setitem__(
+                "decoder_state_sha256_after", "2" * 64
+            ),
+            "anatomy-memory qualification changed",
+        ),
+    ],
+)
+def test_qualification_receipt_changes_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Any,
+    message: str,
+) -> None:
+    inputs = _fixture(tmp_path, monkeypatch)
+    _rewrite_self_hashed(
+        inputs.a100_qualification_receipt,
+        "receipt_sha256",
+        mutation,
+    )
+    with pytest.raises(ValueError, match=message):
+        audit.verify_step200_pilot_evidence(
+            inputs, audit_implementation_commit=AUDIT_COMMIT
+        )
+
+
+def test_qualification_receipt_invalid_self_hash_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _fixture(tmp_path, monkeypatch)
+    payload = json.loads(
+        inputs.a100_qualification_receipt.read_text(encoding="utf-8")
+    )
+    payload["receipt_sha256"] = "0" * 64
+    _write_json(inputs.a100_qualification_receipt, payload)
+    with pytest.raises(ValueError, match="Self-hash mismatch"):
+        audit.verify_step200_pilot_evidence(
+            inputs, audit_implementation_commit=AUDIT_COMMIT
+        )
+
+
+def test_selection_rule_remains_independently_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = _fixture(tmp_path, monkeypatch)
+    _rewrite_self_hashed(
+        inputs.selection_receipt,
+        "selection_sha256",
+        lambda body: body.__setitem__("selection_rule_sha256", "e" * 64),
+    )
+    monkeypatch.setattr(
+        audit,
+        "STEP200_SELECTION_RECEIPT_FILE_SHA256",
+        audit.sha256_file_streaming(inputs.selection_receipt),
+    )
+    with pytest.raises(ValueError, match="selection receipt"):
+        audit.verify_step200_pilot_evidence(
+            inputs, audit_implementation_commit=AUDIT_COMMIT
+        )
 
 
 @pytest.mark.parametrize(
@@ -368,5 +573,11 @@ def test_cpu_audit_source_has_no_bank_array_or_gpu_access() -> None:
     assert "PhotometryFactoredLatentBankIndex" not in source
     assert "torch.cuda" not in source
     assert "load_gate01" not in source
+    assert "run_stage2_unified_train" not in source
+    assert "import_gate01_p0006" not in source
     assert ".source_records" not in source
     assert ".target_records" not in source
+    qualification_validator = source.split(
+        "def _validate_a100_qualification_receipt", 1
+    )[1].split("def _validate_a100_gate", 1)[0]
+    assert "selection_rule_sha256" not in qualification_validator

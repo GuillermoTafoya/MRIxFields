@@ -71,6 +71,15 @@ for module_name in tuple(sys.modules):
 importlib.invalidate_caches()
 if not isinstance(AUDIT_DEPENDENCY_PROVENANCE, dict):
     raise RuntimeError("Sealed dependency provenance is missing before Drive mount.")
+if (
+    AUDIT_DEPENDENCY_PROVENANCE.get("contract_version")
+    != "stage2-step200-inference-audit-dependency-lock-v2"
+    or AUDIT_DEPENDENCY_PROVENANCE.get("torch_or_torchvision_reinstalled") is not False
+    or AUDIT_DEPENDENCY_PROVENANCE.get("preinstalled_packages_mutated") is not False
+    or AUDIT_DEPENDENCY_PROVENANCE.get("pip_no_deps") is not True
+    or AUDIT_DEPENDENCY_PROVENANCE.get("pip_require_hashes") is not True
+):
+    raise RuntimeError("Sealed dependency provenance contract changed.")
 for dependency_name in ("numpy", "scipy", "torch", "yaml", "matplotlib", "nibabel", "skimage", "lpips"):
     importlib.import_module(dependency_name)
 import fieldbridge
@@ -84,8 +93,17 @@ print(
         {
             "stage": "inference_audit_dependency_preflight",
             "status": "pass",
-            "runtime_requirement": "NVIDIA A100 80 GB",
+            "runtime_requirement": "NVIDIA A100-SXM4-80GB",
             "training_authorized": False,
+            "observed_runtime_profile": AUDIT_DEPENDENCY_PROVENANCE[
+                "observed_runtime_profile"
+            ],
+            "notebook_installed_packages": AUDIT_DEPENDENCY_PROVENANCE[
+                "notebook_installed_packages"
+            ],
+            "lpips_distribution_artifact": AUDIT_DEPENDENCY_PROVENANCE[
+                "lpips_distribution_artifact"
+            ],
             "dependency_lock_file_sha256": AUDIT_DEPENDENCY_PROVENANCE[
                 "lock_file_sha256"
             ],
@@ -107,7 +125,7 @@ import torch
 if not torch.cuda.is_available():
     raise RuntimeError("Attach the required NVIDIA A100 80 GB runtime before this audit.")
 gpu = torch.cuda.get_device_properties(0)
-if "A100" not in str(gpu.name) or int(gpu.total_memory) < 79 * 1024**3:
+if str(gpu.name) != "NVIDIA A100-SXM4-80GB" or int(gpu.total_memory) < 79 * 1024**3:
     raise RuntimeError("The first owner inference qualification requires NVIDIA A100 80 GB.")
 print(
     json.dumps(

@@ -44,7 +44,9 @@ def test_wrong_gpu_stops_before_every_downstream_external_action(
         calls.append(list(command))
         if command[0] != "nvidia-smi":
             raise AssertionError("a downstream command ran after the failed GPU gate")
-        return subprocess.CompletedProcess(command, 0, "NVIDIA L4, 23034, 22000\n", "")
+        return subprocess.CompletedProcess(
+            command, 0, "580.82.07, NVIDIA L4, 23034, 22000\n", ""
+        )
 
     monkeypatch.setattr(subprocess, "run", probe)
     source = _notebook_source().replace(
@@ -57,7 +59,7 @@ def test_wrong_gpu_stops_before_every_downstream_external_action(
     assert calls == [
         [
             "nvidia-smi",
-            "--query-gpu=name,memory.total,memory.free",
+            "--query-gpu=driver_version,name,memory.total,memory.free",
             "--format=csv,noheader,nounits",
         ]
     ]
@@ -65,94 +67,413 @@ def test_wrong_gpu_stops_before_every_downstream_external_action(
     assert receipt["pip_install_invoked"] is False
     assert receipt["dependency_download_invoked"] is False
     assert receipt["model_weight_download_invoked"] is False
+    assert receipt["git_clone_or_fetch_invoked"] is False
     assert receipt["drive_mount_invoked"] is False
     assert receipt["bank_accessed"] is False
     assert receipt["checkpoint_loaded"] is False
     assert receipt["private_data_accessed"] is False
+    assert receipt["lpips_constructed"] is False
     assert receipt["inference_invoked"] is False
     assert receipt["training_invoked"] is False
 
 
-def test_dependency_lock_is_exact_closed_and_excludes_cuda_stack_install() -> None:
-    module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
-    assert lock["preinstalled_cuda_stack"] == {
-        "python": "3.12.13",
-        "torch": "2.8.0+cu126",
-        "torch_cuda": "12.6",
-        "torchvision": "0.23.0+cu126",
-    }
-    assert set(lock["installed_by_notebook"]) == module._INSTALL_KEYS
-    assert all(value and "*" not in value for value in lock["installed_by_notebook"].values())
-    assert "torch" not in lock["installed_by_notebook"]
-    assert "torchvision" not in lock["installed_by_notebook"]
-
-
-def test_torch_torchvision_cuda_mismatch_fails_closed(
+def test_hardware_gate_records_authenticated_gpu_and_driver(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
+    def probe(command, **kwargs):
+        del kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "580.82.07, NVIDIA A100-SXM4-80GB, 81920, 81153\n",
+            "",
+        )
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    source = _notebook_source().replace(
+        "__AUDIT_IMPLEMENTATION_COMMIT__", "a" * 40
+    )
+    prefix = source.split("A100_HARDWARE_GATE = standard_library_a100_gate()", 1)[0]
+    prefix += "A100_HARDWARE_GATE = standard_library_a100_gate()\n"
+    namespace: dict[str, object] = {}
+    exec(compile(prefix, "sealed-notebook-gate", "exec"), namespace)
+    receipt = json.loads(capsys.readouterr().out.strip())
+    assert receipt["status"] == "pass"
+    assert receipt["gpu_name"] == "NVIDIA A100-SXM4-80GB"
+    assert receipt["nvidia_driver"] == "580.82.07"
+    assert receipt["gpu_total_memory_mib"] == 81920
+    assert receipt["gpu_free_memory_mib"] == 81153
+    assert receipt["pip_install_invoked"] is False
+    assert receipt["git_clone_or_fetch_invoked"] is False
+
+
+def _hardware_gate(driver: str = "580.82.07") -> dict[str, object]:
+    return {
+        "stage": "standard_library_a100_80gb_gate",
+        "status": "pass",
+        "gpu_name": "NVIDIA A100-SXM4-80GB",
+        "nvidia_driver": driver,
+    }
+
+
+def _install_authenticated_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    torch_version: str = "2.11.0+cu128",
+    torchvision_version: str = "0.26.0+cu128",
+    torch_cuda: str = "12.8",
+    cuda_available: bool = True,
+) -> None:
     fake_torch = ModuleType("torch")
-    fake_torch.__version__ = "2.8.0+cu126"
-    fake_torch.version = SimpleNamespace(cuda="12.6")
-    fake_torch.cuda = SimpleNamespace(is_available=lambda: True)
+    fake_torch.__version__ = torch_version
+    fake_torch.version = SimpleNamespace(cuda=torch_cuda)
+    fake_torch.cuda = SimpleNamespace(is_available=lambda: cuda_available)
     fake_vision = ModuleType("torchvision")
-    fake_vision.__version__ = "0.23.0+cu126"
+    fake_vision.__version__ = torchvision_version
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "torchvision", fake_vision)
-    monkeypatch.setattr(module.platform, "python_version", lambda: "3.12.13")
-    assert module.validate_preinstalled_cuda_stack(lock)["torch_cuda"] == "12.6"
-    fake_vision.__version__ = "0.24.0+cu126"
-    with pytest.raises(RuntimeError, match="compatibility gate failed"):
-        module.validate_preinstalled_cuda_stack(lock)
-    fake_vision.__version__ = "0.23.0+cu126"
-    fake_torch.__version__ = "2.9.0+cu126"
-    with pytest.raises(RuntimeError, match="compatibility gate failed"):
-        module.validate_preinstalled_cuda_stack(lock)
-    fake_torch.__version__ = "2.8.0+cu126"
-    fake_torch.version.cuda = "12.8"
-    with pytest.raises(RuntimeError, match="compatibility gate failed"):
-        module.validate_preinstalled_cuda_stack(lock)
 
 
-def test_closed_installer_uses_only_exact_no_deps_specs(
+def _set_python_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    module,
+    *,
+    implementation: str = "CPython",
+    cache_tag: str = "cpython-313",
+    major_minor: list[int] | None = None,
+    patch: str = "3.13.15",
+) -> None:
+    monkeypatch.setattr(
+        module,
+        "_python_runtime_identity",
+        lambda: {
+            "python_implementation": implementation,
+            "python_cache_tag": cache_tag,
+            "python_major_minor": major_minor or [3, 13],
+            "python_patch": patch,
+        },
+    )
+
+
+def test_dependency_lock_v2_is_exact_and_only_lpips_is_installable() -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    assert lock["contract_version"].endswith("-v2")
+    assert lock["accepted_runtime_profile"] == {
+        "gpu_name": "NVIDIA A100-SXM4-80GB",
+        "observed_driver": "580.82.07",
+        "observed_python_patch": "3.13.15",
+        "python_cache_tag": "cpython-313",
+        "python_implementation": "CPython",
+        "python_major_minor": [3, 13],
+        "torch": "2.11.0+cu128",
+        "torch_cuda": "12.8",
+        "torchvision": "0.26.0+cu128",
+    }
+    assert lock["preinstalled_runtime_packages"] == {
+        "PyYAML": "6.0.3",
+        "matplotlib": "3.10.0",
+        "nibabel": "5.4.2",
+        "numpy": "2.1.3",
+        "scikit-image": "0.25.2",
+        "scipy": "1.16.3",
+    }
+    assert lock["notebook_install"] == {
+        "artifact_filename": "lpips-0.1.4-py3-none-any.whl",
+        "artifact_sha256": module.LPIPS_WHEEL_SHA256,
+        "artifact_url": module.LPIPS_WHEEL_URL,
+        "distribution": "lpips",
+        "version": "0.1.4",
+    }
+    assert lock["provenance_only_unqualified_profiles"][0]["accepted"] is False
+    assert lock["provenance_only_unqualified_profiles"][0]["python"] == "3.12.13"
+
+
+@pytest.mark.parametrize("patch", ["3.13.15", "3.13.16"])
+def test_authenticated_profile_accepts_python_patch_variation_and_records_it(
+    patch: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    _install_authenticated_modules(monkeypatch)
+    _set_python_identity(monkeypatch, module, patch=patch)
+    observed = module.validate_preinstalled_cuda_stack(
+        lock, hardware_gate=_hardware_gate()
+    )
+    assert observed["python_patch"] == patch
+    assert observed["python_patch_matches_observed_profile"] is (patch == "3.13.15")
+    assert observed["nvidia_driver"] == "580.82.07"
+    assert observed["torch_cuda"] == "12.8"
+
+
+@pytest.mark.parametrize(
+    ("implementation", "cache_tag", "major_minor"),
+    [
+        ("CPython", "cpython-312", [3, 12]),
+        ("CPython", "cpython-314", [3, 14]),
+        ("PyPy", "pypy313", [3, 13]),
+        ("CPython", "cpython-313-custom", [3, 13]),
+    ],
+)
+def test_other_python_abi_profiles_fail_closed(
+    implementation: str,
+    cache_tag: str,
+    major_minor: list[int],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _environment_module()
     lock = module.load_dependency_lock(LOCK)
-    installed: dict[str, str] = {}
+    _set_python_identity(
+        monkeypatch,
+        module,
+        implementation=implementation,
+        cache_tag=cache_tag,
+        major_minor=major_minor,
+    )
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.validate_preinstalled_cuda_stack(
+            lock, hardware_gate=_hardware_gate()
+        )
+    receipt = caught.value.receipt
+    assert receipt["reason"] == "python_abi_identity_changed"
+    assert all(receipt[key] is False for key in module._NO_ACTION_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("torch_version", "torchvision_version", "torch_cuda"),
+    [
+        ("2.11.1+cu128", "0.26.0+cu128", "12.8"),
+        ("2.11.0+cu128", "0.26.1+cu128", "12.8"),
+        ("2.11.0+cu128", "0.26.0+cu128", "12.9"),
+    ],
+)
+def test_torch_torchvision_or_cuda_mismatch_fails_closed(
+    torch_version: str,
+    torchvision_version: str,
+    torch_cuda: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    _set_python_identity(monkeypatch, module)
+    _install_authenticated_modules(
+        monkeypatch,
+        torch_version=torch_version,
+        torchvision_version=torchvision_version,
+        torch_cuda=torch_cuda,
+    )
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.validate_preinstalled_cuda_stack(
+            lock, hardware_gate=_hardware_gate()
+        )
+    assert caught.value.receipt["reason"] == (
+        "torch_torchvision_cuda_identity_changed"
+    )
+    assert all(
+        caught.value.receipt[key] is False for key in module._NO_ACTION_FIELDS
+    )
+
+
+def test_cuda_unavailable_after_hardware_gate_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    _set_python_identity(monkeypatch, module)
+    _install_authenticated_modules(monkeypatch, cuda_available=False)
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.validate_preinstalled_cuda_stack(
+            lock, hardware_gate=_hardware_gate()
+        )
+    assert caught.value.receipt["reason"] == (
+        "cuda_visibility_changed_after_hardware_gate"
+    )
+
+
+def test_driver_variation_is_recorded_without_changing_the_accepted_cuda_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    _set_python_identity(monkeypatch, module)
+    _install_authenticated_modules(monkeypatch)
+    observed = module.validate_preinstalled_cuda_stack(
+        lock, hardware_gate=_hardware_gate("580.90.01")
+    )
+    assert observed["nvidia_driver"] == "580.90.01"
+    assert observed["observed_profile_driver"] == "580.82.07"
+    assert observed["driver_matches_observed_profile"] is False
+
+
+def test_observed_environment_installs_only_hash_pinned_lpips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    installed: dict[str, str] = dict(lock["preinstalled_runtime_packages"])
     monkeypatch.setattr(
         module,
         "validate_preinstalled_cuda_stack",
-        lambda value: dict(value["preinstalled_cuda_stack"]),
+        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
     )
-    monkeypatch.setattr(
-        module.importlib.metadata,
-        "version",
-        lambda name: installed.get(name, "changed"),
-    )
+    monkeypatch.setattr(module, "_distribution_version", installed.get)
     monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [])
     commands: list[list[str]] = []
 
     def run(command, **kwargs):
         del kwargs
         commands.append(list(command))
-        installed.update(lock["installed_by_notebook"])
-        return subprocess.CompletedProcess(command, 0, "", "")
+        installed["lpips"] = "0.1.4"
+        return subprocess.CompletedProcess(command, 0, "Downloading lpips wheel\n", "")
 
-    receipt = module.prepare_locked_environment(LOCK, run=run)
+    receipt = module.prepare_locked_environment(
+        LOCK, hardware_gate=_hardware_gate(), run=run
+    )
     assert len(commands) == 1
     command = commands[0]
     assert "--no-deps" in command
     assert "--only-binary=:all:" in command
+    assert "--require-hashes" in command
+    assert "--no-input" in command
     assert not any(item.startswith("torch==") for item in command)
     assert not any(item.startswith("torchvision==") for item in command)
-    assert set(item for item in command if "==" in item) == {
-        f"{name}=={version}"
-        for name, version in lock["installed_by_notebook"].items()
-    }
+    assert sum("files.pythonhosted.org" in item for item in command) == 1
+    assert any(
+        f"#sha256={module.LPIPS_WHEEL_SHA256}" in item for item in command
+    )
+    for name in lock["preinstalled_runtime_packages"]:
+        assert not any(name in item for item in command)
+    assert receipt["notebook_installed_packages"] == {"lpips": "0.1.4"}
+    assert receipt["pip_install_invoked"] is True
+    assert receipt["pip_require_hashes"] is True
     assert receipt["torch_or_torchvision_reinstalled"] is False
+    assert receipt["preinstalled_packages_mutated"] is False
+
+
+def test_exact_preinstalled_lpips_is_verified_without_pip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    versions = {**lock["preinstalled_runtime_packages"], "lpips": "0.1.4"}
+    monkeypatch.setattr(
+        module,
+        "validate_preinstalled_cuda_stack",
+        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
+    )
+    monkeypatch.setattr(module, "_distribution_version", versions.get)
+    monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [])
+    receipt = module.prepare_locked_environment(
+        LOCK,
+        hardware_gate=_hardware_gate(),
+        run=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError((args, kwargs))
+        ),
+    )
+    assert receipt["pip_install_invoked"] is False
+    assert receipt["dependency_download_observed"] is False
+    assert receipt["notebook_installed_packages"] == {}
+    assert receipt["locked_runtime_packages"]["lpips"] == "0.1.4"
+
+
+@pytest.mark.parametrize(
+    ("distribution", "observed"),
+    [("numpy", "2.1.4"), ("PyYAML", None)],
+)
+def test_preinstalled_package_change_fails_without_pip(
+    distribution: str,
+    observed: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    versions: dict[str, str | None] = dict(lock["preinstalled_runtime_packages"])
+    versions[distribution] = observed
+    versions["lpips"] = None
+    monkeypatch.setattr(
+        module,
+        "validate_preinstalled_cuda_stack",
+        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
+    )
+    monkeypatch.setattr(module, "_distribution_version", versions.get)
+    calls = 0
+
+    def forbidden_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError((args, kwargs))
+
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.prepare_locked_environment(
+            LOCK, hardware_gate=_hardware_gate(), run=forbidden_run
+        )
+    assert calls == 0
+    assert caught.value.receipt["reason"] == (
+        "preinstalled_package_inventory_changed"
+    )
+
+
+def test_wrong_installed_lpips_is_not_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    lock = module.load_dependency_lock(LOCK)
+    versions = {**lock["preinstalled_runtime_packages"], "lpips": "0.1.3"}
+    monkeypatch.setattr(
+        module,
+        "validate_preinstalled_cuda_stack",
+        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
+    )
+    monkeypatch.setattr(module, "_distribution_version", versions.get)
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.prepare_locked_environment(
+            LOCK,
+            hardware_gate=_hardware_gate(),
+            run=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError((args, kwargs))
+            ),
+        )
+    assert caught.value.receipt["reason"] == "installed_lpips_identity_changed"
+
+
+def test_wrong_runtime_profile_invokes_no_pip_or_downstream_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _environment_module()
+    _set_python_identity(
+        monkeypatch, module, cache_tag="cpython-312", major_minor=[3, 12]
+    )
+    calls = 0
+
+    def forbidden_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError((args, kwargs))
+
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.prepare_locked_environment(
+            LOCK, hardware_gate=_hardware_gate(), run=forbidden_run
+        )
+    assert calls == 0
+    assert all(
+        caught.value.receipt[key] is False for key in module._NO_ACTION_FIELDS
+    )
+    assert caught.value.receipt["observed_compatibility"]["python_cache_tag"] == (
+        "cpython-312"
+    )
+
+
+def test_lpips_artifact_hash_substitution_fails_closed(
+    tmp_path: Path,
+) -> None:
+    module = _environment_module()
+    payload = json.loads(LOCK.read_text(encoding="utf-8"))
+    payload["notebook_install"]["artifact_sha256"] = "0" * 64
+    changed = tmp_path / "changed-lock.json"
+    changed.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="LPIPS distribution identity"):
+        module.load_dependency_lock(changed)
 
 
 class _FakeLPIPSNetwork(torch.nn.Module):

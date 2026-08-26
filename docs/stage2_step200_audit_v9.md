@@ -45,19 +45,29 @@ verified exactly and reused; incompatible or partial output fails closed.
 
 Open `notebooks/stage2_step200_inference_audit_colab.ipynb`, attach an **NVIDIA A100
 80 GB** runtime, then choose **Runtime → Run all** and authorize Drive. The notebook
-starts with a standard-library-only `nvidia-smi` gate. It requires one visible NVIDIA
-A100, at least 79 GiB total and 75 GiB free memory, and an exact sealed implementation
-pin before it can clone code, invoke pip, download weights, mount Drive, inspect the
-bank, or load any evidence. A failed gate prints a no-action receipt and stops.
+starts with a standard-library-only `nvidia-smi` gate. It requires one visible
+`NVIDIA A100-SXM4-80GB`, at least 79 GiB total and 75 GiB free memory, and an
+exact sealed implementation pin before it can clone code, invoke pip, download
+weights, mount Drive, inspect the bank, or load any evidence. The gate records the
+driver and prints a sanitized no-action receipt on failure.
 
-The CUDA stack is not reinstalled. The sealed environment requires Python 3.12.13,
-PyTorch 2.8.0+cu126, torchvision 0.23.0+cu126, and the PyTorch CUDA 12.6 runtime. This
-pair follows the PyTorch 2.8/torchvision 0.23 compatibility release and the Colab
-Python-3.12/PyTorch-2.8 runtime announcement. Every smaller notebook-installed package
-is exact-version locked in
-`notebooks/stage2_step200_inference_audit_dependency_lock.json`; installation uses
-`--no-deps` so dependency solving cannot expand beyond that closed inventory. The
-complete resolved distribution environment and lock-file SHA-256 are sealed.
+Dependency-lock v2 accepts only the authenticated fresh-Colab profile: CPython with
+the `cpython-313` ABI and Python major/minor 3.13, PyTorch 2.11.0+cu128,
+torchvision 0.26.0+cu128, and the PyTorch CUDA 12.8 runtime. The owner-observed
+Python 3.13.15 patch and NVIDIA driver 580.82.07 are recorded as provenance;
+patch/driver variation is reported but does not authorize a different Python ABI or
+CUDA stack. The former Python-3.12/PyTorch-2.8 profile is retained only as explicitly
+unqualified provenance and is never accepted.
+
+PyYAML 6.0.3, matplotlib 3.10.0, nibabel 5.4.2, NumPy 2.1.3, scikit-image
+0.25.2, and SciPy 1.16.3 must already match exactly and are never reinstalled.
+The sole allowed package installation is the missing `lpips==0.1.4` wheel from
+PyPI, pinned to SHA-256
+`fd537af5828b69d2e6ffc0a397bd506dbc28ca183543617690844c08e102ec5e`.
+Pip runs noninteractively with `--no-deps`, `--only-binary=:all:`, and
+`--require-hashes`; a wrong preinstalled LPIPS version fails instead of being
+replaced. The complete resolved distribution environment, exact observed Python
+patch and driver, install decision, wheel identity, and lock-file SHA-256 are sealed.
 
 After those gates, but still before Drive access, the notebook constructs exactly one
 frozen AlexNet LPIPS evaluator. The torchvision

@@ -66,8 +66,25 @@ PyPI, pinned to SHA-256
 `fd537af5828b69d2e6ffc0a397bd506dbc28ca183543617690844c08e102ec5e`.
 Pip runs noninteractively with `--no-deps`, `--only-binary=:all:`, and
 `--require-hashes`; a wrong preinstalled LPIPS version fails instead of being
-replaced. The complete resolved distribution environment, exact observed Python
-patch and driver, install decision, wheel identity, and lock-file SHA-256 are sealed.
+replaced. Environment-provenance v2 records the complete installed environment as
+a deterministic PEP-503-normalized multimap. Duplicate metadata for an unlocked,
+unused package is reported under `unlocked_distribution_ambiguities` and does not
+authorize or block the audit. Every metadata observation for the locked numerical
+closure is still enumerated: conflicting versions fail, and same-version duplicates
+are accepted only when the active imported module is owned by matching metadata.
+The exact observed Python patch and driver, active imports, install decision, wheel
+identity, source-root hashes, and lock-file SHA-256 are sealed without exposing
+installation paths.
+
+LPIPS bootstrap is transactional in the local implementation-scoped directory
+`/content/stage2_step200_audit_v9_bootstrap/implementation_<commit-prefix>`; it
+never writes a bootstrap receipt to Drive. An absent LPIPS distribution installs
+the exact wheel once and atomically seals the receipt. An exact 0.1.4 installation
+with a valid receipt is reverified and reused without pip or network. Exact 0.1.4
+without a receipt is treated as an interrupted attempt and receives one forced,
+hash-locked, no-dependency reinstall before sealing. A different version, altered
+receipt, changed lock/implementation identity, shadowed import, or changed installed
+package tree fails closed.
 
 After those gates, but still before Drive access, the notebook constructs exactly one
 frozen AlexNet LPIPS evaluator. The torchvision

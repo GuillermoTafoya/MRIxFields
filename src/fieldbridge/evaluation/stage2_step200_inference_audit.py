@@ -1468,7 +1468,11 @@ def _stable_runtime_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
     for key in (
         "initialization_seconds",
         "alexnet_weight_downloaded",
+        "dependency_download_invoked",
         "dependency_download_observed",
+        "lpips_bootstrap_state",
+        "lpips_force_reinstall_invoked",
+        "notebook_installed_packages",
         "pip_install_invoked",
     ):
         result.pop(key, None)

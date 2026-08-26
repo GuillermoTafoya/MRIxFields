@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from fieldbridge.evaluation import mrixfields2026_official as official
+from fieldbridge.evaluation import stage2_step200_inference_audit as inference_audit
 from fieldbridge.evaluation import stage2_step200_lpips_audit as sealed_lpips
 
 
@@ -306,144 +307,459 @@ def test_driver_variation_is_recorded_without_changing_the_accepted_cuda_stack(
     assert observed["driver_matches_observed_profile"] is False
 
 
-def test_observed_environment_installs_only_hash_pinned_lpips(
-    monkeypatch: pytest.MonkeyPatch,
+class _FakeDistribution:
+    def __init__(self, name: str, version: str, root: Path, files: list[Path]) -> None:
+        self.metadata = {"Name": name}
+        self.version = version
+        self._root = root
+        self.files = files
+
+    def locate_file(self, relative) -> Path:
+        return self._root / Path(str(relative))
+
+
+def _record(distribution: _FakeDistribution, module) -> dict[str, object]:
+    root = distribution._root.resolve()
+    return {
+        "_distribution": distribution,
+        "_source_root": root,
+        "normalized_name": module.normalize_distribution_name(distribution.metadata["Name"]),
+        "declared_metadata_name": distribution.metadata["Name"],
+        "version": distribution.version,
+        "source_root_sha256": module._source_root_sha256(root),
+    }
+
+
+def _make_distribution(
+    tmp_path: Path,
+    module,
+    *,
+    distribution_name: str,
+    import_name: str,
+    version: str,
+    root_name: str,
+) -> tuple[_FakeDistribution, ModuleType, dict[str, object]]:
+    root = tmp_path / root_name
+    package = root / import_name
+    package.mkdir(parents=True)
+    module_file = package / "__init__.py"
+    module_file.write_text("# synthetic installed package\n", encoding="utf-8")
+    installed_module = ModuleType(import_name)
+    installed_module.__file__ = str(module_file)
+    installed_module.__version__ = version
+    distribution = _FakeDistribution(
+        distribution_name, version, root, [Path(import_name) / "__init__.py"]
+    )
+    return distribution, installed_module, _record(distribution, module)
+
+
+def test_distribution_name_normalization_is_pep503_style() -> None:
+    module = _environment_module()
+    assert {
+        module.normalize_distribution_name(value)
+        for value in ["Example-Pkg", "example_pkg", "EXAMPLE.PKG", "example...pkg"]
+    } == {"example-pkg"}
+
+
+@pytest.mark.parametrize("name", ["cryptography", "arbitrary_unused_package"])
+def test_unlocked_conflicting_distributions_are_provenance_not_failure(name: str) -> None:
+    module = _environment_module()
+    normalized = module.normalize_distribution_name(name)
+    records = {
+        normalized: [
+            {"declared_metadata_name": name, "version": "1.0", "source_root_sha256": "1" * 64},
+            {"declared_metadata_name": name.upper(), "version": "2.0", "source_root_sha256": "2" * 64},
+        ]
+    }
+    complete, ambiguities = module.build_complete_distribution_provenance(
+        records, locked_normalized_names={"numpy"}
+    )
+    assert [item["version"] for item in complete[normalized]] == ["1.0", "2.0"]
+    assert ambiguities == [{"normalized_name": normalized, "distribution_count": 2, "versions": ["1.0", "2.0"]}]
+
+
+def test_complete_distribution_provenance_is_discovery_order_independent(tmp_path: Path) -> None:
+    module = _environment_module()
+    first = _FakeDistribution("Crypto_graphy", "2", tmp_path / "z", [])
+    second = _FakeDistribution("cryptography", "1", tmp_path / "a", [])
+    first._root.mkdir()
+    second._root.mkdir()
+    left = module._discover_distribution_records([first, second])
+    right = module._discover_distribution_records([second, first])
+    assert module.build_complete_distribution_provenance(left, locked_normalized_names=set()) == module.build_complete_distribution_provenance(right, locked_normalized_names=set())
+
+
+def test_locked_conflicting_metadata_version_fails_before_import(tmp_path: Path) -> None:
+    module = _environment_module()
+    one, _, one_record = _make_distribution(tmp_path, module, distribution_name="numpy", import_name="numpy", version="2.1.3", root_name="one")
+    two = _FakeDistribution("NumPy", "2.1.4", one._root, one.files)
+    with pytest.raises(RuntimeError, match="metadata version changed"):
+        module._validate_locked_distribution("numpy", "2.1.3", {"numpy": [one_record, _record(two, module)]})
+
+
+def test_same_version_locked_duplicates_require_matching_active_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    first, active, first_record = _make_distribution(tmp_path, module, distribution_name="PyYAML", import_name="yaml", version="6.0.3", root_name="yaml")
+    duplicate = _FakeDistribution("py_yaml", "6.0.3", first._root, first.files)
+    monkeypatch.setitem(sys.modules, "yaml", active)
+    provenance, owners = module._validate_locked_distribution("PyYAML", "6.0.3", {"pyyaml": [first_record, _record(duplicate, module)]})
+    assert provenance["metadata_entry_count"] == 2
+    assert provenance["active_import"]["import_name"] == "yaml"
+    assert len(owners) == 2
+
+
+def test_shadowed_locked_active_import_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    _, _, record = _make_distribution(tmp_path, module, distribution_name="scikit-image", import_name="skimage", version="0.25.2", root_name="metadata")
+    shadow = tmp_path / "shadow" / "skimage" / "__init__.py"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("# shadow\n", encoding="utf-8")
+    active = ModuleType("skimage")
+    active.__file__ = str(shadow)
+    active.__version__ = "0.25.2"
+    monkeypatch.setitem(sys.modules, "skimage", active)
+    with pytest.raises(RuntimeError, match="shadowed"):
+        module._validate_locked_distribution("scikit-image", "0.25.2", {"scikit-image": [record]})
+
+
+def test_same_version_metadata_with_changed_active_version_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
-    installed: dict[str, str] = dict(lock["preinstalled_runtime_packages"])
-    monkeypatch.setattr(
+    _, active, record = _make_distribution(
+        tmp_path,
         module,
-        "validate_preinstalled_cuda_stack",
-        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
+        distribution_name="numpy",
+        import_name="numpy",
+        version="2.1.3",
+        root_name="numpy",
     )
-    monkeypatch.setattr(module, "_distribution_version", installed.get)
-    monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [])
+    active.__version__ = "2.1.4"
+    monkeypatch.setitem(sys.modules, "numpy", active)
+    with pytest.raises(RuntimeError, match="active import version changed"):
+        module._validate_locked_distribution(
+            "numpy", "2.1.3", {"numpy": [record]}
+        )
+
+
+def test_environment_implementation_has_no_unlocked_package_allowlist() -> None:
+    assert "cryptography" not in ENVIRONMENT.read_text(encoding="utf-8").lower()
+
+
+def test_installed_lpips_tree_hash_covers_unlisted_package_files(
+    tmp_path: Path,
+) -> None:
+    module = _environment_module()
+    distribution, _, record = _make_distribution(
+        tmp_path,
+        module,
+        distribution_name="lpips",
+        import_name="lpips",
+        version="0.1.4",
+        root_name="site-packages",
+    )
+    extra = distribution._root / "lpips" / "injected.py"
+    extra.write_text("first\n", encoding="utf-8")
+    before = module._installed_lpips_package_tree(record)
+    assert before["file_count"] == 2
+    extra.write_text("changed\n", encoding="utf-8")
+    after = module._installed_lpips_package_tree(record)
+    assert before["tree_sha256"] != after["tree_sha256"]
+
+
+def _transaction_runtime(lock: dict[str, object]) -> dict[str, object]:
+    profile = lock["accepted_runtime_profile"]
+    return {
+        "python_implementation": profile["python_implementation"],
+        "python_cache_tag": profile["python_cache_tag"],
+        "python_major_minor": profile["python_major_minor"],
+        "python_patch": profile["observed_python_patch"],
+        "torch": profile["torch"],
+        "torchvision": profile["torchvision"],
+        "torch_cuda": profile["torch_cuda"],
+    }
+
+
+def _configure_transaction_fixture(module, monkeypatch: pytest.MonkeyPatch, state: dict[str, dict[str, list[dict[str, object]]]], *, tree_sha256: str = "b" * 64) -> None:
+    monkeypatch.setattr(module, "validate_preinstalled_cuda_stack", lambda value, hardware_gate: _transaction_runtime(value))
+    monkeypatch.setattr(module, "_discover_distribution_records", lambda: state["records"])
+
+    def validate(expected, records, include_lpips):
+        del records
+        result = {}
+        for name, version in expected.items():
+            if name == "lpips" and not include_lpips:
+                continue
+            result[name] = {
+                "normalized_name": module.normalize_distribution_name(name),
+                "expected_version": version,
+                "metadata_entry_count": 1,
+                "metadata_observations": [],
+                "active_import": {
+                    "distribution_name": name,
+                    "import_name": module._LOCKED_DISTRIBUTION_IMPORTS[name],
+                    "active_version": version,
+                    "version_source": "synthetic",
+                    "module_file_sha256": "a" * 64,
+                    "owning_distribution_count": 1,
+                    "owning_source_root_sha256": ["c" * 64],
+                },
+            }
+        return result, {}
+
+    monkeypatch.setattr(module, "_validate_locked_closure", validate)
+    monkeypatch.setattr(module, "_active_lpips_package_tree", lambda records: {"tree_sha256": tree_sha256, "file_count": 12, "total_bytes": 3456})
+    monkeypatch.setattr(module, "_remove_lpips_imports", lambda: None)
+
+
+def _lpips_record(module, version: str = "0.1.4") -> dict[str, object]:
+    return {"declared_metadata_name": "lpips", "normalized_name": "lpips", "version": version, "source_root_sha256": "c" * 64, "_distribution": object(), "_source_root": Path("synthetic")}
+
+
+def _seed_valid_bootstrap(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object], Path]:
+    state: dict[str, object] = {"records": {}}
+    _configure_transaction_fixture(module, monkeypatch, state)
+
+    def run(command, **kwargs):
+        assert kwargs == {"check": True}
+        state["records"] = {"lpips": [_lpips_record(module)]}
+        return subprocess.CompletedProcess(command, 0)
+
+    arguments = {
+        "hardware_gate": _hardware_gate(),
+        "implementation_commit": "a" * 40,
+        "bootstrap_root": tmp_path / "bootstrap",
+    }
+    module.prepare_locked_environment(LOCK, run=run, **arguments)
+    receipt_path = (
+        tmp_path
+        / "bootstrap"
+        / "implementation_aaaaaaaaaaaa"
+        / "lpips-bootstrap-receipt-v1.json"
+    )
+    assert receipt_path.is_file()
+    return state, arguments, receipt_path
+
+
+def test_lpips_absent_installs_once_seals_receipt_then_reuses_without_pip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    state = {"records": {}}
+    _configure_transaction_fixture(module, monkeypatch, state)
+    commands: list[list[str]] = []
+    requirements: list[str] = []
+
+    def run(command, **kwargs):
+        assert kwargs == {"check": True}
+        commands.append(list(command))
+        requirements.append(Path(command[-1]).read_text(encoding="utf-8"))
+        state["records"] = {"lpips": [_lpips_record(module)]}
+        return subprocess.CompletedProcess(command, 0)
+
+    arguments = {"hardware_gate": _hardware_gate(), "implementation_commit": "a" * 40, "bootstrap_root": tmp_path / "bootstrap"}
+    first = module.prepare_locked_environment(LOCK, run=run, **arguments)
+    assert first["lpips_bootstrap_state"] == "installed_from_absent"
+    assert first["pip_install_invoked"] is True
+    assert first["notebook_installed_packages"] == {"lpips": "0.1.4"}
+    assert len(commands) == 1
+    assert "--force-reinstall" not in commands[0]
+    assert "--no-deps" in commands[0]
+    assert "--only-binary=:all:" in commands[0]
+    assert "--require-hashes" in commands[0]
+    assert module.LPIPS_WHEEL_URL in requirements[0]
+    assert module.LPIPS_WHEEL_SHA256 in requirements[0]
+    second = module.prepare_locked_environment(LOCK, run=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError((args, kwargs))), **arguments)
+    assert second["lpips_bootstrap_state"] == "reused_verified"
+    assert second["pip_install_invoked"] is False
+    assert first["lpips_bootstrap_receipt_sha256"] == second["lpips_bootstrap_receipt_sha256"]
+
+
+def test_interrupted_exact_lpips_without_receipt_forces_one_verified_reinstall(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    state = {"records": {"lpips": [_lpips_record(module)]}}
+    _configure_transaction_fixture(module, monkeypatch, state)
     commands: list[list[str]] = []
 
     def run(command, **kwargs):
-        del kwargs
+        assert kwargs == {"check": True}
         commands.append(list(command))
-        installed["lpips"] = "0.1.4"
-        return subprocess.CompletedProcess(command, 0, "Downloading lpips wheel\n", "")
+        return subprocess.CompletedProcess(command, 0)
 
-    receipt = module.prepare_locked_environment(
-        LOCK, hardware_gate=_hardware_gate(), run=run
-    )
+    receipt = module.prepare_locked_environment(LOCK, hardware_gate=_hardware_gate(), implementation_commit="d" * 40, bootstrap_root=tmp_path / "bootstrap", run=run)
     assert len(commands) == 1
-    command = commands[0]
-    assert "--no-deps" in command
-    assert "--only-binary=:all:" in command
-    assert "--require-hashes" in command
-    assert "--no-input" in command
-    assert not any(item.startswith("torch==") for item in command)
-    assert not any(item.startswith("torchvision==") for item in command)
-    assert sum("files.pythonhosted.org" in item for item in command) == 1
-    assert any(
-        f"#sha256={module.LPIPS_WHEEL_SHA256}" in item for item in command
-    )
-    for name in lock["preinstalled_runtime_packages"]:
-        assert not any(name in item for item in command)
-    assert receipt["notebook_installed_packages"] == {"lpips": "0.1.4"}
-    assert receipt["pip_install_invoked"] is True
-    assert receipt["pip_require_hashes"] is True
-    assert receipt["torch_or_torchvision_reinstalled"] is False
-    assert receipt["preinstalled_packages_mutated"] is False
-
-
-def test_exact_preinstalled_lpips_is_verified_without_pip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
-    versions = {**lock["preinstalled_runtime_packages"], "lpips": "0.1.4"}
-    monkeypatch.setattr(
-        module,
-        "validate_preinstalled_cuda_stack",
-        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
-    )
-    monkeypatch.setattr(module, "_distribution_version", versions.get)
-    monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [])
-    receipt = module.prepare_locked_environment(
-        LOCK,
-        hardware_gate=_hardware_gate(),
-        run=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError((args, kwargs))
-        ),
-    )
-    assert receipt["pip_install_invoked"] is False
-    assert receipt["dependency_download_observed"] is False
-    assert receipt["notebook_installed_packages"] == {}
-    assert receipt["locked_runtime_packages"]["lpips"] == "0.1.4"
+    assert "--force-reinstall" in commands[0]
+    assert receipt["lpips_force_reinstall_invoked"] is True
+    assert receipt["lpips_bootstrap_state"].startswith("interrupted_installation")
 
 
 @pytest.mark.parametrize(
-    ("distribution", "observed"),
-    [("numpy", "2.1.4"), ("PyYAML", None)],
+    "field",
+    ["implementation_commit", "dependency_lock_file_sha256", "wheel", "package_tree"],
 )
-def test_preinstalled_package_change_fails_without_pip(
-    distribution: str,
-    observed: str | None,
-    monkeypatch: pytest.MonkeyPatch,
+def test_hash_valid_but_substituted_bootstrap_identity_fails_closed(
+    field: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
-    versions: dict[str, str | None] = dict(lock["preinstalled_runtime_packages"])
-    versions[distribution] = observed
-    versions["lpips"] = None
-    monkeypatch.setattr(
-        module,
-        "validate_preinstalled_cuda_stack",
-        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
+    _, arguments, receipt_path = _seed_valid_bootstrap(
+        module, monkeypatch, tmp_path
     )
-    monkeypatch.setattr(module, "_distribution_version", versions.get)
-    calls = 0
-
-    def forbidden_run(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        raise AssertionError((args, kwargs))
-
-    with pytest.raises(module.RuntimeProfileMismatch) as caught:
-        module.prepare_locked_environment(
-            LOCK, hardware_gate=_hardware_gate(), run=forbidden_run
-        )
-    assert calls == 0
-    assert caught.value.receipt["reason"] == (
-        "preinstalled_package_inventory_changed"
-    )
-
-
-def test_wrong_installed_lpips_is_not_replaced(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _environment_module()
-    lock = module.load_dependency_lock(LOCK)
-    versions = {**lock["preinstalled_runtime_packages"], "lpips": "0.1.3"}
-    monkeypatch.setattr(
-        module,
-        "validate_preinstalled_cuda_stack",
-        lambda value, hardware_gate: dict(value["accepted_runtime_profile"]),
-    )
-    monkeypatch.setattr(module, "_distribution_version", versions.get)
-    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if field == "implementation_commit":
+        payload[field] = "b" * 40
+    elif field == "dependency_lock_file_sha256":
+        payload[field] = "0" * 64
+    elif field == "wheel":
+        payload[field]["sha256"] = "0" * 64
+    else:
+        payload["installed_package_tree"]["tree_sha256"] = "0" * 64
+    body = dict(payload)
+    body.pop("receipt_sha256")
+    payload["receipt_sha256"] = module._sha256_json(body)
+    receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="receipt identity changed"):
         module.prepare_locked_environment(
             LOCK,
-            hardware_gate=_hardware_gate(),
             run=lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError((args, kwargs))
             ),
+            **arguments,
         )
-    assert caught.value.receipt["reason"] == "installed_lpips_identity_changed"
 
 
-def test_wrong_runtime_profile_invokes_no_pip_or_downstream_action(
-    monkeypatch: pytest.MonkeyPatch,
+def test_bootstrap_receipt_self_hash_substitution_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _environment_module()
-    _set_python_identity(
-        monkeypatch, module, cache_tag="cpython-312", major_minor=[3, 12]
+    _, arguments, receipt_path = _seed_valid_bootstrap(
+        module, monkeypatch, tmp_path
     )
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload["receipt_sha256"] = "0" * 64
+    receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="self-hash changed"):
+        module.prepare_locked_environment(
+            LOCK,
+            run=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError((args, kwargs))
+            ),
+            **arguments,
+        )
+
+
+def test_changed_active_lpips_tree_fails_against_valid_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _environment_module()
+    _, arguments, _ = _seed_valid_bootstrap(module, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_active_lpips_package_tree",
+        lambda records: {
+            "tree_sha256": "9" * 64,
+            "file_count": 12,
+            "total_bytes": 3456,
+        },
+    )
+    with pytest.raises(RuntimeError, match="receipt identity changed"):
+        module.prepare_locked_environment(
+            LOCK,
+            run=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError((args, kwargs))
+            ),
+            **arguments,
+        )
+
+
+def test_changed_lock_file_bytes_fail_against_valid_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _environment_module()
+    _, arguments, _ = _seed_valid_bootstrap(module, monkeypatch, tmp_path)
+    alternate_lock = tmp_path / "same-contract-different-bytes.json"
+    alternate_lock.write_text(
+        json.dumps(json.loads(LOCK.read_text(encoding="utf-8")), indent=4) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="receipt identity changed"):
+        module.prepare_locked_environment(
+            alternate_lock,
+            run=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError((args, kwargs))
+            ),
+            **arguments,
+        )
+
+
+def test_runtime_receipt_normalization_preserves_exact_resume_across_bootstrap_state() -> None:
+    first = {
+        "dependency_lock_file_sha256": "1" * 64,
+        "lpips_bootstrap_receipt_sha256": "2" * 64,
+        "lpips_installed_package_tree": {"tree_sha256": "3" * 64},
+        "lpips_bootstrap_state": "installed_from_absent",
+        "lpips_force_reinstall_invoked": False,
+        "notebook_installed_packages": {"lpips": "0.1.4"},
+        "dependency_download_invoked": True,
+        "dependency_download_observed": True,
+        "pip_install_invoked": True,
+    }
+    resumed = {
+        **first,
+        "lpips_bootstrap_state": "reused_verified",
+        "notebook_installed_packages": {},
+        "dependency_download_invoked": False,
+        "dependency_download_observed": False,
+        "pip_install_invoked": False,
+    }
+    assert inference_audit._stable_runtime_provenance(first) == (
+        inference_audit._stable_runtime_provenance(resumed)
+    )
+    substituted = {**resumed, "dependency_lock_file_sha256": "9" * 64}
+    assert inference_audit._stable_runtime_provenance(first) != (
+        inference_audit._stable_runtime_provenance(substituted)
+    )
+
+
+def test_runtime_receipt_reuse_returns_original_bytes_after_bootstrap_reuse(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "dependency-runtime-receipt.json"
+    first = {
+        "dependency_lock_file_sha256": "1" * 64,
+        "lpips_bootstrap_receipt_sha256": "2" * 64,
+        "lpips_bootstrap_state": "interrupted_installation_reverified_by_forced_reinstall",
+        "lpips_force_reinstall_invoked": True,
+        "notebook_installed_packages": {"lpips": "0.1.4"},
+        "dependency_download_invoked": True,
+        "dependency_download_observed": True,
+        "pip_install_invoked": True,
+    }
+    stored = inference_audit._seal_or_reuse_runtime_receipt(
+        path, first, label="dependency_environment"
+    )
+    bytes_before = path.read_bytes()
+    resumed = {
+        **first,
+        "lpips_bootstrap_state": "reused_verified",
+        "lpips_force_reinstall_invoked": False,
+        "notebook_installed_packages": {},
+        "dependency_download_invoked": False,
+        "dependency_download_observed": False,
+        "pip_install_invoked": False,
+    }
+    reused = inference_audit._seal_or_reuse_runtime_receipt(
+        path, resumed, label="dependency_environment"
+    )
+    assert reused == stored
+    assert path.read_bytes() == bytes_before
+
+
+def test_wrong_installed_lpips_is_not_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    state = {"records": {"lpips": [_lpips_record(module, "0.1.3")]}}
+    _configure_transaction_fixture(module, monkeypatch, state)
     calls = 0
 
     def forbidden_run(*args, **kwargs):
@@ -452,16 +768,26 @@ def test_wrong_runtime_profile_invokes_no_pip_or_downstream_action(
         raise AssertionError((args, kwargs))
 
     with pytest.raises(module.RuntimeProfileMismatch) as caught:
-        module.prepare_locked_environment(
-            LOCK, hardware_gate=_hardware_gate(), run=forbidden_run
-        )
+        module.prepare_locked_environment(LOCK, hardware_gate=_hardware_gate(), implementation_commit="e" * 40, bootstrap_root=tmp_path / "bootstrap", run=forbidden_run)
     assert calls == 0
-    assert all(
-        caught.value.receipt[key] is False for key in module._NO_ACTION_FIELDS
-    )
-    assert caught.value.receipt["observed_compatibility"]["python_cache_tag"] == (
-        "cpython-312"
-    )
+    assert caught.value.receipt["reason"] == "installed_lpips_identity_changed"
+
+
+def test_wrong_runtime_profile_invokes_no_pip_or_downstream_action(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _environment_module()
+    _set_python_identity(monkeypatch, module, cache_tag="cpython-312", major_minor=[3, 12])
+    calls = 0
+
+    def forbidden_run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError((args, kwargs))
+
+    with pytest.raises(module.RuntimeProfileMismatch) as caught:
+        module.prepare_locked_environment(LOCK, hardware_gate=_hardware_gate(), implementation_commit="f" * 40, bootstrap_root=tmp_path / "bootstrap", run=forbidden_run)
+    assert calls == 0
+    assert all(caught.value.receipt[key] is False for key in module._NO_ACTION_FIELDS)
+    assert caught.value.receipt["observed_compatibility"]["python_cache_tag"] == "cpython-312"
 
 
 def test_lpips_artifact_hash_substitution_fails_closed(

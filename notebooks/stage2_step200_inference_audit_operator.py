@@ -73,11 +73,15 @@ if not isinstance(AUDIT_DEPENDENCY_PROVENANCE, dict):
     raise RuntimeError("Sealed dependency provenance is missing before Drive mount.")
 if (
     AUDIT_DEPENDENCY_PROVENANCE.get("contract_version")
+    != "stage2-step200-inference-environment-provenance-v2"
+    or AUDIT_DEPENDENCY_PROVENANCE.get("dependency_lock_contract_version")
     != "stage2-step200-inference-audit-dependency-lock-v2"
     or AUDIT_DEPENDENCY_PROVENANCE.get("torch_or_torchvision_reinstalled") is not False
     or AUDIT_DEPENDENCY_PROVENANCE.get("preinstalled_packages_mutated") is not False
     or AUDIT_DEPENDENCY_PROVENANCE.get("pip_no_deps") is not True
     or AUDIT_DEPENDENCY_PROVENANCE.get("pip_require_hashes") is not True
+    or set(AUDIT_DEPENDENCY_PROVENANCE.get("notebook_installed_packages", {}))
+    - {"lpips"}
 ):
     raise RuntimeError("Sealed dependency provenance contract changed.")
 for dependency_name in ("numpy", "scipy", "torch", "yaml", "matplotlib", "nibabel", "skimage", "lpips"):
@@ -101,6 +105,17 @@ print(
             "notebook_installed_packages": AUDIT_DEPENDENCY_PROVENANCE[
                 "notebook_installed_packages"
             ],
+            "lpips_bootstrap_state": AUDIT_DEPENDENCY_PROVENANCE[
+                "lpips_bootstrap_state"
+            ],
+            "lpips_bootstrap_receipt_file_sha256": AUDIT_DEPENDENCY_PROVENANCE[
+                "lpips_bootstrap_receipt_file_sha256"
+            ],
+            "unlocked_distribution_ambiguity_count": len(
+                AUDIT_DEPENDENCY_PROVENANCE[
+                    "unlocked_distribution_ambiguities"
+                ]
+            ),
             "lpips_distribution_artifact": AUDIT_DEPENDENCY_PROVENANCE[
                 "lpips_distribution_artifact"
             ],

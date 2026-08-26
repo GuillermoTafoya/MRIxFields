@@ -48,6 +48,12 @@ OUTPUT_ROOT = DRIVE_ROOT / "UnifiedStage2_1ca2b4a_01"
 STAGE2_V7_ROOT = OUTPUT_ROOT / "stage2_unified_v7"
 BANK_NAMESPACE = STAGE2_V7_ROOT / "bank_8081ce89a0ea"
 TRAINING_NAMESPACE = BANK_NAMESPACE / "implementation_82633d66e5ea"
+PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT = (
+    "e626623355b9275e38705357b0ff0fe707b44e25"
+)
+PREDECESSOR_RECOVERY_NAMESPACE = BANK_NAMESPACE / (
+    "recovery_training_82633d66e5ea_operator_e626623355b9"
+)
 BANK_ARCHIVE = OUTPUT_ROOT / "photometry_factored_latent_bank_v2.tar"
 UNRECEIPTED_BANK_DIRECTORY = OUTPUT_ROOT / "photometry_factored_latent_bank_v2"
 PAIR_FEASIBILITY = OUTPUT_ROOT / "stage2_retrospective_pair_feasibility_v2.json"
@@ -189,12 +195,16 @@ from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     P0006_COUNT_PROGRESS_VALUE,
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
     P0006_EVIDENCE_LIMITATION,
+    P0006_PREDECESSOR_OPERATOR_COMMIT,
+    P0006_PROTOCOL_FILENAME,
     P0009_CONFIRMATION_STATUS,
     copy_verified_stage2_bank_tar_to_local,
     preflight_gate01_p0006_archive,
     preflight_stage2_local_disk_capacity,
     resolve_stage2_recovery_drive_layout,
     restore_verified_stage2_bank_tar,
+    reuse_verified_gate01_p0006_predecessor_protocol,
+    validate_p0006_count_progress,
     verify_completed_stage2_pilot_evidence,
     verify_gate01_p0006_evaluation_protocol_streaming,
 )
@@ -228,6 +238,19 @@ def load_self_hashed_json(path, hash_key):
     if stored != sha256_json(body):
         raise ValueError(f"Self-hash mismatch: {path}")
     return payload
+
+
+def sanitize_p0006_subprocess_progress_line(line):
+    if '"p0006_import_progress"' not in line:
+        return None
+    try:
+        decoded = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError("P:0006 subprocess progress is not valid JSON.") from exc
+    if not isinstance(decoded, dict) or set(decoded) != {"p0006_import_progress"}:
+        raise ValueError("P:0006 subprocess progress envelope is malformed.")
+    sanitized = validate_p0006_count_progress(decoded["p0006_import_progress"])
+    return json.dumps({"p0006_import_progress": sanitized}, sort_keys=True)
 
 
 # Resolve every persisted Stage-2 path before hashing large archives or opening checkpoints.
@@ -360,6 +383,7 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
     ):
         attempt += 1
     local_log = LOCAL_LOG_ROOT / f"{operation}.attempt-{attempt:04d}.log"
+    progress_forwarding_error = None
     with local_log.open("x", encoding="utf-8", buffering=1) as log:
         log.write(
             json.dumps(
@@ -384,11 +408,18 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
         )
         assert process.stdout is not None
         for line in process.stdout:
-            if (
-                not visible_count_progress_only
-                or '"p0006_import_progress"' in line
-            ):
+            if not visible_count_progress_only:
                 print(line, end="", flush=True)
+            else:
+                try:
+                    sanitized_progress = sanitize_p0006_subprocess_progress_line(line)
+                except ValueError:
+                    progress_forwarding_error = (
+                        "P:0006 subprocess emitted invalid count-only progress."
+                    )
+                else:
+                    if sanitized_progress is not None:
+                        print(sanitized_progress, flush=True)
             log.write(line)
             log.flush()
         return_code = process.wait()
@@ -419,6 +450,7 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
         "archived_log_sha256": sha256_file(archived_log),
         "drive_file_held_open_during_process": False,
         "archive_no_clobber": True,
+        "count_only_progress_contract_valid": progress_forwarding_error is None,
     }
     if return_code < 0:
         termination_signal_number = -return_code
@@ -448,6 +480,26 @@ def run_logged(command, operation, *, visible_count_progress_only=False):
             refuse_existing=True,
         ),
     )
+    if progress_forwarding_error is not None:
+        print(
+            json.dumps(
+                {
+                    "sanitized_operation_failure": {
+                        "operation": operation,
+                        "return_code": return_code,
+                        "archived_log_path": str(archived_log),
+                        "archived_log_sha256": receipt["archived_log_sha256"],
+                        "failure_classification": (
+                            "invalid_count_only_progress_contract"
+                        ),
+                        "automatic_retry_performed": False,
+                    }
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        raise RuntimeError(progress_forwarding_error)
     if return_code:
         failure = {
             "operation": operation,
@@ -593,8 +645,13 @@ drive_retry(
     lambda: RECOVERY_NAMESPACE.mkdir(parents=True, exist_ok=True),
 )
 P0006_EVALUATION_PROTOCOL = (
-    RECOVERY_NAMESPACE
-    / "stage2_gate01_p0006_development_validation_evaluation_only_protocol_v4.json"
+    RECOVERY_NAMESPACE / P0006_PROTOCOL_FILENAME
+)
+PREDECESSOR_P0006_EVALUATION_PROTOCOL = (
+    PREDECESSOR_RECOVERY_NAMESPACE / P0006_PROTOCOL_FILENAME
+)
+P0006_PROTOCOL_ORIGIN = (
+    RECOVERY_NAMESPACE / "stage2_gate01_p0006_protocol_origin_v1.json"
 )
 LONG_RUN_EVALUATION_READINESS = (
     RECOVERY_NAMESPACE / "stage2_long_run_evaluation_readiness_v4.json"
@@ -606,22 +663,93 @@ CLI_ENV[P0006_COUNT_PROGRESS_ENV] = P0006_COUNT_PROGRESS_VALUE
 
 
 def emit_p0006_verification_progress(payload):
-    allowed = {
-        "stage",
-        "status",
-        "verified_inventory_entry_count",
-        "case_count",
-        "expected_case_count",
-    }
-    unexpected = set(payload) - allowed
-    if unexpected:
-        raise ValueError(
-            f"P:0006 verification progress contains forbidden fields: {sorted(unexpected)}"
-        )
+    sanitized = validate_p0006_count_progress(payload)
     print(
-        json.dumps({"p0006_import_progress": payload}, sort_keys=True),
+        json.dumps({"p0006_import_progress": sanitized}, sort_keys=True),
         flush=True,
     )
+
+
+def seal_p0006_protocol_origin(provenance):
+    sealed = dict(provenance)
+    stored = sealed.pop("provenance_sha256", None)
+    if stored != sha256_json(sealed):
+        raise RuntimeError("P:0006 protocol origin provenance self-hash mismatch.")
+    return seal_or_verify_exact_json(
+        P0006_PROTOCOL_ORIGIN,
+        provenance,
+        "provenance_sha256",
+    )
+
+
+def imported_p0006_protocol_origin(protocol_file_sha256):
+    body = {
+        "contract_version": "stage2-gate01-p0006-bounded-import-origin-v1",
+        "predecessor_operator_commit": PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT,
+        "predecessor_namespace_read_only": True,
+        "source_protocol_file_sha256": None,
+        "destination_protocol_file_sha256": protocol_file_sha256,
+        "exact_byte_equality": False,
+        "p0006_import_invoked": True,
+        "predecessor_protocol_reused": False,
+    }
+    return {**body, "provenance_sha256": sha256_json(body)}
+
+
+def validate_p0006_protocol_origin(provenance, destination_file_sha256):
+    expected_keys = {
+        "contract_version",
+        "predecessor_operator_commit",
+        "predecessor_namespace_read_only",
+        "source_protocol_file_sha256",
+        "destination_protocol_file_sha256",
+        "exact_byte_equality",
+        "p0006_import_invoked",
+        "predecessor_protocol_reused",
+        "provenance_sha256",
+    }
+    if not isinstance(provenance, dict) or set(provenance) != expected_keys:
+        raise RuntimeError("P:0006 protocol origin schema changed.")
+    unhashed = dict(provenance)
+    stored_provenance_sha256 = unhashed.pop("provenance_sha256")
+    if stored_provenance_sha256 != sha256_json(unhashed):
+        raise RuntimeError("P:0006 protocol origin self-hash changed.")
+    if provenance.get("predecessor_operator_commit") != (
+        PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT
+    ):
+        raise RuntimeError("P:0006 predecessor operator identity changed.")
+    if PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT != P0006_PREDECESSOR_OPERATOR_COMMIT:
+        raise RuntimeError("P:0006 predecessor operator pin disagrees with the importer.")
+    if (
+        provenance.get("predecessor_namespace_read_only") is not True
+        or provenance.get("destination_protocol_file_sha256")
+        != destination_file_sha256
+    ):
+        raise RuntimeError("P:0006 protocol origin destination identity changed.")
+    reused = provenance.get("predecessor_protocol_reused")
+    imported = provenance.get("p0006_import_invoked")
+    if reused is True:
+        if (
+            provenance.get("contract_version")
+            != "stage2-gate01-p0006-pinned-predecessor-protocol-reuse-v1"
+            or imported is not False
+            or provenance.get("exact_byte_equality") is not True
+            or provenance.get("source_protocol_file_sha256")
+            != destination_file_sha256
+        ):
+            raise RuntimeError("P:0006 predecessor reuse provenance changed.")
+    elif reused is False:
+        if (
+            provenance.get("contract_version")
+            != "stage2-gate01-p0006-bounded-import-origin-v1"
+            or imported is not True
+            or provenance.get("exact_byte_equality") is not False
+            or provenance.get("source_protocol_file_sha256") is not None
+        ):
+            raise RuntimeError("P:0006 bounded-import provenance changed.")
+    else:
+        raise RuntimeError("P:0006 protocol origin mode is malformed.")
+    return provenance
 
 released_object_count = gc.collect()
 print(
@@ -637,7 +765,16 @@ print(
     flush=True,
 )
 
-if P0006_EVALUATION_PROTOCOL.exists():
+predecessor_protocol_present = (
+    PREDECESSOR_P0006_EVALUATION_PROTOCOL.exists()
+    or PREDECESSOR_P0006_EVALUATION_PROTOCOL.is_symlink()
+)
+current_protocol_present = (
+    P0006_EVALUATION_PROTOCOL.exists() or P0006_EVALUATION_PROTOCOL.is_symlink()
+)
+if current_protocol_present:
+    if P0006_EVALUATION_PROTOCOL.is_symlink():
+        raise RuntimeError("Current P:0006 recovery protocol cannot be a symlink.")
     protocol, p0006_streaming_verification = (
         verify_gate01_p0006_evaluation_protocol_streaming(
             P0006_EVALUATION_PROTOCOL,
@@ -646,6 +783,49 @@ if P0006_EVALUATION_PROTOCOL.exists():
     )
     if p0006_streaming_verification["case_count"] != 60:
         raise RuntimeError("Existing P:0006 recovery protocol is incomplete.")
+    current_protocol_file_sha256 = sha256_file(P0006_EVALUATION_PROTOCOL)
+    if P0006_PROTOCOL_ORIGIN.exists() or P0006_PROTOCOL_ORIGIN.is_symlink():
+        if P0006_PROTOCOL_ORIGIN.is_symlink():
+            raise RuntimeError("P:0006 protocol origin cannot be a symlink.")
+        p0006_protocol_origin = load_self_hashed_json(
+            P0006_PROTOCOL_ORIGIN, "provenance_sha256"
+        )
+    elif predecessor_protocol_present:
+        if (
+            PREDECESSOR_P0006_EVALUATION_PROTOCOL.is_symlink()
+            or PREDECESSOR_RECOVERY_NAMESPACE.is_symlink()
+            or not PREDECESSOR_P0006_EVALUATION_PROTOCOL.is_file()
+        ):
+            raise RuntimeError("Pinned predecessor P:0006 protocol is not a regular file.")
+        source_sha256 = sha256_file(PREDECESSOR_P0006_EVALUATION_PROTOCOL)
+        if source_sha256 != current_protocol_file_sha256:
+            raise RuntimeError("Existing protocol differs from its pinned predecessor.")
+        origin_body = {
+            "contract_version": "stage2-gate01-p0006-pinned-predecessor-protocol-reuse-v1",
+            "predecessor_operator_commit": PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT,
+            "predecessor_namespace_read_only": True,
+            "source_protocol_file_sha256": source_sha256,
+            "destination_protocol_file_sha256": current_protocol_file_sha256,
+            "exact_byte_equality": True,
+            "p0006_import_invoked": False,
+            "predecessor_protocol_reused": True,
+        }
+        p0006_protocol_origin = seal_p0006_protocol_origin(
+            {**origin_body, "provenance_sha256": sha256_json(origin_body)}
+        )
+    else:
+        p0006_protocol_origin = seal_p0006_protocol_origin(
+            imported_p0006_protocol_origin(current_protocol_file_sha256)
+        )
+elif predecessor_protocol_present:
+    protocol, p0006_streaming_verification, p0006_protocol_origin = (
+        reuse_verified_gate01_p0006_predecessor_protocol(
+            PREDECESSOR_P0006_EVALUATION_PROTOCOL,
+            P0006_EVALUATION_PROTOCOL,
+            progress_callback=emit_p0006_verification_progress,
+        )
+    )
+    p0006_protocol_origin = seal_p0006_protocol_origin(p0006_protocol_origin)
 else:
     run_logged(
         [
@@ -673,6 +853,13 @@ else:
             progress_callback=emit_p0006_verification_progress,
         )
     )
+    p0006_protocol_origin = seal_p0006_protocol_origin(
+        imported_p0006_protocol_origin(sha256_file(P0006_EVALUATION_PROTOCOL))
+    )
+p0006_protocol_origin = validate_p0006_protocol_origin(
+    p0006_protocol_origin,
+    sha256_file(P0006_EVALUATION_PROTOCOL),
+)
 if (
     protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL
     or protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
@@ -800,6 +987,7 @@ recovery_receipt = {
     "selection_rule_sha256": EXPECTED_SELECTION_RULE_SHA256,
     "p0006_protocol_path": str(P0006_EVALUATION_PROTOCOL),
     "p0006_protocol_file_sha256": sha256_file(P0006_EVALUATION_PROTOCOL),
+    "p0006_protocol_origin": p0006_protocol_origin,
     "p0006_streaming_verification": p0006_streaming_verification,
     "evaluation_readiness_path": str(LONG_RUN_EVALUATION_READINESS),
     "evaluation_readiness_file_sha256": sha256_file(
@@ -832,6 +1020,12 @@ print(
             "run_fingerprint": completed_evidence["run_fingerprint"],
             "p0006_protocol_sha256": recovery_receipt[
                 "p0006_protocol_file_sha256"
+            ],
+            "p0006_import_invoked": p0006_protocol_origin[
+                "p0006_import_invoked"
+            ],
+            "predecessor_protocol_reused": p0006_protocol_origin[
+                "predecessor_protocol_reused"
             ],
             "evaluation_readiness_sha256": recovery_receipt[
                 "evaluation_readiness_file_sha256"

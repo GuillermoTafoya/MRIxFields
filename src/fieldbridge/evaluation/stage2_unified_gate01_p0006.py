@@ -130,6 +130,26 @@ STAGE2_COMPLETED_EVIDENCE_DEVICE_OVERRIDE_SOURCE = (
 )
 P0006_COUNT_PROGRESS_ENV = "FIELDBRIDGE_STAGE2_P0006_COUNT_PROGRESS"
 P0006_COUNT_PROGRESS_VALUE = "count-only-json-v1"
+P0006_COUNT_PROGRESS_FIELDS = frozenset(
+    {
+        "stage",
+        "status",
+        "verified_inventory_entry_count",
+        "case_count",
+        "expected_case_count",
+        "acquisition_node_count",
+    }
+)
+P0006_PREDECESSOR_OPERATOR_COMMIT = "e626623355b9275e38705357b0ff0fe707b44e25"
+P0006_PREDECESSOR_RECOVERY_NAMESPACE_NAME = (
+    "recovery_training_82633d66e5ea_operator_e626623355b9"
+)
+P0006_PROTOCOL_FILENAME = (
+    "stage2_gate01_p0006_development_validation_evaluation_only_protocol_v4.json"
+)
+P0006_PREDECESSOR_REUSE_CONTRACT = (
+    "stage2-gate01-p0006-pinned-predecessor-protocol-reuse-v1"
+)
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 REVIEWED_GATE01_RESULT_FILE_SHA256 = (
     "454747cd3e4b1376855915244a7c40fe281b758150e86f584fbea96f94d531f5"
@@ -2142,18 +2162,68 @@ def _single_inventory_json_contract(
 def _resolve_p0006_count_progress_callback(
     callback: Callable[[dict[str, Any]], None] | None,
 ) -> Callable[[dict[str, Any]], None] | None:
-    if callback is not None:
-        return callback
-    if os.environ.get(P0006_COUNT_PROGRESS_ENV) != P0006_COUNT_PROGRESS_VALUE:
+    selected = callback
+    if selected is None and (
+        os.environ.get(P0006_COUNT_PROGRESS_ENV) == P0006_COUNT_PROGRESS_VALUE
+    ):
+
+        def environment_emit(payload: dict[str, Any]) -> None:
+            print(
+                json.dumps({"p0006_import_progress": payload}, sort_keys=True),
+                flush=True,
+            )
+
+        selected = environment_emit
+    if selected is None:
         return None
+    selected_callback = selected
 
     def emit(payload: dict[str, Any]) -> None:
-        print(
-            json.dumps({"p0006_import_progress": payload}, sort_keys=True),
-            flush=True,
-        )
+        selected_callback(validate_p0006_count_progress(payload))
 
     return emit
+
+
+def validate_p0006_count_progress(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a sanitized count-only P:0006 progress event or fail closed."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("P:0006 progress must be a mapping.")
+    unexpected = set(payload) - P0006_COUNT_PROGRESS_FIELDS
+    if unexpected:
+        raise ValueError(
+            f"P:0006 verification progress contains forbidden fields: {sorted(unexpected)}"
+        )
+    if payload.get("stage") not in {
+        "p0006_import",
+        "p0006_streaming_verification",
+        "p0006_load",
+    }:
+        raise ValueError("P:0006 progress stage is unsupported.")
+    if payload.get("status") not in {"start", "periodic", "end"}:
+        raise ValueError("P:0006 progress status is unsupported.")
+    for field in P0006_COUNT_PROGRESS_FIELDS - {"stage", "status"}:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"P:0006 progress field {field!r} must be a nonnegative integer."
+            )
+    if (
+        payload["stage"] == "p0006_streaming_verification"
+        and payload["status"] == "end"
+        and (
+            payload.get("case_count") != 60
+            or payload.get("expected_case_count") != 60
+            or payload.get("acquisition_node_count") != 15
+        )
+    ):
+        raise ValueError(
+            "Final P:0006 streaming verification progress must report 60 cases, "
+            "60 expected cases, and 15 acquisition nodes."
+        )
+    return dict(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2309,8 +2379,6 @@ def import_gate01_p0006_evaluation_protocol(
         {
             "stage": "p0006_import",
             "status": "periodic",
-            "train_record_count": len(train_index.records),
-            "validation_record_count": len(validation_index.records),
             "case_count": 0,
         },
     )
@@ -2447,9 +2515,8 @@ def import_gate01_p0006_evaluation_protocol(
             "stage": "p0006_import",
             "status": "end",
             "verified_inventory_entry_count": len(layout.entries),
-            "train_record_count": len(train_index.records),
-            "validation_record_count": len(validation_index.records),
             "case_count": streamed_inventory.case_count,
+            "expected_case_count": 60,
             "acquisition_node_count": streamed_inventory.acquisition_node_count,
         },
     )
@@ -2589,6 +2656,81 @@ def verify_gate01_p0006_evaluation_protocol_streaming(
         },
     )
     return protocol, summary
+
+
+def reuse_verified_gate01_p0006_predecessor_protocol(
+    predecessor_protocol_path: str | Path,
+    destination_protocol_path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Fully verify and exact-copy the one pinned predecessor P:0006 protocol."""
+
+    source = Path(predecessor_protocol_path)
+    destination = Path(destination_protocol_path)
+    if (
+        source.name != P0006_PROTOCOL_FILENAME
+        or source.parent.name != P0006_PREDECESSOR_RECOVERY_NAMESPACE_NAME
+    ):
+        raise ValueError("P:0006 predecessor protocol path is not the pinned source.")
+    if source.parent.is_symlink() or not source.parent.is_dir():
+        raise ValueError("P:0006 predecessor namespace is not a regular directory.")
+    verified_source = _assert_contained_regular_file(
+        source.parent.resolve(),
+        source,
+        label="pinned predecessor P:0006 protocol",
+    )
+    if destination.name != P0006_PROTOCOL_FILENAME:
+        raise ValueError("P:0006 destination protocol basename changed.")
+    if destination.parent.is_symlink() or not destination.parent.is_dir():
+        raise ValueError("P:0006 destination namespace is not a regular directory.")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Refusing to overwrite P:0006 protocol: {destination}")
+
+    protocol, verification = verify_gate01_p0006_evaluation_protocol_streaming(
+        verified_source,
+        progress_callback=progress_callback,
+    )
+    source_bytes = verified_source.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if source_sha256 != verification.get("protocol_file_sha256"):
+        raise ValueError("Pinned predecessor P:0006 protocol changed during verification.")
+
+    partial = destination.with_name(destination.name + ".partial")
+    if partial.exists() or partial.is_symlink():
+        raise FileExistsError(f"Refusing stale P:0006 protocol partial: {partial}")
+    try:
+        with partial.open("xb") as handle:
+            handle.write(source_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(
+                f"Refusing to overwrite P:0006 protocol: {destination}"
+            )
+        partial.replace(destination)
+    except BaseException:
+        if partial.exists() and not partial.is_symlink():
+            partial.unlink()
+        raise
+
+    destination_bytes = destination.read_bytes()
+    destination_sha256 = hashlib.sha256(destination_bytes).hexdigest()
+    exact_byte_equality = destination_bytes == source_bytes
+    if destination_sha256 != source_sha256 or not exact_byte_equality:
+        raise ValueError("Copied P:0006 protocol differs from its pinned predecessor.")
+    provenance: dict[str, Any] = {
+        "contract_version": P0006_PREDECESSOR_REUSE_CONTRACT,
+        "predecessor_operator_commit": P0006_PREDECESSOR_OPERATOR_COMMIT,
+        "predecessor_namespace_read_only": True,
+        "source_protocol_file_sha256": source_sha256,
+        "destination_protocol_file_sha256": destination_sha256,
+        "exact_byte_equality": exact_byte_equality,
+        "p0006_import_invoked": False,
+        "predecessor_protocol_reused": True,
+    }
+    provenance["provenance_sha256"] = sha256_json(provenance)
+    return protocol, verification, provenance
 
 
 def load_gate01_p0006_evaluation_protocol(
@@ -3834,7 +3976,12 @@ __all__ = [
     "P0006_IDENTITY_SHA256",
     "P0006_SUBJECT_GROUP",
     "P0006_COUNT_PROGRESS_ENV",
+    "P0006_COUNT_PROGRESS_FIELDS",
     "P0006_COUNT_PROGRESS_VALUE",
+    "P0006_PREDECESSOR_OPERATOR_COMMIT",
+    "P0006_PREDECESSOR_RECOVERY_NAMESPACE_NAME",
+    "P0006_PREDECESSOR_REUSE_CONTRACT",
+    "P0006_PROTOCOL_FILENAME",
     "P0009_CONFIRMATION_STATUS",
     "REVIEWED_GATE01_RESULT_FILE_SHA256",
     "STAGE2_BANK_MANIFEST_FILENAME",
@@ -3857,8 +4004,10 @@ __all__ = [
     "preflight_gate01_p0006_archive",
     "resolve_stage2_recovery_drive_layout",
     "restore_verified_stage2_bank_tar",
+    "reuse_verified_gate01_p0006_predecessor_protocol",
     "resolve_gate01_p0006_archive_layout",
     "stage2_bank_tree_identity",
     "verify_completed_stage2_pilot_evidence",
     "verify_gate01_p0006_evaluation_protocol_streaming",
+    "validate_p0006_count_progress",
 ]

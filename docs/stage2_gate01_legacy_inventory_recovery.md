@@ -85,6 +85,13 @@ immutable archived log path and SHA-256. A negative return code is recorded as a
 name; signal 9 is classified only as an external termination/resource-kill candidate, never as an
 OOM without kernel evidence, and is not retried automatically.
 
+The count-only P:0006 progress vocabulary is closed to `stage`, `status`,
+`verified_inventory_entry_count`, `case_count`, `expected_case_count`, and
+`acquisition_node_count`. Count values are nonnegative JSON integers (never booleans). The final
+streaming-verification event must report exactly 60 completed cases, 60 expected cases, and 15
+acquisition nodes. Paths, filenames, hashes, identities, subjects, domains, tensor values, and
+unrecognized fields are rejected before forwarding.
+
 `Runtime -> Run all` is safely repeatable in the same runtime. Each seal uses an
 implementation-commit-scoped checkout directory, so a new seal can clone beside an older exact
 checkout without touching it. An existing checkout for the current seal is reused
@@ -112,6 +119,17 @@ commit prefixes. Existing training attempts are read-only. Publication uses immu
 Drive retries, hashes, and no-clobber writes. All long-run authorization flags remain false, and
 `Runtime -> Run all` stops after P:0006 import and evaluation-readiness sealing for a separate
 resource-bounded training-design review.
+
+The recovery first checks the single pinned predecessor namespace
+`recovery_training_82633d66e5ea_operator_e626623355b9` for the exact v4 protocol filename. It
+never globs or searches other recovery outputs. When that file exists, the operator treats the
+namespace as read-only, streams and verifies the complete protocol and its 60 cases, then copies
+the exact verified bytes with no-clobber publication into the current operator namespace. The
+sealed origin records the predecessor commit, source and destination file SHA-256 values,
+exact-byte equality, `p0006_import_invoked: false`, and
+`predecessor_protocol_reused: true`. A present but invalid predecessor fails closed. Only an absent
+exact predecessor takes the bounded-memory import path. Readiness and the final recovery receipt
+are always sealed in the current operator namespace; neither path authorizes training.
 
 Scientific limits remain unchanged: R-only data trained the model; current pilot selection is
 unpaired; P:0006 is development/model assessment only; population/generalization claims remain

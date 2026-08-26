@@ -72,6 +72,110 @@ class _Calibrator:
         return prediction + support_mask.to(prediction.dtype) * 0.125
 
 
+def test_p0006_count_progress_accepts_exact_final_streaming_payload() -> None:
+    payload = {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
+    assert p0006.validate_p0006_count_progress(payload) == payload
+
+
+def test_p0006_count_progress_accepts_complete_producer_vocabulary() -> None:
+    payloads = (
+        {"stage": "p0006_import", "status": "start", "case_count": 0},
+        {
+            "stage": "p0006_import",
+            "status": "periodic",
+            "verified_inventory_entry_count": 14,
+            "case_count": 0,
+        },
+        {
+            "stage": "p0006_import",
+            "status": "periodic",
+            "case_count": 37,
+            "expected_case_count": 60,
+        },
+        {
+            "stage": "p0006_import",
+            "status": "end",
+            "verified_inventory_entry_count": 14,
+            "case_count": 60,
+            "expected_case_count": 60,
+            "acquisition_node_count": 15,
+        },
+        {
+            "stage": "p0006_streaming_verification",
+            "status": "periodic",
+            "case_count": 60,
+            "expected_case_count": 60,
+        },
+    )
+    assert all(p0006.validate_p0006_count_progress(item) == item for item in payloads)
+    assert p0006.P0006_COUNT_PROGRESS_FIELDS == {
+        "stage",
+        "status",
+        "verified_inventory_entry_count",
+        "case_count",
+        "expected_case_count",
+        "acquisition_node_count",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("case_count", True),
+        ("case_count", -1),
+        ("case_count", 1.0),
+        ("expected_case_count", False),
+        ("acquisition_node_count", "15"),
+    ],
+)
+def test_p0006_count_progress_rejects_malformed_counts(
+    field: str, value: object
+) -> None:
+    payload: dict[str, object] = {
+        "stage": "p0006_streaming_verification",
+        "status": "periodic",
+        field: value,
+    }
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        p0006.validate_p0006_count_progress(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["path", "filename", "sha256", "identity", "subject", "tensor", "domain"],
+)
+def test_p0006_count_progress_rejects_unknown_or_sensitive_fields(field: str) -> None:
+    with pytest.raises(ValueError, match="forbidden fields"):
+        p0006.validate_p0006_count_progress(
+            {"stage": "p0006_import", "status": "periodic", field: "private"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("case_count", "expected_case_count", "acquisition_node_count"),
+    [(59, 60, 15), (60, 59, 15), (60, 60, 14)],
+)
+def test_p0006_count_progress_rejects_incorrect_final_counts(
+    case_count: int, expected_case_count: int, acquisition_node_count: int
+) -> None:
+    with pytest.raises(ValueError, match="60 cases"):
+        p0006.validate_p0006_count_progress(
+            {
+                "stage": "p0006_streaming_verification",
+                "status": "end",
+                "case_count": case_count,
+                "expected_case_count": expected_case_count,
+                "acquisition_node_count": acquisition_node_count,
+            }
+        )
+
+
 class _GateManifest:
     def __init__(self, root: Path, cases: list[Gate01Case]) -> None:
         self.root = root
@@ -561,16 +665,7 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert progress_events[0]["status"] == "start"
     assert any(event["status"] == "periodic" for event in progress_events)
     assert progress_events[-1]["status"] == "end"
-    allowed_progress_fields = {
-        "stage",
-        "status",
-        "verified_inventory_entry_count",
-        "train_record_count",
-        "validation_record_count",
-        "case_count",
-        "expected_case_count",
-        "acquisition_node_count",
-    }
+    allowed_progress_fields = p0006.P0006_COUNT_PROGRESS_FIELDS
     assert all(set(event) <= allowed_progress_fields for event in progress_events)
     assert all(
         not any(
@@ -584,6 +679,7 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
         int(event["case_count"])
         for event in progress_events
         if event.get("expected_case_count") == 60
+        and event.get("status") == "periodic"
     ]
     assert completed_case_progress == list(range(1, 61))
 
@@ -601,12 +697,63 @@ def test_gate01_p0006_import_and_reload_seal_complete_evaluation_graph(
     assert streaming_summary["baseline_tensor_mappings_returned"] == 0
     assert streaming_progress[0]["status"] == "start"
     assert streaming_progress[-1]["status"] == "end"
+    assert streaming_progress[-1] == {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
     assert [
         int(event["case_count"])
         for event in streaming_progress
         if event.get("expected_case_count") == 60
         and event.get("status") == "periodic"
     ] == list(range(1, 61))
+
+    predecessor_namespace = (
+        tmp_path / p0006.P0006_PREDECESSOR_RECOVERY_NAMESPACE_NAME
+    )
+    predecessor_namespace.mkdir()
+    predecessor_protocol = predecessor_namespace / p0006.P0006_PROTOCOL_FILENAME
+    predecessor_protocol.write_bytes(output.read_bytes())
+    destination_namespace = tmp_path / "new-implementation-recovery"
+    destination_namespace.mkdir()
+    reused_path = destination_namespace / p0006.P0006_PROTOCOL_FILENAME
+    reuse_progress: list[dict[str, object]] = []
+    reused_protocol, reused_summary, reuse_provenance = (
+        p0006.reuse_verified_gate01_p0006_predecessor_protocol(
+            predecessor_protocol,
+            reused_path,
+            progress_callback=reuse_progress.append,
+        )
+    )
+    assert reused_protocol == protocol
+    assert reused_summary["case_count"] == 60
+    assert reuse_progress[-1]["acquisition_node_count"] == 15
+    assert reused_path.read_bytes() == predecessor_protocol.read_bytes()
+    assert sha256_file(reused_path) == sha256_file(predecessor_protocol)
+    assert reuse_provenance["source_protocol_file_sha256"] == sha256_file(output)
+    assert reuse_provenance["destination_protocol_file_sha256"] == sha256_file(output)
+    assert reuse_provenance["exact_byte_equality"] is True
+    assert reuse_provenance["p0006_import_invoked"] is False
+    assert reuse_provenance["predecessor_protocol_reused"] is True
+    assert reuse_provenance["predecessor_namespace_read_only"] is True
+
+    predecessor_protocol.write_bytes(
+        output.read_bytes().replace(b"P:0006", b"P:0005", 1)
+    )
+    corrupt_destination_namespace = tmp_path / "bad"
+    corrupt_destination_namespace.mkdir()
+    corrupt_destination = (
+        corrupt_destination_namespace / p0006.P0006_PROTOCOL_FILENAME
+    )
+    with pytest.raises(ValueError, match="Self-hash|JSON|protocol"):
+        p0006.reuse_verified_gate01_p0006_predecessor_protocol(
+            predecessor_protocol,
+            corrupt_destination,
+        )
+    assert not corrupt_destination.exists()
 
     feasibility_body = {
         "contract_version": PAIRED_FEASIBILITY_CONTRACT,

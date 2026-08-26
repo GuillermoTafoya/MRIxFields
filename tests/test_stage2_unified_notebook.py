@@ -26,6 +26,7 @@ from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
     P0006_EVIDENCE_LIMITATION,
     P0009_CONFIRMATION_STATUS,
+    validate_p0006_count_progress,
 )
 from fieldbridge.training.stage2_unified import UnifiedStage2Config
 
@@ -339,6 +340,7 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
         "P0006_COUNT_PROGRESS_ENV",
         "P0006_COUNT_PROGRESS_VALUE",
         "emit_p0006_verification_progress",
+        "validate_p0006_count_progress",
         "progress_callback=emit_p0006_verification_progress",
         "verify_gate01_p0006_evaluation_protocol_streaming",
         "visible_count_progress_only=True",
@@ -348,6 +350,7 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
         '"gpu_used": False',
     ):
         assert required in source
+    assert "acquisition_node_count" in importer_source
     assert 'stage = "p0006_streaming_verification"' in importer_source
     assert "cases = list(gate_manifest)" not in importer_source
     assert "load_gate01_p0006_evaluation_protocol" not in source
@@ -379,16 +382,52 @@ def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
         assert f'"{forbidden}"' not in progress_block
 
 
-def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_operator_accepts_exact_final_streaming_verification_event(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = OPERATOR.read_text(encoding="utf-8")
     tree = ast.parse(source)
     function = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "run_logged"
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "emit_p0006_verification_progress"
     )
+    namespace = {
+        "json": json,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    payload = {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
+    namespace["emit_p0006_verification_progress"](payload)
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {"p0006_import_progress": payload}
+
+
+def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"sanitize_p0006_subprocess_progress_line", "run_logged"}
+    ]
     popen_calls = 0
 
     class KilledProcess:
@@ -428,10 +467,11 @@ def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
         "sha256_file": sha256_file,
         "sha256_json": sha256_json,
         "write_json_atomic": write_json_atomic,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
     }
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
             str(OPERATOR),
             "exec",
         ),
@@ -462,6 +502,43 @@ def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
     assert "synthetic private log payload" not in captured
     assert '"termination_signal_number": 9' in captured
     assert '"termination_signal_name": "SIGKILL"' in captured
+
+
+def test_subprocess_progress_forwarder_revalidates_closed_schema() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "sanitize_p0006_subprocess_progress_line"
+    )
+    namespace = {
+        "json": json,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    payload = {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
+    line = json.dumps({"p0006_import_progress": payload})
+    sanitized = namespace["sanitize_p0006_subprocess_progress_line"](line)
+    assert json.loads(sanitized) == {"p0006_import_progress": payload}
+    with pytest.raises(ValueError, match="forbidden fields"):
+        namespace["sanitize_p0006_subprocess_progress_line"](
+            json.dumps({"p0006_import_progress": {**payload, "subject": "private"}})
+        )
 
 
 def _operator_retry_functions():
@@ -730,6 +807,108 @@ def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only
     assert "archive_no_clobber" in source
     assert "refuse_existing=True" in source
     assert "Existing recovery receipt changed" in source
+    assert "e626623355b9275e38705357b0ff0fe707b44e25" in source
+    assert "recovery_training_82633d66e5ea_operator_e626623355b9" in source
+    assert "PREDECESSOR_P0006_EVALUATION_PROTOCOL" in source
+    assert "reuse_verified_gate01_p0006_predecessor_protocol" in source
+    assert '"p0006_import_invoked": False' in source
+    assert '"predecessor_protocol_reused": True' in source
+    assert '"predecessor_namespace_read_only": True' in source
+    assert '"exact_byte_equality": True' in source
+    assert '"p0006_protocol_origin": p0006_protocol_origin' in source
+    assert ".glob(" not in source
+    assert ".rglob(" not in source
+
+
+def test_pinned_predecessor_routing_reuses_or_imports_without_fallback() -> None:
+    tree = ast.parse(OPERATOR.read_text(encoding="utf-8"))
+    route = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "current_protocol_present"
+    )
+    assert len(route.orelse) == 1 and isinstance(route.orelse[0], ast.If)
+    predecessor_branch = route.orelse[0]
+    assert isinstance(predecessor_branch.test, ast.Name)
+    assert predecessor_branch.test.id == "predecessor_protocol_present"
+    reuse_source = ast.unparse(predecessor_branch.body)
+    import_source = ast.unparse(predecessor_branch.orelse)
+    assert "reuse_verified_gate01_p0006_predecessor_protocol" in reuse_source
+    assert "run_logged" not in reuse_source
+    assert "import-stage2-gate01-p0006-evaluation" in import_source
+    assert "run_logged" in import_source
+    assert "verify_gate01_p0006_evaluation_protocol_streaming" in import_source
+
+
+def test_p0006_origin_receipt_is_exact_and_self_hashed() -> None:
+    tree = ast.parse(OPERATOR.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "validate_p0006_protocol_origin"
+    )
+    predecessor = "e626623355b9275e38705357b0ff0fe707b44e25"
+    namespace = {
+        "sha256_json": sha256_json,
+        "PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT": predecessor,
+        "P0006_PREDECESSOR_OPERATOR_COMMIT": predecessor,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    protocol_sha256 = "a" * 64
+    body = {
+        "contract_version": "stage2-gate01-p0006-pinned-predecessor-protocol-reuse-v1",
+        "predecessor_operator_commit": predecessor,
+        "predecessor_namespace_read_only": True,
+        "source_protocol_file_sha256": protocol_sha256,
+        "destination_protocol_file_sha256": protocol_sha256,
+        "exact_byte_equality": True,
+        "p0006_import_invoked": False,
+        "predecessor_protocol_reused": True,
+    }
+    provenance = {**body, "provenance_sha256": sha256_json(body)}
+    validate = namespace["validate_p0006_protocol_origin"]
+    assert validate(provenance, protocol_sha256) == provenance
+    with pytest.raises(RuntimeError, match="schema changed"):
+        validate({**provenance, "unexpected": 1}, protocol_sha256)
+    with pytest.raises(RuntimeError, match="self-hash changed"):
+        validate({**provenance, "provenance_sha256": "0" * 64}, protocol_sha256)
+
+
+def test_recovery_continues_after_final_streaming_event_to_sealed_stop() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    final_progress_contract = source.index("validate_p0006_count_progress(payload)")
+    streaming_verification = source.index(
+        "p0006_streaming_verification =", final_progress_contract
+    )
+    scientific_role = source.index(
+        "Recovered P:0006 protocol changed its scientific role", streaming_verification
+    )
+    readiness = source.index("if LONG_RUN_EVALUATION_READINESS.exists()", scientific_role)
+    recovery_receipt = source.index("recovery_receipt =", readiness)
+    final_stop = source.index("STOP_FOR_RESOURCE_BOUNDED_TRAINING_DESIGN_REVIEW")
+    assert (
+        final_progress_contract
+        < streaming_verification
+        < scientific_role
+        < readiness
+        < recovery_receipt
+        < final_stop
+    )
+    final_block = source[recovery_receipt:]
+    assert '"training_reused": True' in final_block
+    assert '"training_invoked": False' in final_block
+    assert '"long_run_training_authorized": False' in final_block
+    assert '"gpu_used": False' in final_block
 
 
 def test_recovery_operator_preserves_scientific_role_and_stops_before_long_run() -> None:

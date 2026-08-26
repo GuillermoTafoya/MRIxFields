@@ -117,6 +117,23 @@ When the feasibility audit proves that no genuine R pair exists, import the alre
 development, so this protocol supports development/model assessment only and cannot support
 population or generalization claims. It is not a training or model-selection input:
 
+Before any photometry, bank, checkpoint, private-array, or GPU operation, run the metadata-only
+Gate 0.1 preflight against the logical bundle root. The importer recognizes exactly two layouts:
+the modern flat root with `sha256-inventory.csv`, or the reviewed legacy parent root with
+`archive/sha256-inventory.json`. Modern CSV artifacts remain direct root children. The reviewed
+legacy JSON inventory has exactly 14 rows: normal rows resolve only through the exact lexical
+suffix after one `Gate01Private_8012a3f` marker, and the single pinned external `split_v3.json`
+label resolves only to `archive/split_v3.json`. Supplying the legacy `archive/` child as the
+logical root is invalid. Simultaneous inventories are ambiguous and fail closed. Historical
+absolute paths are provenance labels only; no basename search or fallback is allowed. Exact
+root-relative paths, containment, nonsymlink parents, regular-file type, byte size, and SHA-256
+are verified for every row. The separately pinned operational split and reviewed-module document
+remain outside inventory arithmetic and are linked back to the existing split and protocol-lock
+contracts. The reviewed-module supplemental is a strict five-field comparison-evidence object:
+its current commit and 31-entry module map must exactly equal the protocol lock, while its distinct
+previous commit/map are provenance only and its sole declared `flow_transport.py` change must equal
+the computed map diff. Arbitrary list/object variants cannot substitute for this pinned contract.
+
 ```bash
 fieldbridge import-stage2-gate01-p0006-evaluation \
   --archive-root "$GATE01_PRIVATE_8012A3F" \
@@ -140,6 +157,28 @@ proves the factored train/validation bank contains only R, and proves the frozen
 validation plan contains no P endpoint. Original SB-v2 arrays are imported; calibrated identity
 is deterministically re-derived from the existing raw identity, source support, and frozen Gate
 0.1 calibrator and its tensor identity is sealed. No baseline model is rerun.
+
+New imports use the explicit P:0006 protocol v4, which seals the logical-root identity, layout
+contract, inventory format/path/file hash, normalized entry count and identity, every verified
+relative path/resolution-rule/hash/size, and the separate supplemental identities. Basenames are
+informational only. Its loader retains validation compatibility for already-valid v2 and v3
+protocols; the scientific data role is unchanged. The recovery notebook described in
+`stage2_gate01_legacy_inventory_recovery.md` must be used for the completed v7 pilot. It reads the
+immutable `implementation_82633d66e5ea` evidence and must never launch a replacement pilot.
+That recovery resolves the evidence beneath the exact
+`MRIxFields2026/UnifiedStage2_1ca2b4a_01` output root and restores only its reviewed
+`photometry_factored_latent_bank_v2.tar`. The archive, extracted tree, manifest artifact, file
+count, and byte count are all pinned; the empty unreceipted bank directory is never selected as a
+source. The exact pair-feasibility receipt is also resolved directly beneath that output root.
+The recovery first checks local capacity, streams the Drive tar to local scratch while hashing
+that same copy pass, and extracts only the verified local file. Copy, extraction, tree
+verification, P:0006 import, post-import load, and exact-resume load emit count-only progress. CPU
+High-RAM is recommended; no GPU is used. The checkout directory includes the implementation
+commit prefix, so an old exact seal and a new seal can coexist. A same-seal rerun reuses its
+checkout only after read-only proof that its origin, detached commit, cleanliness, ancestry, and
+operator-only diff are exact; otherwise it fails without mutating either checkout. Deterministic
+artifact/contract failures do not trigger Drive remounts; bounded retries are reserved for actual
+Drive/FUSE transport failures.
 
 Readiness v3 accepts exactly one feasible route: complete genuine R/validation pairs when they
 exist, otherwise the sealed P:0006 development-validation evaluation-only protocol. It records

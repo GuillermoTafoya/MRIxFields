@@ -1,231 +1,944 @@
 from __future__ import annotations
 
 import ast
+import errno
 import json
+import os
 import re
+import signal
+import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from fieldbridge.data.domains import Contrast, Domain
-from fieldbridge.data.photometry_factorization import sha256_json
+from fieldbridge.data.photometry_factorization import (
+    sha256_file,
+    sha256_json,
+    write_json_atomic,
+)
 from fieldbridge.evaluation.stage2_photometry_baseline import PairedEvaluationCase
 from fieldbridge.evaluation.stage2_unified import _load_baseline_predictions
+from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
+    P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+    P0006_EVIDENCE_LIMITATION,
+    P0009_CONFIRMATION_STATUS,
+    validate_p0006_count_progress,
+)
 from fieldbridge.training.stage2_unified import UnifiedStage2Config
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "stage2_unified_retrospective_full_model_colab.ipynb"
+OPERATOR = ROOT / "notebooks" / "stage2_gate01_legacy_recovery_operator.py"
 
 
-def _load_notebook_functions(*names: str, namespace: dict) -> dict:
-    payload = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
-    source = next(
-        ''.join(cell['source'])
-        for cell in payload['cells']
-        if cell['cell_type'] == 'code'
-        and ''.join(cell['source']).startswith(
-            '# Visible attempt-based execution:'
-        )
+def _notebook_source() -> tuple[dict, str]:
+    payload = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in payload["cells"])
+    return payload, source
+
+
+def _checkout_validator():
+    payload, _ = _notebook_source()
+    code = "\n".join(
+        "".join(cell["source"])
+        for cell in payload["cells"]
+        if cell["cell_type"] == "code"
     )
-    tree = ast.parse(source)
-    selected = [
+    tree = ast.parse(code)
+    functions = [
         node
         for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in names
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"git_probe", "validate_existing_operator_checkout"}
     ]
-    assert {node.name for node in selected} == set(names)
-    scope = dict(namespace)
-    exec(
-        compile(ast.Module(body=selected, type_ignores=[]), str(NOTEBOOK), 'exec'),
-        scope,
+    module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
+    namespace = {"Path": Path, "os": os, "subprocess": subprocess}
+    exec(compile(module, str(NOTEBOOK), "exec"), namespace)
+    return namespace["validate_existing_operator_checkout"]
+
+
+def _fake_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[object, dict[str, str], list[tuple[str, ...]], Path, str, str, str]:
+    validate = _checkout_validator()
+    repo = tmp_path / "operator-checkout"
+    repo.mkdir()
+    repository_url = "https://github.com/GuillermoTafoya/MRIxFields.git"
+    operator_commit = "b" * 40
+    training_commit = "a" * 40
+    state = {
+        "origin": repository_url,
+        "head": operator_commit,
+        "status": "",
+        "changed": "docs/recovery.md",
+        "attached": False,
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "git"
+        assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        args = tuple(command[1:])
+        calls.append(args)
+        responses = {
+            ("rev-parse", "--is-inside-work-tree"): (0, "true\n"),
+            ("rev-parse", "--show-toplevel"): (0, str(repo.resolve()) + "\n"),
+            ("remote",): (0, "origin\n"),
+            ("remote", "get-url", "--all", "origin"): (0, state["origin"] + "\n"),
+            ("rev-parse", "HEAD"): (0, state["head"] + "\n"),
+            ("symbolic-ref", "-q", "HEAD"): (
+                (0, "refs/heads/unsafe\n") if state["attached"] else (1, "")
+            ),
+            ("status", "--porcelain=v1", "--untracked-files=all"): (
+                0,
+                state["status"],
+            ),
+            ("merge-base", "--is-ancestor", training_commit, "HEAD"): (0, ""),
+            ("diff", "--name-only", training_commit, "HEAD"): (
+                0,
+                state["changed"] + "\n",
+            ),
+        }
+        return_code, stdout = responses[args]
+        return SimpleNamespace(returncode=return_code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return (
+        validate,
+        state,
+        calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
     )
-    return scope
 
 
-def test_complete_operator_notebook_is_unexecuted_and_ordered() -> None:
-    payload = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+def test_recovery_notebook_is_unexecuted_output_free_and_ast_valid() -> None:
+    payload, source = _notebook_source()
     code_cells = [cell for cell in payload["cells"] if cell["cell_type"] == "code"]
     assert code_cells
-    assert all(cell["execution_count"] is None and cell["outputs"] == [] for cell in code_cells)
+    assert all(
+        cell["execution_count"] is None and cell["outputs"] == [] for cell in code_cells
+    )
     for cell in code_cells:
         ast.parse("".join(cell["source"]))
-    source = "\n".join("".join(cell["source"]) for cell in payload["cells"])
-    for identity in (
-        "f6a19d7a31c4c3bb73edd92088ea078192e88ee4b276309bad81c548ab7f94d5",
-        "cbe885f73a307065418ea80296d6cfd6d634edeb3281f503cf90e149800409e7",
-        "569a17b1316a47a0c95c42c649f4aab61f8fe8c9cf7d0582c411f544c9b23173",
-        "454747cd3e4b1376855915244a7c40fe281b758150e86f584fbea96f94d531f5",
+    assert "TRAINING_EVIDENCE_COMMIT = '82633d66e5ea47f96b149ea22cc192fcf4526f06'" in source
+    pin = re.search(r"OPERATOR_IMPLEMENTATION_COMMIT = '([^']+)'", source)
+    assert pin
+    assert pin.group(1) == "__OPERATOR_IMPLEMENTATION_COMMIT__" or re.fullmatch(
+        r"[0-9a-f]{40}", pin.group(1)
+    )
+    assert "input(" not in source
+    assert "drive.mount" not in source
+    assert "stage2_gate01_legacy_recovery_operator.py" in source
+
+
+def test_operator_scope_guard_separates_commits_and_rejects_training_diff() -> None:
+    _, source = _notebook_source()
+    for required in (
+        "merge-base",
+        "--is-ancestor",
+        "TRAINING_EVIDENCE_COMMIT",
+        "OPERATOR_IMPLEMENTATION_COMMIT",
+        "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py",
+        "src/fieldbridge/evaluation/stage2_unified_preflight.py",
+        "src/fieldbridge/models/",
+        "src/fieldbridge/training/",
+        "configs/",
+        "operator_diff_touches_training_critical_code",
+        "training_critical_code_byte_identical",
     ):
-        assert identity in source
-    required = [
-        "fit-stage2-photometry",
-        "audit-stage2-photometry",
-        "preflight-photometry-factored-latent-bank",
-        "build-photometry-factored-latent-bank",
-        "audit-photometry-factored-latent-bank",
-        "preflight-stage2-factored-domain-separability",
-        "audit-stage2-retrospective-pair-feasibility",
-        "train-stage2-unified",
-        "eval-stage2-unified",
-    ]
-    positions = [source.index(value) for value in required]
-    assert positions == sorted(positions)
-    assert source.count("AUTHORIZE_LONG_FULL_MODEL = False") == 1
-    assert source.count("AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False") == 1
-    assert "RUN_LONG_FULL_AND_BACKWARD_ABLATIONS" not in source
-    assert "a100-full-objective-gate-1" in source
-    assert "full-objective-pilot-20" in source
-    assert "full-objective-pilot-200" in source
-    assert source.index("a100-full-objective-gate-1") < source.index(
-        "full-objective-pilot-20"
-    ) < source.index("full-objective-pilot-200")
-    assert "a100_peak_allocated_limit_bytes': 72 * 1024**3" in source
-    assert "stage2-unified-a100-one-step-memory-gate-v1" in source
-    assert "stage2-unified-a100-qualification-only-exit-v1" in source
-    assert "--qualification-only" in source
-    assert "complete_validation_executed') is not False" in source
-    assert "a100_gate_checkpoint" not in source
-    assert "stage2-unified-term-wise-recomputation-v6" in source
-    assert "immediate_without_retain_graph" in source
-    assert "non_reentrant_rng_preserving_every_differentiable_call" in source
-    assert "saved_tensor_policy': 'save_on_cpu'" in source
-    assert "gradient_measurement_scope': 'pilot_steps_only'" in source
-    assert "long_run_hook_measurement': 'disabled_after_pilot'" in source
-    assert "run_resumable_training" in source
-    assert "stage2-colab-attempt-recovery-v1" in source
-    assert "stage2-colab-scientific-attempt-recovery-v2" in source
-    assert "scientific_attempts/attempt-" in source
-    assert "poisoned_without_checkpoint" in source
-    assert "not candidates and attempt_dir.exists() and any(attempt_dir.iterdir())" in source
-    assert "LOCAL_SCRATCH_ROOT = Path('/content/stage2_unified_v7_scratch')" in source
-    assert "drive_file_held_open_during_process': False" in source
-    assert "drive.mount('/content/drive', force_remount=True)" in source
-    assert "BANK_DIR = LOCAL_BANK_ROOT" in source
-    assert "BANK_DIR = output_root / 'photometry_factored_latent_bank_v2'" not in source
-    assert "stage2-colab-local-bank-staging-v1" in source
-    assert "drive_used_for_training_reads': False" in source
-    assert "publish_local_bank_no_clobber" in source
-    assert "tree_identity(BANK_ARCHIVE_DIR)" in source
-    assert ".open('a'" not in source
-    assert "No ablation is launched by this flag" in source
-    assert "Complete paired R/validation manifest with Stage-1 ceilings" not in source
-    assert "AUTHORIZE_FIT_AFTER" not in source
-    assert "AUTHORIZE_QUALIFICATION_AFTER" not in source
-    assert "descriptor_coupling': False" in source
-    assert "Path outside reviewed Windows root" in source
-    assert "classification_before_array_load" in source
-    assert "StarGAN_control_claim': False" in source
-    assert "learned_disentanglement_claim': False" in source
-    assert source.index("seal-stage2-long-run-evaluation-readiness") < source.index(
-        "AUTHORIZE_LONG_FULL_MODEL = False"
-    )
-    assert "find_latest_stage2_selection_receipt" in source
-    assert "--selection-receipt" in source
-    assert "FROZEN_VALIDATION_PLAN_SHA256" in source
-    assert "selected_best_checkpoint" in source
-    assert "final_checkpoint_diagnostic_only" in source
-    assert "import-stage2-gate01-p0006-evaluation" in source
-    assert "import-stage2-retrospective-paired-evaluation" in source
-    assert "Gate01Private_8012a3f" in source
-    assert "stage2_unified_validation_plan_v2.json" in source
-    assert "required_directed_domain_cell_count" in source
-    assert "validation_directed_domain_cell_count': 60" in source
-    assert "prospective_training_or_model_selection': False" in source
-    assert "development_validation_P0006_evaluation_only" in source
-    assert "development/model assessment only; cannot support population or generalization claims" in source
-    assert "frozen_and_unused_for_possible_later_confirmation" in source
-    assert "'P0009_executed': False" in source
-    assert "projected_training_plus_complete_validation" in source
-    assert "planned_validation_run_count" in source
-    assert "projected_validation_seconds" in source
-    assert "measured_complete_validation_directed_domain_cell_count" in source
-    assert "projected_total_hours" in source
-    assert "projected_total_gpu_cost_usd" in source
-    assert "peak_cuda_bytes_across_training_and_validation" in source
-    assert source.index("LONG_RUN_AUTHORIZATION_RESOURCE_ESTIMATE") < source.index(
-        "AUTHORIZE_LONG_FULL_MODEL = False"
-    )
-    prohibited_p0006_claims = re.compile(
-        r"(?:P:0006|P0006).{0,80}(?:held.?out|final|blind|independent.?test|definitive)"
-        r"|(?:held.?out|final|blind|independent.?test|definitive).{0,80}(?:P:0006|P0006)",
-        re.IGNORECASE,
-    )
-    assert prohibited_p0006_claims.search(source) is None
-    assert "MATERIALIZED_VALIDATION_ARRAYS_RAW" not in source
-    assert "BASELINE_SOURCE_ARTIFACT_RAW" not in source
-    assert "stage2_unified_full_retrospective_v2.yaml" not in source
-    assert 'stage2_unified_full_retrospective_v7.yaml' in source
-    assert "output_root / 'stage2_unified_v7'" in source
-    assert 'fine_grained_full_volume_v1' in source
-    assert 'outer_full_decoder_checkpoint' in source
-    assert 'one_step_anatomy_memory_qualification' in source
-    assert 'anatomy_cuda_peak_memory' in source
-    assert 'generator_optimizer_updates_per_step' in source
-    assert '_memory_checkpointed_decode' not in source
+        assert required in source
 
 
-def test_notebook_rotates_nonempty_precheckpoint_attempt_and_resumes_checkpoint(
+def test_gate01_metadata_preflight_precedes_every_expensive_recovery_operation() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    ast.parse(source)
+    topology_preflight = source.index("stage2_drive_layout = drive_retry")
+    disk_preflight = source.index("local_disk_capacity =")
+    preflight = source.index("gate01_preflight = drive_retry")
+    pair_preflight = source.index("pair_feasibility = drive_retry")
+    assert source.index("preflight_gate01_p0006_archive(", preflight) > preflight
+    for operation in (
+        "bank_restore = drive_retry",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "subprocess.Popen",
+        "import-stage2-gate01-p0006-evaluation",
+        "seal-stage2-long-run-evaluation-readiness",
+    ):
+        assert preflight < source.index(operation)
+    assert (
+        source.index("drive.mount")
+        < topology_preflight
+        < disk_preflight
+        < preflight
+        < pair_preflight
+    )
+    assert pair_preflight < source.index("bank_restore = drive_retry")
+    assert "resolve-exact-stage2-drive-layout" in source
+    assert "Early step-200 selection-receipt file SHA-256 mismatch" in source
+    assert "private_array_payloads_opened" in source
+    assert "early_gate01_metadata_preflight" in source
+
+
+def test_fresh_colab_dependency_import_preflight_precedes_drive_and_artifacts() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    dependency_preflight = source.index("dependency_versions = {}")
+    drive_mount = source.index('drive.mount("/content/drive")')
+    gate_preflight = source.index("gate01_preflight = drive_retry")
+    assert dependency_preflight < drive_mount < gate_preflight
+    for dependency in ('"numpy"', '"scipy"', '"torch"', '"yaml"'):
+        assert dependency in source[dependency_preflight:drive_mount]
+    assert "import fieldbridge.cli" in source[dependency_preflight:drive_mount]
+    assert "fresh_colab_dependency_import_preflight" in source
+    assert '"packages_installed_or_downloaded": False' in source
+
+
+def test_recovery_operator_uses_actual_drive_topology_and_completed_namespace() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert 'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f"' in source
+    assert (
+        'GATE01_PRIVATE_ARCHIVE_ROOT = DRIVE_ROOT / "Gate01Private_8012a3f" / "archive"'
+        not in source
+    )
+    assert 'OUTPUT_ROOT = DRIVE_ROOT / "UnifiedStage2_1ca2b4a_01"' in source
+    assert 'STAGE2_V7_ROOT = OUTPUT_ROOT / "stage2_unified_v7"' in source
+    assert 'BANK_NAMESPACE = STAGE2_V7_ROOT / "bank_8081ce89a0ea"' in source
+    assert 'TRAINING_NAMESPACE = BANK_NAMESPACE / "implementation_82633d66e5ea"' in source
+    assert 'BANK_ARCHIVE = OUTPUT_ROOT / "photometry_factored_latent_bank_v2.tar"' in source
+    assert (
+        'PAIR_FEASIBILITY = OUTPUT_ROOT / "stage2_retrospective_pair_feasibility_v2.json"'
+        in source
+    )
+    assert (
+        'UNRECEIPTED_BANK_DIRECTORY = OUTPUT_ROOT / "photometry_factored_latent_bank_v2"'
+        in source
+    )
+    assert 'STAGE2_V7_ROOT = DRIVE_ROOT / "stage2_unified_v7"' not in source
+    assert "unique_existing_directory" not in source
+    assert "unique_existing(" not in source
+    assert "attempt-0001" in source
+    assert "stage2_unified_full_selection_step000000200.json" in source
+    assert "c8d73fec48815224fcb87333dfd093c15738cc41dce89c4fb8ccf2cd874ef828" in source
+    assert "3afca2bab6a440529f88e7c8d9a9294fed9ecbf07eea1e308ed0910e2ba16421" in source
+    assert "fd15be634185a29d5ddedec3f2d7a24527bf5e59a49731f101f62cafcf1b06d6" in source
+
+
+def test_recovery_operator_pins_and_verifies_reviewed_bank_tar() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    for required in (
+        "78d323c02ceccdfcb054307da3c9e14575210869d22cade6c5ecd4afa4baf8d5",
+        "f9cb09bfa177a3e389f87f087b0d756a2709e2054559a39c85e8272d5e1cfaa3",
+        "8081ce89a0eac1522b4fb28cd7919de4a4ecf1d5af72552d141a0ee9b9944194",
+        "EXPECTED_BANK_FILE_COUNT = 3312",
+        "EXPECTED_BANK_TOTAL_BYTES = 12873486620",
+        "restore_verified_stage2_bank_tar",
+        "copy_verified_stage2_bank_tar_to_local",
+        "preflight_stage2_local_disk_capacity",
+        "LOCAL_BANK_ARCHIVE",
+        "CPU High-RAM",
+        '"gpu_used": False',
+        "progress_callback=emit_recovery_progress",
+        "ignored_empty_unreceipted_bank_directory",
+        "resolve_stage2_recovery_drive_layout",
+    ):
+        assert required in source
+    assert source.index("copy_verified_stage2_bank_tar_to_local(") < source.index(
+        "restore_verified_stage2_bank_tar("
+    )
+    assert (
+        "restore_verified_stage2_bank_tar(\n"
+        "        stage2_drive_layout.bank_archive"
+        not in source
+    )
+
+
+def test_existing_checkout_is_reused_only_through_read_only_validation(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    captured: list[list[str]] = []
-
-    def run_logged(command, log_path, operation):
-        del log_path, operation
-        captured.append(list(command))
-        return {'return_code': 0}
-
-    scope = _load_notebook_functions(
-        'replace_flag_value',
-        'run_resumable_training',
-        namespace={
-            'drive_retry': lambda label, operation: operation(),
-            'run_logged': run_logged,
-        },
+    (
+        validate,
+        _state,
+        calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
+    ) = _fake_checkout(monkeypatch, tmp_path)
+    first = validate(repo, repository_url, operator_commit, training_commit)
+    second = validate(repo, repository_url, operator_commit, training_commit)
+    assert first == second == {"changed_path_count": 1, "checkout_reused": True}
+    assert calls
+    assert not any(
+        args and args[0] in {"clone", "fetch", "checkout", "reset", "clean"}
+        for args in calls
     )
-    run_dir = tmp_path / 'run'
-    failed = run_dir / 'scientific_attempts' / 'attempt-0001'
-    failed.mkdir(parents=True)
-    (failed / 'history.jsonl').write_text('{"event":"oom_hard_stop"}\n')
-    command = [
-        'fieldbridge',
-        'train-stage2-unified',
-        '--checkpoint-dir',
-        str(run_dir / 'checkpoints'),
-        '--history-jsonl',
-        str(run_dir / 'history.jsonl'),
+
+    _, source = _notebook_source()
+    reuse_start = source.index("if checkout_reused:")
+    reuse_end = source.index("\nelse:", reuse_start)
+    reuse_branch = source[reuse_start:reuse_end]
+    for forbidden in ("git', 'clone", "git', 'fetch", "git', 'checkout", "rmtree"):
+        assert forbidden not in reuse_branch
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("status", "?? changed.py\n", "dirty"),
+        ("head", "c" * 40, "wrong commit"),
+        (
+            "origin",
+            "https://example.invalid/wrong.git",
+            "origin differs",
+        ),
+        ("changed", "src/fieldbridge/training/stage2_unified.py", "training_critical"),
+        ("attached", True, "detached HEAD"),
+    ],
+)
+def test_existing_checkout_rejects_dirty_wrong_or_training_changed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    (
+        validate,
+        state,
+        _calls,
+        repo,
+        repository_url,
+        operator_commit,
+        training_commit,
+    ) = _fake_checkout(monkeypatch, tmp_path)
+    state[field] = value
+    with pytest.raises(RuntimeError, match=message):
+        validate(repo, repository_url, operator_commit, training_commit)
+
+
+def test_operator_emits_count_only_progress_and_cpu_disk_guidance() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    for progress_stage in (
+        "bank_archive_local_copy",
+        "bank_archive_extraction",
+        "bank_tree_verification",
+    ):
+        assert progress_stage in importer_source
+    for required in (
+        "P0006_COUNT_PROGRESS_ENV",
+        "P0006_COUNT_PROGRESS_VALUE",
+        "emit_p0006_verification_progress",
+        "validate_p0006_count_progress",
+        "progress_callback=emit_p0006_verification_progress",
+        "verify_gate01_p0006_evaluation_protocol_streaming",
+        "visible_count_progress_only=True",
+        "early_local_disk_capacity_preflight",
+        "runtime_recommendation",
+        '"gpu_required": False',
+        '"gpu_used": False',
+    ):
+        assert required in source
+    assert "acquisition_node_count" in importer_source
+    assert 'stage = "p0006_streaming_verification"' in importer_source
+    assert "cases = list(gate_manifest)" not in importer_source
+    assert "load_gate01_p0006_evaluation_protocol" not in source
+    streaming_verifier = importer_source[
+        importer_source.index(
+            "def verify_gate01_p0006_evaluation_protocol_streaming"
+        ) : importer_source.index("def load_gate01_p0006_evaluation_protocol")
     ]
-    first = scope['run_resumable_training'](
-        command,
-        run_dir / 'checkpoints',
-        'stage2_unified_full_step*.pt',
-        run_dir / 'diagnostic.log',
-        'synthetic',
+    assert "PairedEvaluationCase" not in streaming_verifier
+    assert "baselines" not in streaming_verifier
+    assert "torch.Tensor" not in streaming_verifier
+    evidence_check = source.index("completed_evidence = verify_completed_stage2_pilot_evidence")
+    memory_release = source.index("released_object_count = gc.collect()")
+    import_subprocess = source.index('"import-stage2-gate01-p0006-evaluation"')
+    assert evidence_check < memory_release < import_subprocess
+    assert "sanitized_operation_failure" in source
+    assert '"archived_log_path"' in source
+    assert '"archived_log_sha256"' in source
+    assert '"termination_signal_number"' in source
+    assert '"termination_signal_name"' in source
+    assert '"external_process_termination_or_resource_kill_candidate"' in source
+    assert '"oom_claimed": False' in source
+    assert '"automatic_retry_performed": False' in source
+    progress_block = source[
+        source.index("def emit_recovery_progress"):
+        source.index("def load_self_hashed_json")
+    ]
+    for forbidden in ("path", "sha256", "identity", "subject", "fingerprint"):
+        assert f'"{forbidden}"' not in progress_block
+
+
+def test_operator_accepts_exact_final_streaming_verification_event(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "emit_p0006_verification_progress"
     )
-    assert first['attempt'] == 2
-    assert Path(first['checkpoint_dir']).parent.name == 'attempt-0002'
-    assert '--resume-from' not in captured[-1]
-    assert captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
-        'attempt-0002\\history.jsonl'
-    ) or captured[-1][captured[-1].index('--history-jsonl') + 1].endswith(
-        'attempt-0002/history.jsonl'
+    namespace = {
+        "json": json,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    payload = {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
+    namespace["emit_p0006_verification_progress"](payload)
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted == {"p0006_import_progress": payload}
+
+
+def test_sigkill_attempt_receipt_is_signal_aware_and_sanitized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"sanitize_p0006_subprocess_progress_line", "run_logged"}
+    ]
+    popen_calls = 0
+
+    class KilledProcess:
+        stdout = iter(["synthetic private log payload must stay archived\n"])
+
+        @staticmethod
+        def wait() -> int:
+            return -9
+
+    def popen(*_args, **_kwargs):
+        nonlocal popen_calls
+        popen_calls += 1
+        return KilledProcess()
+
+    subprocess_namespace = SimpleNamespace(
+        Popen=popen,
+        PIPE=subprocess.PIPE,
+        STDOUT=subprocess.STDOUT,
+        CalledProcessError=subprocess.CalledProcessError,
+    )
+    local_logs = tmp_path / "local-logs"
+    local_logs.mkdir()
+    namespace = {
+        "json": json,
+        "os": os,
+        "Path": Path,
+        "shutil": shutil,
+        "signal": signal,
+        "subprocess": subprocess_namespace,
+        "RECOVERY_NAMESPACE": tmp_path / "recovery",
+        "LOCAL_LOG_ROOT": local_logs,
+        "TRAINING_EVIDENCE_COMMIT": "8" * 40,
+        "OPERATOR_IMPLEMENTATION_COMMIT": "9" * 40,
+        "REPO_DIR": tmp_path,
+        "CLI_ENV": {},
+        "drive_retry": lambda _label, operation: operation(),
+        "sha256_file": sha256_file,
+        "sha256_json": sha256_json,
+        "write_json_atomic": write_json_atomic,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
     )
 
-    checkpoint_dir = Path(first['checkpoint_dir'])
-    checkpoint_dir.mkdir(parents=True)
-    checkpoint = checkpoint_dir / 'stage2_unified_full_step000000010.pt'
-    checkpoint.write_bytes(b'synthetic')
-    second = scope['run_resumable_training'](
-        command,
-        run_dir / 'checkpoints',
-        'stage2_unified_full_step*.pt',
-        run_dir / 'diagnostic.log',
-        'synthetic',
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        namespace["run_logged"](
+            ["python", "synthetic-import"],
+            "synthetic-p0006-import",
+            visible_count_progress_only=True,
+        )
+    assert caught.value.returncode == -9
+    assert popen_calls == 1
+    receipt_path = (
+        tmp_path
+        / "recovery/operation_attempts/synthetic-p0006-import/attempt-0001.receipt.json"
     )
-    assert second['attempt'] == 2
-    assert captured[-1][-2:] == ['--resume-from', str(checkpoint)]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["termination_signal_number"] == 9
+    assert receipt["termination_signal_name"] == "SIGKILL"
+    assert receipt["termination_classification"] == (
+        "external_process_termination_or_resource_kill_candidate"
+    )
+    assert receipt["oom_claimed"] is False
+    assert receipt["automatic_retry_performed"] is False
+    captured = capsys.readouterr().out
+    assert "synthetic private log payload" not in captured
+    assert '"termination_signal_number": 9' in captured
+    assert '"termination_signal_name": "SIGKILL"' in captured
+
+
+def test_subprocess_progress_forwarder_revalidates_closed_schema() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "sanitize_p0006_subprocess_progress_line"
+    )
+    namespace = {
+        "json": json,
+        "validate_p0006_count_progress": validate_p0006_count_progress,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    payload = {
+        "stage": "p0006_streaming_verification",
+        "status": "end",
+        "case_count": 60,
+        "expected_case_count": 60,
+        "acquisition_node_count": 15,
+    }
+    line = json.dumps({"p0006_import_progress": payload})
+    sanitized = namespace["sanitize_p0006_subprocess_progress_line"](line)
+    assert json.loads(sanitized) == {"p0006_import_progress": payload}
+    with pytest.raises(ValueError, match="forbidden fields"):
+        namespace["sanitize_p0006_subprocess_progress_line"](
+            json.dumps({"p0006_import_progress": {**payload, "subject": "private"}})
+        )
+
+
+def _operator_retry_functions():
+    source = OPERATOR.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "_RETRYABLE_DRIVE_ERRNOS"
+            for target in node.targets
+        ):
+            selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in {
+            "is_retryable_drive_transport_failure",
+            "drive_retry",
+        }:
+            selected.append(node)
+    namespace = {
+        "errno": errno,
+        "time": SimpleNamespace(sleep=lambda _seconds: None),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+def test_drive_retry_does_not_retry_deterministic_missing_artifact() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def missing():
+        nonlocal calls
+        calls += 1
+        raise FileNotFoundError("deterministic reviewed artifact is missing")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(FileNotFoundError, match="deterministic"):
+        namespace["drive_retry"]("missing", missing)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_drive_retry_does_not_retry_reviewed_module_schema_failure() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def invalid_schema():
+        nonlocal calls
+        calls += 1
+        raise ValueError("reviewed module comparison evidence has an incorrect key set")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(ValueError, match="comparison evidence"):
+        namespace["drive_retry"]("gate01-metadata-preflight", invalid_schema)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_drive_retry_does_not_retry_gate01_result_integrity_failure() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def invalid_result():
+        nonlocal calls
+        calls += 1
+        raise ValueError("Gate 0.1 result byte snapshot SHA-256 differs")
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    with pytest.raises(ValueError, match="byte snapshot"):
+        namespace["drive_retry"]("gate01-metadata-preflight", invalid_result)
+    assert calls == 1
+    assert remounts == 0
+
+
+def test_result_snapshot_validation_precedes_private_or_expensive_work() -> None:
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    preflight = importer_source[
+        importer_source.index("def _preflight_gate01_p0006_archive") :
+        importer_source.index("def _assert_p0006_metadata")
+    ]
+    snapshot_check = preflight.index("_load_verified_gate01_result_snapshot")
+    assert snapshot_check < preflight.index("load_gate01_input_manifest")
+    assert snapshot_check < preflight.index("_assert_gate_arrays_inside_archive")
+
+    operator_source = OPERATOR.read_text(encoding="utf-8")
+    preflight_call = operator_source.index("gate01_preflight = drive_retry")
+    for later_operation in (
+        "bank_restore = drive_retry",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "subprocess.Popen",
+        "import-stage2-gate01-p0006-evaluation",
+    ):
+        assert preflight_call < operator_source.index(later_operation)
+
+
+def test_reviewed_module_schema_check_is_inside_early_metadata_preflight() -> None:
+    operator_source = OPERATOR.read_text(encoding="utf-8")
+    importer_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_unified_gate01_p0006.py"
+    ).read_text(encoding="utf-8")
+    preflight_definition = importer_source[
+        importer_source.index("def preflight_gate01_p0006_archive") :
+        importer_source.index("def import_gate01_p0006_evaluation_protocol")
+    ]
+    linkage_definition = importer_source[
+        importer_source.index("def _verify_supplemental_linkage") :
+        importer_source.index("def _json_loads_without_duplicate_keys")
+    ]
+    assert "_verify_supplemental_linkage(layout, lock)" in preflight_definition
+    assert "_load_reviewed_module_comparison_evidence" in linkage_definition
+    preflight_call = operator_source.index("gate01_preflight = drive_retry")
+    for later_operation in (
+        "bank_restore = drive_retry",
+        "completed_evidence = verify_completed_stage2_pilot_evidence",
+        "import-stage2-gate01-p0006-evaluation",
+    ):
+        assert preflight_call < operator_source.index(later_operation)
+
+
+def test_drive_retry_keeps_bounded_transport_retry_and_remount() -> None:
+    namespace = _operator_retry_functions()
+    calls = 0
+    remounts = 0
+
+    def transient_then_pass():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise OSError(errno.EIO, "mock Drive transport failure")
+        return "pass"
+
+    def mount(*_args, **_kwargs):
+        nonlocal remounts
+        remounts += 1
+
+    namespace["drive"] = SimpleNamespace(mount=mount)
+    assert namespace["drive_retry"]("transport", transient_then_pass) == "pass"
+    assert calls == 3
+    assert remounts == 2
+
+
+def test_old_and_new_implementation_scoped_checkouts_can_coexist_read_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    validate = _checkout_validator()
+    training_commit = "a" * 40
+    repository_url = "https://github.com/GuillermoTafoya/MRIxFields.git"
+    commits = ("c26df4ca" + "1" * 32, "d" * 40)
+    checkouts = {
+        (tmp_path / f"recovery-v8-{commit[:12]}").resolve(): commit
+        for commit in commits
+    }
+    for checkout in checkouts:
+        checkout.mkdir()
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+
+    def fake_run(command, **kwargs):
+        cwd = Path(kwargs["cwd"]).resolve()
+        args = tuple(command[1:])
+        calls.append((cwd, args))
+        responses = {
+            ("rev-parse", "--is-inside-work-tree"): (0, "true\n"),
+            ("rev-parse", "--show-toplevel"): (0, str(cwd) + "\n"),
+            ("remote",): (0, "origin\n"),
+            ("remote", "get-url", "--all", "origin"): (0, repository_url + "\n"),
+            ("rev-parse", "HEAD"): (0, checkouts[cwd] + "\n"),
+            ("symbolic-ref", "-q", "HEAD"): (1, ""),
+            ("status", "--porcelain=v1", "--untracked-files=all"): (0, ""),
+            ("merge-base", "--is-ancestor", training_commit, "HEAD"): (0, ""),
+            ("diff", "--name-only", training_commit, "HEAD"): (
+                0,
+                "docs/recovery.md\n",
+            ),
+        }
+        return_code, stdout = responses[args]
+        return SimpleNamespace(returncode=return_code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    for checkout, commit in checkouts.items():
+        assert validate(checkout, repository_url, commit, training_commit) == {
+            "changed_path_count": 1,
+            "checkout_reused": True,
+        }
+    assert all(checkout.is_dir() for checkout in checkouts)
+    assert not any(
+        args and args[0] in {"fetch", "checkout", "reset", "clean"}
+        for _, args in calls
+    )
+    _, source = _notebook_source()
+    assert (
+        "MRIxFields-stage2-gate01-recovery-v8-' + "
+        "OPERATOR_IMPLEMENTATION_COMMIT[:12]"
+    ) in source
+
+
+def test_same_runtime_receipt_excludes_transient_resume_observations() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert '"local_disk_capacity_preflight": stable_local_capacity_receipt' in source
+    assert '"local_bank_archive": stable_local_archive_receipt' in source
+    assert '"bank_archive_tree": stable_bank_tree_receipt' in source
+    normalization = source[
+        source.index("stable_local_capacity_receipt ="):
+        source.index("recovery_receipt =")
+    ]
+    for transient in (
+        "copied_from_source",
+        "copy_and_sha256_same_pass",
+        "exact_local_resume_verified",
+        "restored_from_tar",
+    ):
+        assert transient in normalization
+    receipt = source[source.index("recovery_receipt ="):]
+    assert '"local_disk_capacity_preflight": local_disk_capacity.to_dict()' not in receipt
+    assert '"local_bank_archive": local_bank_archive_identity' not in receipt
+    assert '"bank_archive_tree": bank_archive_identity' not in receipt
+
+
+def test_recovery_operator_reuses_without_training_and_writes_new_namespace_only() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    assert "verify_completed_stage2_pilot_evidence" in source
+    assert '"training_reused": True' in source
+    assert '"training_invoked": False' in source
+    assert "recovery_training_" in source
+    assert '"training_namespace_read_only": True' in source
+    assert "TRAINING_NAMESPACE.mkdir" not in source
+    assert "train-stage2-unified" not in source
+    assert "--device" not in source
+    assert "cuda" not in source.casefold()
+    assert '"pip"' not in source.casefold()
+    assert "pip install" not in source.casefold()
+    assert "restore_verified_stage2_bank_tar" in source
+    assert "restore_bank_archive_to_scratch" not in source
+    assert 'LOCAL_SCRATCH_ROOT = Path("/content/stage2_gate01_recovery_v8_scratch")' in source
+    assert '"archive_copied_to_local_scratch"' in source
+    assert '"bank_extracted_from_tar"' in source
+    assert '"local_bank_reused"' in source
+    assert '"completed_evidence_configuration_override"' in source
+    assert '"completed_evidence_resolved_config_file_sha256"' in source
+    assert '"completed_evidence_effective_normalized_config_sha256"' in source
+    assert '"stage2_gate01_recovery_receipt_v2.json"' in source
+    assert "drive_retry" in source
+    assert "archive_no_clobber" in source
+    assert "refuse_existing=True" in source
+    assert "Existing recovery receipt changed" in source
+    assert "e626623355b9275e38705357b0ff0fe707b44e25" in source
+    assert "recovery_training_82633d66e5ea_operator_e626623355b9" in source
+    assert "PREDECESSOR_P0006_EVALUATION_PROTOCOL" in source
+    assert "reuse_verified_gate01_p0006_predecessor_protocol" in source
+    assert '"p0006_import_invoked": False' in source
+    assert '"predecessor_protocol_reused": True' in source
+    assert '"predecessor_namespace_read_only": True' in source
+    assert '"exact_byte_equality": True' in source
+    assert '"p0006_protocol_origin": p0006_protocol_origin' in source
+    assert ".glob(" not in source
+    assert ".rglob(" not in source
+
+
+def test_pinned_predecessor_routing_reuses_or_imports_without_fallback() -> None:
+    tree = ast.parse(OPERATOR.read_text(encoding="utf-8"))
+    route = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "current_protocol_present"
+    )
+    assert len(route.orelse) == 1 and isinstance(route.orelse[0], ast.If)
+    predecessor_branch = route.orelse[0]
+    assert isinstance(predecessor_branch.test, ast.Name)
+    assert predecessor_branch.test.id == "predecessor_protocol_present"
+    reuse_source = ast.unparse(predecessor_branch.body)
+    import_source = ast.unparse(predecessor_branch.orelse)
+    assert "reuse_verified_gate01_p0006_predecessor_protocol" in reuse_source
+    assert "run_logged" not in reuse_source
+    assert "import-stage2-gate01-p0006-evaluation" in import_source
+    assert "run_logged" in import_source
+    assert "verify_gate01_p0006_evaluation_protocol_streaming" in import_source
+
+
+def test_p0006_origin_receipt_is_exact_and_self_hashed() -> None:
+    tree = ast.parse(OPERATOR.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "validate_p0006_protocol_origin"
+    )
+    predecessor = "e626623355b9275e38705357b0ff0fe707b44e25"
+    namespace = {
+        "sha256_json": sha256_json,
+        "PREDECESSOR_OPERATOR_IMPLEMENTATION_COMMIT": predecessor,
+        "P0006_PREDECESSOR_OPERATOR_COMMIT": predecessor,
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+            str(OPERATOR),
+            "exec",
+        ),
+        namespace,
+    )
+    protocol_sha256 = "a" * 64
+    body = {
+        "contract_version": "stage2-gate01-p0006-pinned-predecessor-protocol-reuse-v1",
+        "predecessor_operator_commit": predecessor,
+        "predecessor_namespace_read_only": True,
+        "source_protocol_file_sha256": protocol_sha256,
+        "destination_protocol_file_sha256": protocol_sha256,
+        "exact_byte_equality": True,
+        "p0006_import_invoked": False,
+        "predecessor_protocol_reused": True,
+    }
+    provenance = {**body, "provenance_sha256": sha256_json(body)}
+    validate = namespace["validate_p0006_protocol_origin"]
+    assert validate(provenance, protocol_sha256) == provenance
+    with pytest.raises(RuntimeError, match="schema changed"):
+        validate({**provenance, "unexpected": 1}, protocol_sha256)
+    with pytest.raises(RuntimeError, match="self-hash changed"):
+        validate({**provenance, "provenance_sha256": "0" * 64}, protocol_sha256)
+
+
+def test_recovery_continues_after_final_streaming_event_to_sealed_stop() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    final_progress_contract = source.index("validate_p0006_count_progress(payload)")
+    streaming_verification = source.index(
+        "p0006_streaming_verification =", final_progress_contract
+    )
+    scientific_role = source.index(
+        "Recovered P:0006 protocol changed its scientific role", streaming_verification
+    )
+    readiness = source.index("if LONG_RUN_EVALUATION_READINESS.exists()", scientific_role)
+    recovery_receipt = source.index("recovery_receipt =", readiness)
+    final_stop = source.index("STOP_FOR_RESOURCE_BOUNDED_TRAINING_DESIGN_REVIEW")
+    assert (
+        final_progress_contract
+        < streaming_verification
+        < scientific_role
+        < readiness
+        < recovery_receipt
+        < final_stop
+    )
+    final_block = source[recovery_receipt:]
+    assert '"training_reused": True' in final_block
+    assert '"training_invoked": False' in final_block
+    assert '"long_run_training_authorized": False' in final_block
+    assert '"gpu_used": False' in final_block
+
+
+def test_recovery_operator_preserves_scientific_role_and_stops_before_long_run() -> None:
+    source = OPERATOR.read_text(encoding="utf-8")
+    for required in (
+        "P0006_DEVELOPMENT_VALIDATION_DATA_ROLE",
+        "P0006_EVIDENCE_LIMITATION",
+        "population_or_generalization_claims_authorized",
+        '"P0009_executed": False',
+        '"descriptor_coupling": False',
+        '"learned_disentanglement_claim": False',
+        '"StarGAN_control_claim": False',
+        "AUTHORIZE_100K_TRAINING = False",
+        "AUTHORIZE_LONG_FULL_MODEL = False",
+        "AUTHORIZE_BACKWARD_ABLATIONS_AFTER_FULL_REVIEW = False",
+        "STOP_FOR_RESOURCE_BOUNDED_TRAINING_DESIGN_REVIEW",
+    ):
+        assert required in source
+    assert (
+        P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
+        == "development_validation_P0006_evaluation_only"
+    )
+    assert P0006_EVIDENCE_LIMITATION == (
+        "development/model assessment only; cannot support population or "
+        "generalization claims"
+    )
+    assert (
+        P0009_CONFIRMATION_STATUS
+        == "frozen_and_unused_for_possible_later_confirmation"
+    )
 
 
 def test_full_config_uses_reviewed_initial_weights() -> None:
@@ -244,24 +957,24 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         "domain": 0.1,
     }
     assert config.batch_size == 1
-    assert config.precision == 'bf16'
+    assert config.precision == "bf16"
     assert config.integration_steps == 4
-    assert config.integration_solver == 'heun'
-    assert config.decoder_activation_checkpoint_mode == 'fine_grained_full_volume_v1'
-    assert payload['training']['decoder_activation_checkpoint'][
-        'outer_full_decoder_checkpoint'
-    ] == 'forbidden'
-    assert payload['training']['generator_gradient_accumulation'][
-        'optimizer_updates_per_step'
+    assert config.integration_solver == "heun"
+    assert config.decoder_activation_checkpoint_mode == "fine_grained_full_volume_v1"
+    assert payload["training"]["decoder_activation_checkpoint"][
+        "outer_full_decoder_checkpoint"
+    ] == "forbidden"
+    assert payload["training"]["generator_gradient_accumulation"][
+        "optimizer_updates_per_step"
     ] == 1
-    accumulation = payload['training']['generator_gradient_accumulation']
-    assert accumulation['contract'] == 'stage2-unified-term-wise-recomputation-v6'
-    assert accumulation['graph_construction'] == 'one_term_at_a_time'
-    assert accumulation['backward'] == 'immediate_without_retain_graph'
-    assert accumulation['saved_tensor_policy'] == 'save_on_cpu'
-    assert accumulation['gradient_measurement_scope'] == 'pilot_steps_only'
-    assert accumulation['long_run_hook_measurement'] == 'disabled_after_pilot'
-    assert payload['training']['pilot']['a100_peak_allocated_limit_bytes'] == (
+    accumulation = payload["training"]["generator_gradient_accumulation"]
+    assert accumulation["contract"] == "stage2-unified-term-wise-recomputation-v6"
+    assert accumulation["graph_construction"] == "one_term_at_a_time"
+    assert accumulation["backward"] == "immediate_without_retain_graph"
+    assert accumulation["saved_tensor_policy"] == "save_on_cpu"
+    assert accumulation["gradient_measurement_scope"] == "pilot_steps_only"
+    assert accumulation["long_run_hook_measurement"] == "disabled_after_pilot"
+    assert payload["training"]["pilot"]["a100_peak_allocated_limit_bytes"] == (
         72 * 1024**3
     )
     assert config.critic_space == "latent"
@@ -290,7 +1003,9 @@ def test_full_config_uses_reviewed_initial_weights() -> None:
         )
 
 
-def test_baseline_manifest_rejects_p_before_array_open(monkeypatch, tmp_path: Path) -> None:
+def test_baseline_manifest_rejects_p_before_array_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     case = PairedEvaluationCase(
         case_identity="R_case",
         source=torch.zeros(1, 2, 2, 2),

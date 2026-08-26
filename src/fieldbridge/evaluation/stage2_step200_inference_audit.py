@@ -13,15 +13,18 @@ import copy
 import csv
 import gc
 import hashlib
+import inspect
 import io
 import json
 import math
 import os
 import platform
 import re
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -31,6 +34,7 @@ import numpy as np
 import torch
 
 from fieldbridge.config import load_yaml_config
+from fieldbridge.data import photometry_factorization as _photometry
 from fieldbridge.data.domains import CONTRASTS, FIELD_STRENGTHS_T, Contrast, Domain
 from fieldbridge.data.latent_bank import encode_latent
 from fieldbridge.data.photometry_factored_bank_dataset import (
@@ -81,14 +85,17 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v3"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v4"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
 CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
 MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v1"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v3"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v4"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
 FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT = "stage2-step200-frozen-stage1-vae-provenance-v1"
+REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT = (
+    "stage2-step200-reviewed-photometry-namespace-provenance-v1"
+)
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
 RUN_FINGERPRINT = "c814c948a5b85bd3a694db7c8e074894e97c16a96a36acbfa6f370faf2dac0aa"
@@ -100,6 +107,37 @@ INFERENCE_SEED = 20_260_825
 A100_MAX_PEAK_ALLOCATED_BYTES = 72 * 1024**3
 STAGE1_RUN_C_CONFIG_SIZE_BYTES = 4_290
 STAGE1_RUN_C_CONFIG_BASENAME = "stage1-run-c.yaml"
+REVIEWED_PHOTOMETRY_ROLE = "frozen_stage2_photometry_factorization_v1"
+REVIEWED_PHOTOMETRY_BASENAME = "stage2_photometry_factorization_v1.json"
+REVIEWED_PHOTOMETRY_FILE_SHA256 = (
+    "de5bd993f34056873a5bc176c9320ff55040c80fa888c224e037a520478009ca"
+)
+REVIEWED_PHOTOMETRY_ARTIFACT_SHA256 = (
+    "076baade3b1f4250124071dc572c40d012b0345f6a62c3e7c1de4283eb2ee923"
+)
+REVIEWED_PHOTOMETRY_PRODUCTION_COMMIT = "1ca2b4a170ad8186b02d44a814e279c9c0e02cb5"
+PROTECTED_PHOTOMETRY_MODULE_SHA256 = (
+    "e4be9c63f4e2b5044678ea1204fee5fe1dfbeda4508a71cf91af159d7e4c6f5e"
+)
+HISTORICAL_PHOTOMETRY_OPERATOR_OVERLAY_SHA256 = (
+    "a43dfbfa8febb89daf1308fd8b945957cc200e62d8ca286555634c9437aef5d4"
+)
+REVIEWED_NAMESPACE_PREDICATE_SOURCE_SHA256 = (
+    "3d5e4dc687aecd2b330f573f6d97b342327477db6f1a12783b43c94e8818b81f"
+)
+REVIEWED_PHOTOMETRY_ACCEPTED_RECORD_COUNT = 1_560
+REVIEWED_PHOTOMETRY_PROSPECTIVE_EXCLUDED_COUNT = 30
+REVIEWED_PHOTOMETRY_RETROSPECTIVE_COLLISION_COUNT = 6
+REVIEWED_PHOTOMETRY_COLLISION_GROUP_COUNTS = {
+    "0f8f0768d3538fb451949ace1532421724771ccf3d18de3f6ac778a033d20d64": 3,
+    "85c0a97a21f7b9a87027508520bd930a0195d267a78f42ed13a1e0e84d989786": 3,
+}
+_PINNED_PHOTOMETRY_OPERATOR_OVERLAY_SHA256 = (
+    "a43dfbfa8febb89daf1308fd8b945957cc200e62d8ca286555634c9437aef5d4"
+)
+_PINNED_NAMESPACE_PREDICATE_SOURCE_SHA256 = (
+    "3d5e4dc687aecd2b330f573f6d97b342327477db6f1a12783b43c94e8818b81f"
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_RE = re.compile(r"[0-9a-f]{40}")
 _METHOD_ORDER = (
@@ -113,6 +151,28 @@ _METHOD_ORDER = (
 )
 _METRICS = ("nrmse", "ssim", "lpips")
 _LOWER_IS_BETTER = {"nrmse": True, "ssim": False, "lpips": True, "edge_mae": True}
+
+
+def _namespace_aware_forbidden_traveller(record_identity, subject_identity):
+    upper = str(record_identity).upper()
+    return any(
+        f"P_{traveller}" in upper or f"P:{traveller}" in upper
+        for traveller in _photometry.FORBIDDEN_TRAVELLER_IDS
+    )
+
+
+_BASE_PHOTOMETRY_FORBIDDEN_TRAVELLER = _photometry._is_forbidden_traveller
+_REVIEWED_NAMESPACE_PREDICATE = _namespace_aware_forbidden_traveller
+_REVIEWED_NAMESPACE_PREDICATE_SOURCE = inspect.getsource(
+    _namespace_aware_forbidden_traveller
+)
+_REVIEWED_NAMESPACE_PREDICATE_CODE = (
+    _namespace_aware_forbidden_traveller.__code__.co_code,
+    _namespace_aware_forbidden_traveller.__code__.co_consts,
+    _namespace_aware_forbidden_traveller.__code__.co_names,
+)
+_PHOTOMETRY_NAMESPACE_LOCK = threading.Lock()
+_PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +239,71 @@ class FrozenStage1VAEProvenance:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewedPhotometryPreflight:
+    """Fully validated frozen artifact under the sealed historical namespace rule."""
+
+    path: Path
+    artifact: FrozenPhotometryArtifact
+    artifact_file_sha256: str
+    artifact_internal_sha256: str
+    accepted_records_sha256: str
+    excluded_records_sha256: str
+    accepted_record_count: int
+    prospective_accepted_count: int
+    prospective_excluded_count: int
+    retrospective_numeric_collision_count: int
+    collision_group_counts: Mapping[str, int]
+
+    def sanitized_provenance(self) -> dict[str, Any]:
+        return {
+            "contract_version": REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT,
+            "artifact_role": REVIEWED_PHOTOMETRY_ROLE,
+            "artifact_file_sha256": self.artifact_file_sha256,
+            "artifact_internal_sha256": self.artifact_internal_sha256,
+            "artifact_production_commit": REVIEWED_PHOTOMETRY_PRODUCTION_COMMIT,
+            "protected_base_module_sha256": PROTECTED_PHOTOMETRY_MODULE_SHA256,
+            "historical_operator_overlay_sha256": (
+                HISTORICAL_PHOTOMETRY_OPERATOR_OVERLAY_SHA256
+            ),
+            "namespace_predicate_source_sha256": (
+                REVIEWED_NAMESPACE_PREDICATE_SOURCE_SHA256
+            ),
+            "accepted_records_sha256": self.accepted_records_sha256,
+            "excluded_records_sha256": self.excluded_records_sha256,
+            "accepted_record_count": self.accepted_record_count,
+            "prospective_accepted_count": self.prospective_accepted_count,
+            "prospective_excluded_count": self.prospective_excluded_count,
+            "retrospective_numeric_collision_count": (
+                self.retrospective_numeric_collision_count
+            ),
+            "retrospective_collision_group_counts": dict(
+                sorted(self.collision_group_counts.items())
+            ),
+            "compatibility_scope_restored": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedPhotometryBankProvenance:
+    """Preflighted artifact cross-checked against the restored bank manifest."""
+
+    preflight: ReviewedPhotometryPreflight
+    bank_dir: Path
+    bank_manifest_artifact_file_sha256: str
+    bank_manifest_artifact_sha256: str
+
+    def sanitized_provenance(self) -> dict[str, Any]:
+        return {
+            **self.preflight.sanitized_provenance(),
+            "bank_manifest_artifact_file_sha256": (
+                self.bank_manifest_artifact_file_sha256
+            ),
+            "bank_manifest_artifact_sha256": self.bank_manifest_artifact_sha256,
+            "bank_photometry_identity_match": True,
+        }
+
+
 class Step200CaseInferenceRuntime(Protocol):
     device: torch.device
     gpu_identity: Mapping[str, Any]
@@ -207,8 +332,13 @@ class UnifiedStep200InferenceRuntime:
     device: torch.device
     gpu_identity: Mapping[str, Any]
     frozen_stage1_vae_provenance: Mapping[str, Any]
+    reviewed_photometry_provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        if photometry_namespace_compatibility_active():
+            raise RuntimeError(
+                "Photometry compatibility scope leaked into model construction."
+            )
         if self.device.type != "cuda":
             raise ValueError("The production step-200 inference runtime requires CUDA.")
         for module in (self.translator, self.encoder, self.decoder):
@@ -521,6 +651,294 @@ def build_frozen_step200_inference_plan(protocol: Mapping[str, Any]) -> FrozenSt
     return FrozenStep200InferencePlan(body)
 
 
+def photometry_namespace_compatibility_active() -> bool:
+    """Expose only the compatibility-scope state for containment assertions."""
+
+    return _PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE
+
+
+def _verify_reviewed_photometry_code_boundary() -> None:
+    module_path = Path(str(_photometry.__file__)).resolve(strict=True)
+    checkout_root = Path(__file__).resolve().parents[3]
+    expected_path = (
+        checkout_root / "src/fieldbridge/data/photometry_factorization.py"
+    ).resolve(strict=True)
+    if module_path != expected_path:
+        raise ValueError(
+            "Active photometry module is outside the detached implementation checkout."
+        )
+    if sha256_file(module_path) != PROTECTED_PHOTOMETRY_MODULE_SHA256:
+        raise ValueError("Protected base photometry module SHA-256 mismatch.")
+    if _photometry._is_forbidden_traveller is not _BASE_PHOTOMETRY_FORBIDDEN_TRAVELLER:
+        raise RuntimeError("Protected photometry namespace helper was substituted.")
+    if (
+        _namespace_aware_forbidden_traveller is not _REVIEWED_NAMESPACE_PREDICATE
+        or inspect.getsource(_namespace_aware_forbidden_traveller)
+        != _REVIEWED_NAMESPACE_PREDICATE_SOURCE
+        or (
+            _namespace_aware_forbidden_traveller.__code__.co_code,
+            _namespace_aware_forbidden_traveller.__code__.co_consts,
+            _namespace_aware_forbidden_traveller.__code__.co_names,
+        )
+        != _REVIEWED_NAMESPACE_PREDICATE_CODE
+    ):
+        raise RuntimeError("Reviewed photometry namespace predicate was substituted.")
+    if (
+        HISTORICAL_PHOTOMETRY_OPERATOR_OVERLAY_SHA256
+        != _PINNED_PHOTOMETRY_OPERATOR_OVERLAY_SHA256
+    ):
+        raise ValueError("Historical photometry operator-overlay identity changed.")
+    if (
+        REVIEWED_NAMESPACE_PREDICATE_SOURCE_SHA256
+        != _PINNED_NAMESPACE_PREDICATE_SOURCE_SHA256
+    ):
+        raise ValueError("Reviewed photometry namespace-predicate identity changed.")
+
+
+@contextmanager
+def _reviewed_photometry_namespace_scope():
+    """Temporarily replay exactly the reviewed traveller-namespace predicate."""
+
+    global _PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE
+    if not _PHOTOMETRY_NAMESPACE_LOCK.acquire(blocking=False):
+        raise RuntimeError("Nested or concurrent photometry compatibility scope is forbidden.")
+    installed = False
+    try:
+        if _PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE:
+            raise RuntimeError("Nested photometry compatibility scope is forbidden.")
+        _verify_reviewed_photometry_code_boundary()
+        _PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE = True
+        _photometry._is_forbidden_traveller = _REVIEWED_NAMESPACE_PREDICATE
+        installed = True
+        yield
+        if _photometry._is_forbidden_traveller is not _REVIEWED_NAMESPACE_PREDICATE:
+            raise RuntimeError("Photometry compatibility helper changed inside its scope.")
+    finally:
+        if installed:
+            _photometry._is_forbidden_traveller = _BASE_PHOTOMETRY_FORBIDDEN_TRAVELLER
+        _PHOTOMETRY_NAMESPACE_SCOPE_ACTIVE = False
+        restored = (
+            _photometry._is_forbidden_traveller
+            is _BASE_PHOTOMETRY_FORBIDDEN_TRAVELLER
+        )
+        _PHOTOMETRY_NAMESPACE_LOCK.release()
+        if installed and not restored:
+            raise RuntimeError("Protected photometry namespace helper was not restored.")
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key in frozen photometry artifact: {key!r}.")
+        result[key] = value
+    return result
+
+
+def _parse_reviewed_photometry_snapshot(raw_bytes: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(
+            raw_bytes.decode("utf-8-sig"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Frozen photometry artifact JSON is malformed.") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Frozen photometry artifact root must be a JSON object.")
+    return payload
+
+
+def _validate_reviewed_photometry_membership(
+    artifact: FrozenPhotometryArtifact,
+) -> tuple[str, str, dict[str, int]]:
+    provenance = artifact.provenance
+    accepted_raw = provenance.get("accepted_records")
+    excluded_raw = provenance.get("excluded_prospective_records")
+    if (
+        not isinstance(accepted_raw, Sequence)
+        or isinstance(accepted_raw, (str, bytes))
+        or not isinstance(excluded_raw, Sequence)
+        or isinstance(excluded_raw, (str, bytes))
+    ):
+        raise ValueError("Reviewed photometry membership evidence is malformed.")
+    accepted = [dict(item) for item in accepted_raw if isinstance(item, Mapping)]
+    excluded = [dict(item) for item in excluded_raw if isinstance(item, Mapping)]
+    if len(accepted) != len(accepted_raw) or len(excluded) != len(excluded_raw):
+        raise ValueError("Reviewed photometry membership evidence contains malformed rows.")
+    if len(accepted) != REVIEWED_PHOTOMETRY_ACCEPTED_RECORD_COUNT:
+        raise ValueError("Reviewed photometry accepted-record count changed.")
+    if len(excluded) != REVIEWED_PHOTOMETRY_PROSPECTIVE_EXCLUDED_COUNT:
+        raise ValueError("Reviewed photometry prospective-exclusion count changed.")
+    accepted_sha = str(provenance.get("accepted_records_sha256", ""))
+    excluded_sha = str(provenance.get("excluded_prospective_records_sha256", ""))
+    if sha256_json(accepted) != accepted_sha:
+        raise ValueError("Reviewed photometry accepted-record content hash mismatch.")
+    if sha256_json(excluded) != excluded_sha:
+        raise ValueError("Reviewed photometry excluded-record content hash mismatch.")
+
+    collision_counts: dict[str, int] = defaultdict(int)
+    for item in accepted:
+        identity = _photometry.classify_variant_a_cohort(
+            case_identity=str(item.get("record_identity", "")),
+            metadata_prefix=item.get("metadata_prefix"),
+            supplied_cohort=item.get("cohort"),
+            subject_identity=item.get("subject_identity"),
+            allowed_cohorts=("R",),
+        )
+        if item.get("split") != "train":
+            raise ValueError("Reviewed photometry accepted a non-R/train record.")
+        if item.get("subject_group_identity") != identity.subject_group_identity:
+            raise ValueError("Reviewed photometry subject grouping changed.")
+        if _REVIEWED_NAMESPACE_PREDICATE(
+            identity.case_identity, identity.subject_identity
+        ):
+            raise ValueError("Reviewed photometry accepted a prospective traveller token.")
+        if str(identity.subject_identity).zfill(4) in _photometry.FORBIDDEN_TRAVELLER_IDS:
+            group_hash = hashlib.sha256(
+                identity.subject_group_identity.encode("utf-8")
+            ).hexdigest()
+            collision_counts[group_hash] += 1
+
+    normalized_excluded = _photometry.normalize_variant_a_prospective_exclusions(
+        excluded, expected_split="train"
+    )
+    if normalized_excluded != excluded:
+        raise ValueError("Reviewed photometry prospective exclusions are not canonical.")
+    proof = provenance.get("eligibility_proof")
+    if (
+        not isinstance(proof, Mapping)
+        or proof.get("accepted_count") != REVIEWED_PHOTOMETRY_ACCEPTED_RECORD_COUNT
+        or proof.get("all_cohort_R") is not True
+        or proof.get("all_split_train") is not True
+        or proof.get("prospective_accepted_count") != 0
+        or proof.get("prospective_excluded_count")
+        != REVIEWED_PHOTOMETRY_PROSPECTIVE_EXCLUDED_COUNT
+        or proof.get("forbidden_traveller_accepted_count") != 0
+    ):
+        raise ValueError("Reviewed photometry eligibility proof changed.")
+    if dict(sorted(collision_counts.items())) != dict(
+        sorted(REVIEWED_PHOTOMETRY_COLLISION_GROUP_COUNTS.items())
+    ):
+        raise ValueError("Reviewed photometry retrospective collision membership changed.")
+    return accepted_sha, excluded_sha, dict(collision_counts)
+
+
+def preflight_reviewed_photometry_namespace_artifact(
+    photometry_artifact_path: str | Path,
+) -> ReviewedPhotometryPreflight:
+    """Validate the small frozen artifact before bank, checkpoint, model, or CUDA I/O."""
+
+    path = Path(photometry_artifact_path)
+    if not path.exists():
+        raise FileNotFoundError("Frozen reviewed photometry artifact is missing.")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Frozen reviewed photometry artifact is not a regular file.")
+    if path.name != REVIEWED_PHOTOMETRY_BASENAME:
+        raise ValueError("Frozen reviewed photometry artifact path role is incorrect.")
+    raw_bytes = path.read_bytes()
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if raw_sha256 != REVIEWED_PHOTOMETRY_FILE_SHA256:
+        raise ValueError("Frozen reviewed photometry artifact raw-file SHA-256 mismatch.")
+    payload = _parse_reviewed_photometry_snapshot(raw_bytes)
+    stored_internal_sha256 = str(payload.get("artifact_sha256", ""))
+    internal_body = dict(payload)
+    internal_body.pop("artifact_sha256", None)
+    if (
+        stored_internal_sha256 != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256
+        or sha256_json(internal_body) != stored_internal_sha256
+    ):
+        raise ValueError("Frozen reviewed photometry artifact internal SHA-256 mismatch.")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Frozen reviewed photometry artifact provenance is malformed.")
+    if provenance.get("code_commit") != REVIEWED_PHOTOMETRY_PRODUCTION_COMMIT:
+        raise ValueError("Frozen reviewed photometry artifact production commit changed.")
+    code_provenance = provenance.get("code_provenance")
+    module_hashes = (
+        code_provenance.get("module_sha256")
+        if isinstance(code_provenance, Mapping)
+        else None
+    )
+    if (
+        not isinstance(module_hashes, Mapping)
+        or module_hashes.get("src/fieldbridge/data/photometry_factorization.py")
+        != PROTECTED_PHOTOMETRY_MODULE_SHA256
+    ):
+        raise ValueError("Frozen photometry code-provenance module hash changed.")
+    _verify_reviewed_photometry_code_boundary()
+    with _reviewed_photometry_namespace_scope():
+        artifact = FrozenPhotometryArtifact.load(
+            path,
+            expected_artifact_sha256=REVIEWED_PHOTOMETRY_ARTIFACT_SHA256,
+        )
+    if photometry_namespace_compatibility_active():
+        raise RuntimeError("Photometry compatibility scope leaked after artifact loading.")
+    if (
+        path.read_bytes() != raw_bytes
+        or sha256_file(path) != REVIEWED_PHOTOMETRY_FILE_SHA256
+    ):
+        raise ValueError("Frozen reviewed photometry artifact changed during preflight.")
+    if artifact.artifact_sha256 != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256:
+        raise ValueError("Frozen reviewed photometry in-memory identity changed.")
+    accepted_sha, excluded_sha, collision_counts = (
+        _validate_reviewed_photometry_membership(artifact)
+    )
+    return ReviewedPhotometryPreflight(
+        path=path,
+        artifact=artifact,
+        artifact_file_sha256=raw_sha256,
+        artifact_internal_sha256=artifact.artifact_sha256,
+        accepted_records_sha256=accepted_sha,
+        excluded_records_sha256=excluded_sha,
+        accepted_record_count=REVIEWED_PHOTOMETRY_ACCEPTED_RECORD_COUNT,
+        prospective_accepted_count=0,
+        prospective_excluded_count=REVIEWED_PHOTOMETRY_PROSPECTIVE_EXCLUDED_COUNT,
+        retrospective_numeric_collision_count=sum(collision_counts.values()),
+        collision_group_counts=collision_counts,
+    )
+
+
+def verify_reviewed_photometry_bank_provenance(
+    preflight: ReviewedPhotometryPreflight,
+    *,
+    bank_dir: str | Path,
+) -> ReviewedPhotometryBankProvenance:
+    """Cross-check the preflighted immutable artifact against the restored bank."""
+
+    if (
+        sha256_file(preflight.path) != REVIEWED_PHOTOMETRY_FILE_SHA256
+        or preflight.artifact_file_sha256 != REVIEWED_PHOTOMETRY_FILE_SHA256
+    ):
+        raise ValueError("Frozen reviewed photometry artifact raw-file SHA-256 mismatch.")
+    if (
+        preflight.artifact.artifact_sha256 != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256
+        or preflight.artifact_internal_sha256
+        != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256
+    ):
+        raise ValueError("Frozen reviewed photometry in-memory identity changed.")
+    if photometry_namespace_compatibility_active():
+        raise RuntimeError("Photometry compatibility scope leaked into bank verification.")
+    bank_path = Path(bank_dir)
+    bank = PhotometryFactoredLatentBankIndex(bank_path, "validation")
+    manifest_photometry = bank.manifest.get("photometry")
+    if not isinstance(manifest_photometry, Mapping):
+        raise ValueError("Restored bank manifest lacks photometry provenance.")
+    manifest_file_sha256 = str(
+        manifest_photometry.get("artifact_file_sha256", "")
+    )
+    if manifest_file_sha256 != REVIEWED_PHOTOMETRY_FILE_SHA256:
+        raise ValueError("Restored bank manifest photometry file SHA-256 mismatch.")
+    manifest_artifact_sha256 = str(manifest_photometry.get("artifact_sha256", ""))
+    if manifest_artifact_sha256 != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256:
+        raise ValueError("Restored bank manifest photometry internal SHA-256 mismatch.")
+    return ReviewedPhotometryBankProvenance(
+        preflight=preflight,
+        bank_dir=bank_path,
+        bank_manifest_artifact_file_sha256=manifest_file_sha256,
+        bank_manifest_artifact_sha256=manifest_artifact_sha256,
+    )
+
+
 def preflight_frozen_stage1_run_c_config(
     vae_config_path: str | Path,
 ) -> FrozenStage1VAEConfigPreflight:
@@ -621,13 +1039,43 @@ def load_unified_step200_inference_runtime(
     bank_dir: str | Path,
     device: str | torch.device = "cuda",
     verified_vae_provenance: FrozenStage1VAEProvenance | None = None,
+    verified_photometry_provenance: ReviewedPhotometryBankProvenance | None = None,
 ) -> UnifiedStep200InferenceRuntime:
-    """Authenticate frozen VAE inputs, then extract only verified inference state."""
+    """Authenticate frozen inputs before extracting only verified inference state."""
 
     vae_config_path = Path(vae_config_path)
     vae_checkpoint_path = Path(vae_checkpoint_path)
     bank_dir = Path(bank_dir)
     config_preflight = preflight_frozen_stage1_run_c_config(vae_config_path)
+    artifact_path = Path(photometry_artifact_path)
+    if verified_photometry_provenance is None:
+        photometry_preflight = preflight_reviewed_photometry_namespace_artifact(
+            artifact_path
+        )
+    else:
+        photometry_preflight = verified_photometry_provenance.preflight
+        if (
+            photometry_preflight.path.resolve(strict=True)
+            != artifact_path.resolve(strict=True)
+            or verified_photometry_provenance.bank_dir.resolve(strict=True)
+            != bank_dir.resolve(strict=True)
+        ):
+            raise ValueError(
+                "Preflighted reviewed photometry operational role changed before loading."
+            )
+    current_photometry_provenance = verify_reviewed_photometry_bank_provenance(
+        photometry_preflight,
+        bank_dir=bank_dir,
+    )
+    if (
+        verified_photometry_provenance is not None
+        and verified_photometry_provenance.sanitized_provenance()
+        != current_photometry_provenance.sanitized_provenance()
+    ):
+        raise ValueError("Preflighted reviewed photometry provenance changed before loading.")
+    if photometry_namespace_compatibility_active():
+        raise RuntimeError("Photometry compatibility scope leaked before model loading.")
+
     current_vae_provenance = verify_frozen_stage1_vae_bank_provenance(
         config_preflight,
         vae_checkpoint_path=vae_checkpoint_path,
@@ -744,14 +1192,13 @@ def load_unified_step200_inference_runtime(
     del vae_state
     gc.collect()
 
-    artifact_path = Path(photometry_artifact_path)
-    if sha256_file(artifact_path) != bank.manifest.get("photometry", {}).get(
-        "artifact_file_sha256"
-    ):
-        raise ValueError("Frozen photometry artifact and restored bank disagree.")
-    artifact = FrozenPhotometryArtifact.load(artifact_path)
-    if artifact.artifact_sha256 != bank.manifest.get("photometry", {}).get("artifact_sha256"):
-        raise ValueError("Frozen photometry artifact identity changed.")
+    if sha256_file(artifact_path) != REVIEWED_PHOTOMETRY_FILE_SHA256:
+        raise ValueError("Frozen reviewed photometry artifact changed before runtime use.")
+    artifact = current_photometry_provenance.preflight.artifact
+    if artifact.artifact_sha256 != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256:
+        raise ValueError("Frozen reviewed photometry in-memory identity changed.")
+    if photometry_namespace_compatibility_active():
+        raise RuntimeError("Photometry compatibility scope leaked into runtime use.")
     device_obj = torch.device(device)
     if device_obj.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Step-200 inference audit requires an NVIDIA A100 CUDA runtime.")
@@ -779,6 +1226,9 @@ def load_unified_step200_inference_runtime(
         device=device_obj,
         gpu_identity=gpu_identity,
         frozen_stage1_vae_provenance=current_vae_provenance.sanitized_provenance(),
+        reviewed_photometry_provenance=(
+            current_photometry_provenance.sanitized_provenance()
+        ),
     )
 
 
@@ -813,6 +1263,12 @@ def run_step200_p0006_inference_audit(
         "synthetic_test_runtime"
     ) is True:
         raise ValueError("Production inference audit lacks frozen Stage-1 VAE provenance.")
+    if require_a100 and _runtime_reviewed_photometry_provenance(runtime).get(
+        "synthetic_test_runtime"
+    ) is True:
+        raise ValueError("Production inference audit lacks reviewed photometry provenance.")
+    if photometry_namespace_compatibility_active():
+        raise RuntimeError("Photometry compatibility scope leaked into the inference audit.")
     protocol_path = Path(protocol_path)
     readiness_path = Path(evaluation_readiness_path)
     if sha256_file(protocol_path) != P0006_PROTOCOL_FILE_SHA256:
@@ -873,6 +1329,10 @@ def run_step200_p0006_inference_audit(
         for streamed in iter_gate01_p0006_evaluation_cases(
             protocol_path, progress_callback=progress_callback
         ):
+            if photometry_namespace_compatibility_active():
+                raise RuntimeError(
+                    "Photometry compatibility scope leaked into the case loop."
+                )
             case = streamed.case
             case_hash = hashlib.sha256(case.case_id.encode("utf-8")).hexdigest()
             receipt_path = receipt_dir / f"case_{case_hash}.json"
@@ -1406,6 +1866,9 @@ def _build_inference_summary(
         "lpips_provenance_sha256": sha256_json(lpips_receipt),
         "lpips_post_audit": dict(lpips_post_audit),
         "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
+        "reviewed_photometry_provenance": (
+            _runtime_reviewed_photometry_provenance(runtime)
+        ),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
@@ -1561,6 +2024,9 @@ def _seal_artifact_manifest(
         "lpips_provenance": dict(lpips_receipt),
         "lpips_post_audit": dict(lpips_post_audit),
         "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
+        "reviewed_photometry_provenance": (
+            _runtime_reviewed_photometry_provenance(runtime)
+        ),
         "run_contract_sha256": run_contract["run_contract_sha256"],
         "render_library_versions": {
             "python": platform.python_version(),
@@ -1593,7 +2059,7 @@ def _run_contract(
     lpips_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v3",
+        "contract_version": "stage2-step200-p0006-inference-run-v4",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
@@ -1605,6 +2071,9 @@ def _run_contract(
         "dependency_environment_sha256": sha256_json(dependency_receipt),
         "lpips_provenance_sha256": sha256_json(lpips_receipt),
         "frozen_stage1_vae_provenance": _runtime_frozen_stage1_vae_provenance(runtime),
+        "reviewed_photometry_provenance": (
+            _runtime_reviewed_photometry_provenance(runtime)
+        ),
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
@@ -1648,6 +2117,85 @@ def _runtime_frozen_stage1_vae_provenance(
         or _SHA256_RE.fullmatch(str(body["parsed_canonical_config_sha256"])) is None
     ):
         raise ValueError("Frozen Stage-1 VAE runtime provenance identity changed.")
+    return copy.deepcopy(body)
+
+
+def _runtime_reviewed_photometry_provenance(
+    runtime: Step200CaseInferenceRuntime,
+) -> dict[str, Any]:
+    provenance = getattr(runtime, "reviewed_photometry_provenance", None)
+    if provenance is None:
+        return {"synthetic_test_runtime": True}
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Reviewed photometry runtime provenance is malformed.")
+    body = dict(provenance)
+    expected_keys = {
+        "contract_version",
+        "artifact_role",
+        "artifact_file_sha256",
+        "artifact_internal_sha256",
+        "artifact_production_commit",
+        "protected_base_module_sha256",
+        "historical_operator_overlay_sha256",
+        "namespace_predicate_source_sha256",
+        "accepted_records_sha256",
+        "excluded_records_sha256",
+        "accepted_record_count",
+        "prospective_accepted_count",
+        "prospective_excluded_count",
+        "retrospective_numeric_collision_count",
+        "retrospective_collision_group_counts",
+        "compatibility_scope_restored",
+        "bank_manifest_artifact_file_sha256",
+        "bank_manifest_artifact_sha256",
+        "bank_photometry_identity_match",
+    }
+    if set(body) != expected_keys:
+        raise ValueError("Reviewed photometry runtime provenance key inventory changed.")
+    count_fields = {
+        "accepted_record_count": REVIEWED_PHOTOMETRY_ACCEPTED_RECORD_COUNT,
+        "prospective_accepted_count": 0,
+        "prospective_excluded_count": REVIEWED_PHOTOMETRY_PROSPECTIVE_EXCLUDED_COUNT,
+        "retrospective_numeric_collision_count": (
+            REVIEWED_PHOTOMETRY_RETROSPECTIVE_COLLISION_COUNT
+        ),
+    }
+    if any(
+        isinstance(body[key], bool)
+        or not isinstance(body[key], int)
+        or body[key] != expected
+        for key, expected in count_fields.items()
+    ):
+        raise ValueError("Reviewed photometry runtime provenance counts changed.")
+    collision_groups = body["retrospective_collision_group_counts"]
+    if not isinstance(collision_groups, Mapping):
+        raise ValueError("Reviewed photometry collision-group provenance is malformed.")
+    if (
+        body["contract_version"]
+        != REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT
+        or body["artifact_role"] != REVIEWED_PHOTOMETRY_ROLE
+        or body["artifact_file_sha256"] != REVIEWED_PHOTOMETRY_FILE_SHA256
+        or body["artifact_internal_sha256"] != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256
+        or body["artifact_production_commit"]
+        != REVIEWED_PHOTOMETRY_PRODUCTION_COMMIT
+        or body["protected_base_module_sha256"]
+        != PROTECTED_PHOTOMETRY_MODULE_SHA256
+        or body["historical_operator_overlay_sha256"]
+        != HISTORICAL_PHOTOMETRY_OPERATOR_OVERLAY_SHA256
+        or body["namespace_predicate_source_sha256"]
+        != REVIEWED_NAMESPACE_PREDICATE_SOURCE_SHA256
+        or body["bank_manifest_artifact_file_sha256"]
+        != REVIEWED_PHOTOMETRY_FILE_SHA256
+        or body["bank_manifest_artifact_sha256"]
+        != REVIEWED_PHOTOMETRY_ARTIFACT_SHA256
+        or body["compatibility_scope_restored"] is not True
+        or body["bank_photometry_identity_match"] is not True
+        or dict(collision_groups)
+        != REVIEWED_PHOTOMETRY_COLLISION_GROUP_COUNTS
+        or _SHA256_RE.fullmatch(str(body["accepted_records_sha256"])) is None
+        or _SHA256_RE.fullmatch(str(body["excluded_records_sha256"])) is None
+    ):
+        raise ValueError("Reviewed photometry runtime provenance identity changed.")
     return copy.deepcopy(body)
 
 
@@ -1947,6 +2495,13 @@ __all__ = [
     "MONTAGE_SPECIFICATION_CONTRACT",
     "P0006_PROTOCOL_FILE_SHA256",
     "P0006_PROTOCOL_SHA256",
+    "PROTECTED_PHOTOMETRY_MODULE_SHA256",
+    "REVIEWED_NAMESPACE_PREDICATE_SOURCE_SHA256",
+    "REVIEWED_PHOTOMETRY_ARTIFACT_SHA256",
+    "REVIEWED_PHOTOMETRY_FILE_SHA256",
+    "REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT",
+    "ReviewedPhotometryBankProvenance",
+    "ReviewedPhotometryPreflight",
     "RUN_FINGERPRINT",
     "STAGE1_RUN_C_CONFIG_SIZE_BYTES",
     "STAGE1_RUN_C_CONFIG_BASENAME",
@@ -1955,7 +2510,10 @@ __all__ = [
     "UnifiedStep200InferenceRuntime",
     "build_frozen_step200_inference_plan",
     "load_unified_step200_inference_runtime",
+    "photometry_namespace_compatibility_active",
     "preflight_frozen_stage1_run_c_config",
+    "preflight_reviewed_photometry_namespace_artifact",
     "run_step200_p0006_inference_audit",
     "verify_frozen_stage1_vae_bank_provenance",
+    "verify_reviewed_photometry_bank_provenance",
 ]

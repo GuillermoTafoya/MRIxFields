@@ -639,12 +639,14 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     vae_path = tmp_path / "vae.pt"
     config_path = tmp_path / "resolved.json"
     vae_config_path = tmp_path / "stage1-run-c.yaml"
-    photo_path = tmp_path / "photometry.json"
+    photo_path = tmp_path / audit.REVIEWED_PHOTOMETRY_BASENAME
     for path in (checkpoint_path, vae_path, config_path, vae_config_path, photo_path):
         path.write_bytes(b"synthetic")
 
     monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SHA256", config_raw_sha)
     monkeypatch.setattr(audit, "STAGE1_RUN_C_CONFIG_SIZE_BYTES", len(b"synthetic"))
+    monkeypatch.setattr(audit, "REVIEWED_PHOTOMETRY_FILE_SHA256", photo_sha)
+    monkeypatch.setattr(audit, "REVIEWED_PHOTOMETRY_ARTIFACT_SHA256", "6" * 64)
     monkeypatch.setattr(audit, "_load_json", lambda _path: config)
     monkeypatch.setattr(audit, "load_yaml_config", lambda _path: vae_config)
     monkeypatch.setattr(
@@ -680,7 +682,34 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     monkeypatch.setattr(
         audit.FactoredLatentStats, "from_bank", lambda _path: SimpleNamespace()
     )
-    monkeypatch.setattr(audit.FrozenPhotometryArtifact, "load", lambda _path: artifact)
+    photo_preflight = audit.ReviewedPhotometryPreflight(
+        path=photo_path,
+        artifact=artifact,
+        artifact_file_sha256=photo_sha,
+        artifact_internal_sha256="6" * 64,
+        accepted_records_sha256="8" * 64,
+        excluded_records_sha256="9" * 64,
+        accepted_record_count=1_560,
+        prospective_accepted_count=0,
+        prospective_excluded_count=30,
+        retrospective_numeric_collision_count=6,
+        collision_group_counts=audit.REVIEWED_PHOTOMETRY_COLLISION_GROUP_COUNTS,
+    )
+    monkeypatch.setattr(
+        audit,
+        "preflight_reviewed_photometry_namespace_artifact",
+        lambda _path: photo_preflight,
+    )
+    monkeypatch.setattr(
+        audit,
+        "verify_reviewed_photometry_bank_provenance",
+        lambda preflight, *, bank_dir: audit.ReviewedPhotometryBankProvenance(
+            preflight=preflight,
+            bank_dir=Path(bank_dir),
+            bank_manifest_artifact_file_sha256=photo_sha,
+            bank_manifest_artifact_sha256="6" * 64,
+        ),
+    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
         torch.cuda,
@@ -705,6 +734,20 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     assert runtime.frozen_stage1_vae_provenance["parsed_canonical_config_sha256"] == sha256_json(
         vae_config
     )
+    assert (
+        runtime.reviewed_photometry_provenance["artifact_file_sha256"]
+        == photo_sha
+    )
+    assert (
+        runtime.reviewed_photometry_provenance["artifact_internal_sha256"]
+        == "6" * 64
+    )
+    assert (
+        runtime.reviewed_photometry_provenance[
+            "bank_manifest_artifact_file_sha256"
+        ]
+        == photo_sha
+    )
     run_contract = audit._run_contract(
         audit.FrozenStep200InferencePlan({"inference_plan_sha256": "9" * 64}),
         runtime,
@@ -716,6 +759,13 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     assert sealed_vae["raw_config_file_sha256"] == config_raw_sha
     assert sealed_vae["parsed_canonical_config_sha256"] == sha256_json(vae_config)
     assert "config_path" not in sealed_vae
+    sealed_photometry = run_contract["reviewed_photometry_provenance"]
+    assert sealed_photometry["contract_version"] == (
+        audit.REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT
+    )
+    assert sealed_photometry["accepted_record_count"] == 1_560
+    assert sealed_photometry["prospective_accepted_count"] == 0
+    assert "artifact_path" not in sealed_photometry
 
     checkpoint_state["_meta"] = {
         "git_commit": audit.TRAINING_EVIDENCE_COMMIT,

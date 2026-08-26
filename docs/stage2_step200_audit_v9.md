@@ -111,8 +111,36 @@ operator independently requires the bank manifest to name that same raw config i
 and requires both the VAE checkpoint file and manifest identity to equal
 `74132b9c514bb91b86d8eb43c63542780bce11304e31e67d3bf75c90ff5d4d79`
 before any checkpoint is deserialized or model is constructed. Audit protocol, run, and
-artifact-manifest contracts are v3 because no v2 owner audit output was produced before
-this provenance boundary was corrected.
+artifact-manifest contracts were v3 at this boundary because no v2 owner audit output
+was produced before the VAE provenance correction.
+
+The same early metadata phase now authenticates the exact direct-child
+`stage2_photometry_factorization_v1.json` before local-capacity checks, bank copying,
+bank extraction, checkpoint deserialization, model construction, private array access,
+or CUDA inference. The
+`stage2-step200-reviewed-photometry-namespace-provenance-v1` contract pins raw file
+SHA-256
+`de5bd993f34056873a5bc176c9320ff55040c80fa888c224e037a520478009ca`,
+internal artifact SHA-256
+`076baade3b1f4250124071dc572c40d012b0345f6a62c3e7c1de4283eb2ee923`,
+production commit `1ca2b4a170ad8186b02d44a814e279c9c0e02cb5`, the protected base
+module, the reviewed operator-overlay identity, and the exact historical
+namespace-predicate provenance. The base data module is not changed. A nonblocking
+compatibility scope temporarily replaces only `_is_forbidden_traveller` while the
+existing `FrozenPhotometryArtifact` machinery validates every numerical, eligibility,
+membership, content-hash, and provenance contract; a `finally` block restores the
+original function identity, and nested or concurrent use fails closed.
+
+This replay preserves cohort-qualified identity: six accepted retrospective records
+whose subject groups are `R:0006` or `R:0009` remain R/train, while every P record and
+every embedded prospective traveller token remains forbidden. The receipt records only
+counts and hashed subject groups, never record identities. It requires 1,560 accepted
+R/train rows, zero accepted P rows, 30 excluded P rows, and the exact two 3-record
+collision groups. After bank restoration the manifest must repeat both exact photometry
+hashes. The already validated in-memory artifact is passed to runtime construction and
+is rehashed immediately before use; it is never reloaded after model construction.
+Run, summary, and artifact-manifest contracts are v4 so exact resume/no-clobber rejects
+outputs that predate this provenance.
 
 The operator revalidates the complete step-200 evidence, the full checkpoint container,
 the frozen Stage-1 VAE, the R-only photometry/bank identities, the P:0006 protocol, and

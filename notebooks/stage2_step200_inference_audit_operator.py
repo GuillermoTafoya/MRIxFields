@@ -201,8 +201,10 @@ from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.evaluation.stage2_step200_inference_audit import (
     load_unified_step200_inference_runtime,
     preflight_frozen_stage1_run_c_config,
+    preflight_reviewed_photometry_namespace_artifact,
     run_step200_p0006_inference_audit,
     verify_frozen_stage1_vae_bank_provenance,
+    verify_reviewed_photometry_bank_provenance,
 )
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     copy_verified_stage2_bank_tar_to_local,
@@ -247,6 +249,28 @@ print(
             "stage": "frozen_stage1_run_c_config_preflight",
             "status": "pass",
             **vae_config_preflight.sanitized_provenance(),
+            "bank_copy_invoked": False,
+            "bank_extraction_invoked": False,
+            "checkpoint_deserialized": False,
+            "model_constructed": False,
+            "private_array_opened": False,
+            "inference_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
+
+photometry_preflight = preflight_reviewed_photometry_namespace_artifact(
+    PHOTOMETRY_ARTIFACT
+)
+print(
+    json.dumps(
+        {
+            "stage": "frozen_photometry_namespace_preflight",
+            "status": "pass",
+            **photometry_preflight.sanitized_provenance(),
             "bank_copy_invoked": False,
             "bank_extraction_invoked": False,
             "checkpoint_deserialized": False,
@@ -331,6 +355,26 @@ print(
     flush=True,
 )
 
+verified_photometry_provenance = verify_reviewed_photometry_bank_provenance(
+    photometry_preflight,
+    bank_dir=LOCAL_BANK_ROOT,
+)
+print(
+    json.dumps(
+        {
+            "stage": "frozen_photometry_bank_provenance",
+            "status": "pass",
+            **verified_photometry_provenance.sanitized_provenance(),
+            "checkpoint_deserialized": False,
+            "model_constructed": False,
+            "private_array_opened": False,
+            "inference_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+
 verified_vae_provenance = verify_frozen_stage1_vae_bank_provenance(
     vae_config_preflight,
     vae_checkpoint_path=VAE_CHECKPOINT,
@@ -383,6 +427,7 @@ runtime = load_unified_step200_inference_runtime(
     bank_dir=LOCAL_BANK_ROOT,
     device="cuda",
     verified_vae_provenance=verified_vae_provenance,
+    verified_photometry_provenance=verified_photometry_provenance,
 )
 result = run_step200_p0006_inference_audit(
     protocol_path=P0006_PROTOCOL,

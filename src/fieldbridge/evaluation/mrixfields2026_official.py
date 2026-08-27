@@ -185,6 +185,77 @@ def official_task3_lpips(
     return _finite_metric_result("lpips", result)
 
 
+class OfficialTask3LPIPSEvaluator:
+    """One frozen AlexNet LPIPS evaluator with unchanged Task-3 numerics.
+
+    The public official_task3_lpips function intentionally retains its historical
+    one-invocation construction behavior. Streaming audits can inject this bounded
+    evaluator so one already-authenticated network serves every case and method.
+    """
+
+    def __init__(self, network: Any, *, device: str) -> None:
+        import torch
+
+        self.device = resolve_official_lpips_device(device)
+        self.network = network.to(self.device)
+        if self.network.training:
+            raise RuntimeError(
+                "LPIPS constructor did not produce deterministic evaluation mode."
+            )
+        self.network.requires_grad_(False)
+        if self.network.training or any(
+            parameter.requires_grad for parameter in self.network.parameters()
+        ):
+            raise RuntimeError("LPIPS audit evaluator must be frozen in evaluation mode.")
+        self._torch = torch
+
+    def __call__(
+        self,
+        prediction: np.ndarray,
+        target: np.ndarray,
+        *,
+        slice_axis: int = 2,
+    ) -> float:
+        _validate_official_inputs(prediction, target)
+        pred_normalized = prediction.astype(np.float64) * 2.0 - 1.0
+        target_normalized = target.astype(np.float64) * 2.0 - 1.0
+
+        def evaluate_2d(pred_slice: np.ndarray, target_slice: np.ndarray) -> float:
+            pred_tensor = (
+                self._torch.from_numpy(pred_slice)
+                .float()
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(1, 3, 1, 1)
+                .to(self.device)
+            )
+            target_tensor = (
+                self._torch.from_numpy(target_slice)
+                .float()
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(1, 3, 1, 1)
+                .to(self.device)
+            )
+            with self._torch.no_grad():
+                return float(self.network(pred_tensor, target_tensor).item())
+
+        if prediction.ndim == 2:
+            return _finite_metric_result(
+                "lpips", evaluate_2d(pred_normalized, target_normalized)
+            )
+        values: list[float] = []
+        for index in range(prediction.shape[slice_axis]):
+            selection = [slice(None)] * prediction.ndim
+            selection[slice_axis] = index
+            key = tuple(selection)
+            if np.abs(target_normalized[key]).max() < 1e-10:
+                continue
+            values.append(evaluate_2d(pred_normalized[key], target_normalized[key]))
+        result = float(np.mean(values)) if values else 0.0
+        return _finite_metric_result("lpips", result)
+
+
 def evaluate_official_task3_pair(
     prediction_path: str | Path,
     target_path: str | Path,

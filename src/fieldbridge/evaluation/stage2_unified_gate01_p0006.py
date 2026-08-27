@@ -17,7 +17,7 @@ import re
 import shutil
 import tarfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -2197,6 +2197,7 @@ def validate_p0006_count_progress(payload: Mapping[str, Any]) -> dict[str, Any]:
     if payload.get("stage") not in {
         "p0006_import",
         "p0006_streaming_verification",
+        "p0006_streaming_evaluation",
         "p0006_load",
     }:
         raise ValueError("P:0006 progress stage is unsupported.")
@@ -2211,7 +2212,8 @@ def validate_p0006_count_progress(payload: Mapping[str, Any]) -> dict[str, Any]:
                 f"P:0006 progress field {field!r} must be a nonnegative integer."
             )
     if (
-        payload["stage"] == "p0006_streaming_verification"
+        payload["stage"]
+        in {"p0006_streaming_verification", "p0006_streaming_evaluation"}
         and payload["status"] == "end"
         and (
             payload.get("case_count") != 60
@@ -2531,6 +2533,34 @@ class _VerifiedP0006ProtocolContext:
     calibrator: PosthocTargetCalibrator
 
 
+@dataclass
+class P0006StreamingEvaluationCase:
+    """One releasable tensor-bearing case from the sealed P:0006 protocol.
+
+    Consumers must call :meth:`release` before requesting the next iterator item.
+    This explicit handoff is intentionally stricter than relying on allocator cleanup.
+    """
+
+    index: int
+    expected_case_count: int
+    case_receipt: dict[str, Any]
+    calibrator: PosthocTargetCalibrator
+    _case: Gate01Case | None
+
+    @property
+    def case(self) -> Gate01Case:
+        if self._case is None:
+            raise RuntimeError("P:0006 streaming case was already released.")
+        return self._case
+
+    @property
+    def released(self) -> bool:
+        return self._case is None
+
+    def release(self) -> None:
+        self._case = None
+
+
 def _load_verified_p0006_protocol_context(
     path: str | Path,
 ) -> _VerifiedP0006ProtocolContext:
@@ -2656,6 +2686,108 @@ def verify_gate01_p0006_evaluation_protocol_streaming(
         },
     )
     return protocol, summary
+
+
+def iter_gate01_p0006_evaluation_cases(
+    path: str | Path,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> Iterator[P0006StreamingEvaluationCase]:
+    """Yield one verified P:0006 case and forbid advancing before release.
+
+    The protocol/archive/calibrator graph is reverified first. Every yielded case is
+    compared with its sealed receipt before control reaches the consumer. The
+    iterator retains only counts and graph-node identities across yields.
+    """
+
+    progress = _resolve_p0006_count_progress_callback(progress_callback)
+    stage = "p0006_streaming_evaluation"
+    _emit_progress(
+        progress,
+        {"stage": stage, "status": "start", "case_count": 0, "expected_case_count": 60},
+    )
+    context = _load_verified_p0006_protocol_context(path)
+    protocol = context.protocol
+    expected_receipts = protocol.get("case_receipts")
+    if not isinstance(expected_receipts, list) or len(expected_receipts) != 60:
+        raise ValueError("P:0006 streaming evaluation requires 60 sealed case receipts.")
+    directed_cells: set[tuple[str, float, float]] = set()
+    acquisition_nodes: set[tuple[str, str]] = set()
+    case_ids: set[str] = set()
+    count = 0
+    iterator = iter(context.gate_manifest)
+    while True:
+        try:
+            gate_case = next(iterator)
+        except StopIteration:
+            break
+        receipt = _case_receipt(gate_case, context.calibrator)
+        if count >= len(expected_receipts) or receipt != expected_receipts[count]:
+            del gate_case
+            raise ValueError("P:0006 streaming case differs from its sealed receipt.")
+        if gate_case.case_id in case_ids:
+            del gate_case
+            raise ValueError("P:0006 streaming evaluation contains a duplicate case.")
+        directed_cells.add(
+            (
+                gate_case.source_domain.contrast.value,
+                float(gate_case.source_domain.field_strength_t),
+                float(gate_case.target_domain.field_strength_t),
+            )
+        )
+        acquisition_nodes.update(
+            (
+                (gate_case.source_domain.label, gate_case.array_sha256["source_image"]),
+                (gate_case.target_domain.label, gate_case.array_sha256["target"]),
+            )
+        )
+        case_ids.add(gate_case.case_id)
+        count += 1
+        item = P0006StreamingEvaluationCase(
+            index=count,
+            expected_case_count=60,
+            case_receipt=receipt,
+            calibrator=context.calibrator,
+            _case=gate_case,
+        )
+        try:
+            yield item
+        except GeneratorExit:
+            item.release()
+            raise
+        if not item.released:
+            item.release()
+            raise RuntimeError(
+                "P:0006 consumer requested the next case before releasing the current case."
+            )
+        del item
+        del gate_case
+        _emit_progress(
+            progress,
+            {
+                "stage": stage,
+                "status": "periodic",
+                "case_count": count,
+                "expected_case_count": 60,
+            },
+        )
+    if (
+        count != 60
+        or len(case_ids) != 60
+        or len(directed_cells) != 60
+        or len(acquisition_nodes) != 15
+    ):
+        raise ValueError("P:0006 streaming evaluation graph is incomplete or ambiguous.")
+    _emit_progress(
+        progress,
+        {
+            "stage": stage,
+            "status": "end",
+            "case_count": count,
+            "expected_case_count": 60,
+            "acquisition_node_count": len(acquisition_nodes),
+        },
+    )
 
 
 def reuse_verified_gate01_p0006_predecessor_protocol(
@@ -3982,6 +4114,7 @@ __all__ = [
     "P0006_PREDECESSOR_RECOVERY_NAMESPACE_NAME",
     "P0006_PREDECESSOR_REUSE_CONTRACT",
     "P0006_PROTOCOL_FILENAME",
+    "P0006StreamingEvaluationCase",
     "P0009_CONFIRMATION_STATUS",
     "REVIEWED_GATE01_RESULT_FILE_SHA256",
     "STAGE2_BANK_MANIFEST_FILENAME",
@@ -3999,6 +4132,7 @@ __all__ = [
     "VerifiedStage2LocalArchive",
     "copy_verified_stage2_bank_tar_to_local",
     "import_gate01_p0006_evaluation_protocol",
+    "iter_gate01_p0006_evaluation_cases",
     "load_gate01_p0006_evaluation_protocol",
     "preflight_stage2_local_disk_capacity",
     "preflight_gate01_p0006_archive",

@@ -1,0 +1,48 @@
+{
+  "authoritative_compatibility_sources": {
+    "authenticated_owner_runtime_observation": "fresh Colab A100 runtime observed after the standard-library hardware gate",
+    "lpips_pypi_release": "https://pypi.org/pypi/lpips/0.1.4/json",
+    "pytorch_version_pairing": "https://pytorch.org/get-started/previous-versions/",
+    "torchvision_alexnet_weights": "https://github.com/pytorch/vision/blob/main/torchvision/models/alexnet.py"
+  },
+  "contract_version": "stage2-step200-inference-audit-dependency-lock-v2",
+  "accepted_runtime_profile": {
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "observed_driver": "580.82.07",
+    "observed_python_patch": "3.13.15",
+    "python_cache_tag": "cpython-313",
+    "python_implementation": "CPython",
+    "python_major_minor": [
+      3,
+      13
+    ],
+    "torch": "2.11.0+cu128",
+    "torch_cuda": "12.8",
+    "torchvision": "0.26.0+cu128"
+  },
+  "notebook_install": {
+    "artifact_filename": "lpips-0.1.4-py3-none-any.whl",
+    "artifact_sha256": "fd537af5828b69d2e6ffc0a397bd506dbc28ca183543617690844c08e102ec5e",
+    "artifact_url": "https://files.pythonhosted.org/packages/9b/13/1df50c7925d9d2746702719f40e864f51ed66f307b20ad32392f1ad2bb87/lpips-0.1.4-py3-none-any.whl",
+    "distribution": "lpips",
+    "version": "0.1.4"
+  },
+  "preinstalled_runtime_packages": {
+    "PyYAML": "6.0.3",
+    "matplotlib": "3.10.0",
+    "nibabel": "5.4.2",
+    "numpy": "2.1.3",
+    "scikit-image": "0.25.2",
+    "scipy": "1.16.3"
+  },
+  "provenance_only_unqualified_profiles": [
+    {
+      "accepted": false,
+      "python": "3.12.13",
+      "reason": "not authenticated by the owner A100 runtime",
+      "torch": "2.8.0+cu126",
+      "torch_cuda": "12.6",
+      "torchvision": "0.23.0+cu126"
+    }
+  ]
+}

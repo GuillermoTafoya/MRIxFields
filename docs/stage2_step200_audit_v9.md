@@ -139,8 +139,8 @@ R/train rows, zero accepted P rows, 30 excluded P rows, and the exact two 3-reco
 collision groups. After bank restoration the manifest must repeat both exact photometry
 hashes. The already validated in-memory artifact is passed to runtime construction and
 is rehashed immediately before use; it is never reloaded after model construction.
-Run, summary, and artifact-manifest contracts are v6 so exact resume/no-clobber rejects
-outputs that predate this provenance.
+Run, summary, and artifact-manifest contracts are v7 so exact resume/no-clobber rejects
+outputs that predate the complete layout and decoder-range provenance.
 
 The inference boundary uses the sealed
 `stage2-step200-full-volume-layout-adapter-v1` contract. It accepts only one
@@ -154,11 +154,25 @@ legitimate singleton spatial dimension.
 Source-derived support is reduced only across validated leading singleton axes to
 `XYZ`, then represented as `11XYZ` for encoder/anatomy use. Every one-channel decoder
 result must be `11XYZ` with identical spatial axes and is restored to the exact
-authenticated canonical-context shape before primary, graph, or field-sweep rendering.
-All seven metric methods are then exposed to the unchanged official metrics as the
-same strict three-dimensional voxel array. The v2 one-case memory gate and v6 run,
-summary, and manifest receipts record only sanitized ranks and representation-safety
-flags, never voxel values or case identities.
+authenticated canonical-context shape.
+
+The protected Stage-1 decoder remains linear: its effective `output_activation` must
+be exactly `none`. The audit's closed
+`stage2-step200-decoder-evaluation-range-v1` boundary retains that raw float32 output
+for range diagnostics and the existing anatomy calculation, then provides photometry
+with exactly `clamp(raw_decoder_output,0,1)`. The same pointwise hard clamp is applied
+to the primary output, graph-direct and graph-composed outputs, and all five field-sweep
+outputs. It performs no sigmoid, tanh, normalization, percentile scaling, rescaling,
+cropping, padding, interpolation, or transposition, and it never clamps source, target,
+baseline, latent, or transport tensors.
+
+Case receipts keep separately named raw and bounded canonical tensor hashes and
+sanitized all-voxel/source-support overshoot counts, fractions, and extrema. The raw
+`decoded_canonical_sha256` meaning is unchanged. All seven metric methods receive the
+bounded rendered output as the same strict three-dimensional voxel array. The v3
+one-case memory gate, v2 case receipts, and v7 run, summary, and manifest contracts
+make earlier range-provenance-incomplete outputs incompatible with exact resume while
+never exposing voxel values or case identities.
 
 After Drive mount and before local-capacity checks or bank restoration, the operator
 authenticates the small sealed P:0006 protocol v4 and evaluation-readiness v3 byte

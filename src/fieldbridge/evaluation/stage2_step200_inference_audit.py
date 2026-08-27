@@ -90,12 +90,12 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v6"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v7"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
-CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
-MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v2"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v6"
+CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v2"
+MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v3"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v7"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
 FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT = "stage2-step200-frozen-stage1-vae-provenance-v1"
 REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT = (
@@ -106,6 +106,9 @@ FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT = (
 )
 FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT = (
     "stage2-step200-full-volume-layout-adapter-v1"
+)
+DECODER_EVALUATION_RANGE_CONTRACT = (
+    "stage2-step200-decoder-evaluation-range-v1"
 )
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
@@ -455,6 +458,272 @@ def _validate_full_volume_layout_provenance(value: Any) -> dict[str, Any]:
     return provenance
 
 
+_DECODER_RANGE_OBSERVATION_ROLES = frozenset(
+    {
+        "primary_unified_output",
+        "graph_direct_output",
+        "graph_composed_output",
+        *(f"field_sweep_{float(field):g}T" for field in FIELD_STRENGTHS_T),
+    }
+)
+_DECODER_RANGE_GRAPH_ROLES = frozenset(
+    {"graph_direct_output", "graph_composed_output"}
+)
+_DECODER_RANGE_SWEEP_ROLES = frozenset(
+    f"field_sweep_{float(field):g}T" for field in FIELD_STRENGTHS_T
+)
+
+
+def decoder_evaluation_range_policy() -> dict[str, Any]:
+    """Return the closed official evaluation-only range policy."""
+
+    return {
+        "contract_version": DECODER_EVALUATION_RANGE_CONTRACT,
+        "effective_decoder_output_activation": "none",
+        "raw_output_retained_for_diagnostics": True,
+        "photometry_input_rule": "clamp(raw_decoder_output,0,1)",
+        "transformation": "pointwise_hard_clamp",
+        "sigmoid_applied": False,
+        "tanh_applied": False,
+        "normalization_applied": False,
+        "percentile_scaling_applied": False,
+        "rescaling_applied": False,
+        "cropping_performed": False,
+        "padding_performed": False,
+        "interpolation_performed": False,
+        "transposition_performed": False,
+        "source_support_unchanged": True,
+        "training_invoked": False,
+    }
+
+
+def _validate_decoder_evaluation_range_policy(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Decoder evaluation-range policy is missing or malformed.")
+    policy = dict(value)
+    expected = decoder_evaluation_range_policy()
+    if set(policy) != set(expected) or policy != expected:
+        raise ValueError("Decoder evaluation-range policy changed.")
+    return policy
+
+
+def _require_linear_decoder_output_activation(decoder: torch.nn.Module) -> None:
+    if getattr(decoder, "output_activation", None) != "none":
+        raise ValueError(
+            "Frozen Stage-1 decoder effective output_activation must be exactly none."
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DecoderEvaluationRange:
+    """Raw linear decoder output plus its sole authorized evaluation view."""
+
+    raw: torch.Tensor
+    bounded: torch.Tensor
+    observation: dict[str, Any]
+
+
+def adapt_decoder_evaluation_range(
+    raw: torch.Tensor,
+    source_support: torch.Tensor,
+    *,
+    expected_shape: tuple[int, ...],
+    role: str,
+) -> DecoderEvaluationRange:
+    """Apply only the official pointwise hard clamp at a photometry boundary."""
+
+    if role not in _DECODER_RANGE_OBSERVATION_ROLES:
+        raise ValueError("Decoder evaluation-range role is not predeclared.")
+    raw_layout = adapt_full_volume_layout(
+        raw, role=f"{role} raw decoder output", expected_shape=expected_shape
+    )
+    if raw.dtype != torch.float32:
+        raise ValueError(f"{role} raw decoder output must be float32.")
+    if source_support.dtype != torch.bool:
+        raise ValueError(f"{role} source support must be boolean.")
+    support_layout = adapt_full_volume_layout(
+        source_support,
+        role=f"{role} immutable source support",
+        expected_shape=expected_shape,
+    )
+    raw_spatial = raw_layout.spatial_volume()
+    support_spatial = support_layout.spatial_volume()
+    if raw_spatial.shape != support_spatial.shape:
+        raise ValueError(f"{role} raw decoder output and source support disagree.")
+    supported_voxel_count = int(support_spatial.sum().item())
+    if supported_voxel_count <= 0:
+        raise ValueError(f"{role} source support is empty.")
+
+    below = raw_spatial < 0.0
+    above = raw_spatial > 1.0
+    voxel_count = int(raw_spatial.numel())
+    below_count = int(below.sum().item())
+    above_count = int(above.sum().item())
+    supported_below_count = int((below & support_spatial).sum().item())
+    supported_above_count = int((above & support_spatial).sum().item())
+
+    bounded = raw.clamp(0.0, 1.0)
+    if bounded.shape != raw.shape or bounded.dtype != raw.dtype:
+        raise RuntimeError(f"{role} official hard clamp changed shape or dtype.")
+    bounded_layout = adapt_full_volume_layout(
+        bounded,
+        role=f"{role} bounded photometry input",
+        expected_shape=expected_shape,
+    )
+    bounded_spatial = bounded_layout.spatial_volume()
+    bounded_min = float(bounded_spatial.min().item())
+    bounded_max = float(bounded_spatial.max().item())
+    if bounded_min < 0.0 or bounded_max > 1.0:
+        raise RuntimeError(f"{role} official hard clamp violated [0,1].")
+    if below_count == 0 and above_count == 0 and not torch.equal(bounded, raw):
+        raise RuntimeError(f"{role} in-range decoder output changed under hard clamp.")
+
+    observation = {
+        "role": role,
+        "voxel_count": voxel_count,
+        "supported_voxel_count": supported_voxel_count,
+        "raw_min": float(raw_spatial.min().item()),
+        "raw_max": float(raw_spatial.max().item()),
+        "raw_below_zero_count": below_count,
+        "raw_below_zero_fraction": below_count / voxel_count,
+        "raw_above_one_count": above_count,
+        "raw_above_one_fraction": above_count / voxel_count,
+        "supported_raw_below_zero_count": supported_below_count,
+        "supported_raw_below_zero_fraction": (
+            supported_below_count / supported_voxel_count
+        ),
+        "supported_raw_above_one_count": supported_above_count,
+        "supported_raw_above_one_fraction": (
+            supported_above_count / supported_voxel_count
+        ),
+        "bounded_min": bounded_min,
+        "bounded_max": bounded_max,
+        "raw_canonical_tensor_sha256": canonical_tensor_sha256(raw_spatial),
+        "bounded_canonical_tensor_sha256": canonical_tensor_sha256(bounded_spatial),
+    }
+    return DecoderEvaluationRange(
+        raw=raw,
+        bounded=bounded,
+        observation=_validate_decoder_range_observation(observation),
+    )
+
+
+def _validate_decoder_range_observation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Decoder range observation is missing or malformed.")
+    observation = dict(value)
+    expected_keys = {
+        "role",
+        "voxel_count",
+        "supported_voxel_count",
+        "raw_min",
+        "raw_max",
+        "raw_below_zero_count",
+        "raw_below_zero_fraction",
+        "raw_above_one_count",
+        "raw_above_one_fraction",
+        "supported_raw_below_zero_count",
+        "supported_raw_below_zero_fraction",
+        "supported_raw_above_one_count",
+        "supported_raw_above_one_fraction",
+        "bounded_min",
+        "bounded_max",
+        "raw_canonical_tensor_sha256",
+        "bounded_canonical_tensor_sha256",
+    }
+    if set(observation) != expected_keys:
+        raise ValueError("Decoder range observation key inventory changed.")
+    if observation.get("role") not in _DECODER_RANGE_OBSERVATION_ROLES:
+        raise ValueError("Decoder range observation role changed.")
+    voxel_count = observation.get("voxel_count")
+    supported_count = observation.get("supported_voxel_count")
+    count_keys = (
+        "raw_below_zero_count",
+        "raw_above_one_count",
+        "supported_raw_below_zero_count",
+        "supported_raw_above_one_count",
+    )
+    if (
+        isinstance(voxel_count, bool)
+        or not isinstance(voxel_count, int)
+        or voxel_count <= 0
+        or isinstance(supported_count, bool)
+        or not isinstance(supported_count, int)
+        or supported_count <= 0
+        or supported_count > voxel_count
+    ):
+        raise ValueError("Decoder range observation voxel counts changed.")
+    for key in count_keys:
+        count = observation.get(key)
+        limit = supported_count if key.startswith("supported_") else voxel_count
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= limit:
+            raise ValueError("Decoder range observation overshoot counts changed.")
+    fraction_pairs = (
+        ("raw_below_zero_fraction", "raw_below_zero_count", voxel_count),
+        ("raw_above_one_fraction", "raw_above_one_count", voxel_count),
+        (
+            "supported_raw_below_zero_fraction",
+            "supported_raw_below_zero_count",
+            supported_count,
+        ),
+        (
+            "supported_raw_above_one_fraction",
+            "supported_raw_above_one_count",
+            supported_count,
+        ),
+    )
+    for fraction_key, count_key, denominator in fraction_pairs:
+        fraction = observation.get(fraction_key)
+        if (
+            isinstance(fraction, bool)
+            or not isinstance(fraction, (int, float))
+            or not math.isfinite(float(fraction))
+            or not math.isclose(
+                float(fraction), int(observation[count_key]) / denominator, abs_tol=1e-15
+            )
+        ):
+            raise ValueError("Decoder range observation overshoot fractions changed.")
+    for key in ("raw_min", "raw_max", "bounded_min", "bounded_max"):
+        number = observation.get(key)
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(float(number))
+        ):
+            raise ValueError("Decoder range observation extrema changed.")
+    if (
+        float(observation["raw_min"]) > float(observation["raw_max"])
+        or float(observation["bounded_min"]) < 0.0
+        or float(observation["bounded_max"]) > 1.0
+        or float(observation["bounded_min"]) > float(observation["bounded_max"])
+    ):
+        raise ValueError("Decoder range observation bounds changed.")
+    for key in ("raw_canonical_tensor_sha256", "bounded_canonical_tensor_sha256"):
+        if _SHA256_RE.fullmatch(str(observation.get(key, ""))) is None:
+            raise ValueError("Decoder range observation tensor identity changed.")
+    return observation
+
+
+def _validate_decoder_range_observations(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Decoder range observations are missing or malformed.")
+    observations = {
+        str(role): _validate_decoder_range_observation(observation)
+        for role, observation in value.items()
+    }
+    if set(observations) - _DECODER_RANGE_OBSERVATION_ROLES:
+        raise ValueError("Decoder range observations contain an unknown role.")
+    if "primary_unified_output" not in observations:
+        raise ValueError("Decoder range observations lack the primary output.")
+    graph_roles = set(observations) & _DECODER_RANGE_GRAPH_ROLES
+    if graph_roles and graph_roles != _DECODER_RANGE_GRAPH_ROLES:
+        raise ValueError("Decoder graph range observations are incomplete.")
+    sweep_roles = set(observations) & _DECODER_RANGE_SWEEP_ROLES
+    if sweep_roles and sweep_roles != _DECODER_RANGE_SWEEP_ROLES:
+        raise ValueError("Decoder sweep range observations are incomplete.")
+    return observations
+
+
 @dataclass(frozen=True, slots=True)
 class InferenceCaseOutputs:
     methods: dict[str, torch.Tensor]
@@ -462,7 +731,10 @@ class InferenceCaseOutputs:
     graph: dict[str, Any]
     sweep_slices: dict[str, np.ndarray]
     decoded_canonical_sha256: str
+    bounded_decoded_canonical_sha256: str
     full_volume_layout_provenance: dict[str, Any]
+    decoder_evaluation_range_policy: dict[str, Any]
+    decoder_range_observations: dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +881,7 @@ class UnifiedStep200InferenceRuntime:
             )
         if self.device.type != "cuda":
             raise ValueError("The production step-200 inference runtime requires CUDA.")
+        _require_linear_decoder_output_activation(self.decoder)
         for module in (self.translator, self.encoder, self.decoder):
             module.to(self.device).eval().requires_grad_(False)
             if any(parameter.requires_grad for parameter in module.parameters()):
@@ -631,6 +904,10 @@ class UnifiedStep200InferenceRuntime:
     ) -> InferenceCaseOutputs:
         if torch.is_grad_enabled():
             raise RuntimeError("Step-200 inference unexpectedly enabled gradients.")
+        _require_linear_decoder_output_activation(self.decoder)
+        range_policy = _validate_decoder_evaluation_range_policy(
+            decoder_evaluation_range_policy()
+        )
         source_layout = _validate_authenticated_case_layout(case)
         case_seed = _case_seed(plan, case)
         devices = [self.device] if self.device.type == "cuda" else []
@@ -697,8 +974,15 @@ class UnifiedStep200InferenceRuntime:
                 decoded_model_batch,
                 role="primary unified output",
             ).cpu()
+            primary_range = adapt_decoder_evaluation_range(
+                decoded,
+                canonical_context.support_mask,
+                expected_shape=canonical_layout.authenticated_shape,
+                role="primary_unified_output",
+            )
             unified = self.artifact.render_target(
-                canonical_context.with_values(decoded), case.target_domain
+                canonical_context.with_values(primary_range.bounded),
+                case.target_domain,
             ).float().cpu()
             adapt_full_volume_layout(
                 unified,
@@ -753,30 +1037,51 @@ class UnifiedStep200InferenceRuntime:
                 image_support_batch,
             )
             anatomy = {key: float(value.detach().float().cpu()) for key, value in anatomy_values.items()}
-            graph = self._graph_diagnostic(
-                case, z, support_batch, canonical_context, canonical_layout, plan
+            graph, graph_range_observations = self._graph_diagnostic(
+                case,
+                z,
+                support_batch,
+                canonical_context,
+                canonical_layout,
+                canonical_context.support_mask,
+                plan,
             )
-            sweep_slices = self._field_sweep(
-                case, z, canonical_context, canonical_layout, plan
+            sweep_slices, sweep_range_observations = self._field_sweep(
+                case,
+                z,
+                canonical_context,
+                canonical_layout,
+                canonical_context.support_mask,
+                plan,
             )
-            decoded_sha = canonical_tensor_sha256(
-                adapt_full_volume_layout(
-                    decoded, role="restored primary decoded canonical volume"
-                ).spatial_volume()
+            range_observations = _validate_decoder_range_observations(
+                {
+                    "primary_unified_output": primary_range.observation,
+                    **graph_range_observations,
+                    **sweep_range_observations,
+                }
             )
+            decoded_sha = primary_range.observation["raw_canonical_tensor_sha256"]
+            bounded_decoded_sha = primary_range.observation[
+                "bounded_canonical_tensor_sha256"
+            ]
             layout_provenance = canonical_layout.sanitized_provenance(
                 source_rank=source_layout.authenticated_rank
             )
             del generated_z, decoded, decoded_model_batch, latent, z, support
             del support_batch, canonical_batch
             del image_support_batch, anatomy_values
+            del primary_range
         return InferenceCaseOutputs(
             methods=methods,
             anatomy=anatomy,
             graph=graph,
             sweep_slices=sweep_slices,
             decoded_canonical_sha256=decoded_sha,
+            bounded_decoded_canonical_sha256=bounded_decoded_sha,
             full_volume_layout_provenance=layout_provenance,
+            decoder_evaluation_range_policy=range_policy,
+            decoder_range_observations=range_observations,
         )
 
     def _graph_diagnostic(
@@ -786,11 +1091,12 @@ class UnifiedStep200InferenceRuntime:
         support: torch.Tensor,
         canonical_context: Any,
         canonical_layout: AdaptedFullVolume,
+        source_support: torch.Tensor,
         plan: FrozenStep200InferencePlan,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
         selected = _graph_intermediate(plan, case)
         if selected is None:
-            return {"selected": False}
+            return {"selected": False}, {}
         intermediate = Domain(selected, case.source_domain.contrast)
         with _bf16_inference_autocast(self.device):
             l1, direct, composed = graph_consistency_loss(
@@ -815,11 +1121,23 @@ class UnifiedStep200InferenceRuntime:
         composed_decoded = canonical_layout.restore_decoder_output(
             composed_decoded_batch, role="graph composed output"
         ).cpu()
+        direct_range = adapt_decoder_evaluation_range(
+            direct_decoded,
+            source_support,
+            expected_shape=canonical_layout.authenticated_shape,
+            role="graph_direct_output",
+        )
+        composed_range = adapt_decoder_evaluation_range(
+            composed_decoded,
+            source_support,
+            expected_shape=canonical_layout.authenticated_shape,
+            role="graph_composed_output",
+        )
         direct_image = self.artifact.render_target(
-            canonical_context.with_values(direct_decoded), case.target_domain
+            canonical_context.with_values(direct_range.bounded), case.target_domain
         )
         composed_image = self.artifact.render_target(
-            canonical_context.with_values(composed_decoded), case.target_domain
+            canonical_context.with_values(composed_range.bounded), case.target_domain
         )
         adapt_full_volume_layout(
             direct_image,
@@ -844,7 +1162,12 @@ class UnifiedStep200InferenceRuntime:
         }
         del direct, composed, direct_decoded_batch, composed_decoded_batch
         del direct_decoded, composed_decoded, direct_image, composed_image
-        return result
+        observations = {
+            "graph_direct_output": direct_range.observation,
+            "graph_composed_output": composed_range.observation,
+        }
+        del direct_range, composed_range
+        return result, observations
 
     def _field_sweep(
         self,
@@ -852,13 +1175,15 @@ class UnifiedStep200InferenceRuntime:
         z: torch.Tensor,
         canonical_context: Any,
         canonical_layout: AdaptedFullVolume,
+        source_support: torch.Tensor,
         plan: FrozenStep200InferencePlan,
-    ) -> dict[str, np.ndarray]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
         if float(case.source_domain.field_strength_t) != float(
             plan.payload["field_sweep"]["source_field_t"]
         ):
-            return {}
+            return {}, {}
         slices: dict[str, np.ndarray] = {}
+        observations: dict[str, dict[str, Any]] = {}
         for field in plan.payload["field_sweep"]["target_fields_t"]:
             target = Domain(float(field), case.source_domain.contrast)
             if target == case.source_domain:
@@ -880,8 +1205,15 @@ class UnifiedStep200InferenceRuntime:
             decoded = canonical_layout.restore_decoder_output(
                 decoded_batch, role=f"field-sweep {float(field):g}T output"
             ).cpu()
+            range_role = f"field_sweep_{float(field):g}T"
+            sweep_range = adapt_decoder_evaluation_range(
+                decoded,
+                source_support,
+                expected_shape=canonical_layout.authenticated_shape,
+                role=range_role,
+            )
             rendered = self.artifact.render_target(
-                canonical_context.with_values(decoded), target
+                canonical_context.with_values(sweep_range.bounded), target
             )
             adapt_full_volume_layout(
                 rendered,
@@ -889,10 +1221,11 @@ class UnifiedStep200InferenceRuntime:
                 expected_shape=canonical_layout.authenticated_shape,
             )
             slices[f"{float(field):g}T"] = _middle_slice(rendered)
+            observations[range_role] = sweep_range.observation
             if target_z is not z:
                 del target_z
-            del decoded_batch, decoded, rendered
-        return slices
+            del decoded_batch, decoded, rendered, sweep_range
+        return slices, observations
 
 
 def build_frozen_step200_inference_plan(protocol: Mapping[str, Any]) -> FrozenStep200InferencePlan:
@@ -1574,8 +1907,14 @@ def load_unified_step200_inference_runtime(
     vae_model = vae_config.get("model") if isinstance(vae_config, Mapping) else None
     if not isinstance(vae_model, Mapping):
         raise ValueError("Frozen VAE checkpoint lacks its complete model configuration.")
+    effective_output_activation = vae_model.get("output_activation", "none")
+    if effective_output_activation != "none":
+        raise ValueError(
+            "Frozen Stage-1 decoder effective output_activation must be exactly none."
+        )
     encoder = build_encoder("kl_vae", **_kl_vae_kwargs(vae_model, "encoder"))
     decoder = build_decoder("kl_vae", **_kl_vae_kwargs(vae_model, "decoder"))
+    _require_linear_decoder_output_activation(decoder)
     encoder.load_state_dict(vae_state["encoder"], strict=True)
     decoder.load_state_dict(vae_state["decoder"], strict=True)
     del vae_state
@@ -1719,6 +2058,12 @@ def run_step200_p0006_inference_audit(
         layout_provenance = _validate_full_volume_layout_provenance(
             gate.get("full_volume_layout_provenance")
         )
+        range_policy = _validate_decoder_evaluation_range_policy(
+            gate.get("decoder_evaluation_range_policy")
+        )
+        _validate_decoder_range_observations(
+            gate.get("decoder_range_observations")
+        )
         run_contract = _run_contract(
             plan,
             runtime,
@@ -1727,6 +2072,7 @@ def run_step200_p0006_inference_audit(
             lpips_receipt=lpips_receipt,
             scientific_role_provenance=scientific_role_provenance,
             full_volume_layout_provenance=layout_provenance,
+            decoder_evaluation_range_policy=range_policy,
         )
         _seal_or_verify_json(
             root / "run_contract.json", run_contract, "run_contract_sha256"
@@ -1770,6 +2116,28 @@ def run_step200_p0006_inference_audit(
                     raise ValueError(
                         "P:0006 case full-volume layout differs from the one-case gate."
                     )
+                if (
+                    _validate_decoder_evaluation_range_policy(
+                        outputs.decoder_evaluation_range_policy
+                    )
+                    != range_policy
+                ):
+                    raise ValueError(
+                        "P:0006 case decoder evaluation-range policy differs from the gate."
+                    )
+                range_observations = _validate_decoder_range_observations(
+                    outputs.decoder_range_observations
+                )
+                primary_range = range_observations["primary_unified_output"]
+                if (
+                    outputs.decoded_canonical_sha256
+                    != primary_range["raw_canonical_tensor_sha256"]
+                    or outputs.bounded_decoded_canonical_sha256
+                    != primary_range["bounded_canonical_tensor_sha256"]
+                ):
+                    raise ValueError(
+                        "P:0006 primary decoder raw/bounded identities changed."
+                    )
                 metrics = _score_case(
                     outputs, case, metric_fn=metric_fn, device=str(runtime.device)
                 )
@@ -1798,6 +2166,11 @@ def run_step200_p0006_inference_audit(
                 "anatomy": outputs.anatomy,
                 "graph": _graph_receipt(outputs.graph),
                 "decoded_canonical_sha256": outputs.decoded_canonical_sha256,
+                "bounded_decoded_canonical_sha256": (
+                    outputs.bounded_decoded_canonical_sha256
+                ),
+                "decoder_evaluation_range_policy": range_policy,
+                "decoder_range_observations": range_observations,
                 "slice_artifacts": slice_artifacts,
                 "inference_seconds": time.perf_counter() - started,
                 "training_invoked": False,
@@ -2034,6 +2407,12 @@ def _run_or_verify_one_case_gate(
         _validate_full_volume_layout_provenance(
             gate.get("full_volume_layout_provenance")
         )
+        _validate_decoder_evaluation_range_policy(
+            gate.get("decoder_evaluation_range_policy")
+        )
+        _validate_decoder_range_observations(
+            gate.get("decoder_range_observations")
+        )
         return gate
     if require_a100:
         torch.cuda.reset_peak_memory_stats(runtime.device)
@@ -2061,11 +2440,27 @@ def _run_or_verify_one_case_gate(
         raise ValueError("Frozen one-case memory-gate domain cell is absent from P:0006.")
     outputs: InferenceCaseOutputs | None = None
     layout_provenance: dict[str, Any] | None = None
+    range_policy: dict[str, Any] | None = None
+    range_observations: dict[str, dict[str, Any]] | None = None
     try:
         outputs = runtime.infer_case(streamed.case, streamed.calibrator, plan=plan)
         layout_provenance = _validate_full_volume_layout_provenance(
             outputs.full_volume_layout_provenance
         )
+        range_policy = _validate_decoder_evaluation_range_policy(
+            outputs.decoder_evaluation_range_policy
+        )
+        range_observations = _validate_decoder_range_observations(
+            outputs.decoder_range_observations
+        )
+        primary_range = range_observations["primary_unified_output"]
+        if (
+            outputs.decoded_canonical_sha256
+            != primary_range["raw_canonical_tensor_sha256"]
+            or outputs.bounded_decoded_canonical_sha256
+            != primary_range["bounded_canonical_tensor_sha256"]
+        ):
+            raise ValueError("One-case decoder raw/bounded identities changed.")
     finally:
         if outputs is not None:
             _release_case_outputs(outputs)
@@ -2074,6 +2469,8 @@ def _run_or_verify_one_case_gate(
         iterator.close()
     if layout_provenance is None:
         raise RuntimeError("One-case inference gate did not produce layout provenance.")
+    if range_policy is None or range_observations is None:
+        raise RuntimeError("One-case inference gate did not produce range provenance.")
     if require_a100:
         torch.cuda.synchronize(runtime.device)
         peak_allocated = int(torch.cuda.max_memory_allocated(runtime.device))
@@ -2100,6 +2497,8 @@ def _run_or_verify_one_case_gate(
         "model_state_before": dict(initial_state),
         "model_state_after": state_after,
         "full_volume_layout_provenance": layout_provenance,
+        "decoder_evaluation_range_policy": range_policy,
+        "decoder_range_observations": range_observations,
         "gradients_enabled": False,
         "optimizer_loaded": False,
         "training_invoked": False,
@@ -2166,6 +2565,20 @@ def _validate_case_receipt(
         "protocol_case_receipt_sha256"
     ) != sha256_json(expected_protocol_receipt):
         raise ValueError("Inference case receipt belongs to different P:0006 arrays.")
+    _validate_decoder_evaluation_range_policy(
+        receipt.get("decoder_evaluation_range_policy")
+    )
+    range_observations = _validate_decoder_range_observations(
+        receipt.get("decoder_range_observations")
+    )
+    primary_range = range_observations["primary_unified_output"]
+    if (
+        receipt.get("decoded_canonical_sha256")
+        != primary_range["raw_canonical_tensor_sha256"]
+        or receipt.get("bounded_decoded_canonical_sha256")
+        != primary_range["bounded_canonical_tensor_sha256"]
+    ):
+        raise ValueError("Inference case decoder raw/bounded identities changed.")
     metrics = receipt.get("metrics")
     if not isinstance(metrics, Mapping) or set(metrics) != set(_METHOD_ORDER):
         raise ValueError("Inference case receipt method inventory changed.")
@@ -2276,6 +2689,16 @@ def _build_inference_summary(
         "inference_plan_sha256": plan.sha256,
         "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
             gate.get("full_volume_layout_provenance")
+        ),
+        "decoder_evaluation_range_policy": (
+            _validate_decoder_evaluation_range_policy(
+                gate.get("decoder_evaluation_range_policy")
+            )
+        ),
+        "one_case_decoder_range_observations": (
+            _validate_decoder_range_observations(
+                gate.get("decoder_range_observations")
+            )
         ),
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
@@ -2467,6 +2890,16 @@ def _seal_artifact_manifest(
         "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
             gate.get("full_volume_layout_provenance")
         ),
+        "decoder_evaluation_range_policy": (
+            _validate_decoder_evaluation_range_policy(
+                gate.get("decoder_evaluation_range_policy")
+            )
+        ),
+        "one_case_decoder_range_observations": (
+            _validate_decoder_range_observations(
+                gate.get("decoder_range_observations")
+            )
+        ),
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
         "GPU_identity": dict(runtime.gpu_identity),
@@ -2513,9 +2946,10 @@ def _run_contract(
     lpips_receipt: Mapping[str, Any],
     scientific_role_provenance: Mapping[str, Any],
     full_volume_layout_provenance: Mapping[str, Any],
+    decoder_evaluation_range_policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v6",
+        "contract_version": "stage2-step200-p0006-inference-run-v7",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
@@ -2528,6 +2962,11 @@ def _run_contract(
         "inference_plan_sha256": plan.sha256,
         "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
             full_volume_layout_provenance
+        ),
+        "decoder_evaluation_range_policy": (
+            _validate_decoder_evaluation_range_policy(
+                decoder_evaluation_range_policy
+            )
         ),
         "model_state": dict(runtime.state_identity()),
         "GPU_identity": dict(runtime.gpu_identity),
@@ -3177,6 +3616,8 @@ __all__ = [
     "ARTIFACT_MANIFEST_CONTRACT",
     "CASE_RECEIPT_CONTRACT",
     "CHECKPOINT_SHA256",
+    "DECODER_EVALUATION_RANGE_CONTRACT",
+    "DecoderEvaluationRange",
     "FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT",
     "FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT",
     "FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT",
@@ -3204,8 +3645,10 @@ __all__ = [
     "Step200CaseInferenceRuntime",
     "TRAINING_EVIDENCE_COMMIT",
     "UnifiedStep200InferenceRuntime",
+    "adapt_decoder_evaluation_range",
     "adapt_full_volume_layout",
     "build_frozen_step200_inference_plan",
+    "decoder_evaluation_range_policy",
     "load_unified_step200_inference_runtime",
     "photometry_namespace_compatibility_active",
     "preflight_frozen_stage1_run_c_config",

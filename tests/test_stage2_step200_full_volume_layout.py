@@ -81,12 +81,15 @@ class _EncoderSpy(torch.nn.Module):
 
 
 class _DecoderSpy(torch.nn.Module):
-    def __init__(self) -> None:
+    output_activation = "none"
+
+    def __init__(self, transform=None) -> None:
         super().__init__()
         self.outputs: list[torch.Tensor] = []
+        self.transform = transform or (lambda value: value.clone())
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        result = value.clone()
+        result = self.transform(value)
         self.outputs.append(result.detach().clone())
         return result
 
@@ -96,11 +99,17 @@ class _ArtifactSpy:
 
     def __init__(self) -> None:
         self.rendered_context_shapes: list[tuple[int, ...]] = []
+        self.rendered_context_values: list[torch.Tensor] = []
+        self.support_pattern: torch.Tensor | None = None
 
     def normalize_source(self, source: torch.Tensor, domain: Domain):
         return SourceCanonicalizedVolume(
             values=source,
-            support_mask=torch.ones_like(source, dtype=torch.bool),
+            support_mask=(
+                torch.ones_like(source, dtype=torch.bool)
+                if self.support_pattern is None
+                else self.support_pattern.reshape(source.shape).clone()
+            ),
             source_domain=domain,
             artifact_sha256=self.artifact_sha256,
         )
@@ -108,6 +117,7 @@ class _ArtifactSpy:
     def render_target(self, context, target_domain: Domain) -> torch.Tensor:
         del target_domain
         self.rendered_context_shapes.append(tuple(context.values.shape))
+        self.rendered_context_values.append(context.values.detach().clone())
         return context.values.clone()
 
 
@@ -123,19 +133,24 @@ class _StatsSpy:
 class _CalibratorSpy:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        self.values: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def apply(self, prediction, domain, *, support_mask, mode):
         del domain, mode
         self.calls.append((tuple(prediction.shape), tuple(support_mask.shape)))
+        self.values.append(
+            (prediction.detach().clone(), support_mask.detach().clone())
+        )
         assert prediction.shape == support_mask.shape
         return prediction.clone()
 
 
-def _runtime(monkeypatch):
+def _runtime(monkeypatch, *, decoder_transform=None):
     encoder = _EncoderSpy()
-    decoder = _DecoderSpy()
+    decoder = _DecoderSpy(decoder_transform)
     artifact = _ArtifactSpy()
     anatomy_shapes: list[tuple[tuple[int, ...], ...]] = []
+    anatomy_inputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     propagated_supports: list[torch.Tensor] = []
 
     def encode(encoder_module, value, *args, **kwargs):
@@ -160,6 +175,13 @@ def _runtime(monkeypatch):
         anatomy_shapes.append(
             (tuple(canonical.shape), tuple(decoded.shape), tuple(support.shape))
         )
+        anatomy_inputs.append(
+            (
+                canonical.detach().clone(),
+                decoded.detach().clone(),
+                support.detach().clone(),
+            )
+        )
         return {"gradient": torch.tensor(0.0)}
 
     monkeypatch.setattr(audit, "encode_latent", encode)
@@ -181,6 +203,7 @@ def _runtime(monkeypatch):
     runtime.gpu_identity = {"name": "synthetic CPU", "total_memory_bytes": 0}
     runtime.frozen_stage1_vae_provenance = {"synthetic_test_runtime": True}
     runtime.reviewed_photometry_provenance = {"synthetic_test_runtime": True}
+    runtime.synthetic_anatomy_inputs = anatomy_inputs
     return runtime, encoder, decoder, artifact, anatomy_shapes, propagated_supports
 
 
@@ -237,6 +260,107 @@ def test_representation_wrappers_are_numerically_equivalent(monkeypatch):
     assert torch.equal(results[0][0], results[1][0])
     assert torch.equal(results[0][0], results[2][0])
     assert results[0][1] == results[1][1] == results[2][1]
+
+
+def test_official_decoder_range_adapter_is_exact_hard_clamp_with_support_diagnostics():
+    raw = torch.tensor([[[[[-1.0, 0.0, 0.5, 1.0, 2.0]]]]], dtype=torch.float32)
+    support = torch.tensor([[[[[False, True, True, True, False]]]]])
+    adapted = audit.adapt_decoder_evaluation_range(
+        raw,
+        support,
+        expected_shape=tuple(raw.shape),
+        role="primary_unified_output",
+    )
+    expected = torch.tensor([[[[[0.0, 0.0, 0.5, 1.0, 1.0]]]]], dtype=torch.float32)
+    assert adapted.raw is raw
+    assert torch.equal(adapted.bounded, expected)
+    assert adapted.bounded[0, 0, 0, 0, 1].item() == 0.0
+    assert adapted.bounded[0, 0, 0, 0, 3].item() == 1.0
+    observation = adapted.observation
+    assert observation["raw_below_zero_count"] == 1
+    assert observation["raw_above_one_count"] == 1
+    assert observation["supported_raw_below_zero_count"] == 0
+    assert observation["supported_raw_above_one_count"] == 0
+    assert observation["supported_voxel_count"] == 3
+    assert observation["raw_canonical_tensor_sha256"] != observation[
+        "bounded_canonical_tensor_sha256"
+    ]
+
+    in_range = torch.tensor([[[0.0, 0.25, 1.0]]], dtype=torch.float32)
+    unchanged = audit.adapt_decoder_evaluation_range(
+        in_range,
+        torch.ones_like(in_range, dtype=torch.bool),
+        expected_shape=tuple(in_range.shape),
+        role="primary_unified_output",
+    )
+    assert torch.equal(unchanged.bounded, in_range)
+    assert unchanged.bounded.dtype == in_range.dtype
+    assert unchanged.observation["raw_canonical_tensor_sha256"] == unchanged.observation[
+        "bounded_canonical_tensor_sha256"
+    ]
+
+
+def test_all_eight_decoder_render_paths_are_bounded_and_anatomy_keeps_raw(monkeypatch):
+    case = _case((1, 1, 2, 3, 4))
+    case.raw_identity[..., 0, 0, 0] = 1.25
+    runtime, _, decoder, artifact, _, _ = _runtime(
+        monkeypatch, decoder_transform=lambda value: value * 2.0 - 0.5
+    )
+    calibrator = _CalibratorSpy()
+    outputs = runtime.infer_case(case, calibrator, plan=_plan(case))
+
+    assert len(decoder.outputs) == 8
+    assert len(artifact.rendered_context_values) == 8
+    assert all(float(value.min()) >= 0.0 for value in artifact.rendered_context_values)
+    assert all(float(value.max()) <= 1.0 for value in artifact.rendered_context_values)
+    expected_primary = decoder.outputs[0].reshape(case.source_image.shape)
+    expected_bounded = expected_primary.clamp(0.0, 1.0)
+    assert torch.equal(artifact.rendered_context_values[0], expected_bounded)
+    assert torch.equal(runtime.synthetic_anatomy_inputs[0][1], decoder.outputs[0])
+    assert torch.equal(calibrator.values[2][0], expected_bounded)
+    assert torch.equal(calibrator.values[2][1], case.support_mask)
+    assert outputs.methods["raw_identity"][..., 0, 0, 0].item() == 1.25
+
+    observations = outputs.decoder_range_observations
+    assert set(observations) == {
+        "primary_unified_output",
+        "graph_direct_output",
+        "graph_composed_output",
+        *(f"field_sweep_{float(field):g}T" for field in FIELD_STRENGTHS_T),
+    }
+    primary = observations["primary_unified_output"]
+    assert primary["raw_min"] < 0.0
+    assert primary["raw_max"] > 1.0
+    assert primary["bounded_min"] == 0.0
+    assert primary["bounded_max"] == 1.0
+    assert outputs.decoded_canonical_sha256 == primary[
+        "raw_canonical_tensor_sha256"
+    ]
+    assert outputs.bounded_decoded_canonical_sha256 == primary[
+        "bounded_canonical_tensor_sha256"
+    ]
+    assert outputs.decoded_canonical_sha256 != outputs.bounded_decoded_canonical_sha256
+    assert outputs.decoder_evaluation_range_policy == audit.decoder_evaluation_range_policy()
+    assert outputs.decoder_evaluation_range_policy["sigmoid_applied"] is False
+    assert outputs.decoder_evaluation_range_policy["normalization_applied"] is False
+    assert outputs.decoder_evaluation_range_policy["rescaling_applied"] is False
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_decoder_output_fails_before_render_or_calibration(monkeypatch, nonfinite):
+    case = _case((1, 1, 2, 3, 4))
+
+    def corrupt(value):
+        result = value.clone()
+        result[..., 0, 0, 0] = nonfinite
+        return result
+
+    runtime, _, _, artifact, _, _ = _runtime(monkeypatch, decoder_transform=corrupt)
+    calibrator = _CalibratorSpy()
+    with pytest.raises(ValueError, match="non-finite"):
+        runtime.infer_case(case, calibrator, plan=_plan(case))
+    assert artifact.rendered_context_values == []
+    assert calibrator.calls == []
 
 
 @pytest.mark.parametrize(
@@ -351,6 +475,40 @@ def test_shape_failure_precedes_encoder_and_releases_memory_gate_case(
     assert not (tmp_path / "gate.json").exists()
 
 
+def test_nonfinite_decoder_failure_releases_streamed_memory_gate_case(
+    monkeypatch, tmp_path: Path
+):
+    case = _case((1, 1, 2, 3, 4))
+
+    def corrupt(value):
+        result = value.clone()
+        result[..., 0, 0, 0] = float("nan")
+        return result
+
+    runtime, _, _, artifact, _, _ = _runtime(
+        monkeypatch, decoder_transform=corrupt
+    )
+    streamed = _StreamedCase(case, _CalibratorSpy())
+    iterator = _SingleIterator(streamed)
+    monkeypatch.setattr(
+        audit, "iter_gate01_p0006_evaluation_cases", lambda path: iterator
+    )
+    gate_path = tmp_path / "gate.json"
+    with pytest.raises(ValueError, match="non-finite"):
+        audit._run_or_verify_one_case_gate(
+            tmp_path / "protocol.json",
+            runtime,
+            _plan(case),
+            gate_path,
+            initial_state=runtime.state_identity(),
+            require_a100=False,
+        )
+    assert streamed.released is True
+    assert iterator.closed is True
+    assert artifact.rendered_context_values == []
+    assert not gate_path.exists()
+
+
 def test_production_shaped_one_case_memory_gate_completes(monkeypatch, tmp_path: Path):
     case = _case((1, 1, 2, 3, 4))
     runtime, encoder, _, _, _, _ = _runtime(monkeypatch)
@@ -368,6 +526,10 @@ def test_production_shaped_one_case_memory_gate_completes(monkeypatch, tmp_path:
     assert gate["status"] == "pass"
     assert gate["contract_version"] == audit.MEMORY_GATE_CONTRACT
     assert gate["full_volume_layout_provenance"]["model_input_rank"] == 5
+    assert gate["decoder_evaluation_range_policy"] == (
+        audit.decoder_evaluation_range_policy()
+    )
+    assert "primary_unified_output" in gate["decoder_range_observations"]
     assert gate["training_invoked"] is False
     assert len(encoder.inputs) == 1
     assert streamed.released is True

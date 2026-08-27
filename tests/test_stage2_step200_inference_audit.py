@@ -44,6 +44,28 @@ def _layout_provenance(rank: int = 4) -> dict[str, object]:
     }
 
 
+def _range_observation(role: str, digest: str = "4" * 64) -> dict[str, object]:
+    return {
+        "role": role,
+        "voxel_count": 64,
+        "supported_voxel_count": 64,
+        "raw_min": 0.2,
+        "raw_max": 0.9,
+        "raw_below_zero_count": 0,
+        "raw_below_zero_fraction": 0.0,
+        "raw_above_one_count": 0,
+        "raw_above_one_fraction": 0.0,
+        "supported_raw_below_zero_count": 0,
+        "supported_raw_below_zero_fraction": 0.0,
+        "supported_raw_above_one_count": 0,
+        "supported_raw_above_one_fraction": 0.0,
+        "bounded_min": 0.2,
+        "bounded_max": 0.9,
+        "raw_canonical_tensor_sha256": digest,
+        "bounded_canonical_tensor_sha256": digest,
+    }
+
+
 def _node_sha(contrast: str, field: float) -> str:
     return hashlib.sha256(f"{contrast}|{field:g}".encode()).hexdigest()
 
@@ -235,13 +257,35 @@ class _DummyRuntime:
                 "composed_slice": np.full((8, 8), 0.21, dtype=np.float32),
                 "absolute_difference_slice": np.full((8, 8), 0.01, dtype=np.float32),
             }
+        range_observations = {
+            "primary_unified_output": _range_observation("primary_unified_output")
+        }
+        if selected:
+            range_observations.update(
+                {
+                    "graph_direct_output": _range_observation("graph_direct_output"),
+                    "graph_composed_output": _range_observation("graph_composed_output"),
+                }
+            )
+        if float(case.source_domain.field_strength_t) == 3.0:
+            range_observations.update(
+                {
+                    f"field_sweep_{float(field):g}T": _range_observation(
+                        f"field_sweep_{float(field):g}T"
+                    )
+                    for field in FIELD_STRENGTHS_T
+                }
+            )
         outputs = audit.InferenceCaseOutputs(
             methods=methods,
             anatomy={"gradient": 0.01},
             graph=graph,
             sweep_slices=sweeps,
             decoded_canonical_sha256="4" * 64,
+            bounded_decoded_canonical_sha256="4" * 64,
             full_volume_layout_provenance=_layout_provenance(),
+            decoder_evaluation_range_policy=audit.decoder_evaluation_range_policy(),
+            decoder_range_observations=range_observations,
         )
         weakref.finalize(unified, self._output_released)
         return outputs
@@ -527,6 +571,10 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
     ] is False
     assert result["contract_version"] == audit.INFERENCE_AUDIT_CONTRACT
     assert result["full_volume_layout_provenance"] == _layout_provenance()
+    assert result["decoder_evaluation_range_policy"] == (
+        audit.decoder_evaluation_range_policy()
+    )
+    assert "primary_unified_output" in result["one_case_decoder_range_observations"]
     assert result["final_stop"] == "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION"
     assert max(live_counts) == 1
     assert runtime.max_live_outputs == 1
@@ -553,11 +601,18 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
             "long_run_authorized_by_evaluation_path"
         ] is True
         assert sealed["full_volume_layout_provenance"] == _layout_provenance()
+        assert sealed["decoder_evaluation_range_policy"] == (
+            audit.decoder_evaluation_range_policy()
+        )
     gate = json.loads(
         (output / "one_case_inference_memory_gate.json").read_text(encoding="utf-8")
     )
     assert gate["contract_version"] == audit.MEMORY_GATE_CONTRACT
     assert gate["full_volume_layout_provenance"] == _layout_provenance()
+    assert gate["decoder_evaluation_range_policy"] == (
+        audit.decoder_evaluation_range_policy()
+    )
+    assert "primary_unified_output" in gate["decoder_range_observations"]
     for path in output.rglob("*.npy"):
         assert np.load(path, allow_pickle=False).ndim < 4
 
@@ -586,6 +641,28 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
 
     receipt = next((output / "stage2_step200_p0006_case_receipts").glob("*.json"))
     payload = json.loads(receipt.read_text(encoding="utf-8"))
+    provenance_incomplete = copy.deepcopy(payload)
+    provenance_incomplete.pop("decoder_evaluation_range_policy")
+    provenance_incomplete["case_receipt_sha256"] = sha256_json(
+        {
+            key: value
+            for key, value in provenance_incomplete.items()
+            if key != "case_receipt_sha256"
+        }
+    )
+    receipt.write_text(json.dumps(provenance_incomplete), encoding="utf-8")
+    with pytest.raises(ValueError, match="range policy"):
+        audit.run_step200_p0006_inference_audit(
+            protocol_path=protocol_path,
+            evaluation_readiness_path=readiness_path,
+            runtime=runtime,
+            output_dir=output,
+            audit_implementation_commit=AUDIT_COMMIT,
+            require_a100=False,
+            metric_fn=_metric,
+        )
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
     payload["metrics"]["raw_identity"]["nrmse"] += 1.0
     receipt.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="Self-hash"):
@@ -614,7 +691,11 @@ def test_source_enforces_inference_only_generator_state_and_no_materializing_loa
     assert "sha256_json(vae_config) !=" not in source
     assert ".squeeze(" not in source
     assert "stage2-step200-full-volume-layout-adapter-v1" in source
-    assert "stage2-step200-p0006-inference-run-v6" in source
+    assert "stage2-step200-p0006-inference-run-v7" in source
+    assert "stage2-step200-decoder-evaluation-range-v1" in source
+    assert "raw.clamp(0.0, 1.0)" in source
+    assert "torch.sigmoid" not in source
+    assert "torch.tanh" not in source
     assert "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION" in source
 
 
@@ -824,6 +905,9 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     class Empty(torch.nn.Module):
         pass
 
+    class LinearDecoder(Empty):
+        output_activation = "none"
+
     checkpoint_path = tmp_path / "checkpoint.pt"
     vae_path = tmp_path / "vae.pt"
     config_path = tmp_path / "resolved.json"
@@ -865,7 +949,9 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
         audit, "build_encoder", lambda *args, **kwargs: built.append("encoder") or Empty()
     )
     monkeypatch.setattr(
-        audit, "build_decoder", lambda *args, **kwargs: built.append("decoder") or Empty()
+        audit,
+        "build_decoder",
+        lambda *args, **kwargs: built.append("decoder") or LinearDecoder(),
     )
     monkeypatch.setattr(audit, "PhotometryFactoredLatentBankIndex", lambda *_: bank)
     monkeypatch.setattr(
@@ -918,6 +1004,7 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     assert runtime.translator.training is False
     assert runtime.encoder.training is False
     assert runtime.decoder.training is False
+    assert runtime.decoder.output_activation == "none"
     assert not any(parameter.requires_grad for parameter in runtime.translator.parameters())
     assert runtime.frozen_stage1_vae_provenance["raw_config_file_sha256"] == config_raw_sha
     assert runtime.frozen_stage1_vae_provenance["parsed_canonical_config_sha256"] == sha256_json(
@@ -945,6 +1032,11 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
         lpips_receipt={"synthetic": True},
         scientific_role_provenance={"synthetic_test_role": True},
         full_volume_layout_provenance=_layout_provenance(),
+        decoder_evaluation_range_policy=audit.decoder_evaluation_range_policy(),
+    )
+    assert run_contract["contract_version"] == "stage2-step200-p0006-inference-run-v7"
+    assert run_contract["decoder_evaluation_range_policy"] == (
+        audit.decoder_evaluation_range_policy()
     )
     sealed_vae = run_contract["frozen_stage1_vae_provenance"]
     assert sealed_vae["raw_config_file_sha256"] == config_raw_sha
@@ -957,6 +1049,22 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
     assert sealed_photometry["accepted_record_count"] == 1_560
     assert sealed_photometry["prospective_accepted_count"] == 0
     assert "artifact_path" not in sealed_photometry
+
+    class SubstitutedDecoder(Empty):
+        output_activation = "sigmoid"
+
+    monkeypatch.setattr(
+        audit, "build_decoder", lambda *args, **kwargs: SubstitutedDecoder()
+    )
+    with pytest.raises(ValueError, match="output_activation must be exactly none"):
+        audit.load_unified_step200_inference_runtime(
+            checkpoint_path=checkpoint_path,
+            resolved_config_path=config_path,
+            vae_config_path=vae_config_path,
+            vae_checkpoint_path=vae_path,
+            photometry_artifact_path=photo_path,
+            bank_dir=tmp_path / "bank",
+        )
 
     checkpoint_state["_meta"] = {
         "git_commit": audit.TRAINING_EVIDENCE_COMMIT,

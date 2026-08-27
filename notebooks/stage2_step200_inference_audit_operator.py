@@ -197,9 +197,9 @@ from google.colab import drive
 
 drive.mount("/content/drive")
 
-from fieldbridge.data.photometry_factorization import sha256_file
 from fieldbridge.evaluation.stage2_step200_inference_audit import (
     load_unified_step200_inference_runtime,
+    preflight_frozen_p0006_scientific_role,
     preflight_frozen_stage1_run_c_config,
     preflight_reviewed_photometry_namespace_artifact,
     run_step200_p0006_inference_audit,
@@ -284,10 +284,28 @@ print(
 )
 
 
-if sha256_file(P0006_PROTOCOL) != PROTOCOL_FILE_SHA256:
-    raise RuntimeError("Pinned P:0006 protocol file identity changed.")
-if sha256_file(EVALUATION_READINESS) != READINESS_FILE_SHA256:
-    raise RuntimeError("Pinned evaluation-readiness file identity changed.")
+scientific_role_preflight = preflight_frozen_p0006_scientific_role(
+    P0006_PROTOCOL,
+    EVALUATION_READINESS,
+)
+print(
+    json.dumps(
+        {
+            "stage": "frozen_p0006_scientific_role_preflight",
+            "status": "pass",
+            **scientific_role_preflight.sanitized_provenance(),
+            "bank_copy_invoked": False,
+            "bank_extraction_invoked": False,
+            "checkpoint_deserialized": False,
+            "model_constructed": False,
+            "private_array_opened": False,
+            "inference_invoked": False,
+            "training_invoked": False,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
 metadata_preflight = preflight_gate01_p0006_archive(
     GATE01_ROOT,
     expected_gate01_result_sha256=(
@@ -441,6 +459,7 @@ result = run_step200_p0006_inference_audit(
     dependency_provenance=AUDIT_DEPENDENCY_PROVENANCE,
     lpips_provenance=SEALED_LPIPS.provenance,
     lpips_integrity_verifier=SEALED_LPIPS.verify_unchanged,
+    verified_scientific_role_preflight=scientific_role_preflight,
 )
 print(
     json.dumps(

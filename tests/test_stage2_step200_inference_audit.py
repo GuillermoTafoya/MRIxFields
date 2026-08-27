@@ -17,6 +17,10 @@ from fieldbridge.data.photometry_factorization import sha256_file, sha256_json
 from fieldbridge.evaluation import stage2_step200_inference_audit as audit
 from fieldbridge.evaluation import stage2_unified_gate01_p0006 as p0006
 from fieldbridge.evaluation.stage2_gate01 import Gate01Case
+from fieldbridge.evaluation.stage2_unified_preflight import (
+    PAIRED_FEASIBILITY_CONTRACT,
+    seal_long_run_evaluation_readiness,
+)
 
 
 AUDIT_COMMIT = "a" * 40
@@ -73,8 +77,20 @@ def _protocol() -> dict[str, object]:
     body: dict[str, object] = {
         "contract_version": p0006.GATE01_P0006_EVALUATION_PROTOCOL,
         "data_role": p0006.P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
+        "evidence_interpretation": p0006.P0006_EVIDENCE_LIMITATION,
         "training_or_model_selection_use": False,
         "population_or_generalization_claims_authorized": False,
+        "subject_group_identity": p0006.P0006_SUBJECT_GROUP,
+        "traveller_identity_sha256": p0006.P0006_IDENTITY_SHA256,
+        "acquisition_count": 15,
+        "directed_pair_count": 60,
+        "wrong_target_reference_count": 180,
+        "factored_bank": {"P_record_count": 0},
+        "frozen_unpaired_validation": {"P_endpoint_count": 0},
+        "gate01_result": {"file_sha256": "d" * 64},
+        "private_arrays_validated": True,
+        "forbidden_travellers": ["P:0007", "P:0009"],
+        "P0009_confirmation_status": p0006.P0009_CONFIRMATION_STATUS,
         "P0009_executed": False,
         "case_receipts": receipts,
     }
@@ -226,14 +242,25 @@ def _install_synthetic_protocol(monkeypatch, tmp_path: Path):
     protocol = _protocol()
     protocol_path = tmp_path / "protocol.json"
     protocol_path.write_text(json.dumps(protocol, sort_keys=True), encoding="utf-8")
-    readiness: dict[str, object] = {
-        "contract_version": "synthetic-readiness",
-        "long_run_training_authorized": False,
-        "population_or_generalization_claims_authorized": False,
+    feasibility_body: dict[str, object] = {
+        "contract_version": PAIRED_FEASIBILITY_CONTRACT,
+        "complete_inventory_no_selection": True,
+        "paired_evaluation_possible": False,
     }
-    readiness["readiness_sha256"] = sha256_json(readiness)
+    feasibility = {
+        **feasibility_body,
+        "result_sha256": sha256_json(feasibility_body),
+    }
+    feasibility_path = tmp_path / "feasibility.json"
+    feasibility_path.write_text(
+        json.dumps(feasibility, sort_keys=True), encoding="utf-8"
+    )
     readiness_path = tmp_path / "readiness.json"
-    readiness_path.write_text(json.dumps(readiness, sort_keys=True), encoding="utf-8")
+    readiness = seal_long_run_evaluation_readiness(
+        feasibility_path,
+        p0006_evaluation_protocol_path=protocol_path,
+        output_path=readiness_path,
+    )
     monkeypatch.setattr(audit, "P0006_PROTOCOL_FILE_SHA256", sha256_file(protocol_path))
     monkeypatch.setattr(audit, "P0006_PROTOCOL_SHA256", protocol["protocol_sha256"])
     monkeypatch.setattr(
@@ -259,6 +286,121 @@ def _install_synthetic_protocol(monkeypatch, tmp_path: Path):
         float(case.target_domain.field_strength_t),
     ))
     return protocol, protocol_path, readiness_path, live_counts
+
+
+def test_authentic_production_shaped_readiness_v3_preflight_passes(
+    monkeypatch, tmp_path
+):
+    protocol, protocol_path, readiness_path, _ = _install_synthetic_protocol(
+        monkeypatch, tmp_path
+    )
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    assert readiness["contract_version"] == "stage2-long-run-evaluation-readiness-v3"
+    assert readiness["long_run_authorized_by_evaluation_path"] is True
+    assert "long_run_training_authorized" not in readiness
+    preflight = audit.preflight_frozen_p0006_scientific_role(
+        protocol_path, readiness_path
+    )
+    provenance = preflight.sanitized_provenance()
+    assert preflight.protocol == protocol
+    assert provenance["long_run_authorized_by_evaluation_path"] is True
+    assert provenance["long_run_training_authorized"] is False
+    assert provenance["acquisition_count"] == 15
+    assert provenance["directed_pair_count"] == 60
+    assert provenance["wrong_target_reference_count"] == 180
+
+
+@pytest.mark.parametrize("value", [False, None])
+def test_readiness_requires_authentic_evaluation_path_authorization(
+    monkeypatch, tmp_path, value
+):
+    _, _, readiness_path, _ = _install_synthetic_protocol(monkeypatch, tmp_path)
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    if value is None:
+        readiness.pop("long_run_authorized_by_evaluation_path")
+    else:
+        readiness["long_run_authorized_by_evaluation_path"] = value
+    with pytest.raises(ValueError, match="key inventory|Evaluation path"):
+        audit._validate_scientific_role(_protocol(), readiness)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("evaluation_role", "training", "role"),
+        ("evidence_interpretation", "population evidence", "interpretation"),
+        ("prospective_protocol_used", False, "prospective inventory"),
+        ("prospective_training_or_model_selection_use", True, "safety boundary"),
+        ("population_or_generalization_claims_authorized", True, "safety boundary"),
+        ("reviewed_prospective_protocol_available", False, "prospective inventory"),
+        ("complete_inventory_no_selection", False, "prospective inventory"),
+        ("retrospective_pair_feasibility", True, "safety boundary"),
+        ("factored_bank_P_record_count", 1, "P-record"),
+        ("unpaired_validation_P_endpoint_count", 1, "P-endpoint"),
+        ("P0009_confirmation_status", "executed", "P:0009 status"),
+        ("P0009_executed", True, "safety boundary"),
+    ],
+)
+def test_readiness_v3_semantic_mutations_fail_closed(
+    monkeypatch, tmp_path, field, value, message
+):
+    protocol, _, readiness_path, _ = _install_synthetic_protocol(monkeypatch, tmp_path)
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    readiness[field] = value
+    with pytest.raises(ValueError, match=message):
+        audit._validate_scientific_role(protocol, readiness)
+
+
+def test_readiness_protocol_link_and_closed_schema_fail_closed(monkeypatch, tmp_path):
+    protocol, _, readiness_path, _ = _install_synthetic_protocol(monkeypatch, tmp_path)
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    readiness["p0006_evaluation_protocol_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="another P:0006 protocol"):
+        audit._validate_scientific_role(protocol, readiness)
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    readiness["long_run_training_authorized"] = False
+    with pytest.raises(ValueError, match="key inventory"):
+        audit._validate_scientific_role(protocol, readiness)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("data_role", "training", "data role"),
+        ("evidence_interpretation", "generalization", "interpretation"),
+        ("subject_group_identity", "P:0009", "subject-group"),
+        ("traveller_identity_sha256", "0" * 64, "traveller identity"),
+        ("acquisition_count", 14, "acquisition count"),
+        ("directed_pair_count", 59, "directed-pair count"),
+        ("wrong_target_reference_count", 179, "wrong-target reference count"),
+        ("training_or_model_selection_use", True, "training or model selection"),
+        ("population_or_generalization_claims_authorized", True, "population"),
+        ("P0009_confirmation_status", "executed", "P:0009 status"),
+        ("P0009_executed", True, "P:0009 execution"),
+    ],
+)
+def test_protocol_v4_scientific_role_mutations_fail_closed(
+    monkeypatch, tmp_path, field, value, message
+):
+    protocol, _, readiness_path, _ = _install_synthetic_protocol(monkeypatch, tmp_path)
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    protocol[field] = value
+    with pytest.raises(ValueError, match=message):
+        audit._validate_scientific_role(protocol, readiness)
+
+
+def test_scientific_role_preflight_rehash_detects_change_before_use(
+    monkeypatch, tmp_path
+):
+    _, protocol_path, readiness_path, _ = _install_synthetic_protocol(
+        monkeypatch, tmp_path
+    )
+    preflight = audit.preflight_frozen_p0006_scientific_role(
+        protocol_path, readiness_path
+    )
+    readiness_path.write_bytes(readiness_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="file SHA-256 mismatch"):
+        audit.verify_frozen_p0006_scientific_role_preflight(preflight)
 
 
 def test_streaming_iterator_requires_release_and_keeps_one_case_live(monkeypatch, tmp_path):
@@ -357,6 +499,13 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
     assert result["optimizer_loaded"] is False
     assert result["P0006_training_or_model_selection_use"] is False
     assert result["population_or_generalization_claims_authorized"] is False
+    assert result["long_run_training_authorized"] is False
+    assert result["frozen_p0006_scientific_role_provenance"][
+        "long_run_authorized_by_evaluation_path"
+    ] is True
+    assert result["frozen_p0006_scientific_role_provenance"][
+        "long_run_training_authorized"
+    ] is False
     assert result["final_stop"] == "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION"
     assert max(live_counts) == 1
     assert runtime.max_live_outputs == 1
@@ -372,6 +521,16 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
     assert (output / "stage2_step200_p0006_montages.pdf").is_file()
     assert (output / "stage2_step200_p0006_audit.html").is_file()
     assert not list(output.rglob("*.pt"))
+    for sealed_name in (
+        "run_contract.json",
+        "stage2_step200_p0006_summary.json",
+        "artifact_manifest.json",
+    ):
+        sealed = json.loads((output / sealed_name).read_text(encoding="utf-8"))
+        assert sealed["long_run_training_authorized"] is False
+        assert sealed["frozen_p0006_scientific_role_provenance"][
+            "long_run_authorized_by_evaluation_path"
+        ] is True
     for path in output.rglob("*.npy"):
         assert np.load(path, allow_pickle=False).ndim < 4
 
@@ -754,6 +913,7 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
         audit_implementation_commit=AUDIT_COMMIT,
         dependency_receipt={"synthetic": True},
         lpips_receipt={"synthetic": True},
+        scientific_role_provenance={"synthetic_test_role": True},
     )
     sealed_vae = run_contract["frozen_stage1_vae_provenance"]
     assert sealed_vae["raw_config_file_sha256"] == config_raw_sha

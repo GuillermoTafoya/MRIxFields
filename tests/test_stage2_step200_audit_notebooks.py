@@ -102,6 +102,17 @@ def test_a100_gate_precedes_large_bank_copy_and_private_streaming():
     runtime_load = operator.index("load_unified_step200_inference_runtime(")
     audit_run = operator.index("run_step200_p0006_inference_audit(")
     assert gpu_gate < bank_copy < runtime_load < audit_run
+    scientific_role_preflight = operator.index(
+        "scientific_role_preflight = preflight_frozen_p0006_scientific_role("
+    )
+    assert scientific_role_preflight < operator.index(
+        "preflight_stage2_local_disk_capacity("
+    ) < bank_copy
+    assert scientific_role_preflight < runtime_load
+    assert (
+        "verified_scientific_role_preflight=scientific_role_preflight"
+        in operator
+    )
     assert operator.index("preflight_gate01_p0006_archive(") < bank_copy
     vae_config_preflight = operator.index(
         "vae_config_preflight = preflight_frozen_stage1_run_c_config(VAE_CONFIG)"
@@ -171,3 +182,30 @@ def test_operator_sources_contain_no_training_launch_or_long_run_authorization()
         "P0006_training_or_model_selection_use\": True",
     )
     assert all(item not in combined for item in forbidden)
+
+
+def test_authentic_readiness_is_preflighted_without_invented_training_field():
+    operator = GPU_OPERATOR.read_text(encoding="utf-8")
+    audit_source = (
+        ROOT / "src/fieldbridge/evaluation/stage2_step200_inference_audit.py"
+    ).read_text(encoding="utf-8")
+    event = '"stage": "frozen_p0006_scientific_role_preflight"'
+    assert event in operator
+    assert operator.index(event) < operator.index(
+        "copy_verified_stage2_bank_tar_to_local("
+    )
+    for flag in (
+        '"bank_copy_invoked": False',
+        '"bank_extraction_invoked": False',
+        '"checkpoint_deserialized": False',
+        '"model_constructed": False',
+        '"private_array_opened": False',
+        '"inference_invoked": False',
+        '"training_invoked": False',
+    ):
+        assert flag in operator[operator.index(event) : operator.index(
+            "metadata_preflight = preflight_gate01_p0006_archive("
+        )]
+    assert 'readiness.get("long_run_training_authorized")' not in audit_source
+    assert '"long_run_authorized_by_evaluation_path"' in audit_source
+    assert '"long_run_training_authorized": False' in audit_source

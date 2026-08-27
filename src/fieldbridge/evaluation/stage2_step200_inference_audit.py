@@ -71,8 +71,13 @@ from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     GATE01_P0006_EVALUATION_PROTOCOL,
     P0006_DEVELOPMENT_VALIDATION_DATA_ROLE,
     P0006_EVIDENCE_LIMITATION,
+    P0006_IDENTITY_SHA256,
+    P0006_SUBJECT_GROUP,
     P0009_CONFIRMATION_STATUS,
     iter_gate01_p0006_evaluation_cases,
+)
+from fieldbridge.evaluation.stage2_unified_preflight import (
+    LONG_RUN_EVALUATION_READINESS_CONTRACT,
 )
 from fieldbridge.models.factory import build_decoder, build_encoder, build_translator
 from fieldbridge.training.checkpoints import load_checkpoint
@@ -85,16 +90,19 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v4"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v5"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
 CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
 MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v1"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v4"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v5"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
 FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT = "stage2-step200-frozen-stage1-vae-provenance-v1"
 REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT = (
     "stage2-step200-reviewed-photometry-namespace-provenance-v1"
+)
+FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT = (
+    "stage2-step200-frozen-p0006-scientific-role-preflight-v1"
 )
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
@@ -186,6 +194,53 @@ class FrozenStep200InferencePlan:
     @property
     def montage_specification(self) -> dict[str, Any]:
         return dict(self.payload["montage_specification"])
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenP0006ScientificRolePreflight:
+    """Pinned small-file P:0006 protocol/readiness authentication."""
+
+    protocol_path: Path
+    readiness_path: Path
+    protocol: dict[str, Any]
+    readiness: dict[str, Any]
+    protocol_file_sha256: str
+    protocol_sha256: str
+    readiness_file_sha256: str
+    readiness_sha256: str
+
+    def sanitized_provenance(self) -> dict[str, Any]:
+        return {
+            "contract_version": FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT,
+            "protocol_contract_version": self.protocol["contract_version"],
+            "protocol_file_sha256": self.protocol_file_sha256,
+            "protocol_sha256": self.protocol_sha256,
+            "readiness_contract_version": self.readiness["contract_version"],
+            "readiness_file_sha256": self.readiness_file_sha256,
+            "readiness_sha256": self.readiness_sha256,
+            "evaluation_role": self.readiness["evaluation_role"],
+            "evidence_interpretation": self.readiness["evidence_interpretation"],
+            "traveller_identity_sha256": self.protocol["traveller_identity_sha256"],
+            "acquisition_count": self.protocol["acquisition_count"],
+            "directed_pair_count": self.protocol["directed_pair_count"],
+            "wrong_target_reference_count": self.protocol[
+                "wrong_target_reference_count"
+            ],
+            "factored_bank_P_record_count": self.readiness[
+                "factored_bank_P_record_count"
+            ],
+            "unpaired_validation_P_endpoint_count": self.readiness[
+                "unpaired_validation_P_endpoint_count"
+            ],
+            "long_run_authorized_by_evaluation_path": True,
+            "long_run_training_authorized": False,
+            "prospective_training_or_model_selection_use": False,
+            "population_or_generalization_claims_authorized": False,
+            "P0009_confirmation_status": self.readiness[
+                "P0009_confirmation_status"
+            ],
+            "P0009_executed": False,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -730,7 +785,7 @@ def _reject_duplicate_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"Duplicate JSON key in frozen photometry artifact: {key!r}.")
+            raise ValueError(f"Duplicate JSON key in frozen audit evidence: {key!r}.")
         result[key] = value
     return result
 
@@ -937,6 +992,59 @@ def verify_reviewed_photometry_bank_provenance(
         bank_manifest_artifact_file_sha256=manifest_file_sha256,
         bank_manifest_artifact_sha256=manifest_artifact_sha256,
     )
+
+
+def preflight_frozen_p0006_scientific_role(
+    protocol_path: str | Path,
+    readiness_path: str | Path,
+) -> FrozenP0006ScientificRolePreflight:
+    """Authenticate the two small sealed P:0006 role artifacts before bank I/O."""
+
+    protocol_file = Path(protocol_path)
+    readiness_file = Path(readiness_path)
+    protocol = _load_pinned_self_hashed_snapshot(
+        protocol_file,
+        role="P:0006 protocol",
+        expected_file_sha256=P0006_PROTOCOL_FILE_SHA256,
+        hash_key="protocol_sha256",
+        expected_internal_sha256=P0006_PROTOCOL_SHA256,
+    )
+    readiness = _load_pinned_self_hashed_snapshot(
+        readiness_file,
+        role="evaluation readiness",
+        expected_file_sha256=EVALUATION_READINESS_FILE_SHA256,
+        hash_key="readiness_sha256",
+        expected_internal_sha256=EVALUATION_READINESS_SHA256,
+    )
+    _validate_scientific_role(protocol, readiness)
+    return FrozenP0006ScientificRolePreflight(
+        protocol_path=protocol_file,
+        readiness_path=readiness_file,
+        protocol=copy.deepcopy(protocol),
+        readiness=copy.deepcopy(readiness),
+        protocol_file_sha256=P0006_PROTOCOL_FILE_SHA256,
+        protocol_sha256=P0006_PROTOCOL_SHA256,
+        readiness_file_sha256=EVALUATION_READINESS_FILE_SHA256,
+        readiness_sha256=EVALUATION_READINESS_SHA256,
+    )
+
+
+def verify_frozen_p0006_scientific_role_preflight(
+    preflight: FrozenP0006ScientificRolePreflight,
+) -> FrozenP0006ScientificRolePreflight:
+    """Rehash and semantically revalidate both artifacts immediately before use."""
+
+    current = preflight_frozen_p0006_scientific_role(
+        preflight.protocol_path,
+        preflight.readiness_path,
+    )
+    if current.protocol != preflight.protocol:
+        raise ValueError("P:0006 protocol changed after scientific-role preflight.")
+    if current.readiness != preflight.readiness:
+        raise ValueError("Evaluation readiness changed after scientific-role preflight.")
+    if current.sanitized_provenance() != preflight.sanitized_provenance():
+        raise ValueError("P:0006 scientific-role provenance changed after preflight.")
+    return current
 
 
 def preflight_frozen_stage1_run_c_config(
@@ -1247,6 +1355,9 @@ def run_step200_p0006_inference_audit(
     dependency_provenance: Mapping[str, Any] | None = None,
     lpips_provenance: Mapping[str, Any] | None = None,
     lpips_integrity_verifier: Callable[[], Mapping[str, Any]] | None = None,
+    verified_scientific_role_preflight: (
+        FrozenP0006ScientificRolePreflight | None
+    ) = None,
 ) -> dict[str, Any]:
     """Run or exactly resume the bounded-memory 60-case descriptive audit."""
 
@@ -1271,17 +1382,25 @@ def run_step200_p0006_inference_audit(
         raise RuntimeError("Photometry compatibility scope leaked into the inference audit.")
     protocol_path = Path(protocol_path)
     readiness_path = Path(evaluation_readiness_path)
-    if sha256_file(protocol_path) != P0006_PROTOCOL_FILE_SHA256:
-        raise ValueError("P:0006 protocol file SHA-256 mismatch.")
-    protocol = _load_self_hashed(protocol_path, "protocol_sha256")
-    if protocol.get("protocol_sha256") != P0006_PROTOCOL_SHA256:
-        raise ValueError("P:0006 internal protocol SHA-256 mismatch.")
-    if sha256_file(readiness_path) != EVALUATION_READINESS_FILE_SHA256:
-        raise ValueError("Evaluation-readiness file SHA-256 mismatch.")
-    readiness = _load_self_hashed(readiness_path, "readiness_sha256")
-    if readiness.get("readiness_sha256") != EVALUATION_READINESS_SHA256:
-        raise ValueError("Evaluation-readiness internal SHA-256 mismatch.")
-    _validate_scientific_role(protocol, readiness)
+    if verified_scientific_role_preflight is None:
+        if require_a100:
+            raise ValueError(
+                "Production inference audit lacks the early P:0006 scientific-role preflight."
+            )
+        verified_scientific_role_preflight = (
+            preflight_frozen_p0006_scientific_role(protocol_path, readiness_path)
+        )
+    if (
+        verified_scientific_role_preflight.protocol_path != protocol_path
+        or verified_scientific_role_preflight.readiness_path != readiness_path
+    ):
+        raise ValueError("P:0006 scientific-role preflight paths changed before use.")
+    current_scientific_role = verify_frozen_p0006_scientific_role_preflight(
+        verified_scientific_role_preflight
+    )
+    protocol = current_scientific_role.protocol
+    readiness = current_scientific_role.readiness
+    scientific_role_provenance = current_scientific_role.sanitized_provenance()
     plan = build_frozen_step200_inference_plan(protocol)
     if require_a100:
         _validate_a100_identity(runtime)
@@ -1310,6 +1429,7 @@ def run_step200_p0006_inference_audit(
         audit_implementation_commit=audit_implementation_commit,
         dependency_receipt=dependency_receipt,
         lpips_receipt=lpips_receipt,
+        scientific_role_provenance=scientific_role_provenance,
     )
     _seal_or_verify_json(root / "run_contract.json", run_contract, "run_contract_sha256")
     initial_state = dict(runtime.state_identity())
@@ -1430,6 +1550,7 @@ def run_step200_p0006_inference_audit(
         dependency_receipt=dependency_receipt,
         lpips_receipt=lpips_receipt,
         lpips_post_audit=lpips_post_audit,
+        scientific_role_provenance=scientific_role_provenance,
     )
     summary_path = root / "stage2_step200_p0006_summary.json"
     _seal_or_verify_json(summary_path, summary, "summary_sha256")
@@ -1447,6 +1568,7 @@ def run_step200_p0006_inference_audit(
         dependency_receipt=dependency_receipt,
         lpips_receipt=lpips_receipt,
         lpips_post_audit=lpips_post_audit,
+        scientific_role_provenance=scientific_role_provenance,
     )
     return {
         **summary,
@@ -1783,6 +1905,7 @@ def _build_inference_summary(
     dependency_receipt: Mapping[str, Any],
     lpips_receipt: Mapping[str, Any],
     lpips_post_audit: Mapping[str, Any],
+    scientific_role_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     def reduce(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         return {
@@ -1831,6 +1954,9 @@ def _build_inference_summary(
         "P0006_protocol_sha256": P0006_PROTOCOL_SHA256,
         "evaluation_readiness_file_sha256": EVALUATION_READINESS_FILE_SHA256,
         "evaluation_readiness_sha256": EVALUATION_READINESS_SHA256,
+        "frozen_p0006_scientific_role_provenance": dict(
+            scientific_role_provenance
+        ),
         "inference_plan_sha256": plan.sha256,
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
@@ -1997,6 +2123,7 @@ def _seal_artifact_manifest(
     dependency_receipt: Mapping[str, Any],
     lpips_receipt: Mapping[str, Any],
     lpips_post_audit: Mapping[str, Any],
+    scientific_role_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     outputs = {}
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
@@ -2012,6 +2139,11 @@ def _seal_artifact_manifest(
         "run_fingerprint": RUN_FINGERPRINT,
         "P0006_protocol_file_sha256": P0006_PROTOCOL_FILE_SHA256,
         "P0006_protocol_sha256": P0006_PROTOCOL_SHA256,
+        "evaluation_readiness_file_sha256": EVALUATION_READINESS_FILE_SHA256,
+        "evaluation_readiness_sha256": EVALUATION_READINESS_SHA256,
+        "frozen_p0006_scientific_role_provenance": dict(
+            scientific_role_provenance
+        ),
         "inference_plan_sha256": plan.sha256,
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
@@ -2057,14 +2189,19 @@ def _run_contract(
     audit_implementation_commit: str,
     dependency_receipt: Mapping[str, Any],
     lpips_receipt: Mapping[str, Any],
+    scientific_role_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v4",
+        "contract_version": "stage2-step200-p0006-inference-run-v5",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "run_fingerprint": RUN_FINGERPRINT,
         "protocol_sha256": P0006_PROTOCOL_SHA256,
+        "evaluation_readiness_sha256": EVALUATION_READINESS_SHA256,
+        "frozen_p0006_scientific_role_provenance": dict(
+            scientific_role_provenance
+        ),
         "inference_plan_sha256": plan.sha256,
         "model_state": dict(runtime.state_identity()),
         "GPU_identity": dict(runtime.gpu_identity),
@@ -2077,6 +2214,9 @@ def _run_contract(
         "training_invoked": False,
         "gradients_enabled": False,
         "optimizer_loaded": False,
+        "P0006_training_or_model_selection_use": False,
+        "population_or_generalization_claims_authorized": False,
+        "long_run_training_authorized": False,
     }
     body["run_contract_sha256"] = sha256_json(body)
     return body
@@ -2244,16 +2384,235 @@ def _stable_runtime_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _validate_scientific_role(protocol: Mapping[str, Any], readiness: Mapping[str, Any]) -> None:
+def _load_pinned_self_hashed_snapshot(
+    path: Path,
+    *,
+    role: str,
+    expected_file_sha256: str,
+    hash_key: str,
+    expected_internal_sha256: str,
+) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Pinned {role} is missing.")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"Pinned {role} is not a non-symlink regular file.")
+    raw_bytes = path.read_bytes()
+    observed_file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if observed_file_sha256 != expected_file_sha256:
+        raise ValueError(f"Pinned {role} file SHA-256 mismatch.")
+    try:
+        parsed = json.loads(
+            raw_bytes.decode("utf-8-sig"),
+            object_pairs_hook=_reject_duplicate_json_pairs,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Pinned {role} JSON is malformed.") from error
+    if not isinstance(parsed, Mapping):
+        raise ValueError(f"Pinned {role} root must be a JSON object.")
+    payload = dict(parsed)
+    body = dict(payload)
+    stored_internal_sha256 = body.pop(hash_key, None)
     if (
-        protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE
-        or protocol.get("training_or_model_selection_use") is not False
-        or protocol.get("population_or_generalization_claims_authorized") is not False
-        or protocol.get("P0009_executed") is not False
-        or readiness.get("long_run_training_authorized") is not False
-        or readiness.get("population_or_generalization_claims_authorized") is not False
+        stored_internal_sha256 != sha256_json(body)
+        or stored_internal_sha256 != expected_internal_sha256
     ):
-        raise ValueError("P:0006 scientific role or readiness safety boundary changed.")
+        raise ValueError(f"Pinned {role} internal SHA-256 mismatch.")
+    if path.read_bytes() != raw_bytes:
+        raise ValueError(f"Pinned {role} changed while being authenticated.")
+    return payload
+
+
+def _require_exact_nonnegative_int(value: Any, label: str, expected: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise ValueError(f"{label} must be exactly {expected}.")
+
+
+def _validate_p0006_protocol_v4(protocol: Mapping[str, Any]) -> None:
+    if protocol.get("contract_version") != GATE01_P0006_EVALUATION_PROTOCOL:
+        raise ValueError("P:0006 protocol contract version changed.")
+    if protocol.get("data_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE:
+        raise ValueError("P:0006 protocol data role changed.")
+    if protocol.get("evidence_interpretation") != P0006_EVIDENCE_LIMITATION:
+        raise ValueError("P:0006 protocol evidence interpretation changed.")
+    if protocol.get("subject_group_identity") != P0006_SUBJECT_GROUP:
+        raise ValueError("P:0006 protocol subject-group identity changed.")
+    if protocol.get("traveller_identity_sha256") != P0006_IDENTITY_SHA256:
+        raise ValueError("P:0006 protocol traveller identity changed.")
+    if protocol.get("population_or_generalization_claims_authorized") is not False:
+        raise ValueError("P:0006 protocol authorized population/generalization claims.")
+    if protocol.get("training_or_model_selection_use") is not False:
+        raise ValueError("P:0006 protocol authorized training or model selection.")
+    if protocol.get("private_arrays_validated") is not True:
+        raise ValueError("P:0006 protocol lacks complete private-array validation.")
+    if protocol.get("P0009_confirmation_status") != P0009_CONFIRMATION_STATUS:
+        raise ValueError("P:0006 protocol changed frozen P:0009 status.")
+    if protocol.get("P0009_executed") is not False:
+        raise ValueError("P:0006 protocol indicates P:0009 execution.")
+    if protocol.get("forbidden_travellers") != ["P:0007", "P:0009"]:
+        raise ValueError("P:0006 protocol forbidden-traveller inventory changed.")
+    _require_exact_nonnegative_int(
+        protocol.get("acquisition_count"), "P:0006 acquisition count", 15
+    )
+    _require_exact_nonnegative_int(
+        protocol.get("directed_pair_count"), "P:0006 directed-pair count", 60
+    )
+    _require_exact_nonnegative_int(
+        protocol.get("wrong_target_reference_count"),
+        "P:0006 wrong-target reference count",
+        180,
+    )
+    factored_bank = protocol.get("factored_bank")
+    if not isinstance(factored_bank, Mapping):
+        raise ValueError("P:0006 protocol factored-bank P-record count changed.")
+    _require_exact_nonnegative_int(
+        factored_bank.get("P_record_count"),
+        "P:0006 protocol factored-bank P-record count",
+        0,
+    )
+    frozen_validation = protocol.get("frozen_unpaired_validation")
+    if not isinstance(frozen_validation, Mapping):
+        raise ValueError("P:0006 protocol validation P-endpoint count changed.")
+    _require_exact_nonnegative_int(
+        frozen_validation.get("P_endpoint_count"),
+        "P:0006 protocol validation P-endpoint count",
+        0,
+    )
+    receipts = protocol.get("case_receipts")
+    if not isinstance(receipts, list) or len(receipts) != 60:
+        raise ValueError("P:0006 protocol must contain exactly 60 case receipts.")
+    expected_cells = {
+        (contrast.value, float(source), float(target))
+        for contrast in CONTRASTS
+        for source in FIELD_STRENGTHS_T
+        for target in FIELD_STRENGTHS_T
+        if source != target
+    }
+    observed_cells: set[tuple[str, float, float]] = set()
+    observed_nodes: set[tuple[str, float]] = set()
+    observed_case_identities: set[str] = set()
+    wrong_target_count = 0
+    for receipt in receipts:
+        if not isinstance(receipt, Mapping):
+            raise ValueError("P:0006 protocol contains a malformed case receipt.")
+        case_identity = receipt.get("case_identity")
+        if not isinstance(case_identity, str) or not case_identity:
+            raise ValueError("P:0006 protocol contains a malformed case identity.")
+        if case_identity in observed_case_identities:
+            raise ValueError("P:0006 protocol contains a duplicate case identity.")
+        observed_case_identities.add(case_identity)
+        try:
+            source = Domain.from_dict(dict(receipt["source_domain"]))
+            target = Domain.from_dict(dict(receipt["target_domain"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("P:0006 protocol contains malformed case domains.") from error
+        if source.contrast != target.contrast or source == target:
+            raise ValueError("P:0006 protocol contains an invalid directed domain pair.")
+        cell = (
+            source.contrast.value,
+            float(source.field_strength_t),
+            float(target.field_strength_t),
+        )
+        if cell in observed_cells:
+            raise ValueError("P:0006 protocol contains a duplicate directed domain pair.")
+        observed_cells.add(cell)
+        observed_nodes.add((source.contrast.value, float(source.field_strength_t)))
+        observed_nodes.add((target.contrast.value, float(target.field_strength_t)))
+        wrong_targets = receipt.get("wrong_target_sb_v2_sha256")
+        if not isinstance(wrong_targets, Mapping) or len(wrong_targets) != 3:
+            raise ValueError("P:0006 protocol case has an invalid wrong-target inventory.")
+        if any(_SHA256_RE.fullmatch(str(value)) is None for value in wrong_targets.values()):
+            raise ValueError("P:0006 protocol contains a malformed wrong-target identity.")
+        wrong_target_count += len(wrong_targets)
+    if observed_cells != expected_cells:
+        raise ValueError("P:0006 protocol directed-pair inventory changed.")
+    if len(observed_nodes) != 15:
+        raise ValueError("P:0006 protocol acquisition-node inventory changed.")
+    if wrong_target_count != 180:
+        raise ValueError("P:0006 protocol wrong-target inventory changed.")
+
+
+def _validate_readiness_v3(
+    readiness: Mapping[str, Any], protocol: Mapping[str, Any]
+) -> None:
+    expected_keys = {
+        "contract_version",
+        "long_run_authorized_by_evaluation_path",
+        "evaluation_role",
+        "evidence_interpretation",
+        "population_or_generalization_claims_authorized",
+        "prospective_protocol_used",
+        "prospective_training_or_model_selection_use",
+        "reviewed_prospective_protocol_available",
+        "complete_inventory_no_selection",
+        "directed_pair_count",
+        "feasibility_result_sha256",
+        "retrospective_pair_feasibility",
+        "p0006_evaluation_protocol_sha256",
+        "p0006_gate01_result_file_sha256",
+        "factored_bank_P_record_count",
+        "unpaired_validation_P_endpoint_count",
+        "P0009_confirmation_status",
+        "P0009_executed",
+        "readiness_sha256",
+    }
+    if set(readiness) != expected_keys:
+        raise ValueError("Evaluation-readiness v3 key inventory changed.")
+    if readiness.get("contract_version") != LONG_RUN_EVALUATION_READINESS_CONTRACT:
+        raise ValueError("Evaluation-readiness contract version changed.")
+    if readiness.get("long_run_authorized_by_evaluation_path") is not True:
+        raise ValueError("Evaluation path is not authorized by the sealed readiness evidence.")
+    if readiness.get("evaluation_role") != P0006_DEVELOPMENT_VALIDATION_DATA_ROLE:
+        raise ValueError("Evaluation-readiness role changed.")
+    if readiness.get("evidence_interpretation") != P0006_EVIDENCE_LIMITATION:
+        raise ValueError("Evaluation-readiness evidence interpretation changed.")
+    false_fields = (
+        "population_or_generalization_claims_authorized",
+        "prospective_training_or_model_selection_use",
+        "retrospective_pair_feasibility",
+        "P0009_executed",
+    )
+    if any(readiness.get(field) is not False for field in false_fields):
+        raise ValueError("Evaluation-readiness safety boundary changed.")
+    true_fields = (
+        "prospective_protocol_used",
+        "reviewed_prospective_protocol_available",
+        "complete_inventory_no_selection",
+    )
+    if any(readiness.get(field) is not True for field in true_fields):
+        raise ValueError("Evaluation-readiness prospective inventory is incomplete.")
+    _require_exact_nonnegative_int(
+        readiness.get("directed_pair_count"), "Readiness directed-pair count", 60
+    )
+    _require_exact_nonnegative_int(
+        readiness.get("factored_bank_P_record_count"),
+        "Readiness factored-bank P-record count",
+        0,
+    )
+    _require_exact_nonnegative_int(
+        readiness.get("unpaired_validation_P_endpoint_count"),
+        "Readiness validation P-endpoint count",
+        0,
+    )
+    if readiness.get("p0006_evaluation_protocol_sha256") != protocol.get(
+        "protocol_sha256"
+    ):
+        raise ValueError("Evaluation readiness references another P:0006 protocol.")
+    gate01_result = protocol.get("gate01_result")
+    if (
+        not isinstance(gate01_result, Mapping)
+        or readiness.get("p0006_gate01_result_file_sha256")
+        != gate01_result.get("file_sha256")
+    ):
+        raise ValueError("Evaluation readiness references another Gate 0.1 result.")
+    if _SHA256_RE.fullmatch(str(readiness.get("feasibility_result_sha256", ""))) is None:
+        raise ValueError("Evaluation-readiness feasibility identity is malformed.")
+    if readiness.get("P0009_confirmation_status") != P0009_CONFIRMATION_STATUS:
+        raise ValueError("Evaluation-readiness P:0009 status changed.")
+
+
+def _validate_scientific_role(protocol: Mapping[str, Any], readiness: Mapping[str, Any]) -> None:
+    _validate_p0006_protocol_v4(protocol)
+    _validate_readiness_v3(readiness, protocol)
 
 
 def _validate_a100_identity(runtime: Step200CaseInferenceRuntime) -> None:
@@ -2485,6 +2844,8 @@ __all__ = [
     "CASE_RECEIPT_CONTRACT",
     "CHECKPOINT_SHA256",
     "FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT",
+    "FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT",
+    "FrozenP0006ScientificRolePreflight",
     "FrozenStage1VAEConfigPreflight",
     "FrozenStage1VAEProvenance",
     "FrozenStep200InferencePlan",
@@ -2512,8 +2873,10 @@ __all__ = [
     "load_unified_step200_inference_runtime",
     "photometry_namespace_compatibility_active",
     "preflight_frozen_stage1_run_c_config",
+    "preflight_frozen_p0006_scientific_role",
     "preflight_reviewed_photometry_namespace_artifact",
     "run_step200_p0006_inference_audit",
     "verify_frozen_stage1_vae_bank_provenance",
+    "verify_frozen_p0006_scientific_role_preflight",
     "verify_reviewed_photometry_bank_provenance",
 ]

@@ -139,8 +139,29 @@ R/train rows, zero accepted P rows, 30 excluded P rows, and the exact two 3-reco
 collision groups. After bank restoration the manifest must repeat both exact photometry
 hashes. The already validated in-memory artifact is passed to runtime construction and
 is rehashed immediately before use; it is never reloaded after model construction.
-Run, summary, and artifact-manifest contracts are v4 so exact resume/no-clobber rejects
+Run, summary, and artifact-manifest contracts are v5 so exact resume/no-clobber rejects
 outputs that predate this provenance.
+
+After Drive mount and before local-capacity checks or bank restoration, the operator
+authenticates the small sealed P:0006 protocol v4 and evaluation-readiness v3 byte
+snapshots, their raw-file hashes, and their internal self-hashes. The readiness
+producer's `long_run_authorized_by_evaluation_path: true` means only that the reviewed
+P:0006 development/model-assessment path was complete enough to seal evaluation
+readiness. It is not training permission. The audit run, summary, and manifest continue
+to seal `long_run_training_authorized: false`, and the notebook always stops for a
+human resource-bounded training decision. The same two files are rehashed and fully
+revalidated immediately before P:0006 use so a replacement after preflight fails
+closed.
+
+The protocol check requires the exact development-validation role and evidence
+limitation, the pinned P:0006 traveller identity, 15 acquisition nodes, all 60 directed
+same-contrast field pairs, 180 wrong-target references, zero P records in the factored
+bank, zero P endpoints in frozen unpaired validation, no training/model-selection use,
+and P:0009 frozen and unexecuted. The production-shaped readiness check requires the
+reviewed prospective inventory, its exact protocol linkage, no prospective training or
+selection, no population/generalization authorization, and the frozen P:0009 status;
+the nonexistent synthetic `long_run_training_authorized` readiness input is neither
+required nor accepted.
 
 The operator revalidates the complete step-200 evidence, the full checkpoint container,
 the frozen Stage-1 VAE, the R-only photometry/bank identities, the P:0006 protocol, and

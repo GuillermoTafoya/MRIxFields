@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -90,12 +90,12 @@ from fieldbridge.training.stage2_unified import (
 )
 
 
-INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v5"
+INFERENCE_AUDIT_CONTRACT = "stage2-step200-p0006-inference-audit-v6"
 INFERENCE_PLAN_CONTRACT = "stage2-step200-p0006-frozen-inference-plan-v1"
 MONTAGE_SPECIFICATION_CONTRACT = "stage2-step200-p0006-frozen-montage-v1"
 CASE_RECEIPT_CONTRACT = "stage2-step200-p0006-inference-case-receipt-v1"
-MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v1"
-ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v5"
+MEMORY_GATE_CONTRACT = "stage2-step200-p0006-a100-one-case-gate-v2"
+ARTIFACT_MANIFEST_CONTRACT = "stage2-step200-p0006-audit-artifact-manifest-v6"
 METRIC_CONTRACT = "stage2-step200-p0006-descriptive-official-task3-v1"
 FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT = "stage2-step200-frozen-stage1-vae-provenance-v1"
 REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT = (
@@ -103,6 +103,9 @@ REVIEWED_PHOTOMETRY_NAMESPACE_PROVENANCE_CONTRACT = (
 )
 FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT = (
     "stage2-step200-frozen-p0006-scientific-role-preflight-v1"
+)
+FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT = (
+    "stage2-step200-full-volume-layout-adapter-v1"
 )
 TRAINING_EVIDENCE_COMMIT = "82633d66e5ea47f96b149ea22cc192fcf4526f06"
 CHECKPOINT_SHA256 = "09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021"
@@ -244,12 +247,222 @@ class FrozenP0006ScientificRolePreflight:
 
 
 @dataclass(frozen=True, slots=True)
+class AdaptedFullVolume:
+    """Representation-only view of one 3-D volume with singleton leading axes."""
+
+    tensor: torch.Tensor
+    role: str
+    authenticated_shape: tuple[int, ...]
+    spatial_shape: tuple[int, int, int]
+
+    @property
+    def authenticated_rank(self) -> int:
+        return len(self.authenticated_shape)
+
+    @property
+    def leading_singleton_axis_count(self) -> int:
+        return self.authenticated_rank - 3
+
+    def model_batch(self) -> torch.Tensor:
+        expected = (1, 1, *self.spatial_shape)
+        value = (
+            self.tensor
+            if self.authenticated_shape == expected
+            else self.tensor.reshape(expected)
+        )
+        if tuple(value.shape) != expected:
+            raise RuntimeError(f"{self.role} model-batch adaptation changed shape.")
+        if not torch.equal(value.reshape(self.authenticated_shape), self.tensor):
+            raise RuntimeError(f"{self.role} model-batch adaptation changed values.")
+        return value
+
+    def spatial_volume(self) -> torch.Tensor:
+        value = self.tensor.reshape(self.spatial_shape)
+        if not torch.equal(value.reshape(self.authenticated_shape), self.tensor):
+            raise RuntimeError(f"{self.role} spatial adaptation changed values.")
+        return value
+
+    def restore_decoder_output(
+        self, decoded_model_batch: torch.Tensor, *, role: str
+    ) -> torch.Tensor:
+        expected = (1, 1, *self.spatial_shape)
+        if not isinstance(decoded_model_batch, torch.Tensor):
+            raise TypeError(f"{role} decoder output must be a torch.Tensor.")
+        if tuple(decoded_model_batch.shape) != expected:
+            raise ValueError(
+                f"{role} decoder output must be one channel with unchanged spatial axes: "
+                f"{tuple(decoded_model_batch.shape)} != {expected}."
+            )
+        if not bool(torch.isfinite(decoded_model_batch).all()):
+            raise ValueError(f"{role} decoder output contains non-finite values.")
+        restored = decoded_model_batch.reshape(self.authenticated_shape)
+        if not torch.equal(restored.reshape(expected), decoded_model_batch):
+            raise RuntimeError(f"{role} decoder-output restoration changed values.")
+        return restored
+
+    def sanitized_provenance(self, *, source_rank: int) -> dict[str, Any]:
+        return {
+            "contract_version": FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT,
+            "authenticated_source_rank": source_rank,
+            "authenticated_canonical_rank": self.authenticated_rank,
+            "leading_singleton_axis_count": self.leading_singleton_axis_count,
+            "model_input_rank": 5,
+            "representation_only_reshape": True,
+            "spatial_axes_preserved": True,
+            "resampling_performed": False,
+            "cropping_performed": False,
+            "padding_performed": False,
+            "transposition_performed": False,
+            "output_restored_to_authenticated_case_representation": True,
+            "training_invoked": False,
+        }
+
+
+def adapt_full_volume_layout(
+    tensor: torch.Tensor,
+    *,
+    role: str,
+    expected_shape: tuple[int, ...] | None = None,
+) -> AdaptedFullVolume:
+    """Accept only 3-D, CXYZ, or BCXYZ singleton-leading full volumes."""
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{role} must be a torch.Tensor.")
+    if tensor.ndim < 3 or tensor.ndim > 5:
+        raise ValueError(f"{role} rank must be between 3 and 5.")
+    shape = tuple(int(value) for value in tensor.shape)
+    if expected_shape is not None and shape != expected_shape:
+        raise ValueError(f"{role} shape changed: {shape} != {expected_shape}.")
+    leading = shape[:-3]
+    if any(value != 1 for value in leading):
+        raise ValueError(f"{role} has a non-singleton batch/channel axis.")
+    spatial = shape[-3:]
+    if any(value <= 0 for value in spatial):
+        raise ValueError(f"{role} has a malformed spatial dimension.")
+    if not bool(torch.isfinite(tensor).all()):
+        raise ValueError(f"{role} contains non-finite values.")
+    adapted = AdaptedFullVolume(
+        tensor=tensor,
+        role=role,
+        authenticated_shape=shape,
+        spatial_shape=(spatial[0], spatial[1], spatial[2]),
+    )
+    adapted.model_batch()
+    return adapted
+
+
+def _validate_authenticated_case_layout(case: Gate01Case) -> AdaptedFullVolume:
+    if case.source_image is None:
+        raise ValueError("P:0006 inference case lacks its verified source image.")
+    source = adapt_full_volume_layout(case.source_image, role="P:0006 source image")
+    expected = source.authenticated_shape
+    for role, tensor in (
+        ("P:0006 target", case.target),
+        ("P:0006 raw identity", case.raw_identity),
+        ("P:0006 raw original SB-v2", case.raw_sb_v2),
+        ("P:0006 Stage-1 reconstruction ceiling", case.stage1_reconstruction_ceiling),
+    ):
+        adapt_full_volume_layout(tensor, role=role, expected_shape=expected)
+    if case.support_mask.dtype != torch.bool:
+        raise ValueError("P:0006 support mask must be boolean.")
+    adapt_full_volume_layout(
+        case.support_mask,
+        role="P:0006 source-derived support mask",
+        expected_shape=expected,
+    )
+    return source
+
+
+def _apply_shape_bound_calibrator(
+    calibrator: PosthocTargetCalibrator,
+    prediction: torch.Tensor,
+    target_domain: Domain,
+    support_mask: torch.Tensor,
+    *,
+    expected_shape: tuple[int, ...],
+    role: str,
+) -> torch.Tensor:
+    adapt_full_volume_layout(prediction, role=role, expected_shape=expected_shape)
+    if support_mask.dtype != torch.bool:
+        raise ValueError(f"{role} calibrator support must be boolean.")
+    adapt_full_volume_layout(
+        support_mask,
+        role=f"{role} calibrator support",
+        expected_shape=expected_shape,
+    )
+    calibrated = calibrator.apply(
+        prediction,
+        target_domain,
+        support_mask=support_mask,
+        mode="histogram",
+    )
+    adapt_full_volume_layout(
+        calibrated,
+        role=f"{role} calibrated output",
+        expected_shape=expected_shape,
+    )
+    return calibrated
+
+
+def _validate_full_volume_layout_provenance(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Full-volume layout provenance is missing or malformed.")
+    provenance = dict(value)
+    expected_keys = {
+        "contract_version",
+        "authenticated_source_rank",
+        "authenticated_canonical_rank",
+        "leading_singleton_axis_count",
+        "model_input_rank",
+        "representation_only_reshape",
+        "spatial_axes_preserved",
+        "resampling_performed",
+        "cropping_performed",
+        "padding_performed",
+        "transposition_performed",
+        "output_restored_to_authenticated_case_representation",
+        "training_invoked",
+    }
+    if set(provenance) != expected_keys:
+        raise ValueError("Full-volume layout provenance key inventory changed.")
+    source_rank = provenance.get("authenticated_source_rank")
+    canonical_rank = provenance.get("authenticated_canonical_rank")
+    leading_count = provenance.get("leading_singleton_axis_count")
+    if (
+        isinstance(source_rank, bool)
+        or not isinstance(source_rank, int)
+        or source_rank not in {3, 4, 5}
+        or canonical_rank != source_rank
+        or isinstance(leading_count, bool)
+        or not isinstance(leading_count, int)
+        or leading_count != source_rank - 3
+    ):
+        raise ValueError("Full-volume layout rank provenance changed.")
+    if (
+        provenance.get("contract_version") != FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT
+        or provenance.get("model_input_rank") != 5
+        or provenance.get("representation_only_reshape") is not True
+        or provenance.get("spatial_axes_preserved") is not True
+        or provenance.get("resampling_performed") is not False
+        or provenance.get("cropping_performed") is not False
+        or provenance.get("padding_performed") is not False
+        or provenance.get("transposition_performed") is not False
+        or provenance.get("output_restored_to_authenticated_case_representation")
+        is not True
+        or provenance.get("training_invoked") is not False
+    ):
+        raise ValueError("Full-volume layout safety provenance changed.")
+    return provenance
+
+
+@dataclass(frozen=True, slots=True)
 class InferenceCaseOutputs:
     methods: dict[str, torch.Tensor]
     anatomy: dict[str, float]
     graph: dict[str, Any]
     sweep_slices: dict[str, np.ndarray]
     decoded_canonical_sha256: str
+    full_volume_layout_provenance: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,8 +631,7 @@ class UnifiedStep200InferenceRuntime:
     ) -> InferenceCaseOutputs:
         if torch.is_grad_enabled():
             raise RuntimeError("Step-200 inference unexpectedly enabled gradients.")
-        if case.source_image is None:
-            raise ValueError("P:0006 inference case lacks its verified source image.")
+        source_layout = _validate_authenticated_case_layout(case)
         case_seed = _case_seed(plan, case)
         devices = [self.device] if self.device.type == "cuda" else []
         with torch.random.fork_rng(devices=devices):
@@ -430,15 +642,22 @@ class UnifiedStep200InferenceRuntime:
                 case.source_image, case.source_domain
             )
             canonical = canonical_context.values
-            if canonical.ndim == 3:
-                canonical_batch = canonical[None, None]
-            elif canonical.ndim == 4:
-                canonical_batch = canonical[None]
-            else:
-                raise ValueError("P:0006 canonical source is not one full 3-D volume.")
-            support_image = canonical_context.support_mask.detach().to(torch.bool)
-            while support_image.ndim > 3 and int(support_image.shape[0]) == 1:
-                support_image = support_image[0]
+            canonical_layout = adapt_full_volume_layout(
+                canonical,
+                role="P:0006 authenticated canonical source",
+                expected_shape=source_layout.authenticated_shape,
+            )
+            canonical_batch = canonical_layout.model_batch()
+            canonical_support_layout = adapt_full_volume_layout(
+                canonical_context.support_mask,
+                role="P:0006 canonical source support",
+                expected_shape=source_layout.authenticated_shape,
+            )
+            if canonical_context.support_mask.dtype != torch.bool:
+                raise ValueError("P:0006 canonical source support must be boolean.")
+            support_image = canonical_support_layout.spatial_volume().detach().to(
+                torch.bool
+            )
             latent, path_used = encode_latent(
                 self.encoder,
                 canonical_batch.to(self.device),
@@ -455,9 +674,12 @@ class UnifiedStep200InferenceRuntime:
                 self.encoder,
                 expected_rule_sha256=self.support_rule_sha256,
             )
-            support_batch = support[None, None].to(self.device)
+            support_batch = adapt_full_volume_layout(
+                support,
+                role="P:0006 propagated latent support",
+            ).model_batch().to(self.device)
             z = self.stats.normalize(latent, support_batch)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with _bf16_inference_autocast(self.device):
                 generated_z = integrate_transport(
                     self.translator,
                     z,
@@ -466,33 +688,48 @@ class UnifiedStep200InferenceRuntime:
                     steps=4,
                     solver="heun",
                 )
-                decoded = _decode(
+                decoded_model_batch = _decode(
                     self.decoder,
                     self.stats.denormalize(generated_z),
                     [case.target_domain],
-                )[0].float().cpu()
+                ).float()
+            decoded = canonical_layout.restore_decoder_output(
+                decoded_model_batch,
+                role="primary unified output",
+            ).cpu()
             unified = self.artifact.render_target(
                 canonical_context.with_values(decoded), case.target_domain
             ).float().cpu()
-            calibrated_identity = calibrator.apply(
+            adapt_full_volume_layout(
+                unified,
+                role="rendered primary unified output",
+                expected_shape=source_layout.authenticated_shape,
+            )
+            calibrated_identity = _apply_shape_bound_calibrator(
+                calibrator,
                 case.raw_identity,
                 case.target_domain,
-                support_mask=case.support_mask,
-                mode="histogram",
+                case.support_mask,
+                expected_shape=source_layout.authenticated_shape,
+                role="raw identity",
             )
-            calibrated_sb = calibrator.apply(
+            calibrated_sb = _apply_shape_bound_calibrator(
+                calibrator,
                 case.raw_sb_v2,
                 case.target_domain,
-                support_mask=case.support_mask,
-                mode="histogram",
+                case.support_mask,
+                expected_shape=source_layout.authenticated_shape,
+                role="raw original SB-v2",
             )
             # The reviewed calibrator is fitted only from retrospective training target
             # CDFs and consumes the prediction/support, never the paired P:0006 target.
-            calibrated_unified = calibrator.apply(
+            calibrated_unified = _apply_shape_bound_calibrator(
+                calibrator,
                 unified,
                 case.target_domain,
-                support_mask=case.support_mask,
-                mode="histogram",
+                case.support_mask,
+                expected_shape=source_layout.authenticated_shape,
+                role="raw unified step-200 output",
             )
             methods = {
                 "raw_identity": case.raw_identity,
@@ -503,19 +740,35 @@ class UnifiedStep200InferenceRuntime:
                 "calibrated_unified_step200": calibrated_unified,
                 "stage1_reconstruction_ceiling": case.stage1_reconstruction_ceiling,
             }
-            image_support = canonical_context.support_mask
-            if image_support.ndim == 3:
-                image_support_batch = image_support[None, None].to(self.device)
-            else:
-                image_support_batch = image_support[None].to(self.device)
+            for method, prediction in methods.items():
+                adapt_full_volume_layout(
+                    prediction,
+                    role=f"P:0006 method {method}",
+                    expected_shape=source_layout.authenticated_shape,
+                )
+            image_support_batch = canonical_support_layout.model_batch().to(self.device)
             anatomy_values = anatomy_preservation_components(
-                canonical_batch.to(self.device), decoded[None].to(self.device), image_support_batch
+                canonical_batch.to(self.device),
+                decoded_model_batch.to(self.device),
+                image_support_batch,
             )
             anatomy = {key: float(value.detach().float().cpu()) for key, value in anatomy_values.items()}
-            graph = self._graph_diagnostic(case, z, support_batch, canonical_context, plan)
-            sweep_slices = self._field_sweep(case, z, canonical_context, plan)
-            decoded_sha = canonical_tensor_sha256(decoded)
-            del generated_z, decoded, latent, z, support, support_batch, canonical_batch
+            graph = self._graph_diagnostic(
+                case, z, support_batch, canonical_context, canonical_layout, plan
+            )
+            sweep_slices = self._field_sweep(
+                case, z, canonical_context, canonical_layout, plan
+            )
+            decoded_sha = canonical_tensor_sha256(
+                adapt_full_volume_layout(
+                    decoded, role="restored primary decoded canonical volume"
+                ).spatial_volume()
+            )
+            layout_provenance = canonical_layout.sanitized_provenance(
+                source_rank=source_layout.authenticated_rank
+            )
+            del generated_z, decoded, decoded_model_batch, latent, z, support
+            del support_batch, canonical_batch
             del image_support_batch, anatomy_values
         return InferenceCaseOutputs(
             methods=methods,
@@ -523,6 +776,7 @@ class UnifiedStep200InferenceRuntime:
             graph=graph,
             sweep_slices=sweep_slices,
             decoded_canonical_sha256=decoded_sha,
+            full_volume_layout_provenance=layout_provenance,
         )
 
     def _graph_diagnostic(
@@ -531,13 +785,14 @@ class UnifiedStep200InferenceRuntime:
         z: torch.Tensor,
         support: torch.Tensor,
         canonical_context: Any,
+        canonical_layout: AdaptedFullVolume,
         plan: FrozenStep200InferencePlan,
     ) -> dict[str, Any]:
         selected = _graph_intermediate(plan, case)
         if selected is None:
             return {"selected": False}
         intermediate = Domain(selected, case.source_domain.contrast)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with _bf16_inference_autocast(self.device):
             l1, direct, composed = graph_consistency_loss(
                 self.translator,
                 z,
@@ -548,17 +803,33 @@ class UnifiedStep200InferenceRuntime:
                 steps=4,
                 solver="heun",
             )
-            direct_decoded = _decode(
+            direct_decoded_batch = _decode(
                 self.decoder, self.stats.denormalize(direct), [case.target_domain]
-            )[0].float().cpu()
-            composed_decoded = _decode(
+            ).float()
+            composed_decoded_batch = _decode(
                 self.decoder, self.stats.denormalize(composed), [case.target_domain]
-            )[0].float().cpu()
+            ).float()
+        direct_decoded = canonical_layout.restore_decoder_output(
+            direct_decoded_batch, role="graph direct output"
+        ).cpu()
+        composed_decoded = canonical_layout.restore_decoder_output(
+            composed_decoded_batch, role="graph composed output"
+        ).cpu()
         direct_image = self.artifact.render_target(
             canonical_context.with_values(direct_decoded), case.target_domain
         )
         composed_image = self.artifact.render_target(
             canonical_context.with_values(composed_decoded), case.target_domain
+        )
+        adapt_full_volume_layout(
+            direct_image,
+            role="rendered graph direct output",
+            expected_shape=canonical_layout.authenticated_shape,
+        )
+        adapt_full_volume_layout(
+            composed_image,
+            role="rendered graph composed output",
+            expected_shape=canonical_layout.authenticated_shape,
         )
         result = {
             "selected": True,
@@ -571,7 +842,8 @@ class UnifiedStep200InferenceRuntime:
             "composed_slice": _middle_slice(composed_image),
             "absolute_difference_slice": _middle_slice((direct_image - composed_image).abs()),
         }
-        del direct, composed, direct_decoded, composed_decoded, direct_image, composed_image
+        del direct, composed, direct_decoded_batch, composed_decoded_batch
+        del direct_decoded, composed_decoded, direct_image, composed_image
         return result
 
     def _field_sweep(
@@ -579,6 +851,7 @@ class UnifiedStep200InferenceRuntime:
         case: Gate01Case,
         z: torch.Tensor,
         canonical_context: Any,
+        canonical_layout: AdaptedFullVolume,
         plan: FrozenStep200InferencePlan,
     ) -> dict[str, np.ndarray]:
         if float(case.source_domain.field_strength_t) != float(
@@ -591,7 +864,7 @@ class UnifiedStep200InferenceRuntime:
             if target == case.source_domain:
                 target_z = z
             else:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with _bf16_inference_autocast(self.device):
                     target_z = integrate_transport(
                         self.translator,
                         z,
@@ -600,17 +873,25 @@ class UnifiedStep200InferenceRuntime:
                         steps=4,
                         solver="heun",
                     )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                decoded = _decode(
+            with _bf16_inference_autocast(self.device):
+                decoded_batch = _decode(
                     self.decoder, self.stats.denormalize(target_z), [target]
-                )[0].float().cpu()
+                ).float()
+            decoded = canonical_layout.restore_decoder_output(
+                decoded_batch, role=f"field-sweep {float(field):g}T output"
+            ).cpu()
             rendered = self.artifact.render_target(
                 canonical_context.with_values(decoded), target
+            )
+            adapt_full_volume_layout(
+                rendered,
+                role=f"rendered field-sweep {float(field):g}T output",
+                expected_shape=canonical_layout.authenticated_shape,
             )
             slices[f"{float(field):g}T"] = _middle_slice(rendered)
             if target_z is not z:
                 del target_z
-            del decoded, rendered
+            del decoded_batch, decoded, rendered
         return slices
 
 
@@ -1423,15 +1704,6 @@ def run_step200_p0006_inference_audit(
         directory.mkdir(exist_ok=True)
     plan_path = root / "frozen_inference_plan.json"
     _seal_or_verify_json(plan_path, plan.payload, "inference_plan_sha256")
-    run_contract = _run_contract(
-        plan,
-        runtime,
-        audit_implementation_commit=audit_implementation_commit,
-        dependency_receipt=dependency_receipt,
-        lpips_receipt=lpips_receipt,
-        scientific_role_provenance=scientific_role_provenance,
-    )
-    _seal_or_verify_json(root / "run_contract.json", run_contract, "run_contract_sha256")
     initial_state = dict(runtime.state_identity())
     with forbid_network_access():
         gate = _run_or_verify_one_case_gate(
@@ -1444,6 +1716,21 @@ def run_step200_p0006_inference_audit(
         )
         if dict(runtime.state_identity()) != initial_state:
             raise RuntimeError("Model state changed during the one-case inference gate.")
+        layout_provenance = _validate_full_volume_layout_provenance(
+            gate.get("full_volume_layout_provenance")
+        )
+        run_contract = _run_contract(
+            plan,
+            runtime,
+            audit_implementation_commit=audit_implementation_commit,
+            dependency_receipt=dependency_receipt,
+            lpips_receipt=lpips_receipt,
+            scientific_role_provenance=scientific_role_provenance,
+            full_volume_layout_provenance=layout_provenance,
+        )
+        _seal_or_verify_json(
+            root / "run_contract.json", run_contract, "run_contract_sha256"
+        )
 
         emitted = 0
         for streamed in iter_gate01_p0006_evaluation_cases(
@@ -1474,6 +1761,15 @@ def run_step200_p0006_inference_audit(
             outputs: InferenceCaseOutputs | None = None
             try:
                 outputs = runtime.infer_case(case, streamed.calibrator, plan=plan)
+                if (
+                    _validate_full_volume_layout_provenance(
+                        outputs.full_volume_layout_provenance
+                    )
+                    != layout_provenance
+                ):
+                    raise ValueError(
+                        "P:0006 case full-volume layout differs from the one-case gate."
+                    )
                 metrics = _score_case(
                     outputs, case, metric_fn=metric_fn, device=str(runtime.device)
                 )
@@ -1587,13 +1883,22 @@ def _score_case(
 ) -> dict[str, dict[str, float]]:
     if tuple(outputs.methods) != _METHOD_ORDER:
         raise ValueError("Inference method inventory or deterministic ordering changed.")
-    target = case.target
+    target_layout = adapt_full_volume_layout(case.target, role="P:0006 metric target")
+    target = target_layout.spatial_volume()
     scored: dict[str, dict[str, float]] = {}
     for method, prediction in outputs.methods.items():
-        values = dict(metric_fn(prediction, target, _METRICS, device))
+        prediction_layout = adapt_full_volume_layout(
+            prediction,
+            role=f"P:0006 metric method {method}",
+            expected_shape=target_layout.authenticated_shape,
+        )
+        prediction_volume = prediction_layout.spatial_volume()
+        values = dict(metric_fn(prediction_volume, target, _METRICS, device))
         if set(values) != set(_METRICS) or any(not math.isfinite(float(value)) for value in values.values()):
             raise ValueError("Official P:0006 metric result is incomplete or nonfinite.")
-        values["edge_mae"] = float(gradient_mae(prediction[None], target[None]).cpu())
+        values["edge_mae"] = float(
+            gradient_mae(prediction_volume[None], target[None]).cpu()
+        )
         scored[method] = {key: float(value) for key, value in values.items()}
     return scored
 
@@ -1717,7 +2022,8 @@ def _run_or_verify_one_case_gate(
     if path.exists():
         gate = _load_self_hashed(path, "gate_sha256")
         if (
-            gate.get("inference_plan_sha256") != plan.sha256
+            gate.get("contract_version") != MEMORY_GATE_CONTRACT
+            or gate.get("inference_plan_sha256") != plan.sha256
             or gate.get("memory_gate_case") != plan.payload["memory_gate_case"]
             or gate.get("gpu_identity") != dict(runtime.gpu_identity)
             or gate.get("model_state_before") != dict(initial_state)
@@ -1725,6 +2031,9 @@ def _run_or_verify_one_case_gate(
             or gate.get("status") != "pass"
         ):
             raise ValueError("Existing one-case inference gate is incompatible.")
+        _validate_full_volume_layout_provenance(
+            gate.get("full_volume_layout_provenance")
+        )
         return gate
     if require_a100:
         torch.cuda.reset_peak_memory_stats(runtime.device)
@@ -1751,14 +2060,20 @@ def _run_or_verify_one_case_gate(
         iterator.close()
         raise ValueError("Frozen one-case memory-gate domain cell is absent from P:0006.")
     outputs: InferenceCaseOutputs | None = None
+    layout_provenance: dict[str, Any] | None = None
     try:
         outputs = runtime.infer_case(streamed.case, streamed.calibrator, plan=plan)
+        layout_provenance = _validate_full_volume_layout_provenance(
+            outputs.full_volume_layout_provenance
+        )
     finally:
         if outputs is not None:
             _release_case_outputs(outputs)
         del outputs
         streamed.release()
         iterator.close()
+    if layout_provenance is None:
+        raise RuntimeError("One-case inference gate did not produce layout provenance.")
     if require_a100:
         torch.cuda.synchronize(runtime.device)
         peak_allocated = int(torch.cuda.max_memory_allocated(runtime.device))
@@ -1784,6 +2099,7 @@ def _run_or_verify_one_case_gate(
         "elapsed_seconds": time.perf_counter() - started,
         "model_state_before": dict(initial_state),
         "model_state_after": state_after,
+        "full_volume_layout_provenance": layout_provenance,
         "gradients_enabled": False,
         "optimizer_loaded": False,
         "training_invoked": False,
@@ -1958,6 +2274,9 @@ def _build_inference_summary(
             scientific_role_provenance
         ),
         "inference_plan_sha256": plan.sha256,
+        "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
+            gate.get("full_volume_layout_provenance")
+        ),
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
         "case_count": 60,
@@ -2145,6 +2464,9 @@ def _seal_artifact_manifest(
             scientific_role_provenance
         ),
         "inference_plan_sha256": plan.sha256,
+        "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
+            gate.get("full_volume_layout_provenance")
+        ),
         "montage_specification_sha256": plan.montage_specification["montage_specification_sha256"],
         "metric_contract_version": METRIC_CONTRACT,
         "GPU_identity": dict(runtime.gpu_identity),
@@ -2190,9 +2512,10 @@ def _run_contract(
     dependency_receipt: Mapping[str, Any],
     lpips_receipt: Mapping[str, Any],
     scientific_role_provenance: Mapping[str, Any],
+    full_volume_layout_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
-        "contract_version": "stage2-step200-p0006-inference-run-v5",
+        "contract_version": "stage2-step200-p0006-inference-run-v6",
         "training_evidence_commit": TRAINING_EVIDENCE_COMMIT,
         "audit_implementation_commit": audit_implementation_commit,
         "checkpoint_sha256": CHECKPOINT_SHA256,
@@ -2203,6 +2526,9 @@ def _run_contract(
             scientific_role_provenance
         ),
         "inference_plan_sha256": plan.sha256,
+        "full_volume_layout_provenance": _validate_full_volume_layout_provenance(
+            full_volume_layout_provenance
+        ),
         "model_state": dict(runtime.state_identity()),
         "GPU_identity": dict(runtime.gpu_identity),
         "dependency_environment_sha256": sha256_json(dependency_receipt),
@@ -2703,7 +3029,8 @@ def _middle_slice(value: torch.Tensor) -> np.ndarray:
 def _volume_array(value: torch.Tensor | None, name: str) -> np.ndarray:
     if value is None:
         raise ValueError(f"Montage volume {name!r} is missing.")
-    array = value.detach().cpu().float().numpy().squeeze()
+    spatial = adapt_full_volume_layout(value, role=f"montage volume {name}").spatial_volume()
+    array = spatial.detach().cpu().float().numpy()
     if array.ndim != 3 or not np.isfinite(array).all():
         raise ValueError(f"Montage volume {name!r} is not one finite 3-D array.")
     return np.asarray(array, dtype=np.float32)
@@ -2738,6 +3065,12 @@ def _module_state_sha256(module: torch.nn.Module) -> str:
             for name, value in sorted(module.state_dict().items())
         }
     )
+
+
+def _bf16_inference_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def _decode(decoder: torch.nn.Module, latent: torch.Tensor, domains: Sequence[Domain]) -> torch.Tensor:
@@ -2840,11 +3173,13 @@ def _distribution_version(name: str) -> str:
 
 
 __all__ = [
+    "AdaptedFullVolume",
     "ARTIFACT_MANIFEST_CONTRACT",
     "CASE_RECEIPT_CONTRACT",
     "CHECKPOINT_SHA256",
     "FROZEN_STAGE1_VAE_PROVENANCE_CONTRACT",
     "FROZEN_P0006_SCIENTIFIC_ROLE_PREFLIGHT_CONTRACT",
+    "FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT",
     "FrozenP0006ScientificRolePreflight",
     "FrozenStage1VAEConfigPreflight",
     "FrozenStage1VAEProvenance",
@@ -2869,6 +3204,7 @@ __all__ = [
     "Step200CaseInferenceRuntime",
     "TRAINING_EVIDENCE_COMMIT",
     "UnifiedStep200InferenceRuntime",
+    "adapt_full_volume_layout",
     "build_frozen_step200_inference_plan",
     "load_unified_step200_inference_runtime",
     "photometry_namespace_compatibility_active",

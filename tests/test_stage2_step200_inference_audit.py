@@ -26,6 +26,24 @@ from fieldbridge.evaluation.stage2_unified_preflight import (
 AUDIT_COMMIT = "a" * 40
 
 
+def _layout_provenance(rank: int = 4) -> dict[str, object]:
+    return {
+        "contract_version": audit.FULL_VOLUME_LAYOUT_ADAPTER_CONTRACT,
+        "authenticated_source_rank": rank,
+        "authenticated_canonical_rank": rank,
+        "leading_singleton_axis_count": rank - 3,
+        "model_input_rank": 5,
+        "representation_only_reshape": True,
+        "spatial_axes_preserved": True,
+        "resampling_performed": False,
+        "cropping_performed": False,
+        "padding_performed": False,
+        "transposition_performed": False,
+        "output_restored_to_authenticated_case_representation": True,
+        "training_invoked": False,
+    }
+
+
 def _node_sha(contrast: str, field: float) -> str:
     return hashlib.sha256(f"{contrast}|{field:g}".encode()).hexdigest()
 
@@ -223,6 +241,7 @@ class _DummyRuntime:
             graph=graph,
             sweep_slices=sweeps,
             decoded_canonical_sha256="4" * 64,
+            full_volume_layout_provenance=_layout_provenance(),
         )
         weakref.finalize(unified, self._output_released)
         return outputs
@@ -506,6 +525,8 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
     assert result["frozen_p0006_scientific_role_provenance"][
         "long_run_training_authorized"
     ] is False
+    assert result["contract_version"] == audit.INFERENCE_AUDIT_CONTRACT
+    assert result["full_volume_layout_provenance"] == _layout_provenance()
     assert result["final_stop"] == "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION"
     assert max(live_counts) == 1
     assert runtime.max_live_outputs == 1
@@ -531,6 +552,12 @@ def test_complete_streaming_audit_resume_and_corruption_fail_closed(
         assert sealed["frozen_p0006_scientific_role_provenance"][
             "long_run_authorized_by_evaluation_path"
         ] is True
+        assert sealed["full_volume_layout_provenance"] == _layout_provenance()
+    gate = json.loads(
+        (output / "one_case_inference_memory_gate.json").read_text(encoding="utf-8")
+    )
+    assert gate["contract_version"] == audit.MEMORY_GATE_CONTRACT
+    assert gate["full_volume_layout_provenance"] == _layout_provenance()
     for path in output.rglob("*.npy"):
         assert np.load(path, allow_pickle=False).ndim < 4
 
@@ -585,6 +612,9 @@ def test_source_enforces_inference_only_generator_state_and_no_materializing_loa
     assert "load_state_dict(state[\"translator\"]" not in source
     assert "translator.load_state_dict(translator_state, strict=True)" in source
     assert "sha256_json(vae_config) !=" not in source
+    assert ".squeeze(" not in source
+    assert "stage2-step200-full-volume-layout-adapter-v1" in source
+    assert "stage2-step200-p0006-inference-run-v6" in source
     assert "STOP_FOR_HUMAN_RESOURCE_BOUNDED_TRAINING_DECISION" in source
 
 
@@ -914,6 +944,7 @@ def test_runtime_loader_verifies_complete_checkpoint_then_builds_only_generator_
         dependency_receipt={"synthetic": True},
         lpips_receipt={"synthetic": True},
         scientific_role_provenance={"synthetic_test_role": True},
+        full_volume_layout_provenance=_layout_provenance(),
     )
     sealed_vae = run_contract["frozen_stage1_vae_provenance"]
     assert sealed_vae["raw_config_file_sha256"] == config_raw_sha

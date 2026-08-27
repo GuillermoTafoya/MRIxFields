@@ -139,8 +139,26 @@ R/train rows, zero accepted P rows, 30 excluded P rows, and the exact two 3-reco
 collision groups. After bank restoration the manifest must repeat both exact photometry
 hashes. The already validated in-memory artifact is passed to runtime construction and
 is rehashed immediately before use; it is never reloaded after model construction.
-Run, summary, and artifact-manifest contracts are v5 so exact resume/no-clobber rejects
+Run, summary, and artifact-manifest contracts are v6 so exact resume/no-clobber rejects
 outputs that predate this provenance.
+
+The inference boundary uses the sealed
+`stage2-step200-full-volume-layout-adapter-v1` contract. It accepts only one
+full-volume spatial tensor represented as `XYZ`, `1XYZ`, or `11XYZ`; every leading
+batch/channel axis must be singleton. The authentic `11XYZ` VAE input is passed
+unchanged, while compatibility forms receive only missing leading singleton axes.
+The adapter forbids squeezing, resampling, cropping, padding, transposition, axis
+reordering, and numerical conversion. It validates finite values and preserves even a
+legitimate singleton spatial dimension.
+
+Source-derived support is reduced only across validated leading singleton axes to
+`XYZ`, then represented as `11XYZ` for encoder/anatomy use. Every one-channel decoder
+result must be `11XYZ` with identical spatial axes and is restored to the exact
+authenticated canonical-context shape before primary, graph, or field-sweep rendering.
+All seven metric methods are then exposed to the unchanged official metrics as the
+same strict three-dimensional voxel array. The v2 one-case memory gate and v6 run,
+summary, and manifest receipts record only sanitized ranks and representation-safety
+flags, never voxel values or case identities.
 
 After Drive mount and before local-capacity checks or bank restoration, the operator
 authenticates the small sealed P:0006 protocol v4 and evaluation-readiness v3 byte

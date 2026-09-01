@@ -352,6 +352,8 @@ def test_rescue_notebook_is_unexecuted_and_delegates_to_operator() -> None:
             assert cell["execution_count"] is None
             assert cell["outputs"] == []
     assert "stage2_rescue_diagnostics_operator.py" in code
+    assert "__RESCUE_IMPLEMENTATION_COMMIT__" not in code
+    assert "feaa91dc0b00957a14d5104d250125e2538b4d08" in code
     assert "exec(compile(operator.read_text" in code
     assert "drive.mount('/content/drive')" in code
     assert "git', 'checkout', '--detach'" in code

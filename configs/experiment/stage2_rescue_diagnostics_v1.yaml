@@ -1,0 +1,69 @@
+contract: stage2-rescue-diagnostics-config-v1
+schema_family: stage2-rescue-diagnostics-v1
+scope: retrospective_R_only_diagnostics
+
+data_boundary:
+  fitting: R_train_only
+  diagnostic_assessment: [R_train, R_validation]
+  paired_final_evaluation: P0006_separate_sealed_step
+  P0006_training_tuning_selection_or_iterative_comparison: forbidden
+  P0009: frozen_and_forbidden
+  paired_R_endpoint_assumption: false
+
+checkpoint_identity:
+  training_evidence_commit: 82633d66e5ea47f96b149ea22cc192fcf4526f06
+  checkpoint_sha256: 09b157d7d9b214816693a8d522d7fa9e8a75d8f08254ed2715bfb8fc13795021
+  promotion_authorized: false
+
+conditioning:
+  split: validation
+  fixed_source_count: 3
+  sensitivity_epsilon: 1.0e-10
+  optimizer_step: forbidden
+
+identifiability:
+  fit_split: train
+  assessment_split: validation
+  classifier: fixed_standardized_nearest_R_train_centroid_v1
+  primary_tasks: [contrast_3_way, field_5_way_within_each_contrast]
+  fifteen_way_secondary: true
+  pass_margin_over_chance: 0.10
+
+target_sweep:
+  split: validation
+  fixed_source_count: 3
+  target_fields_t: [0.1, 1.5, 3.0, 5.0, 7.0]
+  integration_steps: 4
+  integration_solver: heun
+  sensitivity_epsilon: 1.0e-8
+  physical_monotonicity_claimed: false
+
+off_manifold:
+  reference_split: train
+  reference_record_count: 30
+  generated_source_count: 3
+  generated_targets_per_source: 5
+  outlier_quantile_fit_on_R_train: 0.99
+  maximum_outlier_fraction: 0.10
+
+gradients:
+  split: train
+  batch_count: 2
+  term_order: [sb, identity, anatomy, graph, adversarial, domain]
+  maximum_exact_cosine_parameters: 2000000
+  gradient_epsilon: 1.0e-12
+  optimizer_step: forbidden
+  retain_graph: false
+
+micro_overfit:
+  evidence_role: synthetic_implementation_gate_only
+  private_data_used: false
+  steps: 200
+  learning_rate: 0.02
+  pass_mae: 0.04
+
+publication:
+  root: /content/drive/MyDrive/MRIxFields2026/UnifiedStage2_1ca2b4a_01/stage2_rescue_2026_09_01/diagnostics_v1
+  no_clobber: true
+  exact_resume: verify_existing_or_fail
+  json_self_hash: result_sha256

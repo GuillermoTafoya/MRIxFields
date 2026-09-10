@@ -12,10 +12,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.utils.data import DataLoader
 
 from fieldbridge.config import dump_yaml_config, load_yaml_config
 from fieldbridge.data.contracts import RawBatch, VolumeRecord
+from fieldbridge.data.domains import Domain, FIELD_STRENGTHS_T
 from fieldbridge.data.vae_splits import (
     build_vae_splits,
     load_vae_splits,
@@ -172,6 +174,10 @@ from fieldbridge.evaluation.stage2_unified_preflight import (
     import_retrospective_paired_evaluation_archive,
     quantify_factored_domain_separability,
     seal_long_run_evaluation_readiness,
+)
+from fieldbridge.evaluation.stage2_rescue_diagnostics import (
+    diagnose_conditioning_plumbing,
+    write_diagnostic_json,
 )
 from fieldbridge.utils.seeding import seed_everything
 from fieldbridge.data.photometry_factored_latent_bank import (
@@ -591,6 +597,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     domain_preflight.add_argument("--bank-dir", type=Path, required=True)
     domain_preflight.add_argument("--out", type=Path, required=True)
+
+    conditioning_diagnostic = subparsers.add_parser(
+        "diagnose-stage2-conditioning",
+        help="Trace R-only Stage-2 source/target conditioning and gradients without training.",
+    )
+    conditioning_diagnostic.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/experiment/stage2_unified_full_retrospective_v7.yaml"),
+    )
+    conditioning_diagnostic.add_argument("--checkpoint", type=Path, required=True)
+    conditioning_diagnostic.add_argument("--bank-dir", type=Path, required=True)
+    conditioning_diagnostic.add_argument(
+        "--split", choices=("train", "validation"), default="validation"
+    )
+    conditioning_diagnostic.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    conditioning_diagnostic.add_argument("--expected-checkpoint-sha256")
+    conditioning_diagnostic.add_argument("--expected-training-commit")
+    conditioning_diagnostic.add_argument("--out", type=Path, required=True)
+    conditioning_diagnostic.add_argument("--resume", action="store_true")
 
     pair_feasibility = subparsers.add_parser(
         "audit-stage2-retrospective-pair-feasibility",
@@ -1881,6 +1909,61 @@ def main(argv: list[str] | None = None) -> int:
         result = quantify_factored_domain_separability(
             train_index, validation_index, stats, output_path=args.out
         )
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    if args.command == "diagnose-stage2-conditioning":
+        config = _load_optional_config(args.config)
+        model_config = _model_config(config)
+        translator = build_translator(
+            str(model_config.get("name", "flow_matching_latent")),
+            **{key: value for key, value in model_config.items() if key != "name"},
+        )
+        if (
+            args.expected_checkpoint_sha256 is not None
+            and sha256_file(args.checkpoint) != args.expected_checkpoint_sha256
+        ):
+            raise ValueError("Stage-2 diagnostic checkpoint SHA-256 mismatch.")
+        checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
+        metadata = checkpoint.get("_meta", {})
+        if (
+            args.expected_training_commit is not None
+            and (
+                not isinstance(metadata, Mapping)
+                or metadata.get("git_commit") != args.expected_training_commit
+            )
+        ):
+            raise ValueError("Stage-2 diagnostic training-evidence commit mismatch.")
+        translator_state = checkpoint.get("translator")
+        if not isinstance(translator_state, Mapping):
+            raise ValueError("Stage-2 diagnostic checkpoint has no translator state.")
+        translator.load_state_dict(translator_state, strict=True)
+        device = _resolve_device(args.device)
+        translator.to(device).eval()
+        index = PhotometryFactoredLatentBankIndex(args.bank_dir, args.split)
+        stats = FactoredLatentStats.from_bank(args.bank_dir)
+        latent, support, source_domains, _ = index.load_batch([0])
+        source = source_domains[0]
+        alternatives = [
+            field for field in FIELD_STRENGTHS_T if field != source.field_strength_t
+        ]
+        requested = Domain(alternatives[0], source.contrast)
+        alternate = Domain(alternatives[1], source.contrast)
+        normalized = stats.normalize(latent.to(device), support.to(device))
+        time_values = (
+            torch.full((1,), 0.5, device=device, dtype=normalized.dtype)
+            if str(model_config.get("name", "")) == "flow_matching_latent"
+            else None
+        )
+        result = diagnose_conditioning_plumbing(
+            translator,
+            normalized,
+            [source],
+            [requested],
+            [alternate],
+            time_values=time_values,
+        )
+        write_diagnostic_json(args.out, result, resume=args.resume)
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
         return 0
 

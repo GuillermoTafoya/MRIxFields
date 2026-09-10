@@ -627,7 +627,7 @@ def same_source_five_target_sweep(
                 steps=integration_steps,
                 solver=solver,
             )
-            decoded = _diagnostic_decode(decoder, stats.denormalize(transported), [target])
+            decoded = _diagnostic_decode(decoder, stats.denormalize(transported), [target]).clamp(0.0, 1.0)
             final = renderer(decoded, target) if renderer is not None else decoded
             latent_outputs.append(transported.detach().float())
             decoded_outputs.append(decoded.detach().float())
@@ -1072,7 +1072,7 @@ def diagnose_per_term_gradients(
     stats: FactoredLatentStats,
     *,
     seed: int = 20_260_901,
-    maximum_exact_cosine_parameters: int = 2_000_000,
+    maximum_exact_cosine_parameters: int = 16_000_000,
     gradient_epsilon: float = 1.0e-12,
 ) -> dict[str, Any]:
     """Recompute each real Stage-2 term independently; never call optimizer.step()."""

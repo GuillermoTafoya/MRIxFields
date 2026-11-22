@@ -118,8 +118,8 @@ def _pilot_descriptor(manifest, receipts, seeds):
     return spec, row
 
 
-def load_pilot_inputs(drive_root):
-    """Authenticate the Gate 0.1 metadata and load only the original paired pilot."""
+def read_p0006_metadata(drive_root):
+    """Authenticate the frozen Gate 0.1 study, roles and calibrator before opening arrays."""
     root = Path(drive_root)
     recovery = (root / "UnifiedStage2_1ca2b4a_01/stage2_unified_v7/bank_8081ce89a0ea"
                 / "recovery_training_82633d66e5ea_operator_d3949c3591df")
@@ -141,7 +141,6 @@ def load_pilot_inputs(drive_root):
         _verified_protocol_file(protocol, "gate01_manifest"), protocol_lock=lock, calibrator=calibrator)
     if manifest.root != archive or info["evidence_scope"]["traveller_identity_sha256"] != P0006_IDENTITY_SHA256:
         raise ValueError("Frozen Gate 0.1 archive or participant identity mismatch.")
-    descriptor, row = _pilot_descriptor(manifest, protocol["case_receipts"], plan["case_seeds"])
     provenance = {
         "participant": "P:0006", "role": role.readiness["evaluation_role"],
         "protocol_file_sha256": role.protocol_file_sha256, "protocol_sha256": role.protocol_sha256,
@@ -149,7 +148,15 @@ def load_pilot_inputs(drive_root):
         "gate_manifest_sha256": info["sha256"], "calibrator_artifact_sha256": calibrator.artifact_sha256,
         "source_support_threshold": manifest.support_threshold, "number_of_acquisitions": 15, "number_of_cases": 60,
     }
-    cohort = Cohort(provenance, calibrator, manifest, {descriptor.case_id: row})
+    rows = {row["case_id"]: row for row in manifest.case_specs}
+    return Cohort(provenance, calibrator, manifest, rows), protocol["case_receipts"], plan["case_seeds"]
+
+
+def load_pilot_inputs(drive_root):
+    """Authenticate the Gate 0.1 metadata and load only the original paired pilot."""
+    cohort, receipts, seeds = read_p0006_metadata(drive_root)
+    descriptor, row = _pilot_descriptor(cohort.manifest, receipts, seeds)
+    cohort.rows = {descriptor.case_id: row}
     source = load_source(cohort, descriptor)
     target = load_target(cohort, descriptor, tuple(source.source_image.shape))
     baseline = calibrated_source_reconstruction(cohort, descriptor, source)
@@ -351,25 +358,24 @@ def _stage(staged):
     print("Shared bank metadata and model inputs are ready.", flush=True)
 
 
-def stage_and_load_models(staged, device, mark):
-    """Stage the immutable inputs and qualify the archived host-staged full-volume VAE."""
-    _stage(staged)
+def load_qualified_codec(staged, bank_dir, device, mark):
+    """Load the frozen Run C codec, qualify its low-memory path and authenticate bank statistics."""
     mark("Authenticate frozen bank, Run C encoder/decoder and training photometry")
     config = op.preflight_frozen_stage1_run_c_config(staged / op.CONFIG.name)
     photo = op.preflight_reviewed_photometry_namespace_artifact(staged / op.PHOTOMETRY.name)
-    bank = op.PhotometryFactoredLatentBankIndex(staged, "validation", expected_artifact_sha256=op.BANK_SHA256)
+    bank = op.PhotometryFactoredLatentBankIndex(bank_dir, "validation", expected_artifact_sha256=op.BANK_SHA256)
     manifest = dict(bank.manifest)
     manifest.pop("artifact_sha256")
     if op.sha256_json(manifest) != op.BANK_SHA256:
         raise ValueError("Frozen bank manifest digest mismatch.")
     stats_info = manifest["latent_statistics"]
-    if op.sha256_file(staged / op.FACTORED_LATENT_STATS_FILE) != stats_info["file_sha256"]:
+    if op.sha256_file(bank_dir / op.FACTORED_LATENT_STATS_FILE) != stats_info["file_sha256"]:
         raise ValueError("Latent statistics digest mismatch.")
-    stats = op.FactoredLatentStats.from_bank(staged)
+    stats = op.FactoredLatentStats.from_bank(bank_dir)
     if stats.artifact_sha256 != stats_info["artifact_sha256"]:
         raise ValueError("Latent statistics canonical digest mismatch.")
-    vae = op.verify_frozen_stage1_vae_bank_provenance(config, vae_checkpoint_path=staged / op.CHECKPOINT.name, bank_dir=staged)
-    photo = op.verify_reviewed_photometry_bank_provenance(photo, bank_dir=staged)
+    vae = op.verify_frozen_stage1_vae_bank_provenance(config, vae_checkpoint_path=staged / op.CHECKPOINT.name, bank_dir=bank_dir)
+    photo = op.verify_reviewed_photometry_bank_provenance(photo, bank_dir=bank_dir)
     model = config.parsed_config["model"]
     encoder = op.build_encoder("kl_vae", **op._kl_vae_kwargs(model, "encoder"))
     decoder = op.build_decoder("kl_vae", **op._kl_vae_kwargs(model, "decoder"))
@@ -382,13 +388,20 @@ def stage_and_load_models(staged, device, mark):
     decoder.to(device).requires_grad_(False).eval()
     mark("Qualify the full-volume low-memory operator")
     parity = qualify_local_operator(encoder, decoder, op.Domain(3.0, "T1w"), device)
-    translator, translator_info = load_translator(staged / "stage2_unified_full_step000000200.pt",
-                                                  staged / "resolved_config.json", device=device)
     support_rule = manifest["operational_support_rule"]["rule_sha256"]
     meta = dict(latent_statistics=stats_info, vae_sha256=vae.checkpoint_file_sha256,
                 vae_config=config.parsed_config, frozen_vae=vae.sanitized_provenance(),
                 split=manifest["source_split"], bank_artifact_sha256=op.BANK_SHA256,
                 bank_archive_sha256=op.BANK_ARCHIVE_SHA256,
-                translator_provenance=translator_info, canonical_photometry=photo.sanitized_provenance(),
+                canonical_photometry=photo.sanitized_provenance(),
                 support_rule_sha256=support_rule, same_device_parity=parity)
-    return encoder, decoder, translator, photo.preflight.artifact, stats, support_rule, meta
+    return encoder, decoder, photo.preflight.artifact, stats, support_rule, meta
+
+
+def stage_and_load_models(staged, device, mark):
+    """Stage the immutable pilot inputs and qualify the archived host-staged full-volume VAE."""
+    _stage(staged)
+    encoder, decoder, artifact, stats, rule, meta = load_qualified_codec(staged, staged, device, mark)
+    translator, translator_info = load_translator(staged / "stage2_unified_full_step000000200.pt",
+                                                  staged / "resolved_config.json", device=device)
+    return encoder, decoder, translator, artifact, stats, rule, {**meta, "translator_provenance": translator_info}

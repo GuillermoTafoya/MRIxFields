@@ -113,6 +113,7 @@ CriticSpace = Literal["latent", "image"]
 Precision = Literal["fp32", "bf16"]
 Solver = Literal["euler", "heun"]
 Bridge = Literal["schrodinger", "ot_cfm"]
+BridgeObjective = Literal["forward_drift", "current_velocity"]
 DecoderCheckpointMode = Literal['disabled', 'fine_grained_full_volume_v1']
 
 DEFAULT_UNIFIED_WEIGHTS: dict[str, float] = {
@@ -173,6 +174,14 @@ class UnifiedStage2Config:
     validation_complete_inventory: bool = True
     validation_plan_seed: int = 20_260_818
     variant: str = "full"
+    # Omitted in archived v7 configs, which retain their original normalized hashes.
+    bridge_objective: BridgeObjective | None = None
+
+    @property
+    def effective_bridge_objective(self) -> str:
+        if self.bridge == "ot_cfm":
+            return "ot_cfm"
+        return self.bridge_objective or "forward_drift"
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "UnifiedStage2Config":
@@ -272,6 +281,7 @@ class UnifiedStage2Config:
             lr_critic=float(training.get("lr_critic", defaults.lr_critic)),
             weight_decay=float(training.get("weight_decay", defaults.weight_decay)),
             bridge=str(training.get("bridge", defaults.bridge)),  # type: ignore[arg-type]
+            bridge_objective=training.get("bridge_objective"),
             sigma=float(training.get("sigma", defaults.sigma)),
             time_eps=float(training.get("time_eps", defaults.time_eps)),
             integration_steps=int(training.get("integration_steps", defaults.integration_steps)),
@@ -382,6 +392,7 @@ class UnifiedStage2Config:
             "lr_critic": self.lr_critic,
             "weight_decay": self.weight_decay,
             "bridge": self.bridge,
+            **({"bridge_objective": self.bridge_objective} if self.bridge_objective is not None else {}),
             "sigma": self.sigma,
             "time_eps": self.time_eps,
             "integration_steps": self.integration_steps,
@@ -982,6 +993,7 @@ def run_stage2_unified_train(
             sampler=sampler,
             expected_run_fingerprint=run_fingerprint,
             expected_validation_plan_sha256=validation_plan_sha256,
+            expected_bridge_objective=cfg.effective_bridge_objective,
             expected_pilot_steps=cfg.pilot_steps,
             history_path=history_path,
         )
@@ -2215,7 +2227,12 @@ def _bridge_sample(
         noise = _randn(tuple(source.shape), sampler, source.device, source.dtype)
     if noise.shape != source.shape or noise.device != source.device:
         raise ValueError("Frozen validation noise is shape/device inconsistent.")
-    z_t = (1.0 - t) * source + t * target + cfg.sigma * torch.sqrt(t * (1.0 - t)) * noise
+    scale = torch.sqrt(t * (1.0 - t))
+    z_t = (1.0 - t) * source + t * target + cfg.sigma * scale * noise
+    if cfg.bridge_objective == "current_velocity":
+        # Path derivative at fixed endpoints and epsilon; its conditional mean is the ODE velocity.
+        scale_derivative = cfg.sigma * (1.0 - 2.0 * t) / (2.0 * scale)
+        return z_t, (target - source) + scale_derivative * noise
     return z_t, (target - z_t) / (1.0 - t).clamp_min(cfg.time_eps)
 
 
@@ -2472,6 +2489,7 @@ def _evaluate_unpaired_validation(
     return {
         "contract_version": UNIFIED_SELECTION_CONTRACT,
         "step": step,
+        **({"bridge_objective": cfg.bridge_objective} if cfg.bridge_objective is not None else {}),
         "validation_plan_sha256": stored_plan_sha256,
         "inventory_record_count": len(index.records),
         "edge_count": len(rows),
@@ -2600,6 +2618,7 @@ def _save_exact_checkpoint(
     history_bytes = history_path.read_bytes()
     state = {
         "contract_version": UNIFIED_RESUME_CONTRACT,
+        "bridge_objective": cfg.effective_bridge_objective,
         "run_fingerprint": run_fingerprint,
         "validation_plan_sha256": validation_plan_sha256,
         "selection_rule_sha256": UNIFIED_SELECTION_RULE_SHA256,
@@ -2780,6 +2799,7 @@ def _restore_exact(
     sampler: torch.Generator,
     expected_run_fingerprint: str,
     expected_validation_plan_sha256: str,
+    expected_bridge_objective: str,
     expected_pilot_steps: int,
     history_path: Path,
 ) -> tuple[int, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
@@ -2788,6 +2808,15 @@ def _restore_exact(
         raise ValueError("Unified checkpoint exact-resume contract mismatch.")
     if state.get("run_fingerprint") != expected_run_fingerprint:
         raise ValueError("Unified checkpoint config/bank/code identity mismatch.")
+    stored_config = state["_meta"]["config"]
+    legacy_objective = "ot_cfm" if stored_config["bridge"] == "ot_cfm" else "forward_drift"
+    config_objective = stored_config.get("bridge_objective", legacy_objective)
+    # Only untagged v7 configs predate the top-level checkpoint objective.
+    saved_objective = state.get(
+        "bridge_objective", legacy_objective if "bridge_objective" not in stored_config else None
+    )
+    if saved_objective != expected_bridge_objective or config_objective != expected_bridge_objective:
+        raise ValueError("Unified checkpoint bridge objective identity mismatch.")
     if state.get("validation_plan_sha256") != expected_validation_plan_sha256:
         raise ValueError("Unified checkpoint validation-plan identity mismatch.")
     if state.get("selection_rule_sha256") != UNIFIED_SELECTION_RULE_SHA256:
@@ -3223,6 +3252,11 @@ def validate_unified_config(cfg: UnifiedStage2Config) -> None:
         raise ValueError("steps, batch_size, and integration_steps must be positive.")
     if cfg.bridge not in {"schrodinger", "ot_cfm"}:
         raise ValueError("bridge must be schrodinger or ot_cfm.")
+    if cfg.bridge_objective is not None:
+        if cfg.bridge != "schrodinger" or cfg.bridge_objective not in ("forward_drift", "current_velocity"):
+            raise ValueError("bridge_objective must be forward_drift or current_velocity for a Brownian bridge.")
+        if not 0.0 < cfg.time_eps < 0.5:
+            raise ValueError("Brownian bridge_objective requires 0 < time_eps < 0.5.")
     if cfg.integration_solver not in {"euler", "heun"}:
         raise ValueError("integration_solver must be euler or heun.")
     if cfg.critic_space not in {"latent", "image"}:

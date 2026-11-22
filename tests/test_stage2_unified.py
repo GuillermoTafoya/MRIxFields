@@ -1168,6 +1168,83 @@ def test_validation_draws_are_identical_at_every_checkpoint_step(tmp_path: Path)
     assert first["selection_score"] == last["selection_score"]
 
 
+def test_v7_brownian_objectives_share_bridge_state_and_match_synthetic_reference() -> None:
+    from fieldbridge.evaluation.synthetic_bridge_training import sample_bridge_target
+
+    rng = torch.Generator().manual_seed(426)
+    source, target, noise = torch.randn(3, 5, 4, 2, 3, 2, generator=rng)
+    t = torch.tensor([0.001, 0.17, 0.5, 0.81, 0.999])
+    legacy = UnifiedStage2Config.from_mapping({"training": {"sigma": 0.1, "time_eps": 0.001}})
+    assert "bridge_objective" not in legacy.to_dict()
+    legacy_state, historical = unified._bridge_sample(source, target, t, legacy, noise=noise)
+
+    for objective in ("forward_drift", "current_velocity"):
+        cfg = UnifiedStage2Config.from_mapping({"training": {
+            "bridge_objective": objective, "sigma": 0.1, "time_eps": 0.001,
+        }})
+        state, velocity = unified._bridge_sample(source, target, t, cfg, noise=noise)
+        _, reference = sample_bridge_target(source, target, t, noise, objective=objective, config=legacy)
+        assert torch.equal(state, legacy_state)
+        assert torch.equal(velocity, reference)
+        assert torch.equal(velocity, historical) == (objective == "forward_drift")
+        assert cfg.to_dict()["bridge_objective"] == objective
+
+    with pytest.raises(ValueError, match="bridge_objective"):
+        UnifiedStage2Config.from_mapping({"bridge_objective": "velocity_typo"})
+    with pytest.raises(ValueError, match="Brownian bridge"):
+        UnifiedStage2Config.from_mapping({"bridge": "ot_cfm", "bridge_objective": "current_velocity"})
+
+
+def test_production_fit_and_validation_use_matched_states_and_resume_is_objective_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fieldbridge.evaluation.synthetic_bridge_training import sample_bridge_target
+
+    initial = TinyTranslator()
+    decoder = TinyDecoder().requires_grad_(False)
+    bank, validation = SyntheticFactoredIndex(), SyntheticFactoredIndex("validation")
+    common = {"decoder": decoder, "train_index": bank, "validation_index": validation, "stats": _stats()}
+    sampler = unified._bridge_sample
+    seen = {}
+    fingerprints = {}
+
+    def observe(source, target, t, cfg, *args, noise):
+        state, velocity = sampler(source, target, t, cfg, *args, noise=noise)
+        _, reference = sample_bridge_target(source, target, t, noise, objective=cfg.bridge_objective,
+                                           config=replace(cfg, bridge_objective=None))
+        assert torch.equal(velocity, reference)
+        phase = "validation" if torch.is_inference_mode_enabled() else "training"
+        seen.setdefault((cfg.bridge_objective, phase), []).append(state.detach().clone())
+        return state, velocity
+
+    monkeypatch.setattr(unified, "_bridge_sample", observe)
+    objectives = ("forward_drift", "current_velocity")
+    for objective in objectives:
+        cfg = _config(tmp_path / objective, bridge_objective=objective)
+        fit = run_stage2_unified_train(cfg, translator=copy.deepcopy(initial), **common)
+        checkpoint = Path(fit.checkpoint)
+        state = load_checkpoint(checkpoint)
+        assert state["bridge_objective"] == state["_meta"]["config"]["bridge_objective"] == objective
+        assert state["training_cursor"] == 1
+        fingerprints[objective] = state["run_fingerprint"]
+        other = next(value for value in objectives if value != objective)
+        with pytest.raises(ValueError, match="config/bank/code identity"):
+            run_stage2_unified_train(replace(cfg, resume_from=checkpoint, bridge_objective=other),
+                                     translator=copy.deepcopy(initial), **common)
+        # The objective tag must also agree with the independently fingerprinted config.
+        state["bridge_objective"] = other
+        tampered = tmp_path / objective / "tampered.pt"
+        torch.save(state, tampered)
+        with pytest.raises(ValueError, match="bridge objective identity"):
+            run_stage2_unified_train(replace(cfg, resume_from=tampered),
+                                     translator=copy.deepcopy(initial), **common)
+    assert len(set(fingerprints.values())) == 2
+    for phase in ("training", "validation"):
+        first, second = (seen[(objective, phase)] for objective in objectives)
+        assert first and len(first) == len(second)
+        assert all(torch.equal(a, b) for a, b in zip(first, second, strict=True))
+
+
 def test_selection_rule_is_critic_independent_and_meaningful_for_sb_only() -> None:
     means = {"sb": 1.0, "identity": 2.0, "anatomy": 3.0, "graph": 4.0}
     score = unified_validation_selection_score(
@@ -1270,8 +1347,14 @@ def test_full_step_updates_critic_keeps_vae_frozen_and_exactly_resumes(tmp_path:
     resume_decoder = TinyDecoder()
     resume_decoder.load_state_dict(before)
     resume_decoder.requires_grad_(False)
+    # A historical v7 checkpoint has an untagged forward-drift config and no objective field.
+    assert "bridge_objective" not in state["_meta"]["config"]
+    legacy_state = dict(state)
+    assert legacy_state.pop("bridge_objective") == "forward_drift"
+    legacy_path = tmp_path / "legacy_exact_resume.pt"
+    torch.save(legacy_state, legacy_path)
     resumed = run_stage2_unified_train(
-        replace(cfg, resume_from=checkpoint),
+        replace(cfg, resume_from=legacy_path),
         translator=restored,
         decoder=resume_decoder,
         train_index=index,

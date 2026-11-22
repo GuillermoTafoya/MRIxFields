@@ -4057,6 +4057,8 @@ def _assert_gate_arrays_inside_archive(manifest: Any, archive_root: Path) -> Non
 
 
 def _as_channel_volume(value: torch.Tensor) -> torch.Tensor:
+    if value.ndim == 5 and value.shape[:2] == (1, 1):
+        return value[0]
     if value.ndim == 3:
         return value.unsqueeze(0)
     if value.ndim == 4 and value.shape[0] == 1:

@@ -7,6 +7,7 @@ import os
 import tempfile
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,12 @@ from fieldbridge.data.photometry_factorization import (
     sha256_json,
     sha256_text,
     write_json_atomic,
+)
+from fieldbridge.evaluation.decoder_context import (
+    DECODER_CONTEXT_CONTRACT,
+    DECODER_CONTEXT_POLICIES,
+    HISTORICAL_DENORMALIZE,
+    decoder_input_latent,
 )
 from fieldbridge.evaluation.stage2_photometry_baseline import (
     OfficialQualificationMetrics,
@@ -58,6 +65,44 @@ BASELINE_PREDICTIONS_CONTRACT = "stage2-unified-retrospective-baseline-predictio
 
 
 @torch.inference_mode()
+def decode_unified_endpoint(
+    decoder: torch.nn.Module,
+    normalized_endpoint: torch.Tensor,
+    target_domains: Sequence[Domain],
+    *,
+    stats: FactoredLatentStats,
+    decoder_context: str = HISTORICAL_DENORMALIZE,
+    native_source: torch.Tensor | None = None,
+    valid_core: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode a zero or integrated endpoint and return raw canonical image values.
+
+    For zero transport, pass stats.normalize(native_source, valid_core). For learned
+    transport, pass its integrated endpoint. Both use the same masked translator
+    input. Native source values must be in original encoder units, before masking.
+    """
+    latent = decoder_input_latent(
+        normalized_endpoint, stats=stats, native_source=native_source,
+        valid_core=valid_core, policy=decoder_context,
+    )
+    if len(target_domains) != latent.shape[0]:
+        raise ValueError("Each endpoint requires one target domain.")
+    if hasattr(decoder, "decode"):
+        return decoder.decode(latent, target_domains)
+    return decoder(latent)
+
+
+def _context_for_render(context: Any, decoded: torch.Tensor, decoder_context: str | None) -> Any:
+    # Explicit comparison runs share the step-200 bounded renderer. Raw metrics
+    # continue to use the unbounded decoder output. Omitted policy reproduces v4.
+    if decoder_context is not None:
+        if not bool(torch.isfinite(decoded).all()):
+            raise ValueError("Non-finite canonical output cannot be rendered.")
+        decoded = decoded.clamp(0.0, 1.0)
+    return context.with_values(decoded)
+
+
+@torch.inference_mode()
 def evaluate_stage2_unified(
     *,
     translator: BaseTranslator,
@@ -76,9 +121,12 @@ def evaluate_stage2_unified(
     integration_steps: int = 20,
     solver: str = "heun",
     resume: bool = False,
+    decoder_context: str | None = None,
 ) -> dict[str, Any]:
     """Score genuine-R pairs or P:0006 development-validation evidence."""
 
+    if decoder_context is not None and decoder_context not in DECODER_CONTEXT_POLICIES:
+        raise ValueError(f"Unknown decoder context {decoder_context!r}.")
     if bank.split != "validation":
         raise ValueError("Unified evaluation is restricted to the complete R/validation bank.")
     if p0006_evaluation_protocol_path is not None:
@@ -172,6 +220,13 @@ def evaluate_stage2_unified(
         "integration": {"steps": integration_steps, "solver": solver},
         "case_identities": sorted(case.case_identity for case in cases),
     }
+    if decoder_context is not None:
+        run_contract.update(
+            contract_version="stage2-unified-decoder-context-comparison-run-v1",
+            decoder_context=decoder_context,
+            decoder_context_contract=DECODER_CONTEXT_CONTRACT,
+            render_range="clamp_to_unit_interval_before_target_map",
+        )
     run_contract["run_contract_sha256"] = sha256_json(run_contract)
     contract_path = root / "run_contract.json"
     if contract_path.exists():
@@ -250,6 +305,14 @@ def evaluate_stage2_unified(
             path_used = "frozen_factored_bank_full_encode"
         support_batch = support[None, None].to(device_obj)
         z = stats.normalize(latent.to(device_obj), support_batch)
+        decode_endpoint = partial(
+            decode_unified_endpoint,
+            decoder,
+            stats=stats,
+            decoder_context=decoder_context or HISTORICAL_DENORMALIZE,
+            native_source=latent,
+            valid_core=support_batch,
+        )
         generated_z = integrate_transport(
             translator,
             z,
@@ -258,11 +321,10 @@ def evaluate_stage2_unified(
             steps=integration_steps,
             solver=solver,  # type: ignore[arg-type]
         )
-        decoded_canonical = _decode(
-            decoder, stats.denormalize(generated_z), [case.target_domain]
-        )[0].cpu()
+        decoded_canonical = decode_endpoint(generated_z, [case.target_domain])[0].cpu()
         full_prediction = artifact.render_target(
-            canonical_context.with_values(decoded_canonical), case.target_domain
+            _context_for_render(canonical_context, decoded_canonical, decoder_context),
+            case.target_domain,
         )
         methods: dict[str, torch.Tensor] = {
             "raw_identity": case.source,
@@ -273,6 +335,12 @@ def evaluate_stage2_unified(
             "full_unified_model": full_prediction,
             "stage1_reconstruction_ceiling": _require_ceiling(case),
         }
+        if decoder_context is not None:
+            zero_canonical = decode_endpoint(z, [case.target_domain])[0].cpu()
+            methods["zero_transport"] = artifact.render_target(
+                _context_for_render(canonical_context, zero_canonical, decoder_context),
+                case.target_domain,
+            )
         if sb_only_translator is not None:
             sb_z = integrate_transport(
                 sb_only_translator,
@@ -282,11 +350,10 @@ def evaluate_stage2_unified(
                 steps=integration_steps,
                 solver=solver,  # type: ignore[arg-type]
             )
-            sb_canonical = _decode(
-                decoder, stats.denormalize(sb_z), [case.target_domain]
-            )[0].cpu()
+            sb_canonical = decode_endpoint(sb_z, [case.target_domain])[0].cpu()
             methods["photometry_factored_sb_only"] = artifact.render_target(
-                canonical_context.with_values(sb_canonical), case.target_domain
+                _context_for_render(canonical_context, sb_canonical, decoder_context),
+                case.target_domain,
             )
         for name, ablation_model in sorted(ablation_translators.items()):
             ablation_z = integrate_transport(
@@ -297,11 +364,10 @@ def evaluate_stage2_unified(
                 steps=integration_steps,
                 solver=solver,  # type: ignore[arg-type]
             )
-            ablation_canonical = _decode(
-                decoder, stats.denormalize(ablation_z), [case.target_domain]
-            )[0].cpu()
+            ablation_canonical = decode_endpoint(ablation_z, [case.target_domain])[0].cpu()
             methods[f"ablation_{name}"] = artifact.render_target(
-                canonical_context.with_values(ablation_canonical), case.target_domain
+                _context_for_render(canonical_context, ablation_canonical, decoder_context),
+                case.target_domain,
             )
         method_metrics = {
             name: dict(metrics(prediction, case.target))
@@ -359,6 +425,9 @@ def evaluate_stage2_unified(
             integration_steps,
             solver,
             device_obj,
+            native_source=latent,
+            valid_core=support_batch,
+            decoder_context=decoder_context,
         )
         support_image = canonical_context.support_mask
         outside = ~support_image
@@ -395,7 +464,8 @@ def evaluate_stage2_unified(
                     requested < item["requested_render_nrmse"] for item in wrong
                 ),
                 "mechanistic_rendering": "all conditions rendered through requested target map",
-                "condition_native_rendering_role": "separately_labelled_diagnostic_only",
+                **({"condition_native_rendering_role": "separately_labelled_diagnostic_only"}
+                   if decoder_context is None else {}),
             },
             "graph_consistency": {
                 "all_valid_intermediate_fields": True,
@@ -485,6 +555,13 @@ def evaluate_stage2_unified(
         "descriptor_coupling_used": False,
         "learned_disentanglement_claim": "none",
     }
+    if decoder_context is not None:
+        result.update(
+            contract_version="stage2-unified-decoder-context-comparison-v1",
+            decoder_context=decoder_context,
+            decoder_context_contract=DECODER_CONTEXT_CONTRACT,
+            render_range=run_contract["render_range"],
+        )
     result["result_sha256"] = sha256_json(result)
     write_json_atomic(result_path, result, refuse_existing=True)
     _write_markdown(root / "report.md", result)
@@ -591,6 +668,10 @@ def _wrong_target_controls(
     steps: int,
     solver: str,
     device: torch.device,
+    *,
+    native_source: torch.Tensor | None = None,
+    valid_core: torch.Tensor | None = None,
+    decoder_context: str | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for field in FIELD_STRENGTHS_T:
@@ -605,36 +686,38 @@ def _wrong_target_controls(
             steps=steps,
             solver=solver,  # type: ignore[arg-type]
         )
-        wrong_canonical = _decode(
-            decoder, stats.denormalize(wrong_z), [wrong_domain]
+        # In the comparison protocol only the translator receives the wrong
+        # condition. The legacy protocol also conditioned the decoder on it.
+        decoder_domain = case.target_domain if decoder_context is not None else wrong_domain
+        wrong_canonical = decode_unified_endpoint(
+            decoder, wrong_z, [decoder_domain], stats=stats,
+            decoder_context=decoder_context or HISTORICAL_DENORMALIZE,
+            native_source=native_source, valid_core=valid_core,
         )[0].cpu()
-        # Mechanistic condition control: rendering is held fixed at the requested
-        # target, so only the translator condition changes.
+        rendered_context = _context_for_render(canonical_context, wrong_canonical, decoder_context)
         requested_render_prediction = artifact.render_target(
-            canonical_context.with_values(wrong_canonical), case.target_domain
-        )
-        native_render_prediction = artifact.render_target(
-            canonical_context.with_values(wrong_canonical), wrong_domain
+            rendered_context, case.target_domain
         )
         target = case.target.detach().cpu().double().numpy()
-        denominator = float(np.sqrt(np.mean(target**2)))
+        denominator = max(float(np.sqrt(np.mean(target**2))), 1e-12)
         requested_prediction = requested_render_prediction.detach().cpu().double().numpy()
-        native_prediction = native_render_prediction.detach().cpu().double().numpy()
-        rows.append(
-            {
-                "conditioned_domain": wrong_domain.label,
-                "requested_render_domain": case.target_domain.label,
-                "requested_render_nrmse": float(
-                    np.sqrt(np.mean((requested_prediction - target) ** 2))
-                    / max(denominator, 1e-12)
-                ),
-                "condition_native_render_domain": wrong_domain.label,
-                "condition_native_render_nrmse": float(
-                    np.sqrt(np.mean((native_prediction - target) ** 2))
-                    / max(denominator, 1e-12)
-                ),
-            }
-        )
+        row = {
+            "conditioned_domain": wrong_domain.label,
+            "requested_render_domain": case.target_domain.label,
+            "requested_render_nrmse": float(
+                np.sqrt(np.mean((requested_prediction - target) ** 2)) / denominator
+            ),
+        }
+        if decoder_context is None:
+            native_render = artifact.render_target(rendered_context, wrong_domain)
+            native_prediction = native_render.detach().cpu().double().numpy()
+            row["condition_native_render_domain"] = wrong_domain.label
+            row["condition_native_render_nrmse"] = float(
+                np.sqrt(np.mean((native_prediction - target) ** 2)) / denominator
+            )
+        else:
+            row["decoder_domain"] = decoder_domain.label
+        rows.append(row)
     return rows
 
 
@@ -644,12 +727,6 @@ def _all_intermediates(source: Domain, target: Domain) -> list[Domain]:
         for value in FIELD_STRENGTHS_T
         if value not in {source.field_strength_t, target.field_strength_t}
     ]
-
-
-def _decode(decoder: torch.nn.Module, latent: torch.Tensor, domains: Sequence[Domain]) -> torch.Tensor:
-    if hasattr(decoder, "decode"):
-        return decoder.decode(latent, domains)  # type: ignore[attr-defined,no-any-return]
-    return decoder(latent)  # type: ignore[no-any-return]
 
 
 def _require_ceiling(case: PairedEvaluationCase) -> torch.Tensor:
@@ -813,5 +890,7 @@ def _module_state_sha256(module: torch.nn.Module | None) -> str | None:
 __all__ = [
     "BASELINE_PREDICTIONS_CONTRACT",
     "UNIFIED_EVALUATION_CONTRACT",
+    "DECODER_CONTEXT_POLICIES",
+    "decode_unified_endpoint",
     "evaluate_stage2_unified",
 ]

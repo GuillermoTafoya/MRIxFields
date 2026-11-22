@@ -507,6 +507,43 @@ def test_membership_and_prospective_mutations_fail(
         )
 
 
+def test_explicit_unified_evaluation_binds_reviewed_namespace_to_exact_file_and_bank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reviewed_artifact: SyntheticReviewedArtifact,
+) -> None:
+    from fieldbridge.cli import _load_unified_evaluation_photometry
+
+    _configure_synthetic_pins(monkeypatch, reviewed_artifact)
+    identity = {
+        "artifact_file_sha256": reviewed_artifact.file_sha256,
+        "artifact_sha256": reviewed_artifact.artifact_sha256,
+    }
+    monkeypatch.setattr(
+        audit, "PhotometryFactoredLatentBankIndex",
+        lambda *_: SimpleNamespace(manifest={"photometry": identity}),
+    )
+    for policy in ("historical", "native-exterior"):
+        loaded = _load_unified_evaluation_photometry(
+            reviewed_artifact.path, bank_dir=tmp_path, decoder_context=policy,
+        )
+        assert loaded.artifact_sha256 == reviewed_artifact.artifact_sha256
+
+    with pytest.raises(ValueError, match="reserved traveller"):
+        _load_unified_evaluation_photometry(reviewed_artifact.path, bank_dir=tmp_path, decoder_context=None)
+
+    # A semantically identical JSON file with different bytes uses the strict loader.
+    alternate = tmp_path / reviewed_artifact.path.name
+    alternate.write_bytes(reviewed_artifact.path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="reserved traveller"):
+        _load_unified_evaluation_photometry(alternate, bank_dir=tmp_path, decoder_context="native-exterior")
+
+    identity["artifact_file_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="Restored bank manifest photometry file"):
+        _load_unified_evaluation_photometry(
+            reviewed_artifact.path, bank_dir=tmp_path, decoder_context="native-exterior",
+        )
+    assert not audit.photometry_namespace_compatibility_active()
+
+
 def test_bank_cross_check_is_field_specific(
     monkeypatch: pytest.MonkeyPatch,
     reviewed_artifact: SyntheticReviewedArtifact,

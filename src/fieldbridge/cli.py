@@ -163,7 +163,7 @@ from fieldbridge.training.stage2_unified import (
     load_stage2_selection_receipt,
     run_stage2_unified_train,
 )
-from fieldbridge.evaluation.stage2_unified import evaluate_stage2_unified
+from fieldbridge.evaluation.stage2_unified import DECODER_CONTEXT_POLICIES, evaluate_stage2_unified
 from fieldbridge.evaluation.stage2_unified_gate01_p0006 import (
     import_gate01_p0006_evaluation_protocol,
 )
@@ -715,6 +715,12 @@ def build_parser() -> argparse.ArgumentParser:
     eval_unified.add_argument("--integration-steps", type=int, default=20)
     eval_unified.add_argument("--solver", choices=("euler", "heun"), default="heun")
     eval_unified.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    eval_unified.add_argument(
+        "--decoder-context", choices=DECODER_CONTEXT_POLICIES,
+        help="Compare decoder inputs on paired R or P:0006 data with bounded rendering. Historical decodes the "
+             "whole endpoint; native-exterior uses source encoder values outside the valid core. "
+             "Omit to reproduce the original evaluation protocol.",
+    )
     eval_unified.add_argument("--resume", action="store_true")
 
     eval_transport = subparsers.add_parser(
@@ -2137,7 +2143,9 @@ def main(argv: list[str] | None = None) -> int:
         decoder.load_state_dict(vae_state["decoder"], strict=True)
         encoder.requires_grad_(False)
         decoder.requires_grad_(False)
-        artifact = FrozenPhotometryArtifact.load(args.photometry_artifact)
+        artifact = _load_unified_evaluation_photometry(
+            args.photometry_artifact, bank_dir=args.bank_dir, decoder_context=args.decoder_context,
+        )
         result = evaluate_stage2_unified(
             translator=translator,
             encoder=encoder,
@@ -2155,6 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
             integration_steps=args.integration_steps,
             solver=args.solver,
             resume=args.resume,
+            decoder_context=args.decoder_context,
         )
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
         return 0
@@ -3905,6 +3914,20 @@ def _model_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("Config section 'model' must be a mapping.")
     return dict(value)
+
+
+def _load_unified_evaluation_photometry(
+    path: Path, *, bank_dir: Path, decoder_context: str | None,
+) -> FrozenPhotometryArtifact:
+    """Load the exact reviewed August artifact through its authenticated namespace."""
+    if decoder_context is not None:
+        from fieldbridge.evaluation import stage2_step200_inference_audit as audit
+
+        if sha256_file(path) == audit.REVIEWED_PHOTOMETRY_FILE_SHA256:
+            preflight = audit.preflight_reviewed_photometry_namespace_artifact(path)
+            verified = audit.verify_reviewed_photometry_bank_provenance(preflight, bank_dir=bank_dir)
+            return verified.preflight.artifact
+    return FrozenPhotometryArtifact.load(path)
 
 
 def _assert_bank_vae_inputs(
